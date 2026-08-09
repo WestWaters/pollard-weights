@@ -1,0 +1,72 @@
+# ── weights & large binaries (host on HF, never in git) ──
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.dat
+models/
+data/
+
+# ── experiment artifacts: raw logs/captures stay local; notes/ tells the story ──
+experiments/*.log
+experiments/*.jsonl
+experiments/*.txt
+experiments/e2_capture_routing
+!experiments/*.py
+!experiments/*.sh
+!experiments/*.cpp
+
+# ── secrets ──
+.env
+.env.*
+!.env.example
+
+# ── python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── outputs & temp ──
+output/
+tmp/
+logs/
+*.log
+*.mp4
+*.wav
+
+# ── macOS ──
+.DS_Store
+.metadata_never_index
+
+# ── build & packaging ──
+build/
+dist/
+*.egg-info/
+
+# ── the runtime install.sh builds locally ──
+runtime/
+
+# ── more weights/data formats ──
+*.h5
+*.onnx
+checkpoints/
+weights/
+runs/
+results/
+artifacts/
+
+# ── IDE & OS ──
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# ── more media ──
+*.mov
+*.webm
+*.wav

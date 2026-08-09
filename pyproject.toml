@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pollard-weights"
+version = "0.2.0-dev"
+description = "Know what your hardware can do with any model BEFORE you download it — byte-economics calculator + measurement harnesses for running frontier models on small hardware."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+keywords = ["llm", "quantization", "moe", "inference", "edge", "gguf", "memory-bandwidth"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+pollard-calc = "pollard_calc:main"
+pollard-fit = "pollard_fit:main"
+pollard-run = "pollard_run:main"
+
+[tool.setuptools]
+package-dir = { "" = "tools" }
+py-modules = ["pollard_calc", "pollard_fit", "pollard_run"]
