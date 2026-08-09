@@ -38,10 +38,14 @@ the f16 reference on held-out WikiText (25K tokens):
 
 Every axis, ~14 standard errors apart, in a smaller file.
 
-**Replicated on a second, fully out-of-domain corpus** (literary prose,
-Project Gutenberg, 120 KB slice): uniform 0.1567 mean / 0.0801 median vs
-pollard IQ-mix **0.1240 / 0.0585** (−21% / −27%; 99.9% tails statistically
-tied). The win is not a WikiText artifact.
+**Replicated on a second, fully out-of-domain corpus** (literary prose):
+−21% mean with the first-pass imatrix. **Upgrading the calibration corpus**
+(60 KB single-domain → 1.3 MB mixed encyclopedic/narrative/dialogue/code,
+`experiments/make_calibration.py`) widened the gap, most strongly out of
+domain: WikiText-test **0.1100 vs 0.1500 (−27%)**, fresh literary eval
+**0.1038 vs 0.1678 (−38%)**, both corpora calibration-disjoint, sensitivity
+ranking unchanged (cold layers 4,7,2 under both matrices). Measured
+allocation *generalizes*; the uniform preset degrades off-domain.
 
 ## How the fitting win was found (the method, working)
 
