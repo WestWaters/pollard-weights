@@ -30,6 +30,10 @@ for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
   role-aware and depth-aware bit allocation computed for YOUR RAM budget,
   executed through llama.cpp's per-tensor quantization. `--plan-only` shows the
   full allocation and the exact command before anything is built.
+- **`pollard-fit-dit`** — the builder for everything llama-quantize rejects:
+  diffusion/video/image models in GGUF. Pure-Python per-tensor quantization
+  (F32/F16/Q8_0/Q5_0/Q4_0 ladder) with the same protection-policy + byte-budget
+  planning — validated end-to-end (build → load → coherent generation).
 - **`pollard-calc`** — the planner. Any Hugging Face id, config.json, or GGUF
   on disk; computes the memory economics and the verdict for your hardware
   before you download a byte. No GPU required.

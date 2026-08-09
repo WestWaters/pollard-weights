@@ -20,7 +20,8 @@ classifiers = [
 pollard-calc = "pollard_calc:main"
 pollard-fit = "pollard_fit:main"
 pollard-run = "pollard_run:main"
+pollard-fit-dit = "pollard_fit_dit:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
-py-modules = ["pollard_calc", "pollard_fit", "pollard_run"]
+py-modules = ["pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit"]
