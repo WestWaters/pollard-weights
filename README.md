@@ -165,8 +165,8 @@ naive version through the fitting reframe that became `pollard-fit`.
   granularity, with custom Metal/GPU kernels for the hot path.
 - **Depth-collapse** — post-training layer skipping priced in expert-fetches
   saved (E9); a depth-exited pass doubles as a free speculative drafter.
-- **Video-model harnesses** — the MiniMax-H3 campaign packaged as a
-  reproducible recipe.
+- ~~Video-model harnesses~~ — shipped: `recipes/minimax-h3-16gb.md`, the
+  full H3-on-16GB campaign as a reproducible, agent-executable recipe.
 
 ## What this is not
 
