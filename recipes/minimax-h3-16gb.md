@@ -80,6 +80,40 @@ Baseline → final: 61:31 → 49:46 wall for ~7× the pixels (README chart).
    the SigmaShift node (video 12 / audio 3) and keep audio-critical renders
    at 20 steps.
 
+## 3b. ref2va (reference-conditioned) — measured on the same 16 GB M4
+
+The reference-to-video-audio variant conditions on identity images/video/audio
+and is where a memory-fit build of the DiT itself pays off. All measured with a
+pollard-fit-dit build of the pruned ref2va DiT (11.6 GB, quantized from the
+community Q8_0 with AdaLN/norm/audio-projection tensors protected):
+
+- **It renders end-to-end.** 56 frames @ 832x480, 20 steps: ~96 min. The
+  measured-mix build won a same-seed A/B against the flat Q4_0 on background
+  detail and glow effects; audio levels identical (-14.0 vs -14.1 dB mean).
+- **Turbo LoRA works on ref2va** (undocumented by its creator — verified here):
+  8 steps, euler + simple, strength 1.0, video shift 12, **audio shift 5**,
+  same seed → clean output, ~1.8x wall-clock. Only ~3.5 min/step is sampling;
+  ~26 min/run is fixed (encoder conditioning + load + decode), so the speedup
+  approaches the full 2.5x in multishot where conditioning amortizes. Keep
+  20 steps for final masters; 4-step needs a dual-clock sampler for audio.
+- **API graph gotcha**: the native `MiniMaxH3ReferenceToVideo` node's autogrow
+  reference inputs are dotted paths in API JSON — `ref_images.ref_image_0`
+  (0-based) — while prompt tags stay 1-based (`<Picture 1>`).
+- **Reference text bleeds.** Reference-image tokens ride through every step;
+  a text-heavy reference sheet makes the model hallucinate garbled text into
+  scenes. Use a text-free character crop for shots that don't need on-screen
+  text, and quote exact strings for shots that do.
+
+## 3c. GPU lane (community-reported, not measured here)
+
+The same fit logic applies off-Mac; these are the levers CUDA users report,
+unverified on this recipe's hardware: SageAttention (CUDA-only) on top of the
+turbo LoRA; SeedVR2 / FlashVSR temporal upscalers instead of per-frame ESRGAN
+(per-frame upscalers flicker on faces; temporal models don't — SeedVR2 also
+runs on Apple MPS with fp32 forced, but 16 GB is tight); int8_convrot packs;
+seed-scouting (preview several seeds at low steps, finish only the winner).
+Measured numbers from GPU hardware are welcome via the profile zoo.
+
 ## 4. Quality rules (prompt-side)
 
 - **On-screen text**: H3 spells *quoted strings* perfectly. Put exact text in
