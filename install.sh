@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Pollard Weights — one-shot install: the tools + the llama.cpp runtime.
 # After this runs you have: pollard-calc, pollard-fit, pollard-experts, and a
-# built llama.cpp (llama-quantize, llama-cli, llama-server, rpc-server) on PATH
-# for this checkout. The RPC backend is built in so a Pollard build can span
+# built llama.cpp (llama-quantize, llama-cli, llama-server, ggml-rpc-server) on
+# PATH for this checkout. The RPC backend is built in so a Pollard build can span
 # multiple machines (pool their RAM) — see "across machines" below.
 set -euo pipefail
 
@@ -23,7 +23,7 @@ else
   if [ ! -d "$LLAMA_DIR" ]; then
     git clone --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
   fi
-  # -DGGML_RPC=ON builds the RPC backend + rpc-server so one Pollard build can
+  # -DGGML_RPC=ON builds the RPC backend + ggml-rpc-server so one Pollard build can
   # span several machines (pipeline-parallel: each holds some layers, pooling
   # their RAM). This is how a GGUF too big for one box runs across many — the
   # llama.cpp answer to vLLM's clustering, no vLLM required.
@@ -53,8 +53,11 @@ else
   fi
   cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release \
     -DGGML_RPC=ON $GPU_FLAGS
+  # NOTE: the RPC server target is `ggml-rpc-server` in current llama.cpp
+  # (was `rpc-server` before it moved to tools/rpc/). Using the wrong name
+  # silently builds nothing — verified against llama.cpp master.
   cmake --build "$LLAMA_DIR/build" -j \
-    --target llama-quantize llama-cli llama-server llama-imatrix rpc-server
+    --target llama-quantize llama-cli llama-server llama-imatrix ggml-rpc-server
   echo "runtime built at $LLAMA_DIR/build/bin ${GPU_FLAGS:+($GPU_FLAGS)}"
   echo "add to PATH:  export PATH=\"$LLAMA_DIR/build/bin:\$PATH\""
 fi
@@ -66,5 +69,5 @@ echo "  pollard-fit  --gguf model-f16.gguf --ram 16    # build the Pollard Weigh
 echo "  llama-cli    -m model-pollard.gguf             # run them"
 echo
 echo "across machines (pool RAM for a build bigger than one box):"
-echo "  # on every OTHER machine:  rpc-server -H 0.0.0.0 -p 50052"
+echo "  # on every OTHER machine:  ggml-rpc-server -H 0.0.0.0 -p 50052"
 echo "  # on the main machine:     llama-cli -m model-pollard.gguf --rpc host2:50052,host3:50052"

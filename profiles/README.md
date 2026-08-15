@@ -37,7 +37,7 @@ serving K3 over llama.cpp RPC (the DGX Spark multi-node setups). The capture
 tool speaks the same RPC sharding:
 
 ```bash
-# on each worker node:            rpc-server -p 50052
+# on each worker node:            ggml-rpc-server -p 50052
 # on the head node:
 ./e2_capture_routing -m kimi-k3.gguf --rpc node2:50052,node3:50052 \
     -f task_prompt.txt --gen 2000 --temp 0.8 -o k3_trace.jsonl --ngl 999

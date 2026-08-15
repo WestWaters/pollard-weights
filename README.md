@@ -144,12 +144,12 @@ exactly what `profiles/` wants.
 
 A build too big for one box runs across several — **any number, not just two.**
 llama.cpp has its own clustering (the RPC backend), so this needs no vLLM (and
-keeps the GGUF you built). `install.sh` compiles it in (`-DGGML_RPC=ON` +
-`rpc-server`).
+keeps the GGUF you built). `install.sh` compiles it in (`-DGGML_RPC=ON` + the
+`ggml-rpc-server` binary).
 
 ```bash
 # on every OTHER machine (as many as you have):
-rpc-server -H 0.0.0.0 -p 50052
+ggml-rpc-server -H 0.0.0.0 -p 50052
 # on the main machine — comma-separate every peer; layers split across all, RAM pooled:
 llama-cli -m model-pollard.gguf --rpc host2:50052,host3:50052,host4:50052
 ```
@@ -165,7 +165,7 @@ them (their ConnectX/QSFP, or plain 10GbE to start) carries the activations.
 
 **Every vendor works** — an RTX box, a GB10 / DGX Spark, an AMD Radeon, an Intel
 Arc, and an Apple Silicon Mac can all join the same cluster. Each peer runs
-`rpc-server` built for its own accelerator, and `install.sh` auto-detects which:
+`ggml-rpc-server` built for its own accelerator, and `install.sh` auto-detects which:
 Metal (Apple), CUDA (NVIDIA — RTX, GB10), HIP/ROCm (AMD), SYCL (Intel), or
 Vulkan as a cross-vendor fallback that runs off the graphics driver alone; CPU
 otherwise. Force one with `POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh`. Throughput
