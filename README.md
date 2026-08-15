@@ -24,12 +24,39 @@ DRAM is provisioned today as if every weight deserves the same bits and every
 byte must be resident. Neither is true, and the difference is measurable —
 for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
 
+## Measured-sensitivity allocation — beats uniform imatrix-IQ, dense AND MoE
+
+![pollard-fit vs uniform imatrix-IQ, dense and MoE](assets/kl_win.png)
+
+`pollard-sensitivity` points at a model and **measures** which tensors actually
+matter — it crushes each group one at a time and watches the KL — plus that
+model's own noise curve. Then `pollard-fit --sensitivity` allocates bits to
+minimize KL-divergence for your size budget. At matched size it beats uniform
+imatrix-IQ: **+6–27% lower KL on a dense 1.5B (5/5 sizes)** and **+21–43% on a
+40-expert MoE (4/5)** — measured against f16 on held-out wikitext, 48K tokens. MoE
+wins bigger because expert-importance variance is larger, so the allocation has more
+to exploit. Nothing is baked in: the signals are measured *per model* (granite's
+noise curve runs ~2× Qwen's). "Uniform at size" is the honest naive-mix baseline —
+**linear** interpolation between adjacent measured quants (see `notes/e13`; do not
+use log-log, it manufactures fake losses). It loses only at the extreme IQ2_S floor,
+where nothing smaller exists to compare and nothing's left to allocate. Regenerate
+the chart from raw data: `python experiments/plot_kl_win.py`.
+
 ## What you get
 
 - **`pollard-fit`** — the builder. Any GGUF in, a memory-fit build out:
-  role-aware and depth-aware bit allocation computed for YOUR RAM budget,
-  executed through llama.cpp's per-tensor quantization. `--plan-only` shows the
-  full allocation and the exact command before anything is built.
+  per-layer, per-tensor-type bit allocation computed for YOUR RAM budget by a
+  KL-aware knapsack (minimize importance-weighted quant error under the size
+  budget), executed through llama.cpp's per-tensor quantization. With a
+  `--sensitivity` profile it **beats uniform imatrix-IQ** at matched size on both
+  dense (+6–27%, 5/5) and MoE (+21–43%, 4/5) — see the chart above. `--plan-only`
+  shows the full allocation first.
+- **`pollard-sensitivity`** — the calibration that makes the win real. It crushes
+  each tensor group one at a time and **measures** the actual KL cost, per model —
+  because imatrix magnitude (big activations) is *not* the same as KL sensitivity
+  (it told us to protect attention; measurement showed attention is half as
+  sensitive as FFN). Emits a profile `pollard-fit --sensitivity` allocates on.
+  This is the per-model calibration the strong quantizers pay for.
 - **`pollard-fit-dit`** — the builder for everything llama-quantize rejects:
   diffusion/video/image models in GGUF. Pure-Python per-tensor quantization
   (F32/F16/Q8_0/Q5_0/Q4_0 ladder) with the same protection-policy + byte-budget

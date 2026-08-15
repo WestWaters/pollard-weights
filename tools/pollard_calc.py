@@ -225,6 +225,14 @@ def analyse(cfg):
         active = total
         kind = "dense"
 
+    # A GGUF source carries the EXACT param count in its tensor table — trust it
+    # over the dim estimate, which misses tied/extra embeddings when vocab_size
+    # isn't in the metadata (undersized total -> builds that bust the RAM budget).
+    if cfg.get("_tensor_param_sum"):
+        total = cfg["_tensor_param_sum"]
+        if kind == "dense":
+            active = total
+
     # Hybrid linear-attention / SSM layers (Qwen3.5 / Mamba / DeltaNet-style): not
     # every layer is standard attention, so the attn params above are approximate,
     # AND per-token behaviour differs — linear layers barely grow the KV cache.
@@ -244,6 +252,8 @@ def analyse(cfg):
         "kind": kind, "hidden": h, "layers": layers, "total": total,
         "active": active, "n_experts": n_experts or 0, "top_k": top_k,
         "shared": shared, "expert_params": expert_params,
+        "dense_ffn_params": dense_ffn_params,     # per-layer FFN bulk (for dense allocation)
+        "attn_params": attn,                      # per-layer attention (q,k,v,o) — its own group
         "dense_layers": dense_layers,
         "multimodal": multimodal, "hybrid": hybrid,
         "n_linear": n_linear, "n_full": n_full, "mtp": mtp,

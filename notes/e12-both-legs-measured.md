@@ -3,6 +3,15 @@
 _2026-08-09. The results the method was built to produce. Conditions disclosed
 inline; single-machine, replication invited._
 
+> **Update (2026-08-15) — see `e13`.** Leg 2's "bits need a sensitivity signal"
+> is now MEASURED, not proxied. The imatrix ranking used here (cold layers 4,7,2)
+> is a magnitude proxy that misleads — measured, attention is only 0.48× as
+> sensitive as FFN, so "protect attention" was backwards. And the "victim-layer
+> spikes" below are *avoidable*: allocating against a measured noise curve (a
+> marginal KL-per-byte knapsack) never creates one unless the budget forces it.
+> E13 beats uniform **IQ** (the stronger baseline, not just Q3_K_M) on dense AND
+> MoE, and measures each model's own sensitivity + noise (they differ per model).
+
 ## Leg 1 — measured placement (`pollard-run`): +21% throughput
 
 Qwen3-30B-A3B Q3_K_M (14.7 GB — does not fit the GPU), 16 GB Apple Silicon,
