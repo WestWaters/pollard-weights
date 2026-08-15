@@ -159,6 +159,11 @@ def first(cfg, *keys, default=None):
 def analyse(cfg):
     """Return a dict of architecture facts from a HF config."""
     # multimodal wrappers nest the LM under a sub-config
+    multimodal = None
+    for mm in ("vision_config", "video_config", "audio_config"):
+        if isinstance(cfg.get(mm), dict):
+            multimodal = "vision+video" if cfg.get("video_token_id") is not None else "vision"
+            break
     for sub in ("text_config", "language_config", "llm_config"):
         if isinstance(cfg.get(sub), dict) and cfg[sub].get("hidden_size"):
             cfg = {**cfg[sub], "vocab_size": first(cfg[sub], "vocab_size",
@@ -220,11 +225,28 @@ def analyse(cfg):
         active = total
         kind = "dense"
 
+    # Hybrid linear-attention / SSM layers (Qwen3.5 / Mamba / DeltaNet-style): not
+    # every layer is standard attention, so the attn params above are approximate,
+    # AND per-token behaviour differs — linear layers barely grow the KV cache.
+    lt = cfg.get("layer_types")
+    n_linear = n_full = 0
+    if isinstance(lt, list):
+        n_linear = sum(1 for t in lt if any(s in str(t) for s in ("linear", "mamba", "ssm")))
+        n_full = len(lt) - n_linear
+    hybrid = bool(n_linear) or any(k in cfg for k in
+                  ("mamba_ssm_dtype", "linear_conv_kernel_dim", "linear_num_key_heads"))
+    # Multi-token prediction: emits >1 token per weight-read pass -> the RAM-bandwidth
+    # "ceiling" is really a floor for these models.
+    mtp = first(cfg, "mtp_num_hidden_layers", "num_nextn_predict_layers",
+                "num_mtp_layers", "nextn_predict_layers", default=0) or 0
+
     return {
         "kind": kind, "hidden": h, "layers": layers, "total": total,
         "active": active, "n_experts": n_experts or 0, "top_k": top_k,
         "shared": shared, "expert_params": expert_params,
         "dense_layers": dense_layers,
+        "multimodal": multimodal, "hybrid": hybrid,
+        "n_linear": n_linear, "n_full": n_full, "mtp": mtp,
     }
 
 
@@ -274,6 +296,28 @@ def report(a, ram_gb, flash_gbps, rambw_gbps, qbits, cache_gb):
         need = gb(total_b) / 0.85
         print(f"VERDICT: NEEDS BIGGER TIER — ~{need:,.0f} GB RAM for residency; "
               f"streaming floor here is {t_flash:.2f} tok/s.")
+
+    # Architecture notes — where a new arch makes the numbers above approximate or
+    # conservative. Better to say so than to emit a dense number and stay silent.
+    notes = []
+    if a.get("multimodal"):
+        notes.append(f"multimodal ({a['multimodal']}): the sizes above are the TEXT "
+                     "model — the vision projector (mmproj) ships separately (~1 GB in GGUF).")
+    if a.get("hybrid"):
+        mix = (f"{a['n_linear']}/{a['n_linear'] + a['n_full']} layers are linear-attention"
+               if a.get("n_linear") else "linear-attention / SSM layers present")
+        notes.append(f"hybrid attention ({mix}): the attention params are APPROXIMATE "
+                     "(standard-attention formula applied to non-standard layers), and the "
+                     "linear layers barely grow the KV cache — throughput holds at long "
+                     "context in a way this single-token ceiling doesn't capture.")
+    if a.get("mtp"):
+        notes.append(f"MTP present ({a['mtp']} predictor layer(s)): decode emits >1 token "
+                     "per weight-read pass, so measured tok/s can EXCEED the RAM-bandwidth "
+                     "figure above — treat it as a FLOOR for this model, not a ceiling.")
+    if notes:
+        print("\narch notes:")
+        for n in notes:
+            print("  - " + n)
 
 
 def main():

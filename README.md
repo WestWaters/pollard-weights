@@ -36,7 +36,10 @@ for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
   planning — validated end-to-end (build → load → coherent generation).
 - **`pollard-calc`** — the planner. Any Hugging Face id, config.json, or GGUF
   on disk; computes the memory economics and the verdict for your hardware
-  before you download a byte. No GPU required.
+  before you download a byte. No GPU required. Knows MoE, dense, and the newer
+  hybrid **linear-attention / SSM** stacks (Qwen3.5-class) — it flags where an
+  arch makes the estimate approximate or conservative (multimodal towers, MTP
+  multi-token decode) instead of silently reporting a plain-dense number.
 - **`pollard-experts`** — the routing report. Point it at an `experiments/e2`
   capture and it lists the experts your workload actually runs hot, per layer,
   with an honest coverage read: a load-balanced router touches nearly the whole
