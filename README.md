@@ -37,9 +37,15 @@ for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
 - **`pollard-calc`** — the planner. Any Hugging Face id, config.json, or GGUF
   on disk; computes the memory economics and the verdict for your hardware
   before you download a byte. No GPU required.
-- **The runtime** — `install.sh` builds llama.cpp (Metal on macOS) so the
-  chain runs end-to-end from a fresh clone. Pollard builds are standard GGUFs
-  by design: the entire llama.cpp ecosystem is their runtime.
+- **`pollard-experts`** — the routing report. Point it at an `experiments/e2`
+  capture and it lists the experts your workload actually runs hot, per layer,
+  with an honest coverage read: a load-balanced router touches nearly the whole
+  pool, so you can't prune experts by topic — "hot" is a live residency signal,
+  not a skip list. Emits a keep-list for a residency planner.
+- **The runtime** — `install.sh` builds llama.cpp (Metal on macOS, plus the RPC
+  backend for multi-machine runs) so the chain runs end-to-end from a fresh
+  clone. Pollard builds are standard GGUFs by design: the entire llama.cpp
+  ecosystem is their runtime.
 - **The instruments** — harnesses that capture expert routing, measure reuse on
   your workload, and simulate hot-cache residency (`experiments/`). These are
   what turn the builder's allocation from heuristic to measured.
@@ -130,6 +136,38 @@ measured split; at tight budgets, knowing wins big):
 At the tight budget, measured placement won **every paired run** (+21% mean
 vs blind). Variance is real (shared machine); replication on your hardware is
 exactly what `profiles/` wants.
+
+## Across machines (pool their RAM)
+
+A build too big for one box runs across several — **any number, not just two.**
+llama.cpp has its own clustering (the RPC backend), so this needs no vLLM (and
+keeps the GGUF you built). `install.sh` compiles it in (`-DGGML_RPC=ON` +
+`rpc-server`).
+
+```bash
+# on every OTHER machine (as many as you have):
+rpc-server -H 0.0.0.0 -p 50052
+# on the main machine — comma-separate every peer; layers split across all, RAM pooled:
+llama-cli -m model-pollard.gguf --rpc host2:50052,host3:50052,host4:50052
+```
+
+The `--rpc` list takes as many peers as you add; total usable RAM is the sum
+across all of them, so you scale by adding boxes. It is pipeline-parallel (each
+machine holds a slice of the layers, activations hop between them at layer
+boundaries) — simpler than vLLM's tensor-parallel and a touch slower per token,
+but it pools the memory, which is the point when the model doesn't fit one box.
+Two DGX Sparks (128 GB each) hold a 167 GB Q4 build this way that neither could
+alone; add a third and a ~250 GB build comes into reach. A fast link between
+them (their ConnectX/QSFP, or plain 10GbE to start) carries the activations.
+
+**Every vendor works** — an RTX box, a GB10 / DGX Spark, an AMD Radeon, an Intel
+Arc, and an Apple Silicon Mac can all join the same cluster. Each peer runs
+`rpc-server` built for its own accelerator, and `install.sh` auto-detects which:
+Metal (Apple), CUDA (NVIDIA — RTX, GB10), HIP/ROCm (AMD), SYCL (Intel), or
+Vulkan as a cross-vendor fallback that runs off the graphics driver alone; CPU
+otherwise. Force one with `POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh`. Throughput
+tracks the slowest peer and the link, but the RAM adds up regardless of who made
+the chips.
 
 ## Use it with your agent
 
