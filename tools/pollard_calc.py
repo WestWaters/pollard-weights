@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -58,8 +59,25 @@ QUANTS = {  # effective bits per weight, format overheads included
 }
 
 
-def read_gguf_meta(path):
-    """Minimal GGUF v2/v3 header reader — metadata KV only, stdlib only."""
+def _shard_paths(path):
+    """A model may be split across shards `<prefix>-00001-of-000NN.gguf`. Given
+    ANY shard, return every shard in order (shard 1 first — it holds the full KV
+    metadata; later shards hold only their tensor slice). Non-split → [path].
+    Reading a single shard against the whole param count is what produced Frank's
+    0.00 bpw / 1.6M tok/s garbage — every big model (DeepSeek, Kimi…) is sharded."""
+    m = re.search(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(path))
+    if not m:
+        return [path]
+    prefix, total = m.group(1), int(m.group(3))
+    d = os.path.dirname(path) or "."
+    shards = [os.path.join(d, f"{prefix}-{i:05d}-of-{total:05d}.gguf")
+              for i in range(1, total + 1)]
+    present = [s for s in shards if os.path.exists(s)]
+    return present or [path]
+
+
+def _read_one_gguf(path):
+    """Read ONE GGUF file: (metadata KV dict, tensor_param_sum). stdlib only."""
     _SIMPLE = {0: ("B", 1), 1: ("b", 1), 2: ("H", 2), 3: ("h", 2), 4: ("I", 4),
                5: ("i", 4), 6: ("f", 4), 7: ("?", 1), 10: ("Q", 8),
                11: ("q", 8), 12: ("d", 8)}
@@ -97,20 +115,90 @@ def read_gguf_meta(path):
         # exact per-tensor shapes. Summing gives a ground-truth param count
         # for ANY architecture (LLM, DiT, VAE...) with no key conventions.
         total_params = 0
+        dcounts = {}
         try:
             for _ in range(n_tensors):
                 rd_str()  # tensor name
                 nd, = struct.unpack("<I", f.read(4))
                 dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
-                f.read(4 + 8)  # dtype + offset
+                dt, = struct.unpack("<I", f.read(4)); f.read(8)  # ggml dtype + offset
+                dcounts[dt] = dcounts.get(dt, 0) + 1
                 n = 1
                 for d in dims:
                     n *= d
                 total_params += n
-            meta["_tensor_param_sum"] = total_params
         except Exception:
-            pass  # malformed tail: fall back to key-based analysis only
+            total_params = None  # malformed tail: key-based analysis only
+    return meta, total_params, dcounts
+
+
+def read_gguf_meta(path):
+    """Shard-aware GGUF metadata reader. Reads the arch KV from shard 1 and sums
+    the tensor param count AND file bytes across ALL shards, so multi-shard models
+    report their true size instead of one shard's slice."""
+    shards = _shard_paths(path)
+    meta, param_sum, ok, dcounts = None, 0, True, {}
+    for i, sp in enumerate(shards):
+        kv, psum, dc = _read_one_gguf(sp)
+        if i == 0:
+            meta = kv  # full arch KV lives in the first shard
+        if psum is None:
+            ok = False
+        else:
+            param_sum += psum
+        for t, c in dc.items():
+            dcounts[t] = dcounts.get(t, 0) + c
+    meta["_tensor_param_sum"] = param_sum if ok else None
+    meta["_total_file_bytes"] = sum(os.path.getsize(s) for s in shards)
+    meta["_shard_count"] = len(shards)
+    # the most common tensor type IS the model's quant, read from the file itself —
+    # ground truth that doesn't depend on the (drifting) general.file_type enum.
+    meta["_dominant_ggml_type"] = max(dcounts, key=dcounts.get) if dcounts else None
     return meta
+
+
+def read_gguf_tensor_names(path):
+    """Every tensor name across all shards. Used by pollard-fit to catch tensors
+    that would fall through to an aggressive base preset (the exotic ones — e.g.
+    DeepSeek's indexer_compressor / output_hc_fn — that llama-quantize hard-fails
+    on when they get an imatrix-required type without coverage)."""
+    _SIMPLE = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    names = []
+    for sp in _shard_paths(path):
+        try:
+            with open(sp, "rb") as f:
+                if f.read(4) != b"GGUF":
+                    continue
+                f.read(4)                                   # version
+                nt, = struct.unpack("<Q", f.read(8))
+                nkv, = struct.unpack("<Q", f.read(8))
+
+                def rd_str():
+                    n, = struct.unpack("<Q", f.read(8))
+                    return f.read(n)
+
+                def skip(t):
+                    if t == 8:
+                        n, = struct.unpack("<Q", f.read(8)); f.read(n)
+                    elif t == 9:
+                        et, = struct.unpack("<I", f.read(4))
+                        n, = struct.unpack("<Q", f.read(8))
+                        for _ in range(n):
+                            skip(et)
+                    else:
+                        f.read(_SIMPLE[t])
+
+                for _ in range(nkv):
+                    rd_str()
+                    t, = struct.unpack("<I", f.read(4)); skip(t)
+                for _ in range(nt):
+                    nm = rd_str().decode("utf-8", "replace")
+                    nd, = struct.unpack("<I", f.read(4))
+                    f.read(8 * nd + 4 + 8)                   # dims + dtype + offset
+                    names.append(nm)
+        except Exception:
+            continue
+    return names
 
 
 def gguf_to_config(meta, path):
@@ -133,8 +221,9 @@ def gguf_to_config(meta, path):
         "moe_intermediate_size": g("expert_feed_forward_length",
                                    g("feed_forward_length")),
         "_gguf_arch": arch,
-        "_gguf_file_bytes": os.path.getsize(path),
+        "_gguf_file_bytes": meta.get("_total_file_bytes", os.path.getsize(path)),
         "_tensor_param_sum": meta.get("_tensor_param_sum"),
+        "_shard_count": meta.get("_shard_count", 1),
     }
     if isinstance(cfg["num_attention_heads"], list):  # per-layer lists
         cfg["num_attention_heads"] = max(cfg["num_attention_heads"])
@@ -330,6 +419,51 @@ def report(a, ram_gb, flash_gbps, rambw_gbps, qbits, cache_gb):
             print("  - " + n)
 
 
+# GGUF general.file_type (LLAMA_FTYPE) -> friendly quant name. Best-effort: the
+# enum has drifted across llama.cpp versions, so it's sanity-checked against the
+# measured bpw (the bpw is the ground truth; the name is the convenience).
+_FTYPE = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0",
+          9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L",
+          14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K",
+          19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS",
+          24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S",
+          29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16"}
+
+
+# GGML per-tensor type enum -> name. These are the model's ACTUAL on-disk tensor
+# types (ground truth), used when general.file_type is a value we don't recognize —
+# so a brand-new or fork quant still gets named from what's really in the file.
+_GGML_TYPE = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
+              8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K",
+              14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS",
+              19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS",
+              29: "IQ1_M", 30: "BF16", 34: "TQ1_0", 35: "TQ2_0"}
+_FULL_PRECISION = {"F32", "F16", "BF16"}
+
+
+def describe_source(meta, bpw):
+    """What quant is this GGUF, and is it a good pollard-fit source? Named from the
+    model's declared file_type (friendly preset name) OR — if that enum value is
+    unrecognized — the ACTUAL dominant tensor type read from the file. Only if BOTH
+    are unknown do we say so honestly (with the raw ids), never a fake bpw label.
+    Returns (label, is_full_precision, advice)."""
+    ft = meta.get("general.file_type")
+    dom = meta.get("_dominant_ggml_type")
+    name = (_FTYPE.get(ft) if isinstance(ft, int) else None) \
+        or (_GGML_TYPE.get(dom) if isinstance(dom, int) else None)
+    if name is None:                                    # truly unrecognized — be honest
+        ids = [s for s in (f"file_type {ft}" if isinstance(ft, int) else None,
+                           f"ggml type {dom}" if isinstance(dom, int) else None) if s]
+        name = "unrecognized quant" + (f" ({', '.join(ids)})" if ids else "")
+    full = name in _FULL_PRECISION or (name.startswith("unrecognized") and bpw >= 15.0)
+    if full:
+        advice = "ideal source — pollard-fit builds straight from this"
+    else:
+        advice = ("already quantized — pollard-fit CAN requantize it, but for best "
+                  "quality grab the f16/bf16 source (usually the base repo, not a -GGUF one)")
+    return name, full, advice
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     src = p.add_mutually_exclusive_group(required=True)
@@ -350,8 +484,10 @@ def main():
                    help="hot-cache budget GB (default: RAM minus 4)")
     a = p.parse_args()
 
+    meta = None
     if a.gguf:
-        cfg = gguf_to_config(read_gguf_meta(a.gguf), a.gguf)
+        meta = read_gguf_meta(a.gguf)
+        cfg = gguf_to_config(meta, a.gguf)
         name = f"{a.gguf} [{cfg['_gguf_arch']}]"
     elif a.config:
         cfg, name = json.load(open(a.config)), a.config
@@ -378,6 +514,12 @@ def main():
           f"{a.rambw} GB/s membw, "
           + (f"measured {qbits:.2f} bpw from file" if a.gguf else f"quant {a.quant}")
           + "\n")
+    if meta is not None:                                # a "what have I got" model check
+        label, full, advice = describe_source(meta, qbits)
+        shards = cfg.get("_shard_count", 1)
+        shard_note = f", {shards} shards" if shards > 1 else ""
+        print(f"source quant        : {label} (~{qbits:.2f} bpw{shard_note})  "
+              f"{'✅' if full else '⚠️'} {advice}\n")
     report(arch, a.ram, a.flash, a.rambw, qbits, cache)
 
 

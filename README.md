@@ -16,9 +16,15 @@ llama.cpp, Ollama, or LM Studio the minute it's built.
 ```bash
 ./install.sh                                     # tools + the llama.cpp runtime, one shot
 pollard-calc --model Qwen/Qwen3-30B-A3B --ram 16 # what CAN this machine do
-pollard-fit  --gguf model-f16.gguf --ram 16      # build the Pollard Weights for it
-llama-cli    -m model-pollard.gguf               # run them
+pollard-fit  --gguf model-f16.gguf --ram 16      # build a memory-fit GGUF for it
+llama-cli    -m model-f16-pollard.gguf           # run it
 ```
+
+⚠️ **`pollard-fit` alone gives you a *uniform* build sized to your RAM — no quality
+win.** The win over uniform quants comes from the calibration step: measure the
+model, then allocate on it. See **[Workflow — run these in order](#workflow--run-these-in-order)**.
+Start from an **f16/bf16** source (requantizing an already-quantized file only
+loses); the tool refuses to build *larger* than an already-quantized source.
 
 DRAM is provisioned today as if every weight deserves the same bits and every
 byte must be resident. Neither is true, and the difference is measurable —
@@ -81,6 +87,42 @@ the chart from raw data: `python experiments/plot_kl_win.py`.
   what turn the builder's allocation from heuristic to measured.
 - **The design, with receipts** — every claim in this README carries its
   experiment in `notes/`, failures and retractions included.
+
+## Workflow — run these in order
+
+The win over uniform quants is a **calibration** step. Skip it and you get a
+uniform, memory-fit build (still useful for *fitting* a model, but no quality
+edge). Run it and pollard beats uniform IQ at matched size.
+
+| # | command | when | needs |
+|---|---|---|---|
+| 1 | `pollard-calc --model <hf-id \| --gguf file>` | first — will it fit, what size, **and what quant you already have** (f16 = ideal source; a quant = go get the f16) | nothing (sharded GGUFs OK) |
+| 2 | `llama-imatrix -m f16.gguf -f calib.txt -o m.imatrix` | once per model | an **f16/bf16** source + a calib corpus |
+| 3 | `pollard-sensitivity --gguf f16.gguf --imatrix m.imatrix --eval held.txt --out m.sens.json` | once per model — **this is the win** | f16 source, the imatrix, a held-out eval |
+| 4 | `pollard-fit --gguf f16.gguf --ram N --imatrix m.imatrix --sensitivity m.sens.json` | build | f16 source, imatrix, sensitivity profile |
+| 5 | `llama-perplexity … --kl-divergence` / `llama-cli -m …-pollard.gguf` | verify + run | the built GGUF |
+
+```bash
+# the full winning path, start to finish
+pollard-calc       --gguf DeepSeek-V4-00001-of-00005.gguf --ram 128
+llama-imatrix   -m model-f16.gguf -f calib.txt -o model.imatrix --chunks 30
+pollard-sensitivity --gguf model-f16.gguf --imatrix model.imatrix --eval held.txt --out model.sens.json
+pollard-fit        --gguf model-f16.gguf --ram 128 --imatrix model.imatrix --sensitivity model.sens.json
+```
+
+**Shortcuts and what they cost you:**
+- **No `--sensitivity`, but `--imatrix`** → a **uniform** allocation (the imatrix
+  sets IQ-type quality but does *not* decide the per-layer bits). There is no
+  imatrix-*magnitude* proxy: magnitude misranks (it says "protect attention" when
+  attention is half as sensitive as FFN, see `notes/e13`), so a magnitude-ranked
+  build can land *worse* than uniform — we don't ship that. Run `pollard-sensitivity`
+  for the per-layer win.
+- **No `--imatrix` at all** → uniform build; the imatrix-only IQ2 types are swapped
+  to Q2_K so it can't crash, and pollard-fit **warns** that there's no per-layer
+  benefit. Use this only to *fit* a model, not to beat a quant.
+- **Aggressive (IQ2) builds** need the imatrix — pollard auto-pins any tensor the
+  base preset would touch but the imatrix can't cover (exotic tensors like
+  DeepSeek's compressors), so the build won't die partway.
 
 ## The planner in action
 
@@ -266,6 +308,25 @@ naive version through the fitting reframe that became `pollard-fit`.
 
 ## Errata
 
+- **2026-08-17 — robustness fixes from field testing on a DGX Spark (GB10).**
+  Real runs on DeepSeek-V4 (284B MoE, 5 shards) and Qwen3-30B surfaced three bugs,
+  now fixed: (1) `pollard-calc` read only the **first shard** of a multi-shard model
+  → reported 0.00 bpw / absurd tok/s; it now sums params and bytes across every
+  shard. (2) Aggressive IQ2 builds could **crash partway** when the base preset hit
+  a tensor the imatrix doesn't cover (e.g. DeepSeek's `output_hc_fn`,
+  `indexer_compressor`); pollard-fit now auto-pins those to `q6_K`. (3) With no
+  calibration signal, a build could come out **larger and slower than the source**
+  silently; pollard-fit now warns loudly (no signal = no benefit) and refuses to
+  build larger than an already-quantized source. (4) `pollard-run --vram auto`
+  read **free** VRAM, which is ~0 when a model is already resident → a useless 0
+  budget; it now plans against **total** VRAM when the GPU is occupied (placement
+  runs once the resident model is unloaded anyway). (5) `pollard-sensitivity` (the
+  measured signal itself) was hardened the same way: a **failed probe build now
+  PROTECTS that group (max sensitivity), never records it as 0** — a crash used to
+  silently read as "least important, crush hardest" — and its uniform IQ2 noise
+  builds pin uncoverable tensors so the aggressive end of the curve actually gets
+  measured on exotic models. Thanks to the tester who ran it on real hardware and
+  sent the logs — this is the culture this repo asks for.
 - **2026-08-08 — K3 expert dimensions were 2× too large.** The formula ignored
   `routed_expert_hidden_size` (K3 runs experts in a half-width latent space:
   3584 vs hidden 7168), doubling total params (5.48T → correct **2.75T**),

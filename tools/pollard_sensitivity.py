@@ -30,8 +30,9 @@ import subprocess
 import sys
 import tempfile
 
-from pollard_calc import read_gguf_meta, gguf_to_config, analyse
-from pollard_fit import LADDER, PRESET
+from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
+                          read_gguf_tensor_names)
+from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS
 
 
 def _kl(ppl, model, eval_f, base):
@@ -41,6 +42,26 @@ def _kl(ppl, model, eval_f, base):
                        capture_output=True, text=True)
     m = re.search(r"Mean\s+KLD:\s*([0-9.]+)", r.stdout + r.stderr)
     return float(m.group(1)) if m else None
+
+
+# standard per-layer matmuls the imatrix always covers; ANYTHING else (routers,
+# norms, exotic per-model tensors like DeepSeek's compressors) must not be crushed
+# to an imatrix-only IQ2 type in a uniform noise build or llama-quantize hard-fails.
+_STD_MATMUL = re.compile(
+    r"blk\.\d+\.(ffn_(up|down|gate)(_exps)?|attn_(q|k|v|qkv|output))\.weight$")
+
+
+def _uncoverable_pins(gguf):
+    """--tensor-type '<name>=q6_K' args for every tensor that isn't a standard
+    per-layer matmul, so a uniform IQ2 noise build can't crash on an imatrix-
+    uncovered tensor (token_embd/output are handled by their own flags)."""
+    args = []
+    for nm in read_gguf_tensor_names(gguf):
+        if nm in ("token_embd.weight", "output.weight"):
+            continue
+        if not _STD_MATMUL.search(nm):
+            args += ["--tensor-type", f"{re.escape(nm)}=q6_K"]
+    return args
 
 
 def main():
@@ -91,19 +112,24 @@ def main():
     # the per-type KL cost the allocator needs, MEASURED per model (it shifts a bit
     # model to model), so nothing is baked in. Cheap next to the sensitivity sweep.
     noise = {}
+    pins = _uncoverable_pins(a.gguf)                    # exotic/router/norm tensors
     print("noise curve (uniform KL per type):")
     for t in LADDER:
         uni = os.path.join(tmp, "uni.gguf")
-        subprocess.run([a.llama_quantize, "--imatrix", a.imatrix,
-                        "--token-embedding-type", t, "--output-tensor-type", t,
-                        a.gguf, uni, PRESET[t]], capture_output=True)
+        cmd = [a.llama_quantize, "--imatrix", a.imatrix,
+               "--token-embedding-type", t, "--output-tensor-type", t]
+        if PRESET[t] in IMATRIX_REQUIRED_PRESETS:      # pin uncoverable tensors so
+            cmd += pins                                # the IQ2 build doesn't crash
+        cmd += [a.gguf, uni, PRESET[t]]
+        subprocess.run(cmd, capture_output=True)
         k = _kl(a.llama_perplexity, uni, a.eval, base)
         noise[t] = k if k is not None else None
         os.path.exists(uni) and os.remove(uni)
-        print(f"  {t:8} {noise[t]}")
+        print(f"  {t:8} {noise[t]}{'  (uncovered-tensor build failed)' if noise[t] is None else ''}")
 
     # 3. crush each group in each layer, measure the KL cost over the reference
     profile = {g: {} for g in groups}
+    failed = []
     for i in range(layers):
         for g in groups:
             pat = rf"blk\.{i}\.{g}_.*={a.probe}"
@@ -111,13 +137,30 @@ def main():
                             "--tensor-type", pat, a.gguf, probe, a.ref],
                            capture_output=True)
             k = _kl(a.llama_perplexity, probe, a.eval, base)
-            cost = max(0.0, (k - kl_ref)) if k is not None else 0.0
-            profile[g][str(i)] = cost
+            # a FAILED probe (build/eval crashed) is UNMEASURED, not zero-cost —
+            # recording 0 would tell the allocator this is the LEAST important group
+            # and crush it hardest. Mark None; protect it after the sweep.
+            profile[g][str(i)] = (max(0.0, k - kl_ref) if k is not None else None)
+            if k is None:
+                failed.append(f"{g}.{i}")
             os.path.exists(probe) and os.remove(probe)
         done = (i + 1) / layers
         print(f"  layer {i:>3}/{layers}  " +
-              "  ".join(f"{g}={profile[g][str(i)]:.4f}" for g in groups) +
+              "  ".join(f"{g}={profile[g][str(i)]}" for g in groups) +
               f"   [{done*100:4.0f}%]")
+
+    # failed probes -> PROTECT (max sensitivity), never crush. Loud about it.
+    if failed:
+        for g in groups:
+            vals = [v for v in profile[g].values() if v is not None]
+            hi = max(vals) if vals else 1.0
+            for k2, v in profile[g].items():
+                if v is None:
+                    profile[g][k2] = hi
+        print(f"\nWARNING: {len(failed)} probe build(s) failed (likely imatrix-uncovered "
+              f"tensors) — those groups were set to MAX sensitivity (PROTECTED), not 0, "
+              f"so the allocator keeps their bits. Groups: "
+              f"{', '.join(failed[:8])}{' …' if len(failed) > 8 else ''}")
 
     for f in (base, ref):
         os.path.exists(f) and os.remove(f)

@@ -22,12 +22,11 @@ import json
 import math
 import re
 import shutil
-import struct
 import subprocess
 import sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
-                          detect_available_ram_gb)
+                          detect_available_ram_gb, read_gguf_tensor_names)
 
 # quant types llama-quantize accepts for --tensor-type overrides, with effective
 # bits/weight (format overhead included) used for budget math.
@@ -60,6 +59,15 @@ NOISE = {"q8_0": 0.00048, "q6_K": 0.00479, "q5_K": 0.01033, "iq4_xs": 0.04090,
 # Stepped down only if the budget truly can't hold them. Data, not a magic rule.
 EMB_FLOOR = "q6_K"
 
+# llama-quantize REFUSES these types (and their whole-model presets) unless the
+# imatrix covers the tensor — Frank's DeepSeek IQ2_S build bailed at tensor 3 on
+# output_hc_fn. Base Q2_K and IQ3_S are exempt, which is the safe fallback.
+IMATRIX_REQUIRED_PRESETS = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M", "Q2_K_S"}
+# with no imatrix, swap the imatrix-only IQ2 types for Q2_K (exempt, ~same bpw) so
+# the build succeeds instead of crashing. iq4_xs / iq3_s are already exempt.
+NOIMATRIX_TYPE_SUB = {"iq2_xxs": "q2_K", "iq2_xs": "q2_K", "iq2_s": "q2_K"}
+NOIMATRIX_PRESET_SUB = {"IQ2_XXS": "Q2_K", "IQ2_XS": "Q2_K", "IQ2_S": "Q2_K"}
+
 EXPERT_FRAGS = ["blk.{layer}.ffn_up_exps", "blk.{layer}.ffn_down_exps",
                 "blk.{layer}.ffn_gate_exps"]
 # patterns are REGEXES in llama-quantize: escape the dot or "ffn_up." swallows
@@ -68,72 +76,6 @@ EXPERT_FRAGS = ["blk.{layer}.ffn_up_exps", "blk.{layer}.ffn_down_exps",
 # (this is how per-layer sensitivity allocation reaches a dense model)
 DENSE_FFN_FRAGS = [r"blk\.{layer}\.ffn_up\.weight", r"blk\.{layer}\.ffn_down\.weight",
                    r"blk\.{layer}\.ffn_gate\.weight"]
-
-
-def parse_imatrix_sensitivity(path, layers):
-    """Per-layer sensitivity from a GGUF imatrix: aggregate the FFN importance
-    (in_sum2 = sum of activation^2) per block. Returns {layer: score} or None.
-    THIS is the measured signal that decides which layers keep bits — the thing
-    Unsloth's 'dynamic' quants use, extracted from the imatrix we already build."""
-    try:
-        d = open(path, "rb").read()
-    except Exception:
-        return None
-    if d[:4] != b"GGUF":
-        return None                                    # old flat imatrix: no per-layer read
-    off = 4
-    struct.unpack_from("<I", d, off); off += 4         # version
-    nt, = struct.unpack_from("<Q", d, off); off += 8
-    nkv, = struct.unpack_from("<Q", d, off); off += 8
-    _G = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
-
-    def _rs():
-        nonlocal off
-        n, = struct.unpack_from("<Q", d, off); off += 8
-        s = d[off:off + n].decode("utf-8", "replace"); off += n
-        return s
-
-    def _skip(t):
-        nonlocal off
-        if t == 8:
-            n, = struct.unpack_from("<Q", d, off); off += 8 + n
-        elif t == 9:
-            et, = struct.unpack_from("<I", d, off); off += 4
-            n, = struct.unpack_from("<Q", d, off); off += 8
-            for _ in range(n):
-                _skip(et)
-        else:
-            off += _G[t]
-
-    try:
-        for _ in range(nkv):
-            _rs(); t, = struct.unpack_from("<I", d, off); off += 4; _skip(t)
-        infos = []
-        for _ in range(nt):
-            name = _rs(); nd, = struct.unpack_from("<I", d, off); off += 4
-            dims = struct.unpack_from(f"<{nd}Q", d, off); off += 8 * nd
-            typ, = struct.unpack_from("<I", d, off); off += 4
-            toff, = struct.unpack_from("<Q", d, off); off += 8
-            infos.append((name, dims, typ, toff))
-        base = (off + 31) // 32 * 32                    # data section is 32-aligned
-        ffn, attn = {}, 0.0                              # per-layer FFN + total attention
-        for name, dims, typ, toff in infos:
-            if "in_sum2" not in name or typ != 0:       # importance sums, F32 only
-                continue
-            n = 1
-            for x in dims:
-                n *= x
-            s = sum(struct.unpack_from(f"<{n}f", d, base + toff))
-            m = re.search(r"blk\.(\d+)\.", name)
-            if "ffn" in name and m:
-                ffn[int(m.group(1))] = ffn.get(int(m.group(1)), 0.0) + s
-            elif "attn" in name:
-                attn += s
-        if not ffn:
-            return None
-        return {"ffn": {i: ffn.get(i, 0.0) for i in range(layers)}, "other": attn}
-    except Exception:
-        return None
 
 
 def _alloc_klaware(items, budget, noise=NOISE):
@@ -201,14 +143,15 @@ def _fill_noise(measured):
     return {t: est(t) for t in LADDER}
 
 
-def plan_allocation(arch, ram_gb, imatrix_path, reserve_gb, sensitivity=None):
+def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None):
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
-    by sensitivity — MEASURED from a pollard-sensitivity profile if given, else
-    the imatrix magnitude (weaker), else uniform. Embeddings/output/norms are one
-    'other' group, kept high AND counted for size (so the projection matches the
-    real build). `overrides` is [(regex, type)] for --tensor-type-file."""
+    by MEASURED sensitivity (a pollard-sensitivity profile) — else uniform. There
+    is no imatrix-magnitude proxy: magnitude misranks (see e13), so without a
+    measured profile we allocate uniformly rather than worse-than-uniform.
+    Embeddings/output/norms are one 'other' group, kept high AND counted for size
+    (so the projection matches the real build). `overrides` is [(regex, type)]."""
     budget = ram_gb * 0.85 - reserve_gb
     if budget <= 0:
         sys.exit(f"ERROR: RAM budget {ram_gb}GB minus {reserve_gb}GB activation "
@@ -226,21 +169,20 @@ def plan_allocation(arch, ram_gb, imatrix_path, reserve_gb, sensitivity=None):
                 return [], name, total * bpw / 8 / 1e9, PRESET[name], (f"uniform {name}", "no dims")
         sys.exit("ERROR: does not fit at any supported type; see pollard-calc.")
 
-    # per-group sensitivity: MEASURED profile > imatrix magnitude > uniform
+    # per-group sensitivity: MEASURED profile, else UNIFORM. We deliberately do NOT
+    # rank layers by imatrix MAGNITUDE — e13 proved magnitude != KL sensitivity (it
+    # says "protect attention" when attention is only 0.48x as sensitive as FFN), so
+    # a magnitude-ranked build can land WORSE than uniform. The imatrix still feeds
+    # llama-quantize for IQ-type quality; it just never (mis)decides the allocation.
     if sensitivity:
         ffn_imp = {int(k): float(v) for k, v in sensitivity.get("ffn", {}).items()}
         attn_imp = {int(k): float(v) for k, v in sensitivity.get("attn", {}).items()}
         src = "measured KL sensitivity (pollard-sensitivity profile)"
     else:
-        sens = parse_imatrix_sensitivity(imatrix_path, layers) if imatrix_path else None
-        if sens:
-            ffn_imp = sens["ffn"]
-            attn_imp = {i: sens["other"] / max(1, layers) for i in range(layers)}
-            src = "imatrix magnitude proxy (weaker — run pollard-sensitivity for the real signal)"
-        else:
-            ffn_imp = {i: 1.0 for i in range(layers)}
-            attn_imp = {i: 1.0 for i in range(layers)}
-            src = "uniform (no imatrix/profile)"
+        ffn_imp = {i: 1.0 for i in range(layers)}
+        attn_imp = {i: 1.0 for i in range(layers)}
+        src = ("uniform (no --sensitivity profile — run pollard-sensitivity for the "
+               "per-layer win; any --imatrix is used for IQ quality only)")
 
     # noise curve: THIS model's measured KL-per-type if the profile carries it
     # (it shifts model to model), else the calibrated default. Nothing baked in.
@@ -299,12 +241,8 @@ def main():
                     help="target machine RAM in GB, or 'auto' to measure what is "
                          "actually available right now")
     ap.add_argument("--out", help="output path (default: <src>-pollard.gguf)")
-    ap.add_argument("--profile", help="routing profile json from experiments/e2 "
-                                      "(per-layer activation heat)")
-    ap.add_argument("--cold-layers", help="comma-separated layer indices to step down "
-                                          "FIRST (e.g. from imatrix sensitivity ranking); "
-                                          "overrides the profile ordering")
-    ap.add_argument("--imatrix", help="importance matrix from llama-imatrix")
+    ap.add_argument("--imatrix", help="importance matrix from llama-imatrix — required "
+                                      "for IQ-type quality; does NOT decide the allocation")
     ap.add_argument("--sensitivity", help="measured sensitivity profile from "
                                           "pollard-sensitivity (the calibration that "
                                           "beats uniform quants — real KL cost per tensor)")
@@ -314,6 +252,9 @@ def main():
                     help="path to llama.cpp's llama-quantize binary")
     ap.add_argument("--plan-only", action="store_true",
                     help="print the allocation and the command, build nothing")
+    ap.add_argument("--allow-grow", action="store_true",
+                    help="permit a build LARGER than an already-quantized source "
+                         "(normally refused — requantizing up only loses)")
     a = ap.parse_args()
 
     if str(a.ram).lower() == "auto":
@@ -329,8 +270,50 @@ def main():
     arch = analyse(cfg)
     sensitivity = json.load(open(a.sensitivity)) if a.sensitivity else None
     overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
-        arch, a.ram, a.imatrix, a.reserve, sensitivity)
+        arch, a.ram, a.reserve, sensitivity)
     out = a.out or a.gguf.rsplit(".gguf", 1)[0] + "-pollard.gguf"
+
+    # ---- source facts + safety guards (hardened after Frank's DeepSeek/Qwen30B logs) ----
+    src_bytes = cfg.get("_gguf_file_bytes") or 0
+    src_gb = src_bytes / 1e9
+    src_bpw = (src_bytes * 8.0 / arch["total"]) if (src_bytes and arch["total"]) else None
+    requant = src_bpw is not None and src_bpw < 10.0     # source already quantized
+
+    # GUARD 1 — refuse a build LARGER than an already-quantized source. Requantizing
+    # UP only adds size and loses quality (Frank's Qwen30B: Q4_K_M 18.6 -> Q6_K 23.4 GB,
+    # 23% slower — no Pollard content, just llama-quantize promoting every tensor).
+    if requant and gb > src_gb * 1.02 and not a.allow_grow:
+        sys.exit(
+            f"ERROR: this build (~{gb:.1f} GB) would be LARGER than the source "
+            f"(~{src_gb:.1f} GB, ~{src_bpw:.1f} bpw).\n"
+            f"Requantizing an already-quantized file UP only adds size and loses "
+            f"quality — there is no Pollard benefit.\n"
+            f"Fix: start from an f16/bf16 source, or lower --ram. Override with "
+            f"--allow-grow if you really mean it.")
+
+    # GUARD 2 — no imatrix: swap the imatrix-only IQ2 types for Q2_K (exempt, ~same
+    # bpw) so the build succeeds instead of crashing on uncovered tensors.
+    subbed = False
+    if not a.imatrix:
+        subbed = base_preset in NOIMATRIX_PRESET_SUB or \
+            any(t in NOIMATRIX_TYPE_SUB for _, t in overrides) or emb_type in NOIMATRIX_TYPE_SUB
+        overrides = [(p, NOIMATRIX_TYPE_SUB.get(t, t)) for p, t in overrides]
+        base_preset = NOIMATRIX_PRESET_SUB.get(base_preset, base_preset)
+        emb_type = NOIMATRIX_TYPE_SUB.get(emb_type, emb_type)
+        for a_t, b_t in NOIMATRIX_TYPE_SUB.items():      # keep the printed summary honest
+            summary = summary.replace(a_t, b_t)
+
+    # GUARD 3 — if the base preset is imatrix-required, every tensor matching NO
+    # explicit override falls to it, including exotic ones the imatrix may not cover
+    # (DeepSeek indexer_compressor / output_hc_fn bailed at tensor 3). Pin those to
+    # the embedding floor: exempt, and negligible on these small tensors.
+    base_pins = 0
+    if base_preset in IMATRIX_REQUIRED_PRESETS:
+        handled = ("token_embd.weight", "output.weight")
+        for nm in read_gguf_tensor_names(a.gguf):
+            if nm not in handled and not any(re.search(p, nm) for p, _ in overrides):
+                overrides.append((re.escape(nm), EMB_FLOOR))
+                base_pins += 1
 
     print(f"== pollard-fit :: {a.gguf}")
     print(f"machine budget      : {a.ram:.0f} GB RAM ({a.reserve:.0f} GB reserved) "
@@ -341,22 +324,25 @@ def main():
     print(f"{label}     : {summary}  (base {base_preset})")
     print(f"sensitivity source  : {src}")
 
-    # IQ-lattice types (and measured sensitivity) need an imatrix — say so.
-    if any("iq" in str(t) for t in [emb_type, base_preset.lower()] + [t for _, t in overrides]) \
-            and not a.imatrix:
-        print("WARNING: this build uses IQ-lattice types, which NEED an --imatrix to "
-              "hold quality (llama-imatrix over a calibration corpus). Without one, "
-              "expect degraded output — pass --imatrix.")
-
-    # already-quantized source? requantizing needs the explicit flag.
-    src_bpw = None
-    if cfg.get("_gguf_file_bytes") and arch["total"]:
-        src_bpw = cfg["_gguf_file_bytes"] * 8.0 / arch["total"]
-    requant = src_bpw is not None and src_bpw < 10.0
+    # WARN — no calibration signal at all means a UNIFORM build with no per-layer
+    # benefit. Say it loudly; this is the difference between Pollard and llama-quantize.
+    if not a.sensitivity:
+        extra = " The imatrix here only sets IQ-type quality, not the allocation." if a.imatrix else ""
+        print("WARNING: no --sensitivity profile — this is a UNIFORM allocation, no "
+              f"per-layer benefit.{extra}\n         Run `pollard-sensitivity` to actually "
+              "beat uniform quants (imatrix magnitude is NOT used — it misranks).")
+    if subbed:
+        print("NOTE: no --imatrix — imatrix-only IQ2 types swapped to Q2_K so the build "
+              "won't crash. For the real win, add --imatrix + --sensitivity.")
+    if base_pins:
+        print(f"NOTE: pinned {base_pins} unmatched tensor(s) to {EMB_FLOOR} so the "
+              f"aggressive base preset can't crash on imatrix-uncovered tensors.")
+    if requant:
+        print(f"NOTE: source is already quantized (~{src_bpw:.1f} bpw) — requantizing "
+              f"with --allow-requantize. An f16/bf16 source gives better quality.")
 
     tt_file = out + ".tensor-types.txt"
     ov_lines = [f"{pat}={t}" for pat, t in overrides]
-
     cmd = [a.llama_quantize]
     if requant:
         cmd += ["--allow-requantize"]
@@ -365,11 +351,6 @@ def main():
     cmd += ["--token-embedding-type", emb_type, "--output-tensor-type", emb_type,
             "--tensor-type-file", tt_file,
             a.gguf, out, base_preset]   # base preset DERIVED from the plan
-
-    if requant:
-        print(f"NOTE: source is already quantized (~{src_bpw:.1f} bpw) — "
-              f"requantizing with --allow-requantize. An f16/bf16 source "
-              f"gives better quality.")
     print()
     if a.plan_only:
         print(f"plan only — {len(ov_lines)} tensor overrides; command that would run:")

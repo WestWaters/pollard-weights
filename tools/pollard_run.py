@@ -44,13 +44,28 @@ def main():
 
     if str(a.vram).lower() == "auto":
         try:
-            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,memory.total",
                                   "--format=csv,noheader,nounits"],
                                  capture_output=True, text=True, timeout=10).stdout
-            free_mb = sum(int(x) for x in out.split() if x.strip().isdigit())
-            a.vram = free_mb / 1024 * 0.85          # keep 15% for KV/compute
-            print(f"[--vram auto] nvidia-smi free VRAM: {free_mb/1024:.1f} GB "
-                  f"-> budget {a.vram:.1f} GB (15% reserved)")
+            free_mb = total_mb = 0
+            for line in out.strip().splitlines():
+                nums = [int(x) for x in line.replace(",", " ").split() if x.strip().isdigit()]
+                if len(nums) >= 2:
+                    free_mb += nums[0]; total_mb += nums[1]
+            if total_mb == 0:
+                raise ValueError("nvidia-smi reported no GPU memory")
+            # free VRAM reads ~0 when a model is already resident — but placement PLANS
+            # for when pollard's own model loads (that resident copy is gone by then), so
+            # fall back to TOTAL instead of erroring on a 0 budget (Frank's 09 failure).
+            if free_mb < total_mb * 0.10:
+                a.vram = total_mb / 1024 * 0.85
+                print(f"[--vram auto] only {free_mb/1024:.1f} GB free of {total_mb/1024:.1f} "
+                      f"GB — GPU is occupied; planning against TOTAL VRAM -> budget "
+                      f"{a.vram:.1f} GB (15% reserved). Pass --vram N to pin it.")
+            else:
+                a.vram = free_mb / 1024 * 0.85          # keep 15% for KV/compute
+                print(f"[--vram auto] nvidia-smi free VRAM: {free_mb/1024:.1f} GB "
+                      f"-> budget {a.vram:.1f} GB (15% reserved)")
         except Exception:
             sys.exit("ERROR: --vram auto needs nvidia-smi (NVIDIA GPUs). On Apple "
                      "Silicon pass an explicit budget; the Metal wired ceiling is "
