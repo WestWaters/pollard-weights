@@ -214,6 +214,9 @@ def gguf_to_config(meta, path):
         "intermediate_size": g("feed_forward_length"),
         "num_attention_heads": g("attention.head_count"),
         "num_key_value_heads": g("attention.head_count_kv"),
+        "head_dim": g("attention.key_length"),        # explicit head_dim (often != h/heads)
+        "kv_lora_rank": g("attention.kv_lora_rank"),  # MLA (DeepSeek/GLM): compressed KV
+        "qk_rope_head_dim": g("rope.dimension_count"),
         "vocab_size": g("vocab_size", meta.get("general.vocab_size", 0)) or 0,
         "num_experts": g("expert_count"),
         "num_experts_per_tok": g("expert_used_count"),
@@ -272,6 +275,11 @@ def analyse(cfg):
     kv_heads = first(cfg, "num_key_value_heads", default=heads) or heads
     head_dim = first(cfg, "head_dim", default=(h // heads if heads else 0))
     ffn = first(cfg, "intermediate_size", "n_inner", "ffn_dim", default=4 * h)
+    # Multi-head Latent Attention (DeepSeek / GLM glm-dsa): KV is a COMPRESSED latent
+    # (kv_lora_rank + rope part) per token per layer, ~50x smaller than GQA's
+    # kv_heads*head_dim — the difference between "needs 256 GB" and "fits a Spark".
+    kv_lora_rank = first(cfg, "kv_lora_rank", default=0) or 0
+    qk_rope_head_dim = first(cfg, "qk_rope_head_dim", default=0) or 0
 
     n_experts = first(cfg, "num_experts", "n_routed_experts",
                       "num_local_experts", "moe_num_experts")
@@ -346,7 +354,110 @@ def analyse(cfg):
         "dense_layers": dense_layers,
         "multimodal": multimodal, "hybrid": hybrid,
         "n_linear": n_linear, "n_full": n_full, "mtp": mtp,
+        "kv_heads": kv_heads, "head_dim": head_dim,
+        "mla": kv_lora_rank > 0, "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
     }
+
+
+def kv_cache_bytes(a, ctx, kv_bytes=2.0):
+    """KV-cache bytes at `ctx` tokens. Arch-aware: MLA (DeepSeek/GLM) stores one
+    compressed latent per token/layer (tiny); hybrid models only grow KV on their
+    full-attention layers. kv_bytes: 2 = f16 cache (default), 1 = q8_0, ~0.56 = q4."""
+    n_attn = a.get("n_full") or a["layers"]                 # linear layers barely grow KV
+    if a.get("mla") and a.get("kv_lora_rank"):
+        per_tok_layer = a["kv_lora_rank"] + (a.get("qk_rope_head_dim") or 0)
+        return n_attn * ctx * per_tok_layer * kv_bytes      # MLA: single latent, no K/V split
+    kvh, hd = a.get("kv_heads") or 0, a.get("head_dim") or 0
+    return 2 * n_attn * ctx * kvh * hd * kv_bytes           # GQA/MHA: K and V
+
+
+# per-card VRAM (GB) for the --gpu convenience; anything not listed, pass GB directly
+_GPU_VRAM = {"3050": 8, "3060": 12, "3060ti": 8, "3070": 8, "3080": 10, "3090": 24,
+             "4050": 6, "4060": 8, "4060ti": 16, "4070": 12, "4080": 16, "4090": 24,
+             "5060": 8, "5070": 12, "5080": 16, "5090": 32, "a4000": 16, "a5000": 24,
+             "a6000": 48, "rtx6000": 48, "rtx6000pro": 96,
+             "6000pro": 96, "a40": 48, "l40": 48, "l40s": 48, "v100": 32, "a100": 80,
+             "h100": 80, "h200": 141, "b100": 192, "b200": 192, "mi300x": 192,
+             "spark": 128, "gb10": 128, "m4max": 128, "m3ultra": 512}
+
+
+def parse_gpu(spec):
+    """'5090x4' / '24x8' / 'rtx6000pro x2' / '96' -> total VRAM GB (left = per-card
+    name or GB, right = count). Plain number or a bare card name = that much. None if
+    unparseable — so any stack of any card works, not a fixed menu."""
+    s = spec.lower().replace(" ", "")
+    if s in _GPU_VRAM:                          # bare card name (may contain 'x': rtx…)
+        return _GPU_VRAM[s]
+    try:
+        return float(s)                         # plain GB total
+    except ValueError:
+        pass
+    if "x" in s:                                # CARDxCOUNT / GBxCOUNT — split on LAST x
+        card, _, cnt = s.rpartition("x")
+        per = _GPU_VRAM.get(card)
+        if per is None:
+            try:
+                per = float(card)
+            except ValueError:
+                return None
+        try:
+            return per * int(cnt)
+        except ValueError:
+            return None
+    return None
+
+
+# fraction of a device's RAM actually usable by the model. A dedicated GPU gives
+# almost all its VRAM; a phone hands an app only ~half (iOS/Android reserve the rest
+# and OOM-kill past it — an 8 GB phone ≈ 4-5 GB usable, ~3B practical cap); Apple/APU
+# unified memory wires ~75%. Sources: iOS jetsam limits, community mobile-LLM guides.
+_DEVICE_USABLE = {"gpu": 0.94, "unified": 0.75, "mac": 0.75, "apu": 0.75,
+                  "phone": 0.55, "mobile": 0.55}
+
+
+def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"):
+    """The pre-flight: weights + KV cache at a chosen context + overhead = what it
+    takes to RUN, and which devices that fits — so you decide BEFORE the hours-long
+    build/download whether it's worth it (requested by a user running 300B MoEs)."""
+    kv_gb = kv_cache_bytes(a, ctx, kv_bytes) / 1e9
+    overhead_gb = 1.0 + ctx / 262144 * 2.0                  # compute/activation buffers (approx)
+    total_gb = weights_gb + kv_gb + overhead_gb
+    tag = ("  (MLA — compressed latent, not GQA)" if a.get("mla")
+           else f"  (hybrid: {a['n_full']}/{a['layers']} layers grow KV)"
+           if a.get("hybrid") and a.get("n_full") else "")
+    print(f"\n== will it fit? @ {ctx:,} tokens of context ==")
+    print(f"{'weights':<20}: {weights_gb:7.1f} GB")
+    print(f"{'KV cache (' + kv_label + ')':<20}: {kv_gb:7.1f} GB{tag}")
+    print(f"{'compute overhead':<20}: {overhead_gb:7.1f} GB  (approx)")
+    print(f"{'TOTAL to run':<20}: {total_gb:7.1f} GB")
+    if rig_gb:                                              # verdict for THEIR actual rig
+        frac = _DEVICE_USABLE.get(device, 0.94)
+        usable = rig_gb * frac
+        spare = usable - total_gb
+        verdict = (f"FITS, {spare:.0f} GB to spare" if spare >= usable * 0.10
+                   else f"TIGHT, {spare:.0f} GB headroom" if spare >= 0
+                   else f"SHORT by {-spare:.0f} GB — smaller quant/model, more cards, or --rpc")
+        extra = (f"  [~{frac:.0%} of {rig_gb:.0f} GB usable = {usable:.0f} GB]"
+                 if frac < 0.9 else "")
+        print(f"{'>> YOUR RIG (' + f'{rig_gb:.0f} GB {device})':<20}: {verdict}{extra}")
+        if device in ("phone", "mobile"):
+            print("   note: phones OOM-kill past ~half their RAM; iOS is practical only to "
+                  "~3B, flagship Android to ~7B. Target a 1-3B at q4 for a smooth phone run.")
+    print("reference tiers — dedicated VRAM, ~6% for the OS (phones give an app ~half):")
+    for name, cap in [("8 GB   (4060 / 8GB card)", 8), ("12 GB  (3060 / 4070)", 12),
+                      ("16 GB  (4080 / 5080)", 16), ("24 GB  (4090 / 3090)", 24),
+                      ("32 GB  (5090)", 32), ("48 GB  (2x24 / A6000)", 48),
+                      ("96 GB  (RTX 6000 Pro / 4x24)", 96), ("128 GB (DGX Spark)", 128),
+                      ("192 GB (B200 / 6x32)", 192), ("256 GB (2x Spark)", 256)]:
+        print(f"  [{'YES' if total_gb <= cap * 0.94 else 'no ':<3}] {name}")
+    if total_gb > 256 * 0.94:
+        print("  -> over 256 GB: stack more cards, pool nodes (--rpc), or a smaller quant")
+    if kv_bytes >= 2:
+        kv_q8 = kv_cache_bytes(a, ctx, 1.0) / 1e9
+        if kv_gb - kv_q8 > 0.5:
+            print(f"  tip: --kv-quant q8 halves KV to {kv_q8:.1f} GB "
+                  f"(total {weights_gb + kv_q8 + overhead_gb:.1f} GB)")
 
 
 def gb(nbytes):
@@ -482,6 +593,18 @@ def main():
                    help="quantization (default q4)")
     p.add_argument("--cache", type=float, default=None,
                    help="hot-cache budget GB (default: RAM minus 4)")
+    p.add_argument("--ctx", type=int, default=0,
+                   help="context length for a 'will it fit?' pre-flight: adds KV-cache "
+                        "size + total RAM-to-run + device fit (e.g. --ctx 262144 for 256k)")
+    p.add_argument("--kv-quant", default="f16", choices=["f16", "q8", "q4"],
+                   help="KV cache precision for the --ctx estimate (default f16)")
+    p.add_argument("--gpu", help="your rig for the fit verdict: total VRAM GB, a card "
+                                 "name, or CARDxCOUNT — e.g. '96', '5090x4', '3090x8', "
+                                 "'rtx6000prox2'. Any stack of any card.")
+    p.add_argument("--device", default="gpu", choices=["gpu", "unified", "mac", "phone"],
+                   help="what --gpu's number is: dedicated 'gpu' VRAM (~94%% usable, "
+                        "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% — the OS "
+                        "OOM-kills past ~half)")
     a = p.parse_args()
 
     meta = None
@@ -521,6 +644,15 @@ def main():
         print(f"source quant        : {label} (~{qbits:.2f} bpw{shard_note})  "
               f"{'✅' if full else '⚠️'} {advice}\n")
     report(arch, a.ram, a.flash, a.rambw, qbits, cache)
+    if a.ctx:
+        kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625}[a.kv_quant]
+        rig_gb = None
+        if a.gpu:
+            rig_gb = parse_gpu(a.gpu)
+            if rig_gb is None:
+                print(f"(could not parse --gpu '{a.gpu}'; skipping the rig verdict)")
+        fit_report(arch, arch["total"] * qbits / 8 / 1e9, a.ctx, kv_bytes, a.kv_quant,
+                   rig_gb, a.device)
 
 
 if __name__ == "__main__":
