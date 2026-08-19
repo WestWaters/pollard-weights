@@ -35,11 +35,15 @@ from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
 from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS
 
 
-def _kl(ppl, model, eval_f, base):
-    """Mean KL-divergence of `model` vs the base logits, or None on failure."""
-    r = subprocess.run([ppl, "-m", model, "-f", eval_f, "--kl-divergence",
-                        "--kl-divergence-base", base, "-ngl", "99", "-c", "512"],
-                       capture_output=True, text=True)
+def _kl(ppl, model, eval_f, base, rpc=None):
+    """Mean KL-divergence of `model` vs the base logits, or None on failure.
+    `rpc` (host:port[,host:port…]) pools RPC nodes so a model too big for one box
+    can run the forward pass — the only way to profile a 300B+ MoE on one Spark."""
+    cmd = [ppl, "-m", model, "-f", eval_f, "--kl-divergence",
+           "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
+    if rpc:
+        cmd += ["--rpc", rpc]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     m = re.search(r"Mean\s+KLD:\s*([0-9.]+)", r.stdout + r.stderr)
     return float(m.group(1)) if m else None
 
@@ -78,6 +82,10 @@ def main():
     ap.add_argument("--ref", default="IQ4_XS", help="reference uniform preset (default IQ4_XS)")
     ap.add_argument("--llama-quantize", default="llama-quantize")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
+    ap.add_argument("--rpc", help="RPC servers to pool for the forward pass, "
+                                  "'host:port[,host:port…]' (run ggml-rpc-server on each "
+                                  "peer). REQUIRED to profile a model too big for one node "
+                                  "— the quantize step streams and needs no RPC.")
     a = ap.parse_args()
 
     for tool in (a.llama_quantize, a.llama_perplexity):
@@ -96,14 +104,18 @@ def main():
     print(f"== pollard-sensitivity :: {a.gguf}  ({layers} layers, groups={groups})")
     print(f"reference={a.ref}  probe={a.probe}  — {len(groups)*layers} measured passes")
 
-    # 1. base logits from the full-precision source
-    subprocess.run([a.llama_perplexity, "-m", a.gguf, "-f", a.eval,
-                    "--kl-divergence-base", base, "-ngl", "99", "-c", "512"],
-                   capture_output=True)
-    # 2. reference build + its KL
+    if a.rpc:
+        print(f"RPC pool: {a.rpc}  (forward passes span these nodes; quantize stays local)")
+    # 1. base logits from the full-precision source (forward pass -> may need RPC)
+    base_cmd = [a.llama_perplexity, "-m", a.gguf, "-f", a.eval,
+                "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
+    if a.rpc:
+        base_cmd += ["--rpc", a.rpc]
+    subprocess.run(base_cmd, capture_output=True)
+    # 2. reference build (quantize = local, streams from disk, no RPC) + its KL
     subprocess.run([a.llama_quantize, "--imatrix", a.imatrix, a.gguf, ref, a.ref],
                    capture_output=True)
-    kl_ref = _kl(a.llama_perplexity, ref, a.eval, base)
+    kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc)
     if kl_ref is None:
         sys.exit("ERROR: could not measure reference KL — check the eval file and tools.")
     print(f"reference KL = {kl_ref:.5f}")
@@ -122,7 +134,7 @@ def main():
             cmd += pins                                # the IQ2 build doesn't crash
         cmd += [a.gguf, uni, PRESET[t]]
         subprocess.run(cmd, capture_output=True)
-        k = _kl(a.llama_perplexity, uni, a.eval, base)
+        k = _kl(a.llama_perplexity, uni, a.eval, base, a.rpc)
         noise[t] = k if k is not None else None
         os.path.exists(uni) and os.remove(uni)
         print(f"  {t:8} {noise[t]}{'  (uncovered-tensor build failed)' if noise[t] is None else ''}")
@@ -136,7 +148,7 @@ def main():
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix,
                             "--tensor-type", pat, a.gguf, probe, a.ref],
                            capture_output=True)
-            k = _kl(a.llama_perplexity, probe, a.eval, base)
+            k = _kl(a.llama_perplexity, probe, a.eval, base, a.rpc)
             # a FAILED probe (build/eval crashed) is UNMEASURED, not zero-cost —
             # recording 0 would tell the allocator this is the LEAST important group
             # and crush it hardest. Mark None; protect it after the sweep.

@@ -110,6 +110,13 @@ pollard-sensitivity --gguf model-f16.gguf --imatrix model.imatrix --eval held.tx
 pollard-fit        --gguf model-f16.gguf --ram 128 --imatrix model.imatrix --sensitivity model.sens.json
 ```
 
+**Models too big for one node** (300B+ MoE — GLM-5.2, DeepSeek-V4, Kimi): the
+*profiling* forward pass (steps 2–3) won't fit on one box, so pool peers over RPC.
+Run `ggml-rpc-server` on each peer, then pass `--rpc host:port[,host:port…]` to
+`llama-imatrix` and `pollard-sensitivity`. The **build** (`pollard-fit`) streams from
+disk and needs no RPC — it runs on a single node regardless of model size. To *run*
+the finished model across peers, `pollard-run --rpc …`.
+
 **Shortcuts and what they cost you:**
 - **No `--sensitivity`, but `--imatrix`** → a **uniform** allocation (the imatrix
   sets IQ-type quality but does *not* decide the per-layer bits). There is no

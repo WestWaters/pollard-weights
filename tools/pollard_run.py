@@ -38,6 +38,9 @@ def main():
                     help="GPU memory budget in GB for weights (leave headroom for "
                          "KV/activations), or 'auto' to read free VRAM from nvidia-smi")
     ap.add_argument("--llama-server", default="llama-server")
+    ap.add_argument("--rpc", help="RPC servers to pool, 'host:port[,host:port…]' (run "
+                                  "ggml-rpc-server on each peer) — run a model too big for "
+                                  "one box across several")
     ap.add_argument("--launch", action="store_true", help="exec the command instead of printing it")
     ap.add_argument("--extra", default="", help="extra llama-server args appended verbatim")
     a = ap.parse_args()
@@ -133,6 +136,8 @@ def main():
               f"{len(cpu_layers)} layers from system RAM ({est:.0%} of expert traffic)")
 
     cmd = [a.llama_server, "-m", a.gguf, "-ngl", "999"]
+    if a.rpc:                                           # pool peers for a model too big
+        cmd += ["--rpc", a.rpc]                         # for one box (run ggml-rpc-server there)
     if cpu_layers:
         pats = ",".join(f"blk\\.{i}\\.ffn_.*_exps\\.weight=CPU" for i in cpu_layers)
         # RAM-streaming means experts RESIDENT in RAM, not paged from disk —
