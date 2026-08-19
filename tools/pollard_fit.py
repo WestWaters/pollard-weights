@@ -39,21 +39,30 @@ from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
 # the bulk never wastes bits on a K-quant when an IQ type is strictly better.
 # measured: uniform IQ4_XS (0.041 KL) beat a q4_K-bulk build (0.053) at equal size.
 QTYPES = [("q8_0", 8.5), ("q6_K", 6.6), ("q5_K", 5.5), ("iq4_xs", 4.25),
-          ("iq3_s", 3.4), ("iq2_s", 2.5), ("iq2_xxs", 2.1)]
+          ("iq3_s", 3.4), ("iq2_s", 2.5), ("iq2_xxs", 2.1),
+          ("iq1_m", 1.75), ("iq1_s", 1.56)]      # 1-bit floor (opt-in, --allow-1bit)
 BPW = dict(QTYPES)
 # the whole-model PRESET that carries "everything unmatched" — DERIVED from the
 # chosen bulk type, never hardcoded. (--tensor-type wants base types; the
 # positional base arg wants a preset name.) IQ presets need an --imatrix.
 PRESET = {"q8_0": "Q8_0", "q6_K": "Q6_K", "q5_K": "Q5_K_M", "iq4_xs": "IQ4_XS",
-          "iq3_s": "IQ3_S", "iq2_s": "IQ2_S", "iq2_xxs": "IQ2_XXS"}
+          "iq3_s": "IQ3_S", "iq2_s": "IQ2_S", "iq2_xxs": "IQ2_XXS",
+          "iq1_m": "IQ1_M", "iq1_s": "IQ1_S"}
 LADDER = ["q6_K", "q5_K", "iq4_xs", "iq3_s", "iq2_s", "iq2_xxs"]  # high -> low
+# 1-bit rungs are OFF by default (heavy quality loss); --allow-1bit extends the
+# floor here for the giant-MoE case, where redundancy absorbs it (753B GLM at ~q1
+# stays coherent — a community datapoint). Never used unless the budget forces it.
+LADDER_1BIT = LADDER + ["iq1_m", "iq1_s"]
 # NOISE[type] = KL cost of that type per unit importance = the KL of a UNIFORM
 # build at that type (uniform KL = total_importance x noise). Measured on real
 # models (Qwen2.5-1.5B here; ratios match granite in notes/e11-e12). These are
 # what let the allocator SEE that crushing to iq2_xxs (~10x iq3_s) is catastrophic
 # and avoid victim layers. Data, not logic — remeasure per family to refine.
+# iq1_* are extrapolated from the curve's slope (no measured point yet); a
+# pollard-sensitivity run measures them per model and overrides these.
 NOISE = {"q8_0": 0.00048, "q6_K": 0.00479, "q5_K": 0.01033, "iq4_xs": 0.04090,
-         "iq3_s": 0.12282, "iq2_s": 0.63394, "iq2_xxs": 1.22235}
+         "iq3_s": 0.12282, "iq2_s": 0.63394, "iq2_xxs": 1.22235,
+         "iq1_m": 2.17, "iq1_s": 2.96}
 # embeddings/output/norms kept HIGH by default — measured across sizes, keeping
 # them here beat letting the allocator crush them (they carry the whole vocab).
 # Stepped down only if the budget truly can't hold them. Data, not a magic rule.
@@ -78,7 +87,7 @@ DENSE_FFN_FRAGS = [r"blk\.{layer}\.ffn_up\.weight", r"blk\.{layer}\.ffn_down\.we
                    r"blk\.{layer}\.ffn_gate\.weight"]
 
 
-def _alloc_klaware(items, budget, noise=NOISE):
+def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
     """items: [(params, importance)] — an FFN layer, an expert layer, or the
     attn/embed 'other' group. Assign each a ladder type to MINIMIZE total KL
     (~ sum importance_frac * noise[type]) subject to total size <= budget GB.
@@ -93,14 +102,14 @@ def _alloc_klaware(items, budget, noise=NOISE):
     lvl = [0] * len(items)                              # LADDER index per item, 0 = top
 
     def size_gb():
-        return sum(p * BPW[LADDER[lvl[j]]] for j, (p, _) in enumerate(items)) / 8 / 1e9
+        return sum(p * BPW[ladder[lvl[j]]] for j, (p, _) in enumerate(items)) / 8 / 1e9
 
     def marginal(j):
         p, imp = items[j]
         i = lvl[j]
-        if i + 1 >= len(LADDER):
+        if i + 1 >= len(ladder):
             return None                                 # already at the floor
-        a, b = LADDER[i], LADDER[i + 1]
+        a, b = ladder[i], ladder[i + 1]
         dbytes = p * (BPW[a] - BPW[b]) / 8
         dkl = (imp / tot_imp) * (noise[b] - noise[a])
         return ((dkl / dbytes) if dbytes > 0 else float("inf"), j)
@@ -115,7 +124,7 @@ def _alloc_klaware(items, budget, noise=NOISE):
             heapq.heappush(heap, nxt)
     if size_gb() > budget:
         return None
-    return [LADDER[lvl[j]] for j in range(len(items))], size_gb()
+    return [ladder[lvl[j]] for j in range(len(items))], size_gb()
 
 
 def _fill_noise(measured):
@@ -143,7 +152,7 @@ def _fill_noise(measured):
     return {t: est(t) for t in LADDER}
 
 
-def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None):
+def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False):
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
@@ -191,6 +200,9 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None):
     if prof_noise:
         missing = [t for t in LADDER if not prof_noise.get(t)]
         src += " + measured noise curve" + (f" ({len(missing)} interpolated)" if missing else "")
+    ladder = LADDER_1BIT if allow_1bit else LADDER      # opt-in 1-bit floor
+    for t in ladder:                                    # every rung needs a noise value
+        noise.setdefault(t, NOISE[t])
 
     # items: per-layer bulk + per-layer attention (embeddings handled separately)
     bulk_frag = EXPERT_FRAGS if arch["kind"] == "moe" else DENSE_FFN_FRAGS
@@ -208,15 +220,17 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None):
     emb_type = EMB_FLOOR
     while True:
         emb_gb = other * BPW[emb_type] / 8 / 1e9
-        res = _alloc_klaware(items, budget - emb_gb, noise)
+        res = _alloc_klaware(items, budget - emb_gb, noise, ladder)
         if res is not None:
             break
         ei = LADDER.index(emb_type)
         if ei + 1 < len(LADDER):
-            emb_type = LADDER[ei + 1]
+            emb_type = LADDER[ei + 1]                    # embeddings never go 1-bit
         else:
+            hint = ("" if allow_1bit else
+                    " Or --allow-1bit to extend the floor to iq1 (heavy loss; for giant MoE).")
             sys.exit(f"ERROR: cannot fit {total/1e9:.1f}B into {budget:.1f}GB even at "
-                     f"the floor. pollard-calc will tell you the streaming tier.")
+                     f"the floor. pollard-calc will tell you the streaming tier.{hint}")
     types, alloc_gb = res
     gb = alloc_gb + emb_gb
 
@@ -255,6 +269,10 @@ def main():
     ap.add_argument("--allow-grow", action="store_true",
                     help="permit a build LARGER than an already-quantized source "
                          "(normally refused — requantizing up only loses)")
+    ap.add_argument("--allow-1bit", action="store_true",
+                    help="extend the floor to 1-bit (iq1_m/iq1_s) for models that won't "
+                         "fit at iq2_xxs — heavy quality loss, but giant MoEs absorb it. "
+                         "Only used where the budget forces it.")
     a = ap.parse_args()
 
     if str(a.ram).lower() == "auto":
@@ -265,12 +283,16 @@ def main():
         print(f"[--ram auto] measured available memory: {avail:.1f} GB")
     else:
         a.ram = float(a.ram)
+    if a.allow_1bit and not a.imatrix:
+        sys.exit("ERROR: --allow-1bit needs --imatrix — the 1-bit (iq1) types require a "
+                 "calibration matrix to build at all (and substituting them to a non-imatrix "
+                 "type would defeat the point by growing the file). Run llama-imatrix first.")
     meta = read_gguf_meta(a.gguf)
     cfg = gguf_to_config(meta, a.gguf)
     arch = analyse(cfg)
     sensitivity = json.load(open(a.sensitivity)) if a.sensitivity else None
     overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
-        arch, a.ram, a.reserve, sensitivity)
+        arch, a.ram, a.reserve, sensitivity, a.allow_1bit)
     out = a.out or a.gguf.rsplit(".gguf", 1)[0] + "-pollard.gguf"
 
     # ---- source facts + safety guards (hardened after Frank's DeepSeek/Qwen30B logs) ----
@@ -340,6 +362,12 @@ def main():
     if requant:
         print(f"NOTE: source is already quantized (~{src_bpw:.1f} bpw) — requantizing "
               f"with --allow-requantize. An f16/bf16 source gives better quality.")
+    n_1bit = sum(1 for _, t in overrides if str(t).startswith("iq1")) \
+        + (1 if base_preset in ("IQ1_M", "IQ1_S") else 0)
+    if n_1bit:
+        print(f"WARNING: {n_1bit} group(s) hit the 1-bit floor (iq1) — the budget forced "
+              f"it. Expect real quality loss; sanity-check the output. Viable mainly on "
+              f"giant MoE (redundancy absorbs it), rough on small/dense models.")
 
     tt_file = out + ".tensor-types.txt"
     ov_lines = [f"{pat}={t}" for pat, t in overrides]

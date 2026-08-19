@@ -130,6 +130,10 @@ the finished model across peers, `pollard-run --rpc …`.
 - **Aggressive (IQ2) builds** need the imatrix — pollard auto-pins any tensor the
   base preset would touch but the imatrix can't cover (exotic tensors like
   DeepSeek's compressors), so the build won't die partway.
+- **`--allow-1bit`** extends the floor from iq2_xxs down to 1-bit (iq1_m/iq1_s) for
+  models that won't otherwise fit. Off by default; only used where the budget forces
+  it; needs an `--imatrix`; warns loudly. Heavy quality loss on small/dense models,
+  but giant MoEs absorb it (a 753B GLM at ~1-bit stays coherent — redundancy).
 
 ## The planner in action
 
