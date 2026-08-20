@@ -141,6 +141,10 @@ the clean f16-referenced sweep.)
   models that won't otherwise fit. Off by default; only used where the budget forces
   it; needs an `--imatrix`; warns loudly. Heavy quality loss on small/dense models,
   but giant MoEs absorb it (a 753B GLM at ~1-bit stays coherent — redundancy).
+- **Vision / multimodal models** (Qwen3.8-VL, etc.): pollard-fit builds the **text
+  model**; the vision projector is a separate **mmproj** GGUF. Download it, **don't
+  quantize it**, and ship it alongside — run with `--mmproj mmproj-….gguf` to keep
+  vision. pollard-fit reminds you when the source is multimodal.
 
 ## The planner in action
 

@@ -362,6 +362,10 @@ def main():
     if requant:
         print(f"NOTE: source is already quantized (~{src_bpw:.1f} bpw) — requantizing "
               f"with --allow-requantize. An f16/bf16 source gives better quality.")
+    if arch.get("multimodal"):
+        print(f"NOTE: {arch['multimodal']} model — this builds the TEXT model only. To KEEP "
+              f"vision, download the mmproj (vision projector) GGUF and ship it alongside; "
+              f"run with `llama-* --mmproj mmproj-….gguf`. Do NOT quantize the mmproj.")
     n_1bit = sum(1 for _, t in overrides if str(t).startswith("iq1")) \
         + (1 if base_preset in ("IQ1_M", "IQ1_S") else 0)
     if n_1bit:
