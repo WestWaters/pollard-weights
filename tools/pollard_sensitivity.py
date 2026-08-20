@@ -49,6 +49,17 @@ def _kl(ppl, model, eval_f, base, rpc=None):
     return float(m.group(1)) if m else None
 
 
+def _valid_gguf(path):
+    """A quantize output is valid only if it starts with the GGUF magic — a crashed
+    build leaves an all-zeros file that 'exists' but won't load, turning into a
+    cryptic downstream error. Check the magic and fail loud at the source instead."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"GGUF"
+    except Exception:
+        return False
+
+
 # standard per-layer matmuls the imatrix always covers; ANYTHING else (routers,
 # norms, exotic per-model tensors like DeepSeek's compressors) must not be crushed
 # to an imatrix-only IQ2 type in a uniform noise build or llama-quantize hard-fails.
@@ -155,12 +166,20 @@ def main():
     if a.rpc:
         base_cmd += ["--rpc", a.rpc]
     subprocess.run(base_cmd, capture_output=True)
-    # 2. reference build (quantize = local, streams from disk, no RPC) + its KL
-    subprocess.run([a.llama_quantize, "--imatrix", a.imatrix, a.gguf, ref, a.ref],
-                   capture_output=True)
+    if base_src != a.gguf and not _valid_gguf(base_src):
+        sys.exit(f"ERROR: the memory-fit base build ({a.ref}) came out invalid — "
+                 f"llama-quantize failed (likely an imatrix-uncovered tensor). Bug; report it.")
+    # 2. reference build — SAME pins as the base (an IQ2 ref crashes on uncovered tensors too)
+    subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
+                   + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
+                   + [a.gguf, ref, a.ref], capture_output=True)
+    if not _valid_gguf(ref):
+        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — llama-quantize "
+                 f"failed (likely an imatrix-uncovered tensor). Bug; report it.")
     kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc)
     if kl_ref is None:
-        sys.exit("ERROR: could not measure reference KL — check the eval file and tools.")
+        sys.exit("ERROR: reference GGUF built fine but perplexity couldn't score it — "
+                 "check the eval file, the tools, and free memory (the forward pass runs here).")
     print(f"reference KL = {kl_ref:.5f}")
 
     # 2b. the NOISE curve for THIS model — uniform KL at each ladder rung. This is
@@ -191,9 +210,11 @@ def main():
     for i in range(layers):
         for g in groups:
             pat = rf"blk\.{i}\.{g}_.*={a.probe}"
-            subprocess.run([a.llama_quantize, "--imatrix", a.imatrix,
-                            "--tensor-type", pat, a.gguf, probe, a.ref],
-                           capture_output=True)
+            # crush this group, keep the a.ref base — but the base needs the SAME pins
+            # (an IQ2 base crashes on uncovered tensors), so PINARG goes too.
+            subprocess.run([a.llama_quantize, "--imatrix", a.imatrix, "--tensor-type", pat]
+                           + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
+                           + [a.gguf, probe, a.ref], capture_output=True)
             k = _kl(a.llama_perplexity, probe, a.eval, base, a.rpc)
             # a FAILED probe (build/eval crashed) is UNMEASURED, not zero-cost —
             # recording 0 would tell the allocator this is the LEAST important group
