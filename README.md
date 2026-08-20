@@ -117,6 +117,13 @@ Run `ggml-rpc-server` on each peer, then pass `--rpc host:port[,host:port…]` t
 disk and needs no RPC — it runs on a single node regardless of model size. To *run*
 the finished model across peers, `pollard-run --rpc …`.
 
+**Calibrating a big model on a small box** (make one, not just run one): the sensitivity
+sweep measures against f16, which may not fit your RAM. Pass `pollard-sensitivity --ram
+<GB|auto>` and it drops the base to the highest quant that *does* fit (e.g. a 24B on 16GB
+bases on IQ3_S) — a touch weaker than an f16 base, but it runs on your machine. The build
+still streams from f16, so the output isn't compromised. (On a big box, omit `--ram` for
+the clean f16-referenced sweep.)
+
 **Shortcuts and what they cost you:**
 - **No `--sensitivity`, but `--imatrix`** → a **uniform** allocation (the imatrix
   sets IQ-type quality but does *not* decide the per-layer bits). There is no

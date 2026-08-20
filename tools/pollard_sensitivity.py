@@ -31,8 +31,9 @@ import sys
 import tempfile
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
-                          read_gguf_tensor_names, find_llama_bin)
-from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS
+                          read_gguf_tensor_names, find_llama_bin,
+                          detect_available_ram_gb)
+from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS, BPW
 
 
 def _kl(ppl, model, eval_f, base, rpc=None):
@@ -86,6 +87,10 @@ def main():
                                   "'host:port[,host:port…]' (run ggml-rpc-server on each "
                                   "peer). REQUIRED to profile a model too big for one node "
                                   "— the quantize step streams and needs no RPC.")
+    ap.add_argument("--ram", help="usable RAM/VRAM in GB (or 'auto') to CALIBRATE ON A "
+                                  "SMALL BOX: if f16 won't fit the forward pass, the base "
+                                  "reference drops to the highest quant that fits — Pollard "
+                                  "MAKES big models on small hardware, not just runs them.")
     a = ap.parse_args()
 
     a.llama_quantize = find_llama_bin(a.llama_quantize)
@@ -105,12 +110,37 @@ def main():
     probe = os.path.join(tmp, "probe.gguf")
 
     print(f"== pollard-sensitivity :: {a.gguf}  ({layers} layers, groups={groups})")
-    print(f"reference={a.ref}  probe={a.probe}  — {len(groups)*layers} measured passes")
+    pins = _uncoverable_pins(a.gguf)                    # exotic/router/norm tensors
+
+    # --- memory-adaptive reference: Pollard MAKES big models on small hardware ---
+    # The sweep runs FORWARD passes, so the base must fit RAM. f16 is the ideal ground
+    # truth but rarely fits a big model on a small box, so drop the base to the highest
+    # ladder type that fits and measure against THAT. It can't see the f16->that-type
+    # loss, but it measures the crush-from-here regime — exactly the allocation decision.
+    base_src, base_note, mem_budget = a.gguf, "f16 (ground truth)", None
+    if a.ram:
+        ram = detect_available_ram_gb() if str(a.ram).lower() == "auto" else float(a.ram)
+        mem_budget = (ram or 0) * 0.72                  # usable for a forward pass
+        f16_gb = arch["total"] * 16 / 8 / 1e9
+        if mem_budget and f16_gb > mem_budget:
+            fit = next((t for t in LADDER if arch["total"] * BPW[t] / 8 / 1e9 <= mem_budget),
+                       LADDER[-1])
+            fit_gb = arch["total"] * BPW[fit] / 8 / 1e9
+            base_src = os.path.join(tmp, "membase.gguf")
+            a.ref = PRESET[fit]                         # probes' baseline must also fit
+            base_note = f"{fit} (memory-fit; f16 too big for ~{mem_budget:.0f} GB)"
+            print(f"[--ram {ram:.0f}] f16 is {f16_gb:.0f} GB > ~{mem_budget:.0f} GB usable — "
+                  f"basing on {PRESET[fit]} ({fit_gb:.0f} GB). Signal is vs {fit}, not f16 "
+                  f"(a touch weaker, but it fits YOUR box).")
+            subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
+                           + (pins if PRESET[fit] in IMATRIX_REQUIRED_PRESETS else [])
+                           + [a.gguf, base_src, PRESET[fit]], capture_output=True)
+    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes")
 
     if a.rpc:
         print(f"RPC pool: {a.rpc}  (forward passes span these nodes; quantize stays local)")
-    # 1. base logits from the full-precision source (forward pass -> may need RPC)
-    base_cmd = [a.llama_perplexity, "-m", a.gguf, "-f", a.eval,
+    # 1. base logits from the reference (f16, or the memory-fit quant)
+    base_cmd = [a.llama_perplexity, "-m", base_src, "-f", a.eval,
                 "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
     if a.rpc:
         base_cmd += ["--rpc", a.rpc]
@@ -127,9 +157,12 @@ def main():
     # the per-type KL cost the allocator needs, MEASURED per model (it shifts a bit
     # model to model), so nothing is baked in. Cheap next to the sensitivity sweep.
     noise = {}
-    pins = _uncoverable_pins(a.gguf)                    # exotic/router/norm tensors
     print("noise curve (uniform KL per type):")
     for t in LADDER:
+        if mem_budget and arch["total"] * BPW[t] / 8 / 1e9 > mem_budget:
+            noise[t] = None                            # too big to eval here; interpolated
+            print(f"  {t:8} (skipped — {arch['total']*BPW[t]/8/1e9:.0f} GB > budget; interpolated)")
+            continue
         uni = os.path.join(tmp, "uni.gguf")
         cmd = [a.llama_quantize, "--imatrix", a.imatrix,
                "--token-embedding-type", t, "--output-tensor-type", t]
@@ -183,7 +216,7 @@ def main():
 
     out = a.out or a.gguf.rsplit(".gguf", 1)[0] + ".sensitivity.json"
     payload = {**profile, "noise": noise, "ref": a.ref, "probe": a.probe,
-               "layers": layers, "source": os.path.basename(a.gguf)}
+               "layers": layers, "source": os.path.basename(a.gguf), "base": base_note}
     with open(out, "w") as f:
         json.dump(payload, f, indent=2)
     # a quick read on the signal we found
