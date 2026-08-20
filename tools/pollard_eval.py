@@ -29,12 +29,11 @@ GPU strongly recommended; --rpc pools nodes for a model too big for one box.
 import argparse
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 
-from pollard_calc import _shard_paths
+from pollard_calc import _shard_paths, find_llama_bin
 
 _KLD = re.compile(r"Mean\s+KLD\s*[:=]\s*([0-9.eE+-]+)")
 # llama-perplexity --kl-divergence prints a top-1 agreement line; the wording has
@@ -100,9 +99,18 @@ def main():
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
     a = ap.parse_args()
 
-    for tool in ([a.llama_perplexity] + ([a.llama_cli] if a.trajectory else [])):
-        if shutil.which(tool) is None and not os.path.exists(tool):
-            sys.exit(f"ERROR: '{tool}' not found — build llama.cpp (install.sh) or pass the path.")
+    # auto-detect the llama.cpp binaries (PATH, or the runtime build install.sh made)
+    a.llama_perplexity = find_llama_bin(a.llama_perplexity)
+    if a.trajectory:
+        a.llama_cli = find_llama_bin(a.llama_cli)
+    need = {"llama-perplexity": a.llama_perplexity}
+    if a.trajectory:
+        need["llama-cli"] = a.llama_cli
+    missing = [n for n, v in need.items() if v is None]
+    if missing:
+        sys.exit(f"ERROR: {', '.join(missing)} not found. install.sh builds these into "
+                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass the path "
+                 f"(e.g. --llama-perplexity /path/to/llama-perplexity).")
     if a.trajectory and not a.prompts:
         sys.exit("ERROR: --trajectory needs --prompts (the seeds to continue from f16).")
     if not a.trajectory and not a.eval:

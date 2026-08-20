@@ -59,6 +59,29 @@ QUANTS = {  # effective bits per weight, format overheads included
 }
 
 
+def find_llama_bin(name):
+    """Resolve a llama.cpp binary (llama-perplexity, llama-cli, llama-quantize…):
+    honor an explicit path, else PATH, else the runtime build install.sh created,
+    else common spots. Returns the path or None — so tools AUTO-DETECT what's there
+    instead of dead-ending on 'not found' when the binary is right where we put it."""
+    import shutil
+    if not name:
+        return None
+    if os.path.sep in name or name.startswith("~"):        # explicit path given
+        p = os.path.expanduser(name)
+        return p if os.path.exists(p) else None
+    hit = shutil.which(name)                                # on PATH
+    if hit:
+        return hit
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for c in (os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),
+              os.path.expanduser(f"~/llama.cpp/build/bin/{name}"),
+              f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def _shard_paths(path):
     """A model may be split across shards `<prefix>-00001-of-000NN.gguf`. Given
     ANY shard, return every shard in order (shard 1 first — it holds the full KV

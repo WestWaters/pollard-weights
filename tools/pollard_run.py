@@ -20,11 +20,10 @@ The output command runs stock llama-server — nothing here forks the runtime.
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 
-from pollard_calc import read_gguf_meta, gguf_to_config, analyse
+from pollard_calc import read_gguf_meta, gguf_to_config, analyse, find_llama_bin
 
 
 def main():
@@ -150,8 +149,11 @@ def main():
         print("command:")
         print("  " + " ".join(cmd))
         return
-    if shutil.which(cmd[0]) is None:
-        sys.exit(f"ERROR: '{cmd[0]}' not found — see install.sh or pass --llama-server")
+    resolved = find_llama_bin(cmd[0])
+    if resolved is None:
+        sys.exit(f"ERROR: {cmd[0]} not found. install.sh builds it into "
+                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass --llama-server.")
+    cmd[0] = resolved
     os.execvp(cmd[0], cmd)
 
 

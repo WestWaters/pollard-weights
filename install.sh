@@ -57,7 +57,7 @@ else
   # (was `rpc-server` before it moved to tools/rpc/). Using the wrong name
   # silently builds nothing — verified against llama.cpp master.
   cmake --build "$LLAMA_DIR/build" -j \
-    --target llama-quantize llama-cli llama-server llama-imatrix ggml-rpc-server
+    --target llama-quantize llama-cli llama-server llama-imatrix llama-perplexity ggml-rpc-server
   echo "runtime built at $LLAMA_DIR/build/bin ${GPU_FLAGS:+($GPU_FLAGS)}"
   echo "add to PATH:  export PATH=\"$LLAMA_DIR/build/bin:\$PATH\""
 fi

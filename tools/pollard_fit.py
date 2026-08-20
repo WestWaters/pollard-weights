@@ -21,12 +21,12 @@ import heapq
 import json
 import math
 import re
-import shutil
 import subprocess
 import sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
-                          detect_available_ram_gb, read_gguf_tensor_names)
+                          detect_available_ram_gb, read_gguf_tensor_names,
+                          find_llama_bin)
 
 # quant types llama-quantize accepts for --tensor-type overrides, with effective
 # bits/weight (format overhead included) used for budget math.
@@ -384,9 +384,12 @@ def main():
         print(f"plan only — {len(ov_lines)} tensor overrides; command that would run:")
         print("  " + " ".join(cmd))
         return
-    if shutil.which(cmd[0]) is None:
-        sys.exit(f"ERROR: '{cmd[0]}' not found — build llama.cpp (see install.sh) "
-                 f"or pass --llama-quantize /path/to/llama-quantize")
+    resolved = find_llama_bin(cmd[0])
+    if resolved is None:
+        sys.exit(f"ERROR: {cmd[0]} not found. install.sh builds it into "
+                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass "
+                 f"--llama-quantize /path/to/llama-quantize.")
+    cmd[0] = resolved
     with open(tt_file, "w") as f:
         f.write("\n".join(ov_lines) + "\n")
     print("building…")

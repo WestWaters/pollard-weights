@@ -31,7 +31,7 @@ import sys
 import tempfile
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
-                          read_gguf_tensor_names)
+                          read_gguf_tensor_names, find_llama_bin)
 from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS
 
 
@@ -88,10 +88,13 @@ def main():
                                   "— the quantize step streams and needs no RPC.")
     a = ap.parse_args()
 
-    for tool in (a.llama_quantize, a.llama_perplexity):
-        import shutil
-        if shutil.which(tool) is None and not os.path.exists(tool):
-            sys.exit(f"ERROR: '{tool}' not found — build llama.cpp (install.sh) or pass the path.")
+    a.llama_quantize = find_llama_bin(a.llama_quantize)
+    a.llama_perplexity = find_llama_bin(a.llama_perplexity)
+    missing = [n for n, v in (("llama-quantize", a.llama_quantize),
+                              ("llama-perplexity", a.llama_perplexity)) if v is None]
+    if missing:
+        sys.exit(f"ERROR: {', '.join(missing)} not found. install.sh builds these into "
+                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass the path.")
 
     arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
     layers = arch["layers"]
