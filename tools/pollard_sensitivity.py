@@ -32,7 +32,7 @@ import tempfile
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
                           read_gguf_tensor_names, find_llama_bin,
-                          detect_available_ram_gb)
+                          detect_available_ram_gb, imatrix_covered_tensors)
 from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS, BPW
 
 
@@ -56,17 +56,22 @@ _STD_MATMUL = re.compile(
     r"blk\.\d+\.(ffn_(up|down|gate)(_exps)?|attn_(q|k|v|qkv|output))\.weight$")
 
 
-def _uncoverable_pins(gguf):
-    """--tensor-type '<name>=q6_K' args for every tensor that isn't a standard
-    per-layer matmul, so a uniform IQ2 noise build can't crash on an imatrix-
-    uncovered tensor (token_embd/output are handled by their own flags)."""
-    args = []
+def _uncoverable_pins(gguf, imatrix):
+    """--tensor-type '<name>=q6_K' for every weight the IMATRIX DOESN'T COVER, so an
+    aggressive IQ2/IQ1 build can't hard-fail on it. This catches the ones a name
+    heuristic misses — MTP/`nextn` layer tensors look like standard attention
+    (`blk.64.attn_k.weight`) but are never calibrated, so llama-quantize refuses
+    them at low bit. Falls back to the name heuristic if the imatrix can't be read.
+    (token_embd/output are handled by their own flags.)"""
+    covered = imatrix_covered_tensors(imatrix)
+    lines = []
     for nm in read_gguf_tensor_names(gguf):
         if nm in ("token_embd.weight", "output.weight"):
             continue
-        if not _STD_MATMUL.search(nm):
-            args += ["--tensor-type", f"{re.escape(nm)}=q6_K"]
-    return args
+        uncov = (nm not in covered) if covered is not None else (not _STD_MATMUL.search(nm))
+        if uncov:
+            lines.append(f"{re.escape(nm)}=q6_K")
+    return lines                                           # written to a --tensor-type-file
 
 
 def main():
@@ -110,7 +115,12 @@ def main():
     probe = os.path.join(tmp, "probe.gguf")
 
     print(f"== pollard-sensitivity :: {a.gguf}  ({layers} layers, groups={groups})")
-    pins = _uncoverable_pins(a.gguf)                    # exotic/router/norm tensors
+    pins = _uncoverable_pins(a.gguf, a.imatrix)         # imatrix-uncovered tensors (MTP/norm/exotic)
+    pin_file = os.path.join(tmp, "pins.txt")
+    if pins:                                            # a file, not hundreds of CLI args
+        open(pin_file, "w").write("\n".join(pins) + "\n")
+        print(f"  {len(pins)} imatrix-uncovered tensors pinned to q6_K (MTP/norm/exotic)")
+    PINARG = ["--tensor-type-file", pin_file] if pins else []
 
     # --- memory-adaptive reference: Pollard MAKES big models on small hardware ---
     # The sweep runs FORWARD passes, so the base must fit RAM. f16 is the ideal ground
@@ -133,7 +143,7 @@ def main():
                   f"basing on {PRESET[fit]} ({fit_gb:.0f} GB). Signal is vs {fit}, not f16 "
                   f"(a touch weaker, but it fits YOUR box).")
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
-                           + (pins if PRESET[fit] in IMATRIX_REQUIRED_PRESETS else [])
+                           + (PINARG if PRESET[fit] in IMATRIX_REQUIRED_PRESETS else [])
                            + [a.gguf, base_src, PRESET[fit]], capture_output=True)
     print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes")
 
@@ -167,7 +177,7 @@ def main():
         cmd = [a.llama_quantize, "--imatrix", a.imatrix,
                "--token-embedding-type", t, "--output-tensor-type", t]
         if PRESET[t] in IMATRIX_REQUIRED_PRESETS:      # pin uncoverable tensors so
-            cmd += pins                                # the IQ2 build doesn't crash
+            cmd += PINARG                              # the IQ2 build doesn't crash
         cmd += [a.gguf, uni, PRESET[t]]
         subprocess.run(cmd, capture_output=True)
         k = _kl(a.llama_perplexity, uni, a.eval, base, a.rpc)

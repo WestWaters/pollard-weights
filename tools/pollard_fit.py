@@ -26,7 +26,7 @@ import sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
                           detect_available_ram_gb, read_gguf_tensor_names,
-                          find_llama_bin)
+                          find_llama_bin, imatrix_covered_tensors)
 
 # quant types llama-quantize accepts for --tensor-type overrides, with effective
 # bits/weight (format overhead included) used for budget math.
@@ -325,13 +325,29 @@ def main():
         for a_t, b_t in NOIMATRIX_TYPE_SUB.items():      # keep the printed summary honest
             summary = summary.replace(a_t, b_t)
 
-    # GUARD 3 — if the base preset is imatrix-required, every tensor matching NO
-    # explicit override falls to it, including exotic ones the imatrix may not cover
-    # (DeepSeek indexer_compressor / output_hc_fn bailed at tensor 3). Pin those to
-    # the embedding floor: exempt, and negligible on these small tensors.
+    # GUARD 3 — an imatrix-required type (IQ2/IQ1) on a tensor the imatrix DOESN'T
+    # cover hard-crashes llama-quantize (DeepSeek's compressors; and MTP/`nextn`
+    # layer tensors, which look like standard attention — `blk.64.attn_k.weight` —
+    # but are never calibrated). Read the imatrix's REAL coverage and pin any tensor
+    # that would take an imatrix-required type but isn't covered. Fall back to the
+    # "matches no override" heuristic if the imatrix can't be parsed.
     base_pins = 0
-    if base_preset in IMATRIX_REQUIRED_PRESETS:
-        handled = ("token_embd.weight", "output.weight")
+    covered = imatrix_covered_tensors(a.imatrix) if a.imatrix else None
+    _REQ = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q2_k_s"}
+    handled = ("token_embd.weight", "output.weight")
+    if covered is not None:
+        ovc = [(re.compile(p), str(t).lower()) for p, t in overrides]
+        for nm in read_gguf_tensor_names(a.gguf):
+            if nm in handled or nm in covered:
+                continue
+            planned = base_preset.lower()
+            for pat, ty in ovc:
+                if pat.search(nm):
+                    planned = ty
+            if planned in _REQ:
+                overrides.append((re.escape(nm), EMB_FLOOR))
+                base_pins += 1
+    elif base_preset in IMATRIX_REQUIRED_PRESETS:            # fallback: no imatrix parse
         for nm in read_gguf_tensor_names(a.gguf):
             if nm not in handled and not any(re.search(p, nm) for p, _ in overrides):
                 overrides.append((re.escape(nm), EMB_FLOOR))

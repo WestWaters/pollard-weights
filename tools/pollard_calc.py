@@ -180,6 +180,26 @@ def read_gguf_meta(path):
     return meta
 
 
+def imatrix_covered_tensors(path):
+    """The set of weight tensors an imatrix ACTUALLY covers (base names, the
+    `.in_sum2`/`.counts` stats suffixes stripped). Anything not in here can't take
+    an imatrix-required quant type — llama-quantize hard-fails on it (e.g. MTP /
+    `nextn` layer tensors, which look standard but are never calibrated). Pin those.
+    Returns the set, or None if the imatrix can't be read (callers fall back)."""
+    try:
+        names = read_gguf_tensor_names(path)               # a GGUF imatrix is a GGUF
+    except Exception:
+        return None
+    cov = set()
+    for n in names:
+        for suf in (".in_sum2", ".counts", ".sum2", ".activations"):
+            if n.endswith(suf):
+                n = n[:-len(suf)]
+                break
+        cov.add(n)
+    return cov or None
+
+
 def read_gguf_tensor_names(path):
     """Every tensor name across all shards. Used by pollard-fit to catch tensors
     that would fall through to an aggressive base preset (the exotic ones — e.g.
