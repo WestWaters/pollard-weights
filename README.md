@@ -100,7 +100,7 @@ edge). Run it and pollard beats uniform IQ at matched size.
 | 2 | `llama-imatrix -m f16.gguf -f calib.txt -o m.imatrix` | once per model | an **f16/bf16** source + a calib corpus |
 | 3 | `pollard-sensitivity --gguf f16.gguf --imatrix m.imatrix --eval held.txt --out m.sens.json` | once per model — **this is the win** | f16 source, the imatrix, a held-out eval |
 | 4 | `pollard-fit --gguf f16.gguf --ram N --imatrix m.imatrix --sensitivity m.sens.json` | build | f16 source, imatrix, sensitivity profile |
-| 5 | `llama-perplexity … --kl-divergence` / `llama-cli -m …-pollard.gguf` | verify + run | the built GGUF |
+| 5 | `pollard-eval --ref f16 --quants pollard.gguf other.gguf …` | verify + **compare** — top-1 agreement + KL vs f16, ours next to anyone's, in one table | the built GGUFs |
 
 ```bash
 # the full winning path, start to finish
