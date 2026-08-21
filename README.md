@@ -78,6 +78,16 @@ the chart from raw data: `python experiments/plot_kl_win.py`.
   with an honest coverage read: a load-balanced router touches nearly the whole
   pool, so you can't prune experts by topic — "hot" is a live residency signal,
   not a skip list. Emits a keep-list for a residency planner.
+- **`pollard-health`** — the "is my accelerator actually at full speed?" check.
+  96% GPU utilisation and P0 do *not* mean healthy: a wedged GB10 / DGX Spark (or
+  a throttling RTX, or a Mac drowning in page-outs) shows "busy" while the real
+  clock sits at a third of max and power at a fifth — you quietly lose half your
+  throughput. It reads the signals that matter (NVIDIA: real SM clock vs the
+  card's own max, power vs limit, throttle reasons; Apple Silicon: swap/page-out
+  thrash + thermal speed-cap) and calls it plainly. `--fix` prints an escalating
+  **no-reboot** recovery plan (dry-run; `--yes` to run) — honestly labeled, since a
+  deep firmware wedge may still need a power-cycle. The root cause is usually an
+  over-commit that `pollard-calc --ctx --gpu` would have caught first.
 - **The runtime** — `install.sh` builds llama.cpp (Metal on macOS, plus the RPC
   backend for multi-machine runs) so the chain runs end-to-end from a fresh
   clone. Pollard builds are standard GGUFs by design: the entire llama.cpp

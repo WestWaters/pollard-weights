@@ -24,6 +24,7 @@ pollard-fit-dit = "pollard_fit_dit:main"
 pollard-experts = "pollard_experts:main"
 pollard-sensitivity = "pollard_sensitivity:main"
 pollard-eval = "pollard_eval:main"
+pollard-health = "pollard_health:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
