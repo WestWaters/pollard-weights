@@ -45,7 +45,7 @@ def _kl(ppl, model, eval_f, base, rpc=None):
     if rpc:
         cmd += ["--rpc", rpc]
     r = subprocess.run(cmd, capture_output=True, text=True)
-    m = re.search(r"Mean\s+KLD:\s*([0-9.]+)", r.stdout + r.stderr)
+    m = re.search(r"Mean\s+KLD:\s*(-?[0-9.]+)", r.stdout + r.stderr)
     return float(m.group(1)) if m else None
 
 

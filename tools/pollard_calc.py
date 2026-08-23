@@ -59,27 +59,79 @@ QUANTS = {  # effective bits per weight, format overheads included
 }
 
 
-def find_llama_bin(name):
+def _llama_libs(bin_path):
+    """Every object that might carry llama.cpp's arch table: the binary itself (static
+    build) plus each libllama* shared lib beside it or in a sibling lib/ dir. The core
+    arch names live in libllama.dylib — NOT the per-tool -impl launchers — so we scan
+    them all rather than guess which file it is."""
+    import glob
+    out = [bin_path]
+    d = os.path.dirname(os.path.abspath(bin_path))
+    for base in (d, os.path.join(os.path.dirname(d), "lib")):
+        for pat in ("libllama*.dylib", "libllama*.so*", "llama*.dll"):
+            out.extend(glob.glob(os.path.join(base, pat)))
+    seen, uniq = set(), []
+    for p in out:
+        rp = os.path.realpath(p)
+        if rp not in seen and os.path.exists(rp):
+            seen.add(rp); uniq.append(rp)
+    return uniq
+
+
+def binary_supports_arch(bin_path, arch):
+    """Can this llama.cpp binary LOAD `arch`? llama.cpp stores every supported
+    architecture as a NUL-terminated string literal in libllama (rodata, never
+    stripped), so we grep the linked libraries for the exact token. This is what lets
+    'drop any model in' fail loudly-and-usefully instead of dying on a cryptic
+    'unknown model architecture' from a stale binary that happened to be on PATH.
+    Undetectable (nothing readable) -> True: never block on a detection miss."""
+    if not arch or arch == "unknown":
+        return True
+    token = arch.encode() + b"\x00"                          # exact, NUL-delimited
+    found_readable = False
+    for lib in _llama_libs(bin_path):
+        try:
+            with open(lib, "rb") as f:
+                blob = f.read()
+        except OSError:
+            continue
+        found_readable = True
+        if token in blob:
+            return True
+    return not found_readable                                # unreadable -> don't block
+
+
+def find_llama_bin(name, arch=None):
     """Resolve a llama.cpp binary (llama-perplexity, llama-cli, llama-quantize…):
-    honor an explicit path, else PATH, else the runtime build install.sh created,
-    else common spots. Returns the path or None — so tools AUTO-DETECT what's there
-    instead of dead-ending on 'not found' when the binary is right where we put it."""
+    honor an explicit path, else the runtime build install.sh created (PREFERRED —
+    Pollard keeps it current), else PATH, else common spots. Returns the path or None.
+
+    Pass `arch` (the model's general.architecture) to pick a binary that actually
+    SUPPORTS that architecture: a stale llama.cpp on PATH — e.g. a distro/homebrew
+    build a few weeks behind — silently shadows the fresh runtime build and then dies
+    on 'unknown model architecture: bailingmoe3'. With `arch` we skip incapable
+    binaries; if some exist but none support the arch we return None so the caller can
+    say 'update your runtime' instead of 'not found'."""
     import shutil
     if not name:
         return None
-    if os.path.sep in name or name.startswith("~"):        # explicit path given
+    if os.path.sep in name or name.startswith("~"):        # explicit path given — honored as-is
         p = os.path.expanduser(name)
         return p if os.path.exists(p) else None
-    hit = shutil.which(name)                                # on PATH
-    if hit:
-        return hit
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for c in (os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),
-              os.path.expanduser(f"~/llama.cpp/build/bin/{name}"),
-              f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}"):
-        if os.path.exists(c):
-            return c
-    return None
+    candidates = [
+        os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),  # ours FIRST — kept current
+        shutil.which(name),                                                # then PATH
+        os.path.expanduser(f"~/llama.cpp/build/bin/{name}"),
+        f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}",
+    ]
+    existing = [c for c in candidates if c and os.path.exists(c)]
+    if not existing:
+        return None
+    if arch:
+        capable = [c for c in existing if binary_supports_arch(c, arch)]
+        return capable[0] if capable else None             # exist-but-too-old -> None (caller explains)
+    return existing[0]
 
 
 def _shard_paths(path):

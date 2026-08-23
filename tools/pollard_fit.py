@@ -404,8 +404,18 @@ def main():
         print(f"plan only — {len(ov_lines)} tensor overrides; command that would run:")
         print("  " + " ".join(cmd))
         return
-    resolved = find_llama_bin(cmd[0])
+    arch_name = cfg.get("_gguf_arch")
+    resolved = find_llama_bin(cmd[0], arch=arch_name)
     if resolved is None:
+        # distinguish "no binary at all" from "binary present but too old for THIS arch"
+        present = find_llama_bin(cmd[0])
+        if present is not None and arch_name and arch_name != "unknown":
+            sys.exit(
+                f"ERROR: the llama.cpp build found ({present}) does not support the "
+                f"'{arch_name}' architecture — it predates support for this model. "
+                f"Update the bundled runtime:\n"
+                f"    cd runtime/llama.cpp && git pull && cmake --build build -j\n"
+                f"or point at a capable binary with --llama-quantize /path/to/llama-quantize.")
         sys.exit(f"ERROR: {cmd[0]} not found. install.sh builds it into "
                  f"runtime/llama.cpp/build/bin — re-run install.sh, or pass "
                  f"--llama-quantize /path/to/llama-quantize.")
