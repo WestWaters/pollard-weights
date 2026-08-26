@@ -156,9 +156,25 @@ def main():
     if not os.path.exists(a.eval) or os.path.getsize(a.eval) == 0:
         sys.exit(f"ERROR: eval corpus not found or empty: {a.eval}")
 
-    arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
+    meta = read_gguf_meta(a.gguf)
+    arch = analyse(gguf_to_config(meta, a.gguf))
     layers = arch["layers"]
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+
+    # FAIL FAST — the KL step writes a base-logits file of (tokens x n_vocab x 4)
+    # bytes. On a big-vocab model a large eval balloons that to tens of GB and the
+    # run dies deep in the sweep after wasting minutes. Reject it up front instead.
+    import shutil
+    n_vocab = next((meta[k] for k in meta if k.endswith("vocab_size")), 0) or 0
+    approx_tokens = os.path.getsize(a.eval) / 4                    # ~4 bytes/token of text
+    base_gb = approx_tokens * n_vocab * 4 / 1e9
+    free_gb = shutil.disk_usage(os.path.dirname(os.path.abspath(a.out or a.gguf)) or ".").free / 1e9
+    if n_vocab and base_gb > min(free_gb * 0.7, 20):
+        sys.exit(f"ERROR: eval corpus is too large for this model's vocab ({n_vocab:,}).\n"
+                 f"  the KL base logits would need ~{base_gb:.0f} GB (only {free_gb:.0f} GB free).\n"
+                 f"  fix: use a SMALLER --eval (a ~20-50 KB held-out snippet is plenty — the "
+                 f"sensitivity signal doesn't need a huge corpus).")
+
     tmp = tempfile.mkdtemp(prefix="pollard_sens_")
     base = os.path.join(tmp, "base.dat")
     ref = os.path.join(tmp, "ref.gguf")
