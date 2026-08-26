@@ -60,6 +60,33 @@ def _valid_gguf(path):
         return False
 
 
+# GPU/Metal out-of-memory signatures — a forward pass at -ngl 99 that doesn't fit
+# the GPU crashes HERE, not with a quant error. Detect it and say the actual fix
+# instead of a misleading "imatrix-uncovered tensor" guess.
+_OOM = re.compile(
+    r"Insufficient Memory|kIOGPUCommandBufferCallbackErrorOutOfMemory|out of memory"
+    r"|cudaMalloc|failed to allocate|command buffer .* failed with status 5"
+    r"|recommendedMaxWorkingSetSize", re.I)
+
+
+def _diagnose(stderr, what):
+    """Turn a swallowed subprocess failure into an actionable message. OOM at -ngl 99
+    is the common footgun: an f16/bf16 model too big for the GPU. Give the fix."""
+    s = stderr or ""
+    if _OOM.search(s):
+        return (f"{what} ran OUT OF GPU MEMORY — the model is too big to run at "
+                f"-ngl 99 on this GPU/Metal. Fix: lower --ram so the reference fits, "
+                f"offload fewer layers, or build the imatrix on a smaller quantized "
+                f"host (e.g. Q8_0) instead of f16/bf16. (This is memory, not a bug.)")
+    tail = "\n".join(l for l in s.strip().splitlines() if l.strip())[-400:]
+    return f"{what} failed. Last output:\n{tail}" if tail else f"{what} failed (no output)."
+
+
+def _run(cmd):
+    """Run a llama.cpp step, keep its output so failures can be diagnosed."""
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
 # standard per-layer matmuls the imatrix always covers; ANYTHING else (routers,
 # norms, exotic per-model tensors like DeepSeek's compressors) must not be crushed
 # to an imatrix-only IQ2 type in a uniform noise build or llama-quantize hard-fails.
@@ -117,6 +144,17 @@ def main():
         sys.exit(f"ERROR: {', '.join(missing)} not found. install.sh builds these into "
                  f"runtime/llama.cpp/build/bin — re-run install.sh, or pass the path.")
 
+    # fail loud NOW if the imatrix is missing/empty — otherwise every quantize below
+    # silently no-ops and you sit staring at a dead run. (A too-big f16 imatrix job
+    # that OOM'd on the GPU leaves no file — that's the usual cause; build it on a Q8.)
+    if not os.path.exists(a.imatrix) or os.path.getsize(a.imatrix) < 1024:
+        sys.exit(f"ERROR: imatrix not found or empty: {a.imatrix}\n"
+                 f"  build it first: llama-imatrix -m <Q8-or-smaller-host>.gguf -f calib.txt "
+                 f"-o {a.imatrix} -ngl 99\n"
+                 f"  (use a Q8_0 host, NOT f16/bf16, if the full model won't fit your GPU.)")
+    if not os.path.exists(a.eval) or os.path.getsize(a.eval) == 0:
+        sys.exit(f"ERROR: eval corpus not found or empty: {a.eval}")
+
     arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
     layers = arch["layers"]
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
@@ -165,17 +203,18 @@ def main():
                 "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
     if a.rpc:
         base_cmd += ["--rpc", a.rpc]
-    subprocess.run(base_cmd, capture_output=True)
+    r = _run(base_cmd)
+    if not os.path.exists(base) or os.path.getsize(base) == 0:
+        sys.exit(f"ERROR: could not build the reference logits — {_diagnose(r.stderr, 'the base forward pass')}")
     if base_src != a.gguf and not _valid_gguf(base_src):
         sys.exit(f"ERROR: the memory-fit base build ({a.ref}) came out invalid — "
-                 f"llama-quantize failed (likely an imatrix-uncovered tensor). Bug; report it.")
+                 f"{_diagnose(r.stderr, 'llama-quantize')}")
     # 2. reference build — SAME pins as the base (an IQ2 ref crashes on uncovered tensors too)
-    subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
-                   + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
-                   + [a.gguf, ref, a.ref], capture_output=True)
+    r = _run([a.llama_quantize, "--imatrix", a.imatrix]
+             + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
+             + [a.gguf, ref, a.ref])
     if not _valid_gguf(ref):
-        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — llama-quantize "
-                 f"failed (likely an imatrix-uncovered tensor). Bug; report it.")
+        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — {_diagnose(r.stderr, 'llama-quantize')}")
     kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc)
     if kl_ref is None:
         sys.exit("ERROR: reference GGUF built fine but perplexity couldn't score it — "
