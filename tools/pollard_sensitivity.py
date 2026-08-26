@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
                           read_gguf_tensor_names, find_llama_bin,
@@ -194,7 +195,7 @@ def main():
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
                            + (PINARG if PRESET[fit] in IMATRIX_REQUIRED_PRESETS else [])
                            + [a.gguf, base_src, PRESET[fit]], capture_output=True)
-    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes")
+    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes  (elapsed + ETA shown per layer)")
 
     if a.rpc:
         print(f"RPC pool: {a.rpc}  (forward passes span these nodes; quantize stays local)")
@@ -246,6 +247,10 @@ def main():
     # 3. crush each group in each layer, measure the KL cost over the reference
     profile = {g: {} for g in groups}
     failed = []
+    t_sweep = time.time()
+    def _hms(s):
+        s = int(max(0, s)); h, s = divmod(s, 3600); m, s = divmod(s, 60)
+        return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
     for i in range(layers):
         for g in groups:
             pat = rf"blk\.{i}\.{g}_.*={a.probe}"
@@ -263,9 +268,11 @@ def main():
                 failed.append(f"{g}.{i}")
             os.path.exists(probe) and os.remove(probe)
         done = (i + 1) / layers
+        elapsed = time.time() - t_sweep
+        eta = elapsed / (i + 1) * (layers - i - 1)          # avg-per-layer * remaining
         print(f"  layer {i:>3}/{layers}  " +
               "  ".join(f"{g}={profile[g][str(i)]}" for g in groups) +
-              f"   [{done*100:4.0f}%]")
+              f"   [{done*100:4.0f}%  elapsed {_hms(elapsed)}  ETA {_hms(eta)}]")
 
     # failed probes -> PROTECT (max sensitivity), never crush. Loud about it.
     if failed:
