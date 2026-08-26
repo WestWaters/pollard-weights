@@ -24,14 +24,28 @@ def _hms(s):
     s = int(s); m, s = divmod(s, 60); return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
-def get_wikitext(tokenizer, split, seqlen, n=None):
-    from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-    enc = tokenizer("\n\n".join(ds["text"]), return_tensors="pt").input_ids[0]
+def _chunks(tokenizer, text, seqlen, n=None):
+    enc = tokenizer(text, return_tensors="pt").input_ids[0]
     chunks = [enc[i:i + seqlen] for i in range(0, enc.numel() - seqlen, seqlen)]
     if n:
         chunks = chunks[:n]
     return torch.stack(chunks)
+
+
+def get_wikitext(tokenizer, split, seqlen, n=None, path=None):
+    """Tokenize into seqlen chunks. From a local text FILE if `path` is given
+    (robust across datasets-library versions); else the wikitext-2 HF dataset."""
+    if path:
+        with open(path, encoding="utf-8") as f:
+            return _chunks(tokenizer, f.read(), seqlen, n)
+    from datasets import load_dataset
+    for repo in ("Salesforce/wikitext", "wikitext"):
+        try:
+            ds = load_dataset(repo, "wikitext-2-raw-v1", split=split)
+            return _chunks(tokenizer, "\n\n".join(ds["text"]), seqlen, n)
+        except Exception:
+            continue
+    raise RuntimeError("could not load wikitext — pass --calib-file/--eval-file instead")
 
 
 def quantize_group(w, scale, zero, maxq):
@@ -85,6 +99,39 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False):
     return Q.to(torch.float16)
 
 
+def imatrix_quantize(W, wdiag, bits, groupsize):
+    """llama.cpp-imatrix-equivalent: per group, pick the scale that minimizes the
+    IMPORTANCE-WEIGHTED squared error (wdiag = per-input-channel activation
+    importance = the diagonal of the Hessian). This is exactly what imatrix does —
+    weighted scale selection, NO error feedback — so it isolates 'GPTQ's off-diagonal
+    compensation vs imatrix's diagonal weighting' in ONE harness."""
+    W = W.clone().float(); rows, cols = W.shape; maxq = 2 ** bits - 1
+    w = wdiag.clamp(min=1e-8).float()
+    Q = torch.zeros_like(W)
+    for c0 in range(0, cols, groupsize or cols):
+        g = W[:, c0:c0 + (groupsize or cols)]
+        wg = w[c0:c0 + g.shape[1]][None, :]
+        gmax = g.amax(1, keepdim=True); gmin = g.amin(1, keepdim=True)
+        rng = (gmax - gmin).clamp(min=1e-8)
+        best_err = bq = None
+        # search the group scale (llama.cpp make_qx_quants sweeps ~19 candidates);
+        # proper asymmetric range-based scale + clamped zero-point
+        for is_ in range(-9, 10):
+            scale = rng / maxq * (1.0 + is_ * 0.02)
+            zero = torch.clamp(torch.round(-gmin / scale), 0, maxq)
+            q = torch.clamp(torch.round(g / scale) + zero, 0, maxq)
+            deq = scale * (q - zero)
+            err = (wg * (deq - g) ** 2).sum(1, keepdim=True)
+            if best_err is None:
+                best_err, bq = err, deq
+            else:
+                take = err < best_err                         # [rows,1] broadcasts over the group
+                best_err = torch.where(take, err, best_err)
+                bq = torch.where(take, deq, bq)
+        Q[:, c0:c0 + g.shape[1]] = bq
+    return Q.to(torch.float16)
+
+
 def rtn_quantize(W, bits, groupsize):
     """Round-to-nearest baseline, same INT grid/groups, no error feedback."""
     W = W.clone().float(); rows, cols = W.shape; maxq = 2 ** bits - 1
@@ -97,8 +144,9 @@ def rtn_quantize(W, bits, groupsize):
 
 
 @torch.no_grad()
-def eval_ppl(model, testchunks, dev):
+def eval_ppl(model, testchunks, dev=None):
     model.eval(); nll = 0.0; ntok = 0
+    dev = next(model.parameters()).device                 # run on wherever the model lives
     for c in testchunks:
         ids = c.unsqueeze(0).to(dev)
         out = model(ids, labels=ids)
@@ -112,11 +160,15 @@ def linear_layers(module):
 
 
 @torch.no_grad()
-def sequential_gptq(model, calib, dev, bits, groupsize, act_order):
+def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False):
     """The PROPER GPTQ: process transformer blocks in order, feeding each block's
     QUANTIZED outputs into the next block's Hessian — so every layer compensates for
     the error earlier layers actually introduced. Recovers far more of RTN's loss
-    than the one-shot fp16-Hessian version."""
+    than the one-shot fp16-Hessian version.
+
+    offload=True keeps the whole model on CPU and moves ONE block to `dev` at a time —
+    this is what lets a 7B (15 GB) quantize on a 16 GB GPU: peak VRAM is one block +
+    its Hessians, never the whole model."""
     layers = model.model.layers
     # --- capture the input to block 0 (+ the kwargs each block needs) for every sample.
     # A forward-PRE-hook avoids replacing the layer (so model-level attribute access like
@@ -126,19 +178,35 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order):
         inps.append((args[0] if args else kwargs["hidden_states"]).detach())
         cache.update(kwargs)
         raise RuntimeError("caught")
+    cap_dev = next(model.model.embed_tokens.parameters()).device     # where the model currently is
     h = layers[0].register_forward_pre_hook(catch, with_kwargs=True)
     for c in calib:
-        try: model(c.unsqueeze(0).to(dev))
+        try: model(c.unsqueeze(0).to(cap_dev))
         except RuntimeError: pass
     h.remove()
-    kw = {k: v for k, v in cache.items() if k != "hidden_states"}   # small, stays on dev
+    # small kwargs (position_embeddings, attention_mask) stay on dev; DROP cache-related
+    # kwargs — a shared DynamicCache would accumulate KV across replays and blow up shapes.
+    drop = {"hidden_states", "past_key_values", "past_key_value", "use_cache"}
+    kw = {k: v for k, v in cache.items() if k not in drop}
+    kw["use_cache"] = False
     inps = [x.cpu() for x in inps]                                    # park activations on CPU
+
+    def to_dev(v):
+        if torch.is_tensor(v): return v.to(dev)
+        if isinstance(v, tuple): return tuple(to_dev(x) for x in v)
+        return v
+    kw = {k: to_dev(v) for k, v in kw.items()}                       # pos-emb/mask onto dev once
+
+    def fwd(layer, inp):
+        out = layer(inp, **kw)
+        return out[0] if isinstance(out, tuple) else out
 
     def empty():
         if dev == "mps": torch.mps.empty_cache()
         elif dev == "cuda": torch.cuda.empty_cache()
 
     for i, layer in enumerate(layers):
+        if offload: layer.to(dev)                                     # one block on the GPU
         lins = {n: m for n, m in layer.named_modules() if isinstance(m, nn.Linear)}
         H = {n: torch.zeros(m.in_features, m.in_features, device=dev) for n, m in lins.items()}
         cnt = {n: 0 for n in lins}
@@ -152,7 +220,7 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order):
             hooks.append(m.register_forward_hook(mk(n)))
         with torch.no_grad():
             for inp in inps:
-                layer(inp.to(dev), **kw)
+                fwd(layer, inp.to(dev))
         for h in hooks: h.remove()
         for n, m in lins.items():
             m.weight.data = gptq_quantize(m.weight.data, H[n] / max(cnt[n], 1),
@@ -161,7 +229,8 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order):
         empty()
         # re-run the now-QUANTIZED block to produce inputs for the next block (back to CPU)
         with torch.no_grad():
-            inps = [layer(inp.to(dev), **kw)[0].cpu() for inp in inps]
+            inps = [fwd(layer, inp.to(dev)).cpu() for inp in inps]
+        if offload: layer.to("cpu")                                   # evict the block
         empty()
     return model
 
@@ -174,26 +243,39 @@ def main():
     ap.add_argument("--nsamples", type=int, default=128)
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--eval-chunks", type=int, default=40)
+    ap.add_argument("--calib-file", help="local text file for calibration (skips HF datasets)")
+    ap.add_argument("--eval-file", help="local text file for eval PPL (skips HF datasets)")
     ap.add_argument("--method", default="all",
-                    choices=["rtn", "gptq", "gptq-ao", "gptq-seq", "gptq-seq-ao", "both", "all"])
+                    choices=["rtn", "imatrix", "gptq", "gptq-ao", "gptq-seq", "gptq-seq-ao", "both", "all"])
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--offload", action="store_true",
+                    help="keep the model on CPU and move ONE block to the GPU at a time — "
+                    "required to quantize a model bigger than VRAM (e.g. a 7B on 16 GB)")
     a = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
-    print(f"== pollard-gptq :: {a.model}  W{a.bits}g{a.groupsize}  dev={dev}")
+    mdev = "cpu" if a.offload else dev                    # where the model itself lives
+    print(f"== pollard-gptq :: {a.model}  W{a.bits}g{a.groupsize}  dev={dev}"
+          f"{'  (block-offload)' if a.offload else ''}")
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.float16).to(dev)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(mdev)
 
     print("loading wikitext-2 ...")
-    calib = get_wikitext(tok, "train", a.seqlen, a.nsamples)
-    test = get_wikitext(tok, "test", a.seqlen, a.eval_chunks)
+    calib = get_wikitext(tok, "train", a.seqlen, a.nsamples, path=a.calib_file)
+    test = get_wikitext(tok, "test", a.seqlen, a.eval_chunks, path=a.eval_file)
 
-    ppl_fp16 = eval_ppl(model, test, dev)
-    print(f"fp16 PPL: {ppl_fp16:.4f}")
+    ppl_fp16 = eval_ppl(model, test)
+    print(f"fp16 PPL: {ppl_fp16:.4f}", flush=True)
 
+    methods = {"rtn": ["rtn"], "imatrix": ["imatrix"], "gptq": ["gptq"], "gptq-ao": ["gptq-ao"],
+               "gptq-seq": ["gptq-seq"], "gptq-seq-ao": ["gptq-seq-ao"],
+               "both": ["rtn", "gptq"],
+               "all": ["rtn", "imatrix", "gptq", "gptq-seq"]}[a.method]
     import copy
-    fp16_state = copy.deepcopy(model.state_dict())
+    # only snapshot fp16 weights when we need to run MORE than one method (avoids
+    # holding a second full copy of a 7B in RAM)
+    fp16_state = copy.deepcopy(model.state_dict()) if len(methods) > 1 else None
 
     def collect_hessians(lins):
         H = {n: torch.zeros(m.in_features, m.in_features, device=dev) for n, m in lins.items()}
@@ -213,31 +295,33 @@ def main():
         return {n: H[n] / max(cnt[n], 1) for n in lins}
 
     def run(method):
-        model.load_state_dict(fp16_state)
+        if fp16_state is not None:
+            model.load_state_dict(fp16_state)
         lins = linear_layers(model.model.layers)              # only the transformer-block linears
         t0 = time.time()
         if method in ("gptq-seq", "gptq-seq-ao"):
             sequential_gptq(model, calib, dev, a.bits, a.groupsize,
-                            act_order=method.endswith("-ao"))
+                            act_order=method.endswith("-ao"), offload=a.offload)
         elif method in ("gptq", "gptq-ao"):
-            model.load_state_dict(fp16_state)                 # Hessians from the fp16 activations
-            Hs = collect_hessians(lins)
+            Hs = collect_hessians(lins)                       # Hessians from the fp16 activations
             ao = (method == "gptq-ao")
             for n, m in lins.items():
                 m.weight.data = gptq_quantize(m.weight.data, Hs[n], a.bits, a.groupsize,
-                                              act_order=ao).to(dev)
+                                              act_order=ao).to(m.weight.device)
+        elif method == "imatrix":
+            Hs = collect_hessians(lins)                       # diagonal = per-channel importance
+            for n, m in lins.items():
+                m.weight.data = imatrix_quantize(m.weight.data, torch.diag(Hs[n]),
+                                                 a.bits, a.groupsize).to(m.weight.device)
         else:
             for n, m in lins.items():
-                m.weight.data = rtn_quantize(m.weight.data, a.bits, a.groupsize).to(dev)
-        ppl = eval_ppl(model, test, dev)
+                m.weight.data = rtn_quantize(m.weight.data, a.bits, a.groupsize).to(m.weight.device)
+        ppl = eval_ppl(model, test)
         gap = ppl - ppl_fp16
         print(f"{method.upper():8s} W{a.bits}g{a.groupsize} PPL: {ppl:.4f}   "
               f"(+{gap:.4f} vs fp16)   [{_hms(time.time()-t0)}]", flush=True)
         return ppl
 
-    methods = {"rtn": ["rtn"], "gptq": ["gptq"], "gptq-ao": ["gptq-ao"],
-               "gptq-seq": ["gptq-seq"], "gptq-seq-ao": ["gptq-seq-ao"],
-               "both": ["rtn", "gptq"], "all": ["rtn", "gptq", "gptq-seq"]}[a.method]
     res = {}
     for meth in methods:
         res[meth] = run(meth)
