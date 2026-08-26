@@ -23,9 +23,12 @@ pollard-run = "pollard_run:main"
 pollard-fit-dit = "pollard_fit_dit:main"
 pollard-experts = "pollard_experts:main"
 pollard-sensitivity = "pollard_sensitivity:main"
+pollard-smooth = "pollard_smooth:main"
+pollard-rotate = "pollard_rotate:main"
+pollard-precondition = "pollard_precondition:main"
 pollard-eval = "pollard_eval:main"
 pollard-health = "pollard_health:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
-py-modules = ["pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_eval"]
+py-modules = ["pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval"]
