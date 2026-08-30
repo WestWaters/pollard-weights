@@ -17,6 +17,7 @@ classifiers = [
 ]
 
 [project.scripts]
+pollard = "pollard_auto:main"
 pollard-calc = "pollard_calc:main"
 pollard-fit = "pollard_fit:main"
 pollard-run = "pollard_run:main"
@@ -41,4 +42,4 @@ pollard-palette = "pollard_palette:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
-py-modules = ["pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_pack", "pollard_export", "pollard_gptq", "pollard_automap"]
+py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_pack", "pollard_export", "pollard_gptq", "pollard_automap"]
