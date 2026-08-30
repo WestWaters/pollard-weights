@@ -61,11 +61,28 @@ def group_params(W, maxq):
     return scale, zero
 
 
-def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False):
+def _col_quant(w, scale, zero, maxq, qmode):
+    """Quantize one column w [rows] given the group's scale/zero. Returns dequant [rows].
+    The GPTQ error-feedback loop is quantizer-agnostic — this is the only per-alphabet
+    part, so ternary/binary get the SAME cross-channel compensation as INT."""
+    if qmode == "int":
+        return quantize_group(w.unsqueeze(1), scale, zero, maxq).squeeze(1)
+    s = scale[:, 0]                                          # per-row group scale [rows]
+    if qmode == "ternary":
+        return torch.clamp(torch.round(w / s), -1, 1) * s    # {-1,0,+1}
+    if qmode == "binary":
+        return torch.sign(w) * s                             # {-1,+1}
+    raise ValueError(qmode)
+
+
+def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="int"):
     """GPTQ on one linear weight W [rows, cols] with Hessian H [cols, cols].
     act_order: quantize columns in decreasing-Hessian-diagonal order (most
-    important first) — recovers markedly more of RTN's loss. Returns dequantized
-    weights (same shape)."""
+    important first) — recovers markedly more of RTN's loss.
+    qmode: 'int' (asymmetric scale+zero, `bits` levels) | 'ternary' {-1,0,1} |
+    'binary' {-1,+1} — the last two use a symmetric per-group abs-mean scale and get
+    the SAME error feedback (that's the lever RTN ternary was missing). Returns
+    dequantized weights (same shape)."""
     W = W.clone().float()
     rows, cols = W.shape
     maxq = 2 ** bits - 1
@@ -87,10 +104,13 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False):
     for i in range(cols):
         if groupsize and i % groupsize == 0:
             g = W[:, i:i + groupsize]
-            scale, zero = group_params(g, maxq)
+            if qmode == "int":
+                scale, zero = group_params(g, maxq)
+            else:                                            # symmetric abs-mean scale
+                scale = g.abs().mean(1, keepdim=True).clamp(min=1e-8); zero = None
         d = Hinv[i, i]
         w = W[:, i]
-        q = quantize_group(w.unsqueeze(1), scale, zero, maxq).squeeze(1)
+        q = _col_quant(w, scale, zero, maxq, qmode)
         Q[:, i] = q
         err = (w - q) / d
         W[:, i:] -= err.unsqueeze(1) * Hinv[i, i:].unsqueeze(0)
@@ -132,6 +152,28 @@ def imatrix_quantize(W, wdiag, bits, groupsize):
     return Q.to(torch.float16)
 
 
+def make_recipe(kind, ablate="none"):
+    """Per-tensor rate map for the protected-mix build (Grok's Attempt C in torch):
+    crush the fat MLP body, PROTECT attention + down_proj + first/last-2 blocks + head.
+    `ablate` drops ONE protect class to the body atom (protect-set ablation): one of
+    {none, firstlast, attn (qkv), attnout, down} — measures which protection earns its bits.
+    Returns recipe(layer_idx, tensor_name, nlayers) -> (bits, qmode)."""
+    body = (1, "binary") if kind == "aggr" else (2, "ternary")
+    P = (2, "int")                                    # the protect atom
+    def recipe(i, name, nlayers):
+        first_last = bool(nlayers) and (i < 2 or i >= nlayers - 2)   # first-2 + last-2
+        if first_last and ablate != "firstlast":
+            return P
+        if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            return body if ablate == "attn" else P
+        if "o_proj" in name:
+            return body if ablate == "attnout" else P
+        if "down_proj" in name:
+            return body if ablate == "down" else P
+        return body                                   # gate/up = the fat MLP body
+    return recipe
+
+
 def rtn_quantize(W, bits, groupsize):
     """Round-to-nearest baseline, same INT grid/groups, no error feedback."""
     W = W.clone().float(); rows, cols = W.shape; maxq = 2 ** bits - 1
@@ -160,7 +202,8 @@ def linear_layers(module):
 
 
 @torch.no_grad()
-def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False):
+def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False, qmode="int",
+                    recipe=None, nlayers=None):
     """The PROPER GPTQ: process transformer blocks in order, feeding each block's
     QUANTIZED outputs into the next block's Hessian — so every layer compensates for
     the error earlier layers actually introduced. Recovers far more of RTN's loss
@@ -223,8 +266,11 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
                 fwd(layer, inp.to(dev))
         for h in hooks: h.remove()
         for n, m in lins.items():
+            b, qm = recipe(i, n, nlayers) if recipe else (bits, qmode)
+            if qm == "skip":                                          # leave this tensor fp16
+                del H[n]; continue
             m.weight.data = gptq_quantize(m.weight.data, H[n] / max(cnt[n], 1),
-                                          bits, groupsize, act_order=act_order).to(dev)
+                                          b, groupsize, act_order=act_order, qmode=qm).to(dev)
             del H[n]
         empty()
         # re-run the now-QUANTIZED block to produce inputs for the next block (back to CPU)
@@ -247,6 +293,14 @@ def main():
     ap.add_argument("--eval-file", help="local text file for eval PPL (skips HF datasets)")
     ap.add_argument("--method", default="all",
                     choices=["rtn", "imatrix", "gptq", "gptq-ao", "gptq-seq", "gptq-seq-ao", "both", "all"])
+    ap.add_argument("--qmode", default="int", choices=["int", "ternary", "binary"],
+                    help="alphabet: int (asymmetric `bits`-bit) | ternary {-1,0,1} ~1.58b | binary {-1,+1} ~1.0b")
+    ap.add_argument("--recipe", default="none", choices=["none", "handmix", "aggr"],
+                    help="protected-mix build (gptq-seq only): crush MLP body, protect attn/down/first-last/head")
+    ap.add_argument("--ablate", default="none", choices=["none", "firstlast", "attn", "attnout", "down"],
+                    help="protect-set ablation: drop ONE protect class to the body atom")
+    ap.add_argument("--head-bits", type=int, default=0, help="quantize lm_head to N bits (0=leave fp16). Head/embed sweep.")
+    ap.add_argument("--embed-bits", type=int, default=0, help="quantize token embeddings to N bits (0=leave fp16).")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--offload", action="store_true",
                     help="keep the model on CPU and move ONE block to the GPU at a time — "
@@ -300,25 +354,61 @@ def main():
         lins = linear_layers(model.model.layers)              # only the transformer-block linears
         t0 = time.time()
         if method in ("gptq-seq", "gptq-seq-ao"):
+            rec = make_recipe("aggr" if a.recipe == "aggr" else "handmix", a.ablate) if a.recipe != "none" else None
             sequential_gptq(model, calib, dev, a.bits, a.groupsize,
-                            act_order=method.endswith("-ao"), offload=a.offload)
+                            act_order=method.endswith("-ao"), offload=a.offload, qmode=a.qmode,
+                            recipe=rec, nlayers=len(model.model.layers))
         elif method in ("gptq", "gptq-ao"):
             Hs = collect_hessians(lins)                       # Hessians from the fp16 activations
             ao = (method == "gptq-ao")
             for n, m in lins.items():
                 m.weight.data = gptq_quantize(m.weight.data, Hs[n], a.bits, a.groupsize,
-                                              act_order=ao).to(m.weight.device)
+                                              act_order=ao, qmode=a.qmode).to(m.weight.device)
         elif method == "imatrix":
             Hs = collect_hessians(lins)                       # diagonal = per-channel importance
             for n, m in lins.items():
                 m.weight.data = imatrix_quantize(m.weight.data, torch.diag(Hs[n]),
                                                  a.bits, a.groupsize).to(m.weight.device)
-        else:
+        else:                                                 # rtn (alphabet-aware)
             for n, m in lins.items():
-                m.weight.data = rtn_quantize(m.weight.data, a.bits, a.groupsize).to(m.weight.device)
+                if a.qmode == "ternary":
+                    from pollard_lowbit import q_ternary
+                    m.weight.data = q_ternary(m.weight.data, a.groupsize).to(m.weight.device)
+                elif a.qmode == "binary":
+                    from pollard_lowbit import q_binary
+                    m.weight.data = q_binary(m.weight.data, a.groupsize).to(m.weight.device)
+                else:
+                    m.weight.data = rtn_quantize(m.weight.data, a.bits, a.groupsize).to(m.weight.device)
+        # head/embed sweep: RTN-quantize lm_head / token_embd (the "fat head" cliff).
+        # On tied models (0.5B/1.5B) lm_head shares embed's tensor, so embed-bits drives both.
+        emb = model.model.embed_tokens
+        if a.embed_bits:
+            emb.weight.data = rtn_quantize(emb.weight.data, a.embed_bits, a.groupsize).to(emb.weight.device)
+        lm = getattr(model, "lm_head", None)
+        if a.head_bits and lm is not None and lm.weight.data_ptr() != emb.weight.data_ptr():
+            lm.weight.data = rtn_quantize(lm.weight.data, a.head_bits, a.groupsize).to(lm.weight.device)
         ppl = eval_ppl(model, test)
         gap = ppl - ppl_fp16
-        print(f"{method.upper():8s} W{a.bits}g{a.groupsize} PPL: {ppl:.4f}   "
+        SYM = {"int": float(a.bits), "ternary": 1.585, "binary": 1.0}
+        if a.recipe != "none" and method in ("gptq-seq", "gptq-seq-ao"):
+            rec = make_recipe("aggr" if a.recipe == "aggr" else "handmix", a.ablate)
+            nl = len(model.model.layers)
+            qbits = 0; qw = 0                                  # quantized layer weights
+            for n, m in model.model.layers.named_modules():
+                if isinstance(m, nn.Linear):
+                    # recover (layer_idx, subname) from the full module path
+                    idx = int(n.split(".")[0]); sub = ".".join(n.split(".")[1:])
+                    b, qm = rec(idx, sub, nl)
+                    per = 16.0 if qm == "skip" else SYM.get(qm, float(b)) + 16.0 / a.groupsize
+                    qbits += per * m.weight.numel(); qw += m.weight.numel()
+            bpw = qbits / qw                                   # body-only (matches ternary baseline)
+            tag = f"MIX-{a.recipe}/ablate-{a.ablate}@~{bpw:.2f}bpw body (embed/head fp16)"
+        else:
+            bpw = SYM[a.qmode] + 16.0 / a.groupsize
+            tag = f"{a.qmode}@~{bpw:.2f}bpw"
+        if a.embed_bits or a.head_bits:
+            tag += f" [embed={a.embed_bits or 'fp16'} head={a.head_bits or 'fp16'}]"
+        print(f"{method.upper():8s} {tag} PPL: {ppl:.4f}   "
               f"(+{gap:.4f} vs fp16)   [{_hms(time.time()-t0)}]", flush=True)
         return ppl
 

@@ -273,6 +273,28 @@ otherwise. Force one with `POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh`. Throughpu
 tracks the slowest peer and the link, but the RAM adds up regardless of who made
 the chips.
 
+## Wafer-scale (Cerebras): capacity planning
+
+`pollard-pack` points Pollard's hot-set ranking at an SRAM machine (Cerebras
+WSE-3 / CS-3, WSE-3 Turbo / CS-4). On a wafer, weights are **16-bit resident**, so
+the lever is not bit-width but **sparsity** — the cores skip zeros. Pollard
+re-casts its sensitivity ranking as **REAP-style expert pruning** (drop the
+least-important experts) and forecasts the two numbers that set wafer cost:
+
+```bash
+pollard-pack --gguf your-moe.gguf --target wse3t --prune-experts 0.5
+#   resident: 61.0 GB -> 33.0 GB (-46%)   WAFERS: 2 -> 1 (save 1)   [Qwen3-30B-A3B]
+pollard-pack --gguf your-moe.gguf --emit-plan plan.json   # per-layer expert-drop plan
+```
+
+Footprint ∝ total params → wafers; throughput ∝ active params/token. It forecasts
+**capacity, not a tokens/s number** (single-stream latency on a wafer is
+layer-depth bound). MoE-only — a dense model is 16-bit either way and gets no
+wafer win, and the tool says so. This is an **offline planner**: Cerebras
+inference is a closed 16-bit stack, so a Pollard GGUF does not run on a wafer —
+applying the drop-list and measuring t/s is a partnership track. See
+`notes/wafer-support.md`.
+
 ## Use it with your agent
 
 The repo is written to be agent-executable: hand this README plus
