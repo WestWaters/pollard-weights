@@ -325,6 +325,12 @@ The repo is written to be agent-executable: hand this README plus
 `experiments/README.md` to Claude Code, Hermes Agent, Codex, Cursor, or any
 coding agent, and ask it to run the calculator on a model you're considering
 or to reproduce the routing measurements on one you already have.
+
+**→ Point your agent at [`skills/pollard/SKILL.md`](skills/pollard/SKILL.md)** — the
+Pollard agent skill. It encodes the whole decision tree (dense → imatrix, MoE →
+automap), the exact commands per model type, the runtime export paths (llama.cpp /
+vLLM+SGLang / wafer), and the guards, so an agent runs *your* model down the right
+path for the best result — no wasted multi-hour wrong-tool runs.
 Everything is argparse'd, stdlib-first, and states its expected inputs. Example:
 "clone this repo and tell me what Kimi-K3 would do on my machine" is a complete
 instruction.
