@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""pollard-automap — generate the memory-fit mix recipe for ANY model, automatically.
+
+The Pollard POLICY (measured on 7B, Grok-blessed) as a function of the model's tensor
+list, so we never hand-roll a map again:
+  - crush the fat body               -> IQ1_KT   (dense: ffn_gate/up ; MoE: the *_exps experts)
+  - keep ffn_down LOW                -> IQ2_KT   (raising it to IQ3 leaves the 1-bit size class -> IQ2 wins)
+  - fat attention (q, output)        -> IQ2_KT   ; k,v reclaimed -> IQ1_KT
+  - protect first-2 / last-2 blocks  -> IQ2_KT
+  - MoE router (ffn_gate_inp) + shared experts -> keep high (Q6_K / never IQ1)
+  - fat head/embeddings              -> output Q6_K , token_embd Q4_K  (never < 4-bit)
+  - norms                            -> F32
+
+Reads a `llama-quantize --dry-run` tensor list (the ground truth of what's actually in
+the GGUF), detects layer count + dense/MoE, and emits the three build commands
+(uniform IQ1_KT baseline / PollardMix / uniform IQ2_KT ceiling) as a ready .bat.
+
+Usage:
+  # on the box:  llama-quantize --dry-run ... model-f16.gguf x.gguf IQ1_KT > tensors.txt
+  pollard-automap --tensors tensors.txt --model model-f16.gguf --imatrix ik.imatrix \
+      --out build_mix.bat --bin C:\\pollard\\ik_llama.cpp\\build\\bin
+"""
+import argparse, re, sys
+
+
+def parse_tensors(path):
+    """Return (names, n_layers, is_moe). Accepts dry-run lines or bare tensor names."""
+    names = []
+    for ln in open(path, encoding="utf-8", errors="ignore"):
+        m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output\.weight|output_norm\.weight)", ln)
+        if m:
+            names.append(m.group(1))
+    names = sorted(set(names))
+    layers = [int(m.group(1)) for n in names for m in [re.match(r"blk\.(\d+)\.", n)] if m]
+    n_layers = (max(layers) + 1) if layers else 0
+    is_moe = any("exps" in n or "ffn_gate_inp" in n for n in names)
+    return names, n_layers, is_moe
+
+
+# ---- the real ik_llama.cpp extreme-low ladder (from `llama-quantize --help`) ----
+# bpw + family, so a chosen atom is picked from what the runtime actually ships and
+# users can dial the crush all the way to the floor instead of stopping at 1.75.
+QUANT_BPW = {
+    "iq1_s_r4": 1.50, "iq1_s": 1.56, "iq1_bn": 1.62,   # sub-1.75 floor (iq1_bn = Bitnet ternary)
+    "iq1_kt": 1.75, "iq1_m": 1.75,                      # trellis / i-quant 1.75
+    "iq2_bn": 2.00, "iq2_xxs": 2.06, "iq2_kt": 2.125,   # ~2-bit band (iq2_bn = Bitnet ternary)
+    "iq2_ks": 2.19, "iq2_xs": 2.31, "iq2_k": 2.375,
+    "iq3_kt": 3.125,
+}
+# Frontier mixed-ultra-low formats (e.g. Hy4 MIX-STQ1_0's sparse-ternary STQ1_0) map onto
+# the nearest thing this runtime can actually emit: Bitnet ternary.
+ALIASES = {"stq1_0": "iq1_bn", "stq2_0": "iq2_bn"}
+# atoms known to route reliably through --custom-q (lowercase); the trellis role-flags
+# silently fell back for some types (Mix-v3 lesson), so the Mix goes 100% through custom-q.
+BODY_CHOICES = ["iq1_kt", "iq1_bn", "iq1_s", "iq1_s_r4", "iq2_xxs", "iq2_kt"]
+PROTECT_CHOICES = ["iq2_kt", "iq2_xxs", "iq2_k", "iq3_kt"]
+
+
+def _atom(name):
+    return ALIASES.get(name.lower(), name.lower())
+
+
+def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
+    """Emit the Mix as (base_type, custom-q rules). base_type = the crush atom (fills
+    everything not matched); every protected role is named explicitly via custom-q
+    (lowercase = the reliable path — role-flags silently fell back for some atoms).
+    Rules are ordered general->specific; edge-block rules go LAST so they win.
+    Verified against a dry-run (which prints the actual per-tensor type chosen)."""
+    body, protect = _atom(body), _atom(protect)
+    flags = ["--output-tensor-type Q6_K", "--token-embedding-type Q4_K"]  # head/embed: never < 4-bit
+    cq = []
+    # --custom-q is FIRST-MATCH-WINS (verified via dry-run): list overrides first.
+    # (1) edge whole-block protection FIRST so it beats the general role rules below,
+    #     fully protecting the first-2 / last-2 blocks (attn AND ffn), as the flag-based
+    #     original did (custom-q used to override the role flags).
+    edge = [0, 1, n_layers - 2, n_layers - 1]
+    for i in sorted(set(x for x in edge if 0 <= x < n_layers)):
+        cq.append(rf"blk\.{i}\.={protect}")
+    if is_moe:
+        # (2) crush the cold bulk experts to the body atom; keep the residual writer
+        # (ffn_down_exps) a tier up, the router high, and the shared experts protected.
+        cq += [f"ffn_gate_exps={body}", f"ffn_up_exps={body}", f"ffn_down_exps={protect}",
+               "ffn_gate_inp=q6_K",                       # router: never crushed
+               f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", "ffn_down_shexp=iq3_kt"]
+    # (3) general roles: attn k,v to the body atom; q + output protected; ffn_down LOW.
+    cq += [f"attn_k={body}", f"attn_v={body}",
+           f"attn_q={protect}", f"attn_output={protect}", f"ffn_down={protect}"]
+    return flags, cq
+
+
+def emit_bat(a, n_layers, is_moe):
+    body, protect = _atom(a.body), _atom(a.protect)
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
+    base = a.model
+    stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
+    cqs = ",".join(cq)
+    L = ["@echo off", f"set BIN={a.bin}", f"set IM={a.imatrix}", f"set SRC={base}",
+         f"set EV={a.eval}", f"set LOG={a.log}",
+         f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  "
+         f"body={body}({QUANT_BPW.get(body,'?')}) protect={protect}({QUANT_BPW.get(protect,'?')})"
+         f"=== 1> %LOG% 2>&1", ""]
+    def build(name, typ, extra=""):
+        return (f"%BIN%\\llama-quantize.exe --imatrix %IM% {extra} %SRC% "
+                f"{stem}-{name}.gguf {typ} 1>> %LOG% 2>&1")
+    def ppl(name):
+        return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
+                f"-ngl 99 1>> %LOG% 2>&1")
+    # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
+    L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
+          build(f"u-{body}", body.upper()), ppl(f"u-{body}"), ""]
+    # ceiling (uniform at the protect tier)
+    L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
+          build(f"u-{protect}", protect.upper()), ppl(f"u-{protect}"), ""]
+    # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
+    if a.rival:
+        rv = _atom(a.rival)
+        L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
+              build(f"rival-{rv}", rv.upper()), ppl(f"rival-{rv}"), ""]
+    # PollardMix: base fills with the body atom, custom-q protects the sensitive roles
+    mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
+    L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
+          build("mix", body.upper(), mix_extra), ppl("mix"), ""]
+    L += [f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> %LOG% 2>&1"]
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--tensors", required=True, help="llama-quantize --dry-run tensor list")
+    ap.add_argument("--model", required=True, help="source F16 gguf path (as seen on the box)")
+    ap.add_argument("--imatrix", default="ik.imatrix")
+    ap.add_argument("--eval", default="wikitext2_test.txt")
+    ap.add_argument("--bin", default=r"C:\pollard\ik_llama.cpp\build\bin")
+    ap.add_argument("--log", default=r"C:\pollard\bench\automap.log")
+    ap.add_argument("--out", default="build_automap.bat")
+    ap.add_argument("--body", default="iq1_kt", help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
+    ap.add_argument("--protect", default="iq2_kt", help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
+    ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
+    a = ap.parse_args()
+    names, n_layers, is_moe = parse_tensors(a.tensors)
+    if not n_layers:
+        sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
+    body, protect = _atom(a.body), _atom(a.protect)
+    print(f"parsed: {len(names)} tensors, {n_layers} layers, {'MoE' if is_moe else 'dense'}")
+    print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)")
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
+    print("Mix policy:")
+    print("  flags   :", " ".join(flags))
+    print("  custom-q:", ",".join(cq))
+    open(a.out, "w").write(emit_bat(a, n_layers, is_moe))
+    print(f"wrote {a.out}")
+
+
+if __name__ == "__main__":
+    main()

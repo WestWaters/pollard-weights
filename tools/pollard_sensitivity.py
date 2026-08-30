@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
                           read_gguf_tensor_names, find_llama_bin,
@@ -58,6 +59,33 @@ def _valid_gguf(path):
             return f.read(4) == b"GGUF"
     except Exception:
         return False
+
+
+# GPU/Metal out-of-memory signatures — a forward pass at -ngl 99 that doesn't fit
+# the GPU crashes HERE, not with a quant error. Detect it and say the actual fix
+# instead of a misleading "imatrix-uncovered tensor" guess.
+_OOM = re.compile(
+    r"Insufficient Memory|kIOGPUCommandBufferCallbackErrorOutOfMemory|out of memory"
+    r"|cudaMalloc|failed to allocate|command buffer .* failed with status 5"
+    r"|recommendedMaxWorkingSetSize", re.I)
+
+
+def _diagnose(stderr, what):
+    """Turn a swallowed subprocess failure into an actionable message. OOM at -ngl 99
+    is the common footgun: an f16/bf16 model too big for the GPU. Give the fix."""
+    s = stderr or ""
+    if _OOM.search(s):
+        return (f"{what} ran OUT OF GPU MEMORY — the model is too big to run at "
+                f"-ngl 99 on this GPU/Metal. Fix: lower --ram so the reference fits, "
+                f"offload fewer layers, or build the imatrix on a smaller quantized "
+                f"host (e.g. Q8_0) instead of f16/bf16. (This is memory, not a bug.)")
+    tail = "\n".join(l for l in s.strip().splitlines() if l.strip())[-400:]
+    return f"{what} failed. Last output:\n{tail}" if tail else f"{what} failed (no output)."
+
+
+def _run(cmd):
+    """Run a llama.cpp step, keep its output so failures can be diagnosed."""
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
 # standard per-layer matmuls the imatrix always covers; ANYTHING else (routers,
@@ -117,9 +145,36 @@ def main():
         sys.exit(f"ERROR: {', '.join(missing)} not found. install.sh builds these into "
                  f"runtime/llama.cpp/build/bin — re-run install.sh, or pass the path.")
 
-    arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
+    # fail loud NOW if the imatrix is missing/empty — otherwise every quantize below
+    # silently no-ops and you sit staring at a dead run. (A too-big f16 imatrix job
+    # that OOM'd on the GPU leaves no file — that's the usual cause; build it on a Q8.)
+    if not os.path.exists(a.imatrix) or os.path.getsize(a.imatrix) < 1024:
+        sys.exit(f"ERROR: imatrix not found or empty: {a.imatrix}\n"
+                 f"  build it first: llama-imatrix -m <Q8-or-smaller-host>.gguf -f calib.txt "
+                 f"-o {a.imatrix} -ngl 99\n"
+                 f"  (use a Q8_0 host, NOT f16/bf16, if the full model won't fit your GPU.)")
+    if not os.path.exists(a.eval) or os.path.getsize(a.eval) == 0:
+        sys.exit(f"ERROR: eval corpus not found or empty: {a.eval}")
+
+    meta = read_gguf_meta(a.gguf)
+    arch = analyse(gguf_to_config(meta, a.gguf))
     layers = arch["layers"]
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+
+    # FAIL FAST — the KL step writes a base-logits file of (tokens x n_vocab x 4)
+    # bytes. On a big-vocab model a large eval balloons that to tens of GB and the
+    # run dies deep in the sweep after wasting minutes. Reject it up front instead.
+    import shutil
+    n_vocab = next((meta[k] for k in meta if k.endswith("vocab_size")), 0) or 0
+    approx_tokens = os.path.getsize(a.eval) / 4                    # ~4 bytes/token of text
+    base_gb = approx_tokens * n_vocab * 4 / 1e9
+    free_gb = shutil.disk_usage(os.path.dirname(os.path.abspath(a.out or a.gguf)) or ".").free / 1e9
+    if n_vocab and base_gb > min(free_gb * 0.7, 20):
+        sys.exit(f"ERROR: eval corpus is too large for this model's vocab ({n_vocab:,}).\n"
+                 f"  the KL base logits would need ~{base_gb:.0f} GB (only {free_gb:.0f} GB free).\n"
+                 f"  fix: use a SMALLER --eval (a ~20-50 KB held-out snippet is plenty — the "
+                 f"sensitivity signal doesn't need a huge corpus).")
+
     tmp = tempfile.mkdtemp(prefix="pollard_sens_")
     base = os.path.join(tmp, "base.dat")
     ref = os.path.join(tmp, "ref.gguf")
@@ -156,7 +211,7 @@ def main():
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
                            + (PINARG if PRESET[fit] in IMATRIX_REQUIRED_PRESETS else [])
                            + [a.gguf, base_src, PRESET[fit]], capture_output=True)
-    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes")
+    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes  (elapsed + ETA shown per layer)")
 
     if a.rpc:
         print(f"RPC pool: {a.rpc}  (forward passes span these nodes; quantize stays local)")
@@ -165,17 +220,18 @@ def main():
                 "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
     if a.rpc:
         base_cmd += ["--rpc", a.rpc]
-    subprocess.run(base_cmd, capture_output=True)
+    r = _run(base_cmd)
+    if not os.path.exists(base) or os.path.getsize(base) == 0:
+        sys.exit(f"ERROR: could not build the reference logits — {_diagnose(r.stderr, 'the base forward pass')}")
     if base_src != a.gguf and not _valid_gguf(base_src):
         sys.exit(f"ERROR: the memory-fit base build ({a.ref}) came out invalid — "
-                 f"llama-quantize failed (likely an imatrix-uncovered tensor). Bug; report it.")
+                 f"{_diagnose(r.stderr, 'llama-quantize')}")
     # 2. reference build — SAME pins as the base (an IQ2 ref crashes on uncovered tensors too)
-    subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
-                   + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
-                   + [a.gguf, ref, a.ref], capture_output=True)
+    r = _run([a.llama_quantize, "--imatrix", a.imatrix]
+             + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
+             + [a.gguf, ref, a.ref])
     if not _valid_gguf(ref):
-        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — llama-quantize "
-                 f"failed (likely an imatrix-uncovered tensor). Bug; report it.")
+        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — {_diagnose(r.stderr, 'llama-quantize')}")
     kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc)
     if kl_ref is None:
         sys.exit("ERROR: reference GGUF built fine but perplexity couldn't score it — "
@@ -207,6 +263,10 @@ def main():
     # 3. crush each group in each layer, measure the KL cost over the reference
     profile = {g: {} for g in groups}
     failed = []
+    t_sweep = time.time()
+    def _hms(s):
+        s = int(max(0, s)); h, s = divmod(s, 3600); m, s = divmod(s, 60)
+        return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
     for i in range(layers):
         for g in groups:
             pat = rf"blk\.{i}\.{g}_.*={a.probe}"
@@ -224,9 +284,11 @@ def main():
                 failed.append(f"{g}.{i}")
             os.path.exists(probe) and os.remove(probe)
         done = (i + 1) / layers
+        elapsed = time.time() - t_sweep
+        eta = elapsed / (i + 1) * (layers - i - 1)          # avg-per-layer * remaining
         print(f"  layer {i:>3}/{layers}  " +
               "  ".join(f"{g}={profile[g][str(i)]}" for g in groups) +
-              f"   [{done*100:4.0f}%]")
+              f"   [{done*100:4.0f}%  elapsed {_hms(elapsed)}  ETA {_hms(eta)}]")
 
     # failed probes -> PROTECT (max sensitivity), never crush. Loud about it.
     if failed:

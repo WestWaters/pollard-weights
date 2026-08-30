@@ -56,8 +56,11 @@ else
   # NOTE: the RPC server target is `ggml-rpc-server` in current llama.cpp
   # (was `rpc-server` before it moved to tools/rpc/). Using the wrong name
   # silently builds nothing — verified against llama.cpp master.
+  # llama-mtmd-cli = run vision/audio models with their mmproj; llama-speculative =
+  # draft-model speculative decoding (faster tok/s); llama-bench = measure it.
   cmake --build "$LLAMA_DIR/build" -j \
-    --target llama-quantize llama-cli llama-server llama-imatrix llama-perplexity ggml-rpc-server
+    --target llama-quantize llama-cli llama-server llama-imatrix llama-perplexity \
+             llama-mtmd-cli llama-speculative llama-bench ggml-rpc-server
   echo "runtime built at $LLAMA_DIR/build/bin ${GPU_FLAGS:+($GPU_FLAGS)}"
   echo "add to PATH:  export PATH=\"$LLAMA_DIR/build/bin:\$PATH\""
 fi
@@ -67,6 +70,12 @@ echo "quickstart:"
 echo "  pollard-calc --model <hf-id> --ram 16          # what CAN this machine do"
 echo "  pollard-fit  --gguf model-f16.gguf --ram 16    # build the Pollard Weights"
 echo "  llama-cli    -m model-pollard.gguf             # run them"
+echo
+echo "vision (multimodal models ship an mmproj alongside the gguf):"
+echo "  llama-mtmd-cli -m model-pollard.gguf --mmproj mmproj.gguf --image pic.jpg -p 'Describe this.'"
+echo
+echo "faster decode (pair a small same-vocab draft model):"
+echo "  llama-cli -m model-pollard.gguf -md draft.gguf --draft-max 8   # speculative decoding"
 echo
 echo "across machines (pool RAM for a build bigger than one box):"
 echo "  # on every OTHER machine:  ggml-rpc-server -H 0.0.0.0 -p 50052"
