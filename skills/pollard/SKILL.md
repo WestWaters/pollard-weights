@@ -69,6 +69,27 @@ Optional flagship extreme rung: an **automap 1-bit trellis mix** (the "gold-card
 This is where measured allocation genuinely beats uniform (crush cold experts, protect
 the hot set). `pollard-automap` emits the 3-bar build (uniform-low / PollardMix / uniform-high).
 
+### MoE decoupled (imatrix-FREE) — the robust default for a big MoE
+
+A trellis mix (IQ1_KT/IQ2_KT experts) **hard-requires an imatrix**, and a MoE imatrix is
+the swamp: rare experts don't route, coverage is partial, the compute is 6+ hours and dies
+if interrupted. **Don't force it.** For a big MoE, build the automap mix from **K-quant
+atoms**, which read NO imatrix at all — no coverage problem, no long imatrix step, kill-proof:
+
+```bash
+# 1. FULL tensor list (dry-run at a non-low type so it can't abort mid-list):
+llama-quantize --dry-run moe-f16.gguf x.gguf Q6_K > tensors.txt
+# 2. automap --no-imatrix: K-quant mix straight off the F16 (body q2_k / protect q3_k).
+#    NO imatrix flag, NO calib, NO coverage pins — every atom is a K-quant.
+pollard-automap --tensors tensors.txt --model moe-f16.gguf --no-imatrix --out build.bat
+# 3. run build.bat -> uniform-Q2_K / PollardMix / uniform-Q3_K_M + PPL each
+```
+Rule of thumb: **`imatrix = dense`, `automap = MoE`, and MoE → `--no-imatrix` unless you
+already have a well-covered diverse imatrix.** The trellis path below is the extreme-low
+variant, only worth it when a covered imatrix is cheap to make.
+
+### MoE trellis (imatrix) — the extreme-low variant (only with a covered imatrix)
+
 ```bash
 # 1. f16 GGUF + imatrix — MoE NEEDS a DIVERSE calib (prose+code+varied) or rare experts
 #    never route and get NO importance data. Use --chunks 200+.
@@ -82,7 +103,7 @@ pollard-automap --tensors tensors.txt --model moe-f16.gguf --imatrix moe.imatrix
 ```
 **Watch automap's output:** if it reports "PINNING <many> uncovered tensor(s)", the
 imatrix under-covered experts — the mix will BLOAT. Re-run the imatrix with a larger,
-more diverse calib (more experts routed) before trusting the build.
+more diverse calib (more experts routed), **or just use `--no-imatrix`** (above).
 
 **Accept-the-Mix gate:** keep it only if PollardMix ≤ uniform-low size + ~8–10% AND it
 beats uniform-low on PPL/KL/top-1. If it drifts toward uniform-high size, reject and

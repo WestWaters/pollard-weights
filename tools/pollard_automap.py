@@ -88,7 +88,29 @@ QUANT_BPW = {
     "iq2_bn": 2.00, "iq2_xxs": 2.06, "iq2_kt": 2.125,   # ~2-bit band (iq2_bn = Bitnet ternary)
     "iq2_ks": 2.19, "iq2_xs": 2.31, "iq2_k": 2.375,
     "iq3_kt": 3.125,
+    # imatrix-FREE K-quants: these build with NO importance matrix (the MoE decoupled path),
+    # so a MoE never has to go through the 6-hour, coverage-hungry, kill-prone imatrix step.
+    # These are the SINGLE ggml tensor types (what --custom-q takes); the uniform-bar
+    # positional arg uses the matching preset via _bar_type().
+    "q2_k": 2.63, "q3_k": 3.91, "q4_k": 4.85, "q5_k": 5.50, "q6_k": 6.56,
 }
+
+# uniform-bar positional preset for a single K-quant type (custom-q takes q4_k; the whole-
+# model positional arg wants the preset Q4_K_M). Trellis/I-quants pass through as-is (upper).
+_BAR_PRESET = {"q2_k": "Q2_K", "q3_k": "Q3_K_M", "q4_k": "Q4_K_M", "q5_k": "Q5_K_M", "q6_k": "Q6_K"}
+
+
+def is_kquant(atom):
+    """A K-quant (QN_K*) builds WITHOUT an imatrix; an I-/trellis quant (IQ*, *_KT) requires
+    one. This is what lets the MoE path skip the imatrix entirely."""
+    return bool(re.match(r"q\d_k", (atom or "").lower()))
+
+
+def _bar_type(atom):
+    """The positional quantize preset for a uniform bar of `atom` (K-quant single type ->
+    its preset; trellis/I-quant -> the uppercase type name)."""
+    a = _atom(atom)
+    return _BAR_PRESET.get(a, a.upper())
 # Frontier mixed-ultra-low formats (e.g. Hy4 MIX-STQ1_0's sparse-ternary STQ1_0) map onto
 # the nearest thing this runtime can actually emit: Bitnet ternary.
 ALIASES = {"stq1_0": "iq1_bn", "stq2_0": "iq2_bn"}
@@ -107,8 +129,14 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     everything not matched); every protected role is named explicitly via custom-q
     (lowercase = the reliable path — role-flags silently fell back for some atoms).
     Rules are ordered general->specific; edge-block rules go LAST so they win.
-    Verified against a dry-run (which prints the actual per-tensor type chosen)."""
+    Verified against a dry-run (which prints the actual per-tensor type chosen).
+
+    If body+protect are BOTH K-quants, the recipe is imatrix-free (the decoupled MoE
+    path): the one hard-coded trellis atom (the shared-expert writer) drops to the
+    protect K-quant so no tensor needs an importance matrix."""
     body, protect = _atom(body), _atom(protect)
+    kfree = is_kquant(body) and is_kquant(protect)      # fully imatrix-free build?
+    shexp_down = protect if kfree else "iq3_kt"         # trellis atom only when imatrix is present
     flags = ["--output-tensor-type Q6_K", "--token-embedding-type Q4_K"]  # head/embed: never < 4-bit
     cq = []
     # --custom-q is FIRST-MATCH-WINS (verified via dry-run): list overrides first.
@@ -123,7 +151,7 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
         # (ffn_down_exps) a tier up, the router high, and the shared experts protected.
         cq += [f"ffn_gate_exps={body}", f"ffn_up_exps={body}", f"ffn_down_exps={protect}",
                "ffn_gate_inp=q6_K",                       # router: never crushed
-               f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", "ffn_down_shexp=iq3_kt"]
+               f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", f"ffn_down_shexp={shexp_down}"]
     # (3) general roles: attn k,v to the body atom; q + output protected; ffn_down LOW.
     cq += [f"attn_k={body}", f"attn_v={body}",
            f"attn_q={protect}", f"attn_output={protect}", f"ffn_down={protect}"]
@@ -132,21 +160,24 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
 
 def emit_bat(a, n_layers, is_moe, names):
     body, protect = _atom(a.body), _atom(a.protect)
+    kfree = is_kquant(body) and is_kquant(protect)     # imatrix-free (decoupled MoE) build?
     flags, cq = recipe_flags(n_layers, is_moe, body, protect)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
     # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
-    # MoE build can't hard-fail on a rarely-routed expert the imatrix never saw.
-    pins, ncov = uncovered_pins(names, a.imatrix)
+    # MoE build can't hard-fail on a rarely-routed expert the imatrix never saw. NOT needed
+    # in the imatrix-free path (K-quants don't consult an imatrix -> nothing to be uncovered).
+    pins, ncov = ([], None) if kfree else uncovered_pins(names, a.imatrix)
     pin_cq = (",".join(pins) + ",") if pins else ""
     cqs = pin_cq + ",".join(cq)                     # pins FIRST (custom-q is first-match-wins)
+    im_flag = "" if kfree else "--imatrix %IM% "    # the whole point: no imatrix on the K-quant path
     L = ["@echo off", f"set BIN={a.bin}", f"set IM={a.imatrix}", f"set SRC={base}",
          f"set EV={a.eval}", f"set LOG={a.log}",
-         f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  "
+         f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  imatrix={'no (K-quant)' if kfree else 'yes'}  "
          f"body={body}({QUANT_BPW.get(body,'?')}) protect={protect}({QUANT_BPW.get(protect,'?')})"
          f"=== 1> %LOG% 2>&1", ""]
     def build(name, typ, extra=""):
-        return (f"%BIN%\\llama-quantize.exe --imatrix %IM% {extra} %SRC% "
+        return (f"%BIN%\\llama-quantize.exe {im_flag}{extra} %SRC% "
                 f"{stem}-{name}.gguf {typ} 1>> %LOG% 2>&1")
     def ppl(name):
         return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
@@ -157,19 +188,19 @@ def emit_bat(a, n_layers, is_moe, names):
               f"(covered={ncov}) == 1>> %LOG% 2>&1"]
     # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
     L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
-          build(f"u-{body}", body.upper(), pin_extra), ppl(f"u-{body}"), ""]
+          build(f"u-{body}", _bar_type(body), pin_extra), ppl(f"u-{body}"), ""]
     # ceiling (uniform at the protect tier)
     L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
-          build(f"u-{protect}", protect.upper(), pin_extra), ppl(f"u-{protect}"), ""]
+          build(f"u-{protect}", _bar_type(protect), pin_extra), ppl(f"u-{protect}"), ""]
     # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
     if a.rival:
         rv = _atom(a.rival)
         L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
-              build(f"rival-{rv}", rv.upper()), ppl(f"rival-{rv}"), ""]
+              build(f"rival-{rv}", _bar_type(rv)), ppl(f"rival-{rv}"), ""]
     # PollardMix: base fills with the body atom, custom-q protects the sensitive roles
     mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
     L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
-          build("mix", body.upper(), mix_extra), ppl("mix"), ""]
+          build("mix", _bar_type(body), mix_extra), ppl("mix"), ""]
     L += [f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> %LOG% 2>&1"]
     return "\n".join(L)
 
@@ -183,13 +214,25 @@ def main():
     ap.add_argument("--bin", default=r"C:\pollard\ik_llama.cpp\build\bin")
     ap.add_argument("--log", default=r"C:\pollard\bench\automap.log")
     ap.add_argument("--out", default="build_automap.bat")
-    ap.add_argument("--body", default="iq1_kt", help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
-    ap.add_argument("--protect", default="iq2_kt", help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
+    ap.add_argument("--body", default=None, help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
+    ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
+    ap.add_argument("--no-imatrix", "--kquant", dest="no_imatrix", action="store_true",
+                    help="imatrix-FREE MoE mix: K-quant atoms (body q2_k / protect q4_k) that "
+                         "build straight off the F16 — no 6-hour, coverage-hungry imatrix step. "
+                         "The robust default for a big MoE where a covered imatrix is impractical.")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
     ap.add_argument("--allow-dense", action="store_true",
                     help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
                          "K-quants). Only for the research 1-bit-mix case (the gold-card).")
     a = ap.parse_args()
+    # atom defaults: trellis (imatrix) by default; K-quant (imatrix-free) when --no-imatrix.
+    if a.no_imatrix:
+        a.body = a.body or "q2_k"          # cold experts / attn k,v
+        a.protect = a.protect or "q3_k"    # residual writer + attn q/out + edge: one tier up,
+        #                                    NOT q4_k (that bloats the mix past the accept gate)
+    else:
+        a.body = a.body or "iq1_kt"
+        a.protect = a.protect or "iq2_kt"
     names, n_layers, is_moe = parse_tensors(a.tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
@@ -203,23 +246,30 @@ def main():
                  "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
                  "  research 1-bit-mix case (the gold-card).")
     body, protect = _atom(a.body), _atom(a.protect)
+    kfree = is_kquant(body) and is_kquant(protect)
     print(f"parsed: {len(names)} tensors, {n_layers} layers, {'MoE' if is_moe else 'dense'}")
-    print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)")
+    print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)"
+          f"  ->  {'imatrix-FREE (K-quant) build' if kfree else 'imatrix-guided (trellis) build'}")
     flags, cq = recipe_flags(n_layers, is_moe, body, protect)
     print("Mix policy:")
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
-    pins, ncov = uncovered_pins(names, a.imatrix)
-    if ncov is None:
-        print("  imatrix : could not read coverage (skipping pins — build may fail on "
-              "uncovered experts; rerun the imatrix with more/diverse chunks).")
+    if kfree:
+        print("  imatrix : NONE — every atom is a K-quant, so the build reads no importance "
+              "matrix (no coverage problem, no 6-hour imatrix step, kill-proof).")
     else:
-        print(f"  imatrix : {ncov} tensors covered; PINNING {len(pins)} uncovered "
-              f"matmul/expert tensor(s) to q6_K so the build can't hard-fail."
-              + ("  (!) many uncovered - a fuller/diverse imatrix would keep them low-bit."
-                 if len(pins) > n_layers else ""))
-    if not is_moe and pins:
-        print("  (dense model with uncovered tensors — unusual; check the imatrix.)")
+        pins, ncov = uncovered_pins(names, a.imatrix)
+        if ncov is None:
+            print("  imatrix : could not read coverage (skipping pins — build may fail on "
+                  "uncovered experts; rerun the imatrix with more/diverse chunks, or use "
+                  "--no-imatrix for a K-quant MoE build that needs no imatrix at all).")
+        else:
+            print(f"  imatrix : {ncov} tensors covered; PINNING {len(pins)} uncovered "
+                  f"matmul/expert tensor(s) to q6_K so the build can't hard-fail."
+                  + ("  (!) many uncovered - use --no-imatrix (K-quant) or a fuller/diverse imatrix."
+                     if len(pins) > n_layers else ""))
+        if not is_moe and pins:
+            print("  (dense model with uncovered tensors — unusual; check the imatrix.)")
     open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names))
     print(f"wrote {a.out}")
 
