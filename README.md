@@ -40,6 +40,11 @@ by **~14% perplexity at the same 1-bit size class**, and sits under the 2-bit
 ceiling. It wins on KL-to-f16, top-1 agreement and chat too, same eval and same
 imatrix. (WikiText-2, ctx 2048, 145 chunks, ik_llama.cpp.)
 
+At 4-bit, Pollard's own **error-feedback GPTQ** (`pollard-gptq`) recovers ~46% of
+round-to-nearest's error — the reconstruction lever an imatrix alone can't do:
+
+![Pollard error-feedback GPTQ vs round-to-nearest at 4-bit](assets/gptq_h2h.png)
+
 ## Measured-sensitivity allocation — beats uniform imatrix-IQ, dense AND MoE
 
 ![pollard-fit vs uniform imatrix-IQ, dense and MoE](assets/kl_win.png)
