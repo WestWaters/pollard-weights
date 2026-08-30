@@ -23,6 +23,48 @@ Usage:
 import argparse, re, sys
 
 
+def imatrix_covered(path):
+    """The set of tensor names an ik_llama imatrix ACTUALLY covers. ik writes the OLD
+    binary format (not GGUF): int32 n_entries, then per entry int32 name_len, name,
+    int32 ncall, int32 nval, float[nval]. A MoE routes to only some experts over a short
+    calib, so many `*_exps` tensors get NO entry — and a very-low-bit build hard-fails on
+    an uncovered tensor. Read the real coverage so we can pin the uncovered ones. Returns
+    the set, or None if it can't be parsed (caller then skips pinning)."""
+    import struct
+    try:
+        d = open(path, "rb").read()
+        n = struct.unpack_from("<i", d, 0)[0]; off = 4
+        cov = set()
+        for _ in range(n):
+            ln = struct.unpack_from("<i", d, off)[0]; off += 4
+            if ln <= 0 or ln > 512:
+                return None
+            cov.add(d[off:off + ln].decode("utf-8", "replace")); off += ln
+            nval = struct.unpack_from("<i", d, off + 4)[0]; off += 8 + 4 * nval
+        return cov
+    except Exception:
+        return None
+
+
+# matmul/expert tensors that a very-low-bit build needs an imatrix for; anything here
+# NOT covered by the imatrix must be pinned to a non-imatrix type or the build hard-fails.
+_NEEDS_IMATRIX = re.compile(
+    r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?|attn_(q|k|v|qkv|output))\.weight$")
+
+
+def uncovered_pins(all_names, imatrix, fallback="q6_K"):
+    """--custom-q rules pinning every imatrix-REQUIRED tensor the imatrix doesn't cover
+    to `fallback`, so an aggressive MoE build can't crash on a rarely-routed expert. THIS
+    is what makes automap robust on MoE. Empty if the imatrix can't be read (build may
+    still fail on uncovered experts — rerun the imatrix with more/diverse chunks)."""
+    cov = imatrix_covered(imatrix)
+    if cov is None:
+        return [], None
+    pins = [rf"{re.escape(nm)}={fallback}" for nm in all_names
+            if _NEEDS_IMATRIX.search(nm) and nm not in cov]
+    return pins, len(cov)
+
+
 def parse_tensors(path):
     """Return (names, n_layers, is_moe). Accepts dry-run lines or bare tensor names."""
     names = []
@@ -88,12 +130,16 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     return flags, cq
 
 
-def emit_bat(a, n_layers, is_moe):
+def emit_bat(a, n_layers, is_moe, names):
     body, protect = _atom(a.body), _atom(a.protect)
     flags, cq = recipe_flags(n_layers, is_moe, body, protect)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
-    cqs = ",".join(cq)
+    # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
+    # MoE build can't hard-fail on a rarely-routed expert the imatrix never saw.
+    pins, ncov = uncovered_pins(names, a.imatrix)
+    pin_cq = (",".join(pins) + ",") if pins else ""
+    cqs = pin_cq + ",".join(cq)                     # pins FIRST (custom-q is first-match-wins)
     L = ["@echo off", f"set BIN={a.bin}", f"set IM={a.imatrix}", f"set SRC={base}",
          f"set EV={a.eval}", f"set LOG={a.log}",
          f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  "
@@ -105,12 +151,16 @@ def emit_bat(a, n_layers, is_moe):
     def ppl(name):
         return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
                 f"-ngl 99 1>> %LOG% 2>&1")
+    pin_extra = f' --custom-q "{pin_cq[:-1]}"' if pins else ""   # uniform bars need the pins too
+    if pins:
+        L += [f"echo == pinned {len(pins)} imatrix-uncovered tensor(s) to q6_K "
+              f"(covered={ncov}) == 1>> %LOG% 2>&1"]
     # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
     L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
-          build(f"u-{body}", body.upper()), ppl(f"u-{body}"), ""]
+          build(f"u-{body}", body.upper(), pin_extra), ppl(f"u-{body}"), ""]
     # ceiling (uniform at the protect tier)
     L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
-          build(f"u-{protect}", protect.upper()), ppl(f"u-{protect}"), ""]
+          build(f"u-{protect}", protect.upper(), pin_extra), ppl(f"u-{protect}"), ""]
     # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
     if a.rival:
         rv = _atom(a.rival)
@@ -159,7 +209,18 @@ def main():
     print("Mix policy:")
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
-    open(a.out, "w").write(emit_bat(a, n_layers, is_moe))
+    pins, ncov = uncovered_pins(names, a.imatrix)
+    if ncov is None:
+        print("  imatrix : could not read coverage (skipping pins — build may fail on "
+              "uncovered experts; rerun the imatrix with more/diverse chunks).")
+    else:
+        print(f"  imatrix : {ncov} tensors covered; PINNING {len(pins)} uncovered "
+              f"matmul/expert tensor(s) to q6_K so the build can't hard-fail."
+              + ("  (!) many uncovered - a fuller/diverse imatrix would keep them low-bit."
+                 if len(pins) > n_layers else ""))
+    if not is_moe and pins:
+        print("  (dense model with uncovered tensors — unusual; check the imatrix.)")
+    open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names))
     print(f"wrote {a.out}")
 
 

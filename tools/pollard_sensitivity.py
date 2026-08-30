@@ -135,6 +135,9 @@ def main():
                                   "SMALL BOX: if f16 won't fit the forward pass, the base "
                                   "reference drops to the highest quant that fits — Pollard "
                                   "MAKES big models on small hardware, not just runs them.")
+    ap.add_argument("--allow-dense", action="store_true",
+                    help="force the sweep on a DENSE model (it's the MoE tool; dense doesn't "
+                         "benefit and this is a multi-hour sweep). Research only.")
     a = ap.parse_args()
 
     a.llama_quantize = find_llama_bin(a.llama_quantize)
@@ -159,6 +162,17 @@ def main():
     meta = read_gguf_meta(a.gguf)
     arch = analyse(gguf_to_config(meta, a.gguf))
     layers = arch["layers"]
+    # GUARDRAIL: the measured-KL sensitivity sweep is the MoE tool — it pays off where
+    # expert redundancy lets the knapsack reallocate. On a DENSE model it does NOT beat
+    # uniform (measured), and this sweep is ~2·layers of quantize+KL passes (HOURS). Refuse
+    # dense so nobody burns 3h for nothing (dense -> imatrix K-quants directly).
+    if str(arch.get("kind", "")).startswith("dense") and not getattr(a, "allow_dense", False):
+        sys.exit("REFUSED: this is a DENSE model — the measured-KL sensitivity sweep is the\n"
+                 "  MoE tool and does NOT beat uniform on dense (no expert redundancy to\n"
+                 "  reallocate). It is ~2*layers quantize+KL passes (HOURS) that a dense model\n"
+                 "  can't use. Dense -> imatrix-guided K-quants directly (seconds), no sweep.\n"
+                 "  Rule: imatrix = dense, automap/sensitivity = MoE. Pass --allow-dense to\n"
+                 "  force the sweep anyway (research).")
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
 
     # FAIL FAST — the KL step writes a base-logits file of (tokens x n_vocab x 4)
