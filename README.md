@@ -30,6 +30,16 @@ DRAM is provisioned today as if every weight deserves the same bits and every
 byte must be resident. Neither is true, and the difference is measurable —
 for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
 
+## Proof on real models: 7B and 14B
+
+![PollardMix beats uniform 1-bit on real 7B and 14B models](assets/gold_card.png)
+
+On Qwen2.5-7B and -14B, the Pollard mix — expert/FFN body crushed to 1-bit,
+attention and residual writers protected — beats the uniform 1-bit trellis quant
+by **~14% perplexity at the same 1-bit size class**, and sits under the 2-bit
+ceiling. It wins on KL-to-f16, top-1 agreement and chat too, same eval and same
+imatrix. (WikiText-2, ctx 2048, 145 chunks, ik_llama.cpp.)
+
 ## Measured-sensitivity allocation — beats uniform imatrix-IQ, dense AND MoE
 
 ![pollard-fit vs uniform imatrix-IQ, dense and MoE](assets/kl_win.png)
