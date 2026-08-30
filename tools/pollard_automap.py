@@ -111,6 +111,15 @@ def _bar_type(atom):
     its preset; trellis/I-quant -> the uppercase type name)."""
     a = _atom(atom)
     return _BAR_PRESET.get(a, a.upper())
+
+
+def _cq(atom):
+    """The EXACT ggml type name --custom-q expects. K-quants are `qN_K` (capital K, e.g.
+    q3_K); i-/trellis quants are all-lowercase (iq1_kt). llama-quantize rejects `q3_k`
+    ('Invalid quantization type') — the tensor-type table is case-sensitive on the K."""
+    a = _atom(atom)
+    m = re.match(r"(q\d)_k$", a)
+    return f"{m.group(1)}_K" if m else a
 # Frontier mixed-ultra-low formats (e.g. Hy4 MIX-STQ1_0's sparse-ternary STQ1_0) map onto
 # the nearest thing this runtime can actually emit: Bitnet ternary.
 ALIASES = {"stq1_0": "iq1_bn", "stq2_0": "iq2_bn"}
@@ -134,9 +143,10 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     If body+protect are BOTH K-quants, the recipe is imatrix-free (the decoupled MoE
     path): the one hard-coded trellis atom (the shared-expert writer) drops to the
     protect K-quant so no tensor needs an importance matrix."""
-    body, protect = _atom(body), _atom(protect)
     kfree = is_kquant(body) and is_kquant(protect)      # fully imatrix-free build?
     shexp_down = protect if kfree else "iq3_kt"         # trellis atom only when imatrix is present
+    # custom-q needs the exact ggml type name (K-quants capital-K: q3_K, not q3_k).
+    body, protect, shexp_down = _cq(body), _cq(protect), _cq(shexp_down)
     flags = ["--output-tensor-type Q6_K", "--token-embedding-type Q4_K"]  # head/embed: never < 4-bit
     cq = []
     # --custom-q is FIRST-MATCH-WINS (verified via dry-run): list overrides first.
@@ -180,8 +190,10 @@ def emit_bat(a, n_layers, is_moe, names):
         return (f"%BIN%\\llama-quantize.exe {im_flag}{extra} %SRC% "
                 f"{stem}-{name}.gguf {typ} 1>> %LOG% 2>&1")
     def ppl(name):
+        # PPL is offload-invariant (ngl changes speed, not the number) — so a partial
+        # offload keeps every bar comparable AND stops a big bar OOMing the card.
         return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
-                f"-ngl 99 1>> %LOG% 2>&1")
+                f"-ngl {a.ngl} 1>> %LOG% 2>&1")
     pin_extra = f' --custom-q "{pin_cq[:-1]}"' if pins else ""   # uniform bars need the pins too
     if pins:
         L += [f"echo == pinned {len(pins)} imatrix-uncovered tensor(s) to q6_K "
@@ -211,6 +223,9 @@ def main():
     ap.add_argument("--model", required=True, help="source F16 gguf path (as seen on the box)")
     ap.add_argument("--imatrix", default="ik.imatrix")
     ap.add_argument("--eval", default="wikitext2_test.txt")
+    ap.add_argument("--ngl", type=int, default=99,
+                    help="GPU layers for the PPL eval. Lower it for a big build that would OOM "
+                         "the card (PPL is offload-invariant, so bars stay comparable).")
     ap.add_argument("--bin", default=r"C:\pollard\ik_llama.cpp\build\bin")
     ap.add_argument("--log", default=r"C:\pollard\bench\automap.log")
     ap.add_argument("--out", default="build_automap.bat")
