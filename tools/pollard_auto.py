@@ -86,12 +86,16 @@ def main():
         _run(cmd, a.run)
         return
 
-    # MoE -> automap measured expert-allocation (crush cold experts, protect the hot set,
-    # auto-pin imatrix-uncovered experts). Needs an imatrix and a llama.cpp bin dir.
-    print("   path: MoE -> automap measured expert-allocation (auto-pins uncovered experts)")
-    if not a.imatrix:
-        sys.exit("   MoE build needs --imatrix (build one from a DIVERSE calib: llama-imatrix "
-                 "-m f16.gguf -f calib_diverse.txt -o m.imatrix --chunks 200).")
+    # MoE -> automap measured expert-allocation (crush cold experts, protect the hot set).
+    # With an imatrix -> the extreme-low trellis mix; WITHOUT one -> the imatrix-FREE K-quant
+    # mix (robust default: no 6-hour, coverage-hungry imatrix step). The user need not know.
+    kfree = not a.imatrix
+    if kfree:
+        print("   path: MoE -> automap IMATRIX-FREE K-quant mix (no imatrix supplied -> the "
+              "robust default: builds straight off the F16, no 6-hour imatrix, kill-proof)")
+        print("        (pass --imatrix <covered diverse imatrix> for the extreme-low trellis mix.)")
+    else:
+        print("   path: MoE -> automap trellis mix (imatrix supplied; auto-pins uncovered experts)")
     binq = find_llama_bin("llama-quantize") if not a.bin else os.path.join(a.bin, "llama-quantize")
     here = os.path.dirname(os.path.abspath(a.gguf)) or "."
     tensors = os.path.join(here, "pollard_auto_tensors.txt")
@@ -101,12 +105,14 @@ def main():
         with open(tensors, "w") as f:
             subprocess.run([binq, "--dry-run", a.gguf, "x.gguf", "Q6_K"],
                            stdout=f, stderr=subprocess.STDOUT)
-    print("   2) automap emits the MoE build recipe (+ pins uncovered experts):")
-    am = ["pollard-automap", "--tensors", tensors, "--model", a.gguf, "--imatrix", a.imatrix,
+    print("   2) automap emits the MoE build recipe:")
+    am = ["pollard-automap", "--tensors", tensors, "--model", a.gguf,
           "--out", os.path.join(here, "pollard_auto_build.bat")]
+    am += ["--no-imatrix"] if kfree else ["--imatrix", a.imatrix]
     if a.bin: am += ["--bin", a.bin]
     _run(am, a.run, cwd=here)
-    print("   3) run the emitted build script -> uniform-IQ1 / PollardMix / uniform-IQ2 + PPL.")
+    bars = "uniform-Q2_K / PollardMix / uniform-Q3_K_M" if kfree else "uniform-IQ1 / PollardMix / uniform-IQ2"
+    print(f"   3) run the emitted build script -> {bars} + PPL.")
     print("      (pollard_auto_build.bat — run it on the box with a llama.cpp build.)")
     if not a.run:
         print("\n   plan only — re-run with --run to execute. (dense would run pollard-fit directly.)")
