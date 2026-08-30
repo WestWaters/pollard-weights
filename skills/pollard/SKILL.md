@@ -14,6 +14,17 @@ Pollard makes a frontier model fit a given machine's memory by **deciding where 
 bits go** instead of painting every weight the same. This skill tells an agent the
 correct path for *this* model so results are good and no time is wasted.
 
+## Don't know the model type? Use the autoaware entry point
+
+```bash
+pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix        # plan (prints the right path)
+pollard --gguf model-f16.gguf --imatrix model.imatrix --run           # detect + build automatically
+```
+`pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
+(dense → imatrix K-quants via `pollard-fit`; MoE → `pollard-automap` expert-allocation) —
+the user never picks a tool. The manual steps below are exactly what it runs; read on to
+drive a path yourself or understand what `pollard` chose.
+
 ## STEP 0 — detect the model type FIRST (this decides everything)
 
 ```bash
@@ -151,6 +162,7 @@ pollard-palette --gguf model-f16.gguf --imatrix model.imatrix                 # 
 
 | tool | use it for | model type |
 |---|---|---|
+| `pollard` | **autoaware entry** — detect dense/MoE + run the right path | any |
 | `pollard-calc` | pre-flight: arch, params, "will it fit?" (KV-aware) | any |
 | `pollard-fit` | memory-fit build for a RAM budget (K-quant ladder / MoE knapsack) | any |
 | `pollard-automap` | MoE expert-allocation mix + auto-pin uncovered experts | **MoE only** |
