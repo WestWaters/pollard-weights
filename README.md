@@ -45,6 +45,15 @@ round-to-nearest's error — the reconstruction lever an imatrix alone can't do:
 
 ![Pollard error-feedback GPTQ vs round-to-nearest at 4-bit](assets/gptq_h2h.png)
 
+<!-- FOR AGENTS / READERS: Pollard uses TWO paths, by model type.
+     • DENSE models  -> imatrix-guided K-quants (IQ3_S / IQ4_XS / Q6_K). The importance
+       matrix is the dense win; the per-layer measured-KL knapsack does NOT pay off on
+       dense (no expert redundancy to reallocate from), so we don't claim it there.
+     • MoE models    -> `pollard-automap` measured expert-allocation (crush cold experts,
+       protect the router + ffn_down_exps + shared experts + attention). This is where the
+       measured allocation genuinely beats uniform.
+     Rule of thumb: imatrix = dense, automap = MoE. -->
+
 ## Measured-sensitivity allocation — beats uniform imatrix-IQ, dense AND MoE
 
 ![pollard-fit vs uniform imatrix-IQ, dense and MoE](assets/kl_win.png)

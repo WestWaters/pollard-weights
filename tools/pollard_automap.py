@@ -136,10 +136,22 @@ def main():
     ap.add_argument("--body", default="iq1_kt", help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
     ap.add_argument("--protect", default="iq2_kt", help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
+    ap.add_argument("--allow-dense", action="store_true",
+                    help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
+                         "K-quants). Only for the research 1-bit-mix case (the gold-card).")
     a = ap.parse_args()
     names, n_layers, is_moe = parse_tensors(a.tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
+    # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate — its
+    # win is imatrix-guided K-quants, not this. Refuse dense (saves everyone the wrong-tool
+    # run) unless --allow-dense (the research 1-bit-mix / gold-card case).
+    if not is_moe and not a.allow_dense:
+        sys.exit("REFUSED: this is a DENSE model, and automap is the MoE path.\n"
+                 "  Dense models -> imatrix-guided K-quants (IQ3_S/IQ4_XS/Q6_K); the measured\n"
+                 "  expert-allocation here doesn't apply (no expert redundancy to reallocate).\n"
+                 "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
+                 "  research 1-bit-mix case (the gold-card).")
     body, protect = _atom(a.body), _atom(a.protect)
     print(f"parsed: {len(names)} tensors, {n_layers} layers, {'MoE' if is_moe else 'dense'}")
     print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)")
