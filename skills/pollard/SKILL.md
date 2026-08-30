@@ -77,6 +77,14 @@ more diverse calib (more experts routed) before trusting the build.
 beats uniform-low on PPL/KL/top-1. If it drifts toward uniform-high size, reject and
 tighten the crush.
 
+**MoE measured K-quant ladder (alternative to the trellis mix)** — the KL knapsack that
+beats uniform, for shipping IQ3/IQ4/Q6 sizes:
+```bash
+pollard-sensitivity --gguf moe-f16.gguf --imatrix moe.imatrix --eval held.txt --out moe.sens.json
+pollard-fit --gguf moe-f16.gguf --ram 16 --imatrix moe.imatrix --sensitivity moe.sens.json --out moe-pollard.gguf
+pollard-experts --gguf moe-f16.gguf --imatrix moe.imatrix          # measured hot-expert report
+```
+
 ---
 
 ## Runtime targets (where the build will actually run)
@@ -103,6 +111,32 @@ tighten the crush.
 refusal direction on the FP16 weights BEFORE quantizing (composes with any build). It costs
 some coherence — measure the PPL/KL delta vs the un-ablated build before shipping.
 
+## Preconditioning levers (optional — apply to the f16 BEFORE the imatrix/quantize)
+
+These rotate/smooth the weights so low-bit quant lands better. Bit-width-dependent (they
+help at some tiers, hurt at others) — measure with `pollard-eval`/`pollard-kl` before shipping.
+```bash
+pollard-smooth   --gguf model-f16.gguf --out model-smooth.gguf --alpha 0.5     # AWQ-style channel smoothing
+pollard-rotate   --gguf model-f16.gguf --out model-rot.gguf --kind orthogonal  # QuIP#/QuaRot rotation (also --kind block --block 32)
+pollard-precondition --gguf model-f16.gguf --out model-pre.gguf                # dynamic selector: pick the best lever per bit-width
+pollard-gptq     --model <hf-dir> --bits 4 --groupsize 128 --out ./gptq        # full-Hessian error-feedback GPTQ (beats RTN)
+```
+
+## Utilities & metrics
+
+```bash
+pollard-calc --model <hf-or-gguf> --ram 16 --ctx 8192   # will it fit? KV-cache + total RAM pre-flight
+pollard-run  --gguf model-pollard.gguf --vram auto --launch   # launch a build (llama-server), VRAM-aware
+pollard-eval --gguf model-pollard.gguf --ref model-f16.gguf --eval held.txt   # trajectory-divergence quality
+pollard-kl   --model <hf> --eval-file held.txt --calib-file calib.txt         # KL-to-f16 + top-1 (small models, torch)
+pollard-probe --model <hf> --eval held.txt --out model.sens.json              # CHEAP sensitivity (no GGUF/imatrix, any box)
+pollard-scorecard --results results.json --out scorecard.md                   # the standardized publish scorecard
+pollard-health                                                                # cross-vendor accelerator degradation check
+pollard-fit-dit --gguf dit-model-f16.gguf --ram 16 --out dit-pollard.gguf     # memory-fit builds for DiT (image/video) archs
+pollard-lowbit  --model <hf> --qmode ternary --eval held.txt                  # research: ternary/binary quant primitives
+pollard-palette --gguf model-f16.gguf --imatrix model.imatrix                 # research: measured-cost bit allocator
+```
+
 ## Guards & gotchas (why runs fail or waste time)
 
 - **Dense + sensitivity/automap = REFUSED** (multi-hour no-op / wrong tool). Use imatrix.
@@ -125,8 +159,18 @@ some coherence — measure the PPL/KL delta vs the un-ablated build before shipp
 | `pollard-pack` | Cerebras wafer capacity + expert-prune plan (forecast) | MoE (lever) |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
+| `pollard-experts` | measured hot-expert report | **MoE only** |
+| `pollard-run` | launch a build (llama-server), VRAM-aware | any |
+| `pollard-fit-dit` | memory-fit builds for DiT (image/video) archs | any (DiT) |
+| `pollard-gptq` | full-Hessian error-feedback GPTQ (beats RTN) | any |
+| `pollard-smooth` | AWQ-style channel smoothing (preconditioning) | any |
+| `pollard-rotate` | QuIP#/QuaRot rotation (preconditioning) | any |
+| `pollard-precondition` | dynamic selector for the best lever per bit-width | any |
 | `pollard-eval` | trajectory-divergence quality metric | any |
+| `pollard-kl` | KL-to-f16 + top-1 metric (small models, torch) | any |
 | `pollard-scorecard` | the standardized publish scorecard | any |
+| `pollard-lowbit` | research: ternary/binary quant primitives | any |
+| `pollard-palette` | research: measured-cost bit allocator | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
 
 > **MAINTENANCE:** this skill must track the tools. When a feature is added/changed,

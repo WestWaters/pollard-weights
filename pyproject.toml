@@ -30,7 +30,15 @@ pollard-eval = "pollard_eval:main"
 pollard-health = "pollard_health:main"
 pollard-pack = "pollard_pack:main"
 pollard-export = "pollard_export:main"
+pollard-gptq = "pollard_gptq:main"
+pollard-automap = "pollard_automap:main"
+pollard-abliterate = "pollard_abliterate:main"
+pollard-probe = "pollard_probe:main"
+pollard-scorecard = "pollard_scorecard:main"
+pollard-kl = "pollard_kl:main"
+pollard-lowbit = "pollard_lowbit:main"
+pollard-palette = "pollard_palette:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
-py-modules = ["pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_pack", "pollard_export"]
+py-modules = ["pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_pack", "pollard_export", "pollard_gptq", "pollard_automap"]
