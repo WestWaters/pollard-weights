@@ -15,6 +15,30 @@ import argparse, os, subprocess, sys
 
 from pollard_calc import read_gguf_meta, gguf_to_config, analyse, find_llama_bin
 
+# reference bits-per-weight for the common formats, so a user can see where a Pollard
+# build lands vs f16 / NVFP4 / the usual GGUF tiers ("half the size of NVFP4" etc.).
+_REF_BPW = [("f16", 16.0), ("Q8_0", 8.5), ("Q6_K", 6.6), ("Q5_K_M", 5.5),
+            ("NVFP4", 4.25), ("Q4_K_M", 4.85), ("IQ2 (~2-bit)", 2.1)]
+
+
+def size_ladder(params_b, pollard_gb=None, pollard_label="Pollard"):
+    """Print the shrink story: f16 size, where Pollard's build lands, and the same model
+    at each reference format — so people SEE what Pollard did and can compare to NVFP4."""
+    if not params_b:
+        return
+    gb = lambda bpw: params_b * 1e9 * bpw / 8 / 1e9
+    f16 = gb(16.0)
+    print("   --- what Pollard did (size) ---")
+    if pollard_gb:
+        pct = 100 * (1 - pollard_gb / f16)
+        ratio = f16 / max(pollard_gb, 1e-9)
+        bpw = pollard_gb * 8 * 1e9 / (params_b * 1e9)
+        print(f"   {pollard_label}: {f16:.1f} GB (f16) -> {pollard_gb:.2f} GB  "
+              f"(-{pct:.0f}%, {ratio:.1f}x smaller, {bpw:.2f} bpw)")
+    print("   same model at each format:  " +
+          "  ".join(f"{n} {gb(b):.1f}GB" for n, b in _REF_BPW) +
+          (f"  ->  {pollard_label} {pollard_gb:.2f}GB" if pollard_gb else ""))
+
 
 def _run(cmd, do_run, cwd=None):
     print("   $ " + " ".join(str(c) for c in cmd))
@@ -47,6 +71,9 @@ def main():
     print(f"   detected {tag}  ({(arch.get('total') or 0)/1e9:.1f}B total, "
           f"{(arch.get('active') or arch.get('total') or 0)/1e9:.1f}B active, {arch.get('layers')}L, "
           f"{arch.get('n_experts') or 0} experts)")
+    # show the size ladder so the user sees the shrink + can compare to NVFP4/Q4/etc.
+    # (actual built size is reported by the build step; this is where Pollard will land)
+    size_ladder((arch.get("total") or 0) / 1e9)
 
     if not is_moe:
         # DENSE -> imatrix-guided K-quants (pollard-fit auto-sizes to RAM; NO sensitivity sweep).
