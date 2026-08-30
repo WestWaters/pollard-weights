@@ -50,10 +50,29 @@ def interp_ppl(bars):
     return lin, gain
 
 
+def shrink_headline(r):
+    """Lead every card with what Pollard DID: f16 size -> smallest build, % smaller, and
+    where it lands vs NVFP4 — the pitch, not buried in a table (Frank's ask)."""
+    pb = r.get("params_b")
+    bars = r.get("bars") or []
+    if not pb or not bars:
+        return ""
+    f16 = pb * 2.0                                    # GB at f16 (~2 bytes/param)
+    small = min(b["gb"] for b in bars)
+    pct = 100 * (1 - small / f16)
+    nvfp4 = pb * 4.25 / 8
+    return (f"> ### Pollard shrank this model: **{f16:.1f} GB (f16) → {small:.2f} GB** "
+            f"— **{pct:.0f}% smaller, {f16/small:.1f}× down**, vs ~{nvfp4:.1f} GB at NVFP4.\n"
+            f"> Pick the size that fits your machine from the table below.\n")
+
+
 def md(r):
     pb = r.get("params_b")
     L = []
     L.append(f"# Pollard memory-fit scorecard — {r['model']}\n")
+    hl = shrink_headline(r)
+    if hl:
+        L.append(hl)
     L.append(f"*{r.get('runtime','')}* · source: {r.get('source','')} · eval: {r.get('eval','')}\n")
     # three bars
     L.append("## Bars (same source, same eval)\n")
