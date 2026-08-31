@@ -31,6 +31,28 @@ full metric suite, so you can confirm PollardMix beats uniform at matched size.
 | `pollard-scorecard` | the standardized gold-card scorecard | from a results.json |
 | `pollard-sensitivity` | measured per-group KL profile (the MoE knapsack input) | **hours** (2·layers passes), MoE-only |
 
+## Drop-in benchmark: `pollard-bench`
+
+`pollard` builds; **`pollard-bench` scores** — the symmetric half. Point it at a model (or two)
+and get the whole board (PPL + Mean/Median KLD + top-1) from one command, no hand-run flags:
+
+```bash
+pollard-bench --gguf model.gguf --ref f16.gguf --eval held.txt          # one model, full board
+pollard-bench --gguf pollard.gguf --vs rival.gguf --ref f16.gguf        # HEAD-TO-HEAD (Pareto verdict)
+pollard-bench --gguf model.gguf --out results.json                     # -> pollard-scorecard for the card
+```
+`--ref` is the KL reference (f16, or a near-lossless Q8_0/Q6_K host if f16 won't load). `--vs`
+scores a competitor's file (AWQ/GPTQ/unsloth/bartowski GGUF) the **same** way, so a "Pollard beats X"
+comparison isn't a special mode — it's the same harness at matched size. Read it **Pareto:
+Pollard wins its size class** (same quality for fewer GB, or more at the same GB), not one number.
+
+## Bring your own eval
+
+Pollard's job ends at the **GGUF/GPTQ** — the model. After that it's a standard file: point
+**any** framework at it (lm-eval-harness, your own suite, a downstream task). Most people will
+just `pollard --gguf model.gguf --run` to get the model, then run whatever they already run.
+That's the design: **make the model first, benchmark however you want.**
+
 ## Why this is separated
 
 Shipping the benchmark *inside* the default build made a simple "shrink my model" run take
