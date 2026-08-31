@@ -162,8 +162,12 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
         cq += [f"ffn_gate_exps={body}", f"ffn_up_exps={body}", f"ffn_down_exps={protect}",
                "ffn_gate_inp=q6_K",                       # router: never crushed
                f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", f"ffn_down_shexp={shexp_down}"]
-    # (3) general roles: attn k,v to the body atom; q + output protected; ffn_down LOW.
-    cq += [f"attn_k={body}", f"attn_v={body}",
+    # (3) general roles. Grok's policy: PROTECT attn v/o (they carry the distribution); q/k
+    # are less critical. On DENSE the shipped 7B/14B recipe crushed k,v and still won, so keep
+    # it. On MoE, crushing attn_v was measured to LOSE KLD vs uniform IQ1 (30B: mix 0.371 >
+    # uniform 0.360) — protect attn_v/k there (attention is a small fraction of a MoE anyway).
+    attn_kv = protect if (kfree or is_moe) else body
+    cq += [f"attn_k={attn_kv}", f"attn_v={attn_kv}",
            f"attn_q={protect}", f"attn_output={protect}", f"ffn_down={protect}"]
     return flags, cq
 
