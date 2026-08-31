@@ -31,19 +31,20 @@ full metric suite, so you can confirm PollardMix beats uniform at matched size.
 | `pollard-scorecard` | the standardized gold-card scorecard | from a results.json |
 | `pollard-sensitivity` | measured per-group KL profile (the MoE knapsack input) | **hours** (2·layers passes), MoE-only |
 
-## Head-to-head vs any competitor (it's just an eval on two files)
+## Drop-in benchmark: `pollard-bench`
 
-A "Pollard beats X" comparison is not a special mode — it's the **same harness pointed at two
-files at matched size.** Make (or download) both, then score them the same way:
+`pollard` builds; **`pollard-bench` scores** — the symmetric half. Point it at a model (or two)
+and get the whole board (PPL + Mean/Median KLD + top-1) from one command, no hand-run flags:
 
 ```bash
-# same eval, same base, same ctx — for the Pollard file AND the competitor's (AWQ/GPTQ/unsloth/bartowski):
-llama-perplexity -m pollard-IQ4_XS.gguf   -f held.txt -c 2048 --kl-divergence --kl-divergence-base f16.dat
-llama-perplexity -m competitor-Q4_K_M.gguf -f held.txt -c 2048 --kl-divergence --kl-divergence-base f16.dat
+pollard-bench --gguf model.gguf --ref f16.gguf --eval held.txt          # one model, full board
+pollard-bench --gguf pollard.gguf --vs rival.gguf --ref f16.gguf        # HEAD-TO-HEAD (Pareto verdict)
+pollard-bench --gguf model.gguf --out results.json                     # -> pollard-scorecard for the card
 ```
-Compare PPL / Mean KLD / top-1 at the two files' sizes. The honest, winnable claim is **Pareto:
-Pollard wins its size class** (same quality for fewer GB, or more quality at the same GB) — read
-it on the size–quality curve, not as a single number.
+`--ref` is the KL reference (f16, or a near-lossless Q8_0/Q6_K host if f16 won't load). `--vs`
+scores a competitor's file (AWQ/GPTQ/unsloth/bartowski GGUF) the **same** way, so a "Pollard beats X"
+comparison isn't a special mode — it's the same harness at matched size. Read it **Pareto:
+Pollard wins its size class** (same quality for fewer GB, or more at the same GB), not one number.
 
 ## Bring your own eval
 

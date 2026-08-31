@@ -32,7 +32,8 @@ drive a path yourself or understand what `pollard` chose.
 > The PPL / KLD / top-1 / 3-bar comparison / sensitivity sweep are the **benchmark** — they
 > only *measure* the model and take **hours**. They are **opt-in**, not part of a normal build.
 > - **Just make the model:** `pollard --gguf model.gguf --run` (one model, no eval).
-> - **Reproduce our gold-card numbers:** add `--benchmark` (3-bar board + full metrics — hours).
+> - **Reproduce our gold-card numbers:** add `--benchmark`, or score an existing model with the
+>   drop-in **`pollard-bench --gguf model.gguf --ref f16.gguf`** (PPL + KLD + top-1; `--vs` for head-to-head).
 >
 > Never run the benchmark or the sensitivity sweep as part of a plain build — that's the
 > mistake that turned a minutes-long shrink into a 3-hour run. See `benchmarks/README.md`.
@@ -230,7 +231,8 @@ pollard-palette --model <hf> --calib-file calib.txt --eval-file held.txt --targe
 
 | tool | use it for | model type |
 |---|---|---|
-| `pollard` | **autoaware entry** — detect dense/MoE + run the right path | any |
+| `pollard` | **autoaware entry** — detect dense/MoE + run the right BUILD | any |
+| `pollard-bench` | **drop-in benchmark** — PPL + Mean/Median KLD + top-1 for a model, `--vs` for head-to-head | any |
 | `pollard-calc` | pre-flight: arch, params, "will it fit?" (KV-aware) | any |
 | `pollard-fit` | memory-fit build for a RAM budget (K-quant ladder / MoE knapsack) | any |
 | `pollard-automap` | MoE expert-allocation mix + auto-pin uncovered experts | **MoE only** |
