@@ -31,6 +31,27 @@ full metric suite, so you can confirm PollardMix beats uniform at matched size.
 | `pollard-scorecard` | the standardized gold-card scorecard | from a results.json |
 | `pollard-sensitivity` | measured per-group KL profile (the MoE knapsack input) | **hours** (2·layers passes), MoE-only |
 
+## Head-to-head vs any competitor (it's just an eval on two files)
+
+A "Pollard beats X" comparison is not a special mode — it's the **same harness pointed at two
+files at matched size.** Make (or download) both, then score them the same way:
+
+```bash
+# same eval, same base, same ctx — for the Pollard file AND the competitor's (AWQ/GPTQ/unsloth/bartowski):
+llama-perplexity -m pollard-IQ4_XS.gguf   -f held.txt -c 2048 --kl-divergence --kl-divergence-base f16.dat
+llama-perplexity -m competitor-Q4_K_M.gguf -f held.txt -c 2048 --kl-divergence --kl-divergence-base f16.dat
+```
+Compare PPL / Mean KLD / top-1 at the two files' sizes. The honest, winnable claim is **Pareto:
+Pollard wins its size class** (same quality for fewer GB, or more quality at the same GB) — read
+it on the size–quality curve, not as a single number.
+
+## Bring your own eval
+
+Pollard's job ends at the **GGUF/GPTQ** — the model. After that it's a standard file: point
+**any** framework at it (lm-eval-harness, your own suite, a downstream task). Most people will
+just `pollard --gguf model.gguf --run` to get the model, then run whatever they already run.
+That's the design: **make the model first, benchmark however you want.**
+
 ## Why this is separated
 
 Shipping the benchmark *inside* the default build made a simple "shrink my model" run take
