@@ -25,6 +25,16 @@ pollard --gguf model-f16.gguf --imatrix model.imatrix --run           # detect +
 the user never picks a tool. The manual steps below are exactly what it runs; read on to
 drive a path yourself or understand what `pollard` chose.
 
+> ### Build ≠ benchmark — the default is FAST
+> Making a Pollard model is just the **build** (quantize): **one model, minutes, no eval.**
+> The PPL / KLD / top-1 / 3-bar comparison / sensitivity sweep are the **benchmark** — they
+> only *measure* the model and take **hours**. They are **opt-in**, not part of a normal build.
+> - **Just make the model:** `pollard --gguf model.gguf --run` (one model, no eval).
+> - **Reproduce our gold-card numbers:** add `--benchmark` (3-bar board + full metrics — hours).
+>
+> Never run the benchmark or the sensitivity sweep as part of a plain build — that's the
+> mistake that turned a minutes-long shrink into a 3-hour run. See `benchmarks/README.md`.
+
 ## STEP 0 — detect the model type FIRST (this decides everything)
 
 ```bash
@@ -64,29 +74,27 @@ Optional flagship extreme rung: an **automap 1-bit trellis mix** (the "gold-card
 
 ---
 
-## MoE path — automap measured expert-allocation
+## MoE path
 
-This is where measured allocation genuinely beats uniform (crush cold experts, protect
-the hot set). `pollard-automap` emits the 3-bar build (uniform-low / PollardMix / uniform-high).
+### MoE QUALITY win — the MEASURED allocator (this is the proven one; do NOT reinvent it)
 
-### MoE decoupled (imatrix-FREE) — the robust default for a big MoE
-
-A trellis mix (IQ1_KT/IQ2_KT experts) **hard-requires an imatrix**, and a MoE imatrix is
-the swamp: rare experts don't route, coverage is partial, the compute is 6+ hours and dies
-if interrupted. **Don't force it.** For a big MoE, build the automap mix from **K-quant
-atoms**, which read NO imatrix at all — no coverage problem, no long imatrix step, kill-proof:
-
+The quality win on a MoE (and on dense) is **`pollard-sensitivity` → `pollard-fit --sensitivity`**:
+it CRUSHES one tensor group at a time and measures the *true KL cost*, then a knapsack spends
+bits where the measurement — not a guess — says they matter. **Measured, shipped, and proven
+to beat uniform imatrix-IQ at matched size on both a MoE (granite-3B-a800m, 40 experts) AND a
+dense (Qwen2.5-1.5B)** — see `assets/kl_win.png`. Do not build a second allocator; use this one.
 ```bash
-# 1. FULL tensor list (dry-run at a non-low type so it can't abort mid-list):
-llama-quantize --dry-run moe-f16.gguf x.gguf Q6_K > tensors.txt
-# 2. automap --no-imatrix: K-quant mix straight off the F16 (body q2_k / protect q3_k).
-#    NO imatrix flag, NO calib, NO coverage pins — every atom is a K-quant.
-pollard-automap --tensors tensors.txt --model moe-f16.gguf --no-imatrix --out build.bat
-# 3. run build.bat -> uniform-Q2_K / PollardMix / uniform-Q3_K_M + PPL each
+pollard-sensitivity --gguf moe-f16.gguf --imatrix moe.imatrix --eval held.txt --out moe.sens.json
+pollard-fit --gguf moe-f16.gguf --ram 16 --imatrix moe.imatrix --sensitivity moe.sens.json --out moe-pollard.gguf
 ```
-Rule of thumb: **`imatrix = dense`, `automap = MoE`, and MoE → `--no-imatrix` unless you
-already have a well-covered diverse imatrix.** The trellis path below is the extreme-low
-variant, only worth it when a covered imatrix is cheap to make.
+Cost: the sweep is ~2·num_layers passes (one-time per model). Note: `imatrix magnitude LIES`
+(big activations ≠ high KL) — that's exactly why the measured sweep exists; don't allocate on
+raw imatrix importance.
+
+### MoE trellis (imatrix) — the extreme-low 1-bit-class variant (only with a covered imatrix)
+
+`pollard-automap` emits the 3-bar 1-bit-class build (uniform-IQ1 / PollardMix / uniform-IQ2).
+This is the extreme-low showcase (the 7B/14B gold-cards), NOT the general allocator above.
 
 ### MoE trellis (imatrix) — the extreme-low variant (only with a covered imatrix)
 
@@ -109,6 +117,15 @@ more diverse calib (more experts routed), **or just use `--no-imatrix`** (above)
 beats uniform-low on PPL/KL/top-1. If it drifts toward uniform-high size, reject and
 tighten the crush.
 
+### MoE with NO imatrix — `--no-imatrix` (robustness fallback, NOT a quality win)
+
+If a covered imatrix is impractical (the swamp above), `pollard-automap --no-imatrix` builds a
+K-quant mix straight off the F16 — no imatrix, no coverage problem, kill-proof. **Be honest
+about what it is: a robustness fallback.** Measured on Qwen3-30B-A3B it did NOT beat the stock
+`Q2_K` preset (that preset is itself a tuned mix). So for a real MoE quality win use the
+MEASURED allocator above; reach for `--no-imatrix` only to *get a build at all* when you can't
+make an imatrix, and compare it against stock `Q2_K` before shipping.
+
 **MoE measured K-quant ladder (alternative to the trellis mix)** — the KL knapsack that
 beats uniform, for shipping IQ3/IQ4/Q6 sizes:
 ```bash
@@ -118,6 +135,23 @@ pollard-experts --gguf moe-f16.gguf --imatrix moe.imatrix          # measured ho
 ```
 
 ---
+
+### Giant MoE that won't fit even quantized (e.g. Kimi K2, ~1T params) — PRUNE first
+
+Quant has a floor: params x 1 bit. A 1T MoE is ~125 GB at 1-bit and unusable that low — you
+**cannot quantize a trillion-param MoE onto one small box.** The lever is **expert pruning**:
+a big MoE has many cold/redundant experts (Kimi K2: 384 experts, 8 active). Drop the cold
+third-to-half FIRST (structurally smaller model), THEN quantize:
+```bash
+pollard-pack  --gguf kimi-f16.gguf --emit-plan plan.json      # rank experts (forecast + which to drop)
+pollard-prune --gguf kimi-f16.gguf --keep 0.5 --out kimi-pruned.gguf   # execute: rewrite a smaller GGUF
+pollard-automap --tensors <dry-run kimi-pruned> --model kimi-pruned.gguf --no-imatrix --out build.bat
+```
+`--score imatrix` (with a diverse-calib imatrix) keeps the experts the calib actually routed
+to (REAP-correct); `magnitude` is the zero-calib default. Keep >= the model's active-expert
+count. **Producing the artifact needs the source weights + storage + a big box** — the tool
+runs on the box that holds the model; a user without the disk downloads the finished small
+build instead of making it.
 
 ## Runtime targets (where the build will actually run)
 
@@ -190,6 +224,7 @@ pollard-palette --gguf model-f16.gguf --imatrix model.imatrix                 # 
 | `pollard-sensitivity` | measured per-group KL profile (the knapsack input) | **MoE only** |
 | `pollard-probe` | CHEAP in-process sensitivity (no GGUF/imatrix, any box) | any (research) |
 | `pollard-pack` | Cerebras wafer capacity + expert-prune plan (forecast) | MoE (lever) |
+| `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
 | `pollard-experts` | measured hot-expert report | **MoE only** |

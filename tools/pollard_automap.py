@@ -111,6 +111,15 @@ def _bar_type(atom):
     its preset; trellis/I-quant -> the uppercase type name)."""
     a = _atom(atom)
     return _BAR_PRESET.get(a, a.upper())
+
+
+def _cq(atom):
+    """The EXACT ggml type name --custom-q expects. K-quants are `qN_K` (capital K, e.g.
+    q3_K); i-/trellis quants are all-lowercase (iq1_kt). llama-quantize rejects `q3_k`
+    ('Invalid quantization type') — the tensor-type table is case-sensitive on the K."""
+    a = _atom(atom)
+    m = re.match(r"(q\d)_k$", a)
+    return f"{m.group(1)}_K" if m else a
 # Frontier mixed-ultra-low formats (e.g. Hy4 MIX-STQ1_0's sparse-ternary STQ1_0) map onto
 # the nearest thing this runtime can actually emit: Bitnet ternary.
 ALIASES = {"stq1_0": "iq1_bn", "stq2_0": "iq2_bn"}
@@ -134,9 +143,10 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     If body+protect are BOTH K-quants, the recipe is imatrix-free (the decoupled MoE
     path): the one hard-coded trellis atom (the shared-expert writer) drops to the
     protect K-quant so no tensor needs an importance matrix."""
-    body, protect = _atom(body), _atom(protect)
     kfree = is_kquant(body) and is_kquant(protect)      # fully imatrix-free build?
     shexp_down = protect if kfree else "iq3_kt"         # trellis atom only when imatrix is present
+    # custom-q needs the exact ggml type name (K-quants capital-K: q3_K, not q3_k).
+    body, protect, shexp_down = _cq(body), _cq(protect), _cq(shexp_down)
     flags = ["--output-tensor-type Q6_K", "--token-embedding-type Q4_K"]  # head/embed: never < 4-bit
     cq = []
     # --custom-q is FIRST-MATCH-WINS (verified via dry-run): list overrides first.
@@ -180,27 +190,35 @@ def emit_bat(a, n_layers, is_moe, names):
         return (f"%BIN%\\llama-quantize.exe {im_flag}{extra} %SRC% "
                 f"{stem}-{name}.gguf {typ} 1>> %LOG% 2>&1")
     def ppl(name):
+        # PPL is offload-invariant (ngl changes speed, not the number) — so a partial
+        # offload keeps every bar comparable AND stops a big bar OOMing the card.
         return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
-                f"-ngl 99 1>> %LOG% 2>&1")
+                f"-ngl {a.ngl} 1>> %LOG% 2>&1")
     pin_extra = f' --custom-q "{pin_cq[:-1]}"' if pins else ""   # uniform bars need the pins too
     if pins:
         L += [f"echo == pinned {len(pins)} imatrix-uncovered tensor(s) to q6_K "
               f"(covered={ncov}) == 1>> %LOG% 2>&1"]
-    # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
-    L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
-          build(f"u-{body}", _bar_type(body), pin_extra), ppl(f"u-{body}"), ""]
-    # ceiling (uniform at the protect tier)
-    L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
-          build(f"u-{protect}", _bar_type(protect), pin_extra), ppl(f"u-{protect}"), ""]
-    # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
-    if a.rival:
-        rv = _atom(a.rival)
-        L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
-              build(f"rival-{rv}", _bar_type(rv)), ppl(f"rival-{rv}"), ""]
-    # PollardMix: base fills with the body atom, custom-q protects the sensitive roles
+    # --no-eval skips PPL (a plain user BUILD doesn't need the benchmark); the 3-bar
+    # comparison (uniform baseline + ceiling) is the BENCHMARK, emitted only when NOT --mix-only.
+    def maybe_ppl(name):
+        return [] if a.no_eval else [ppl(name)]
+    if not a.mix_only:
+        # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
+        L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
+              build(f"u-{body}", _bar_type(body), pin_extra), *maybe_ppl(f"u-{body}"), ""]
+        # ceiling (uniform at the protect tier)
+        L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
+              build(f"u-{protect}", _bar_type(protect), pin_extra), *maybe_ppl(f"u-{protect}"), ""]
+        # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
+        if a.rival:
+            rv = _atom(a.rival)
+            L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
+                  build(f"rival-{rv}", _bar_type(rv)), *maybe_ppl(f"rival-{rv}"), ""]
+    # PollardMix: base fills with the body atom, custom-q protects the sensitive roles. This is
+    # the deliverable — always emitted; with --mix-only it's the ONLY thing built (the fast path).
     mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
     L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
-          build("mix", _bar_type(body), mix_extra), ppl("mix"), ""]
+          build("mix", _bar_type(body), mix_extra), *maybe_ppl("mix"), ""]
     L += [f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> %LOG% 2>&1"]
     return "\n".join(L)
 
@@ -211,6 +229,9 @@ def main():
     ap.add_argument("--model", required=True, help="source F16 gguf path (as seen on the box)")
     ap.add_argument("--imatrix", default="ik.imatrix")
     ap.add_argument("--eval", default="wikitext2_test.txt")
+    ap.add_argument("--ngl", type=int, default=99,
+                    help="GPU layers for the PPL eval. Lower it for a big build that would OOM "
+                         "the card (PPL is offload-invariant, so bars stay comparable).")
     ap.add_argument("--bin", default=r"C:\pollard\ik_llama.cpp\build\bin")
     ap.add_argument("--log", default=r"C:\pollard\bench\automap.log")
     ap.add_argument("--out", default="build_automap.bat")
@@ -220,6 +241,13 @@ def main():
                     help="imatrix-FREE MoE mix: K-quant atoms (body q2_k / protect q4_k) that "
                          "build straight off the F16 — no 6-hour, coverage-hungry imatrix step. "
                          "The robust default for a big MoE where a covered imatrix is impractical.")
+    ap.add_argument("--mix-only", dest="mix_only", action="store_true",
+                    help="emit ONLY the PollardMix build — the deliverable model. Skips the "
+                         "uniform baseline/ceiling bars (those are the BENCHMARK). This is the "
+                         "fast user-build path; without it you get the full 3-bar comparison.")
+    ap.add_argument("--no-eval", dest="no_eval", action="store_true",
+                    help="skip the PPL eval lines — a plain build doesn't need the benchmark. "
+                         "(Reproduce the gold-card numbers with the benchmark path instead.)")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
     ap.add_argument("--allow-dense", action="store_true",
                     help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
