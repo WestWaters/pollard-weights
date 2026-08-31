@@ -238,9 +238,10 @@ def main():
     ap.add_argument("--body", default=None, help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
     ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
     ap.add_argument("--no-imatrix", "--kquant", dest="no_imatrix", action="store_true",
-                    help="imatrix-FREE MoE mix: K-quant atoms (body q2_k / protect q4_k) that "
-                         "build straight off the F16 — no 6-hour, coverage-hungry imatrix step. "
-                         "The robust default for a big MoE where a covered imatrix is impractical.")
+                    help="FALLBACK (not a win): imatrix-FREE K-quant MoE mix that builds off the "
+                         "F16 with no imatrix. Use ONLY when a covered imatrix is impractical — it "
+                         "does NOT beat stock Q2_K (measured). The winning path is the trellis mix "
+                         "WITH an imatrix.")
     ap.add_argument("--mix-only", dest="mix_only", action="store_true",
                     help="emit ONLY the PollardMix build — the deliverable model. Skips the "
                          "uniform baseline/ceiling bars (those are the BENCHMARK). This is the "

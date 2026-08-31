@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """pollard — the autoaware entry point. Point it at ANY model; it detects dense vs MoE
-and drives the RIGHT path, so a user who doesn't know (or care) which their model is
-never runs the wrong tool or wastes a run:
+and drives the WINNING method, so a user never runs a losing path or wastes hours.
 
-  DENSE  ->  imatrix-guided K-quants          (dispatches to `pollard-fit`)
-  MoE    ->  automap measured expert-allocation (dry-run -> `pollard-automap` -> build)
+WINNING DEFAULT PATHS (this is what a plain build runs — measured/proven, minutes):
+  DENSE  ->  imatrix K-quant ladder (pollard-fit) + the IQ1_KT mixed-precision flagship
+             (the hand-coded crush-body/protect mix — won on 7B/14B).
+  MoE    ->  the trellis mixed-precision mix (automap WITH an imatrix).
+
+FALLBACK (NOT a win — only when no imatrix is available):
+  MoE (no imatrix) -> automap --no-imatrix K-quant mix. It BUILDS without an imatrix but
+  does NOT beat stock Q2_K. Prefer making a quick imatrix and using the trellis path.
+
+⛔ LOSING / TRAP paths — never the default, opt-in only:
+  - sensitivity SWEEP on DENSE = loses (no expert redundancy) -> pollard-sensitivity refuses dense.
+  - sensitivity SWEEP on a BIG MoE = ~2*layers full-model quantizes = many HOURS; opt-in R&D only.
+  - the 3-bar comparison + KL/PPL = the BENCHMARK, opt-in via --benchmark (see benchmarks/).
 
 Plans by default (prints the exact commands for THIS model); `--run` executes them.
 
     pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix           # plan
-    pollard --gguf moe-f16.gguf   --imatrix moe.imatrix --run                # detect + build
+    pollard --gguf moe-f16.gguf   --imatrix moe.imatrix --run                # detect + build (winning path)
+    pollard --gguf model-f16.gguf --imatrix m.imatrix --benchmark --run      # + the gold-card board (slow)
 """
 import argparse, os, subprocess, sys
 

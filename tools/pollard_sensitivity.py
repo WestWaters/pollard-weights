@@ -141,6 +141,10 @@ def main():
                                   "SMALL BOX: if f16 won't fit the forward pass, the base "
                                   "reference drops to the highest quant that fits — Pollard "
                                   "MAKES big models on small hardware, not just runs them.")
+    ap.add_argument("--allow-slow", action="store_true",
+                    help="force the sweep on a BIG model (>15B) even though it's many HOURS "
+                         "(len(groups)*layers full-model quantizes). Default refuses — use the "
+                         "automap trellis mix for a big MoE instead.")
     ap.add_argument("--allow-dense", action="store_true",
                     help="force the sweep on a DENSE model (it's the MoE tool; dense doesn't "
                          "benefit and this is a multi-hour sweep). Research only.")
@@ -180,6 +184,21 @@ def main():
                  "  Rule: imatrix = dense, automap/sensitivity = MoE. Pass --allow-dense to\n"
                  "  force the sweep anyway (research).")
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+
+    # FEASIBILITY GUARD: the sweep is len(groups)*layers FULL-MODEL quantize+KL passes.
+    # The knapsack pays off on a SMALL MoE (granite-3B: ~2 min/pass); on a BIG MoE each
+    # quantize is ~15-20 min, so a 30B sweep is ~20 HOURS — the trap that ate a whole
+    # session. Estimate + refuse for a big model unless --allow-slow (winning alternative:
+    # the automap trellis mix, minutes, no sweep).
+    passes = len(groups) * layers
+    params_b = (arch.get("total") or 0) / 1e9
+    est_min = passes * max(1.0, params_b / 1.5)          # rough min/pass scales with size
+    if params_b > 15 and est_min > 180 and not getattr(a, "allow_slow", False):
+        sys.exit(f"REFUSED (feasibility): {passes} full-model quantize+KL passes on a "
+                 f"{params_b:.0f}B model ~= {est_min/60:.0f}+ HOURS. The measured knapsack pays "
+                 f"off on a SMALL MoE (minutes/pass); on a big MoE it's a time sink.\n"
+                 f"  For a big MoE, ship the automap trellis mix instead (pollard-automap --mix-only,\n"
+                 f"  minutes) or run this on a small MoE / bigger box. Pass --allow-slow to force it.")
 
     # FAIL FAST — the KL step writes a base-logits file of (tokens x n_vocab x 4)
     # bytes. On a big-vocab model a large eval balloons that to tens of GB and the

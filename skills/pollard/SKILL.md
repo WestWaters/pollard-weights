@@ -37,6 +37,17 @@ drive a path yourself or understand what `pollard` chose.
 > Never run the benchmark or the sensitivity sweep as part of a plain build — that's the
 > mistake that turned a minutes-long shrink into a 3-hour run. See `benchmarks/README.md`.
 
+## Winning default paths vs losing/fallback (so nobody re-hits the 3-hour trap)
+
+| model | ✅ WINNING default (proven, minutes) | ⚠️ fallback / ⛔ losing (never the default) |
+|---|---|---|
+| **DENSE** | imatrix K-quant ladder (`pollard-fit`) **+ the IQ1_KT mixed-precision flagship** (the hand-coded mix — won 7B/14B) | ⛔ sensitivity SWEEP on dense = loses (no expert redundancy) → `pollard-sensitivity` refuses it |
+| **MoE** | the **trellis mixed-precision mix** (`automap` WITH an imatrix) | ⚠️ `automap --no-imatrix` K-quant mix = builds without an imatrix but does NOT beat stock `Q2_K` — fallback only · ⛔ sensitivity SWEEP on a big MoE = ~2·layers full-model quantizes = HOURS → refused unless `--allow-slow` |
+
+The **mixed-precision hand-coded mix** (crush body → protect attn/down/first-last) is the BUILD,
+proven by palette/lowbit and shipped across GGUF (`automap`), torch/GPU (`gptq --recipe`), and
+vLLM (`export`). The **KL/PPL/scorecard/3-bar board** is the BENCHMARK — opt-in, `benchmarks/`.
+
 ## STEP 0 — detect the model type FIRST (this decides everything)
 
 ```bash
