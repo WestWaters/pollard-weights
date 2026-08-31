@@ -21,7 +21,9 @@ pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix        # plan (pr
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run           # detect + build automatically
 ```
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
-(dense → imatrix K-quants via `pollard-fit`; MoE → `pollard-automap` expert-allocation) —
+(dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
+flagship** — the hand-coded mix, the dense repos' headline build; MoE → `pollard-automap`
+expert-allocation) —
 the user never picks a tool. The manual steps below are exactly what it runs; read on to
 drive a path yourself or understand what `pollard` chose.
 
