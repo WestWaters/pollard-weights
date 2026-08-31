@@ -195,12 +195,12 @@ pollard-calc --model <hf-or-gguf> --ram 16 --ctx 8192   # will it fit? KV-cache 
 pollard-run  --gguf model-pollard.gguf --vram auto --launch   # launch a build (llama-server), VRAM-aware
 pollard-eval --gguf model-pollard.gguf --ref model-f16.gguf --eval held.txt   # trajectory-divergence quality
 pollard-kl   --model <hf> --eval-file held.txt --calib-file calib.txt         # KL-to-f16 + top-1 (small models, torch)
-pollard-probe --model <hf> --eval held.txt --out model.sens.json              # CHEAP sensitivity (no GGUF/imatrix, any box)
+pollard-probe --model <hf> --eval held.txt --out model.sens.json              # = pollard-sensitivity, CHEAP mode (same profile output, no GGUF/imatrix sweep — any box)
 pollard-scorecard --results results.json --out scorecard.md                   # the standardized publish scorecard
 pollard-health                                                                # cross-vendor accelerator degradation check
 pollard-fit-dit --gguf dit-model-f16.gguf --ram 16 --out dit-pollard.gguf     # memory-fit builds for DiT (image/video) archs
-pollard-lowbit  --model <hf> --qmode ternary --eval held.txt                  # research: ternary/binary quant primitives
-pollard-palette --gguf model-f16.gguf --imatrix model.imatrix                 # research: measured-cost bit allocator
+pollard-lowbit  --model <hf> --bits 1 --keep 0.01 --levels 3 --eval-file held.txt   # PROVEN low-bit levers: outlier-catch + residual carousel
+pollard-palette --model <hf> --calib-file calib.txt --eval-file held.txt --target-bpw 1.58 1.3  # PROVEN measured mixed-alphabet allocation (beat uniform ternary -22%/-35%)
 ```
 
 ## Guards & gotchas (why runs fail or waste time)
@@ -222,7 +222,7 @@ pollard-palette --gguf model-f16.gguf --imatrix model.imatrix                 # 
 | `pollard-fit` | memory-fit build for a RAM budget (K-quant ladder / MoE knapsack) | any |
 | `pollard-automap` | MoE expert-allocation mix + auto-pin uncovered experts | **MoE only** |
 | `pollard-sensitivity` | measured per-group KL profile (the knapsack input) | **MoE only** |
-| `pollard-probe` | CHEAP in-process sensitivity (no GGUF/imatrix, any box) | any (research) |
+| `pollard-probe` | `pollard-sensitivity` **cheap mode** — same profile, in-process, no GGUF/imatrix sweep | any |
 | `pollard-pack` | Cerebras wafer capacity + expert-prune plan (forecast) | MoE (lever) |
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
@@ -237,8 +237,8 @@ pollard-palette --gguf model-f16.gguf --imatrix model.imatrix                 # 
 | `pollard-eval` | trajectory-divergence quality metric | any |
 | `pollard-kl` | KL-to-f16 + top-1 metric (small models, torch) | any |
 | `pollard-scorecard` | the standardized publish scorecard | any |
-| `pollard-lowbit` | research: ternary/binary quant primitives | any |
-| `pollard-palette` | research: measured-cost bit allocator | any |
+| `pollard-lowbit` | PROVEN low-bit levers: outlier-catch (SpQR) + residual carousel (AQLM) | any (torch, small model) |
+| `pollard-palette` | PROVEN measured mixed-alphabet allocator (prune/binary/ternary/2b) — beat uniform ternary −22%/−35% | any (torch, small model) |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
 
 > **MAINTENANCE:** this skill must track the tools. When a feature is added/changed,
