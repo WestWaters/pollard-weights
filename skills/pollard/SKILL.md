@@ -42,7 +42,7 @@ drive a path yourself or understand what `pollard` chose.
 | model | ✅ WINNING default (proven, minutes) | ⚠️ fallback / ⛔ losing (never the default) |
 |---|---|---|
 | **DENSE** | imatrix K-quant ladder (`pollard-fit`) **+ the IQ1_KT mixed-precision flagship** (the hand-coded mix — won 7B/14B) | ⛔ sensitivity SWEEP on dense = loses (no expert redundancy) → `pollard-sensitivity` refuses it |
-| **MoE** | the **trellis mixed-precision mix** (`automap` WITH an imatrix) | ⚠️ `automap --no-imatrix` K-quant mix = builds without an imatrix but does NOT beat stock `Q2_K` — fallback only · ⛔ sensitivity SWEEP on a big MoE = ~2·layers full-model quantizes = HOURS → refused unless `--allow-slow` |
+| **MoE** | the **trellis mixed-precision mix** (`automap` WITH an imatrix) | ⛔ `automap --no-imatrix` K-quant mix = **DEPRECATED**, does NOT beat stock `Q2_K` (imatrix-free build → just use a stock K-quant ladder) · ⛔ sensitivity SWEEP on a big MoE = ~2·layers full-model quantizes = HOURS → refused unless `--allow-slow` |
 
 The **mixed-precision hand-coded mix** (crush body → protect attn/down/first-last) is the BUILD,
 proven by palette/lowbit and shipped across GGUF (`automap`), torch/GPU (`gptq --recipe`), and
@@ -124,20 +124,20 @@ pollard-automap --tensors tensors.txt --model moe-f16.gguf --imatrix moe.imatrix
 ```
 **Watch automap's output:** if it reports "PINNING <many> uncovered tensor(s)", the
 imatrix under-covered experts — the mix will BLOAT. Re-run the imatrix with a larger,
-more diverse calib (more experts routed), **or just use `--no-imatrix`** (above).
+more diverse calib (more experts routed). (Build it on a Q6_K host + copy `up_exps`→`gate_exps`.)
 
 **Accept-the-Mix gate:** keep it only if PollardMix ≤ uniform-low size + ~8–10% AND it
 beats uniform-low on PPL/KL/top-1. If it drifts toward uniform-high size, reject and
 tighten the crush.
 
-### MoE with NO imatrix — `--no-imatrix` (robustness fallback, NOT a quality win)
+### MoE with NO imatrix — just use a stock K-quant ladder (`--no-imatrix` is DEPRECATED)
 
-If a covered imatrix is impractical (the swamp above), `pollard-automap --no-imatrix` builds a
-K-quant mix straight off the F16 — no imatrix, no coverage problem, kill-proof. **Be honest
-about what it is: a robustness fallback.** Measured on Qwen3-30B-A3B it did NOT beat the stock
-`Q2_K` preset (that preset is itself a tuned mix). So for a real MoE quality win use the
-MEASURED allocator above; reach for `--no-imatrix` only to *get a build at all* when you can't
-make an imatrix, and compare it against stock `Q2_K` before shipping.
+`pollard-automap --no-imatrix` (a K-quant "mix") is **DEPRECATED** — measured on Qwen3-30B-A3B
+it did **NOT** beat the stock `Q2_K` preset, so it's a losing path with no reason to exist.
+The imatrix is no longer a swamp (build it on a **Q6_K** host + copy `up_exps`→`gate_exps` for
+SwiGLU coverage → minutes). So: **make an imatrix and use the trellis mix (the winner); if you
+truly won't, just build a stock K-quant ladder (`pollard-fit`)** — that's the honest imatrix-free
+build, not a fake mix that loses to it.
 
 **MoE measured K-quant ladder (alternative to the trellis mix)** — the KL knapsack that
 beats uniform, for shipping IQ3/IQ4/Q6 sizes:
@@ -158,7 +158,7 @@ third-to-half FIRST (structurally smaller model), THEN quantize:
 ```bash
 pollard-pack  --gguf kimi-f16.gguf --emit-plan plan.json      # rank experts (forecast + which to drop)
 pollard-prune --gguf kimi-f16.gguf --keep 0.5 --out kimi-pruned.gguf   # execute: rewrite a smaller GGUF
-pollard-automap --tensors <dry-run kimi-pruned> --model kimi-pruned.gguf --no-imatrix --out build.bat
+pollard-automap --tensors <dry-run kimi-pruned> --model kimi-pruned.gguf --imatrix kimi.imatrix --out build.bat
 ```
 `--score imatrix` (with a diverse-calib imatrix) keeps the experts the calib actually routed
 to (REAP-correct); `magnitude` is the zero-calib default. Keep >= the model's active-expert

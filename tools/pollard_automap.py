@@ -256,6 +256,10 @@ def main():
     a = ap.parse_args()
     # atom defaults: trellis (imatrix) by default; K-quant (imatrix-free) when --no-imatrix.
     if a.no_imatrix:
+        print("(!) --no-imatrix is DEPRECATED: the K-quant mix does NOT beat stock Q2_K "
+              "(measured). For a real MoE build make an imatrix and use the trellis mix; for an "
+              "imatrix-free build just use a stock K-quant preset (pollard-fit). Continuing anyway.",
+              file=sys.stderr)
         a.body = a.body or "q2_k"          # cold experts / attn k,v
         a.protect = a.protect or "q3_k"    # residual writer + attn q/out + edge: one tier up,
         #                                    NOT q4_k (that bloats the mix past the accept gate)
