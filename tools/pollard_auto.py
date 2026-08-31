@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """pollard — the autoaware entry point. Point it at ANY model; it detects dense vs MoE
-and drives the RIGHT path, so a user who doesn't know (or care) which their model is
-never runs the wrong tool or wastes a run:
+and drives the WINNING method, so a user never runs a losing path or wastes hours.
 
-  DENSE  ->  imatrix-guided K-quants          (dispatches to `pollard-fit`)
-  MoE    ->  automap measured expert-allocation (dry-run -> `pollard-automap` -> build)
+WINNING PATH — the SAME for dense AND MoE (no losing fallback):
+  (1) the imatrix K-quant ladder (pollard-fit) — the honest fit-your-RAM baseline, plus
+  (2) the mixed-precision FLAGSHIP mix (automap trellis) — the hand-coded winner (crush body,
+      protect attn/down/first-last; MoE = expert-allocation) — WHEN an imatrix is present.
+  No imatrix -> just the ladder (stock K-quants). There is NO "imatrix-free mix": it loses
+  to stock Q2_K, so it's deprecated, not a path here.
+
+⛔ LOSING / TRAP paths — never the default, opt-in only:
+  - sensitivity SWEEP on DENSE = loses (no expert redundancy) -> pollard-sensitivity refuses dense.
+  - sensitivity SWEEP on a BIG MoE = ~2*layers full-model quantizes = many HOURS; opt-in R&D only.
+  - the 3-bar comparison + KL/PPL = the BENCHMARK, opt-in via --benchmark (see benchmarks/).
 
 Plans by default (prints the exact commands for THIS model); `--run` executes them.
 
     pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix           # plan
-    pollard --gguf moe-f16.gguf   --imatrix moe.imatrix --run                # detect + build
+    pollard --gguf moe-f16.gguf   --imatrix moe.imatrix --run                # detect + build (winning path)
+    pollard --gguf model-f16.gguf --imatrix m.imatrix --benchmark --run      # + the gold-card board (slow)
 """
 import argparse, os, subprocess, sys
 
@@ -49,6 +58,37 @@ def _run(cmd, do_run, cwd=None):
     return not do_run
 
 
+def _automap_mix(a, is_moe):
+    """Emit + (with --run) build the automap mix — the hand-coded mixed-precision flagship.
+    MoE: expert-allocation (crush cold experts, protect router/down/shared/attn). DENSE: the
+    IQ1_KT crush-body / protect-attn+down+edges flagship (automap-on-dense, --allow-dense).
+    Fast by default (--mix-only --no-eval); --benchmark emits the 3-bar + PPL board instead.
+    This is what keeps the winning hand-coded mix a first-class BUILD, not benchmark-only."""
+    binq = find_llama_bin("llama-quantize") if not a.bin else os.path.join(a.bin, "llama-quantize")
+    here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+    tensors = os.path.join(here, "pollard_auto_tensors.txt")
+    print(f"   tensor list (Q6_K dry-run): {binq} --dry-run {os.path.basename(a.gguf)} x.gguf Q6_K > tensors")
+    if a.run:
+        with open(tensors, "w") as f:
+            subprocess.run([binq, "--dry-run", a.gguf, "x.gguf", "Q6_K"],
+                           stdout=f, stderr=subprocess.STDOUT)
+    out = os.path.join(here, "pollard_auto_build.bat" if is_moe else "pollard_auto_flagship.bat")
+    # the flagship is the TRELLIS mix (winner) — always imatrix-guided. No K-quant fallback.
+    am = ["pollard-automap", "--tensors", tensors, "--model", a.gguf, "--out", out,
+          "--imatrix", a.imatrix]
+    if not is_moe:
+        am += ["--allow-dense"]                             # dense flagship = the hand-coded mix
+    if not a.benchmark:
+        am += ["--mix-only", "--no-eval"]                   # plain build = ONE model, no benchmark
+    if a.bin:
+        am += ["--bin", a.bin]
+    _run(am, a.run, cwd=here)
+    mode = "3-bar BENCHMARK + PPL" if a.benchmark else "ONE mix model, no eval (fast)"
+    print(f"   -> run {os.path.basename(out)} on the box -> {mode}"
+          + ("" if a.benchmark else "  (add --benchmark for the gold-card numbers)"))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", required=True, help="f16/bf16 source GGUF (convert from HF first)")
@@ -79,54 +119,28 @@ def main():
     # (actual built size is reported by the build step; this is where Pollard will land)
     size_ladder((arch.get("total") or 0) / 1e9)
 
-    if not is_moe:
-        # DENSE -> imatrix-guided K-quants (pollard-fit auto-sizes to RAM; NO sensitivity sweep).
-        print("   path: DENSE -> imatrix-guided K-quants via pollard-fit (no sensitivity sweep — "
-              "it doesn't pay off on dense)")
-        cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
-        if a.imatrix: cmd += ["--imatrix", a.imatrix]
-        if a.out: cmd += ["--out", a.out]
-        if not a.run: cmd += ["--plan-only"]
-        _run(cmd, a.run)
-        return
-
-    # MoE -> automap measured expert-allocation (crush cold experts, protect the hot set).
-    # With an imatrix -> the extreme-low trellis mix; WITHOUT one -> the imatrix-FREE K-quant
-    # mix (robust default: no 6-hour, coverage-hungry imatrix step). The user need not know.
-    kfree = not a.imatrix
-    if kfree:
-        print("   path: MoE -> automap IMATRIX-FREE K-quant mix (no imatrix supplied -> the "
-              "robust default: builds straight off the F16, no 6-hour imatrix, kill-proof)")
-        print("        (pass --imatrix <covered diverse imatrix> for the extreme-low trellis mix.)")
+    # WINNING PATH — SAME shape for dense AND MoE (no losing fallback):
+    #   (1) the imatrix K-quant ladder (pollard-fit) — the honest, fit-your-RAM baseline, and
+    #   (2) the mixed-precision FLAGSHIP mix (automap trellis) — the hand-coded winner —
+    #       WHEN an imatrix is given. No imatrix -> just the ladder (stock K-quants), which
+    #       is the correct imatrix-free build; there is NO "imatrix-free mix" (it loses to Q2_K).
+    flagship = "PollardMix expert-allocation" if is_moe else "IQ1_KT"
+    print(f"   path: {tag} -> K-quant ladder (pollard-fit) + the {flagship} mixed-precision "
+          f"flagship (the hand-coded winner) when an imatrix is present")
+    cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
+    if a.imatrix: cmd += ["--imatrix", a.imatrix]
+    if a.out: cmd += ["--out", a.out]
+    if not a.run: cmd += ["--plan-only"]
+    print("   1) the K-quant ladder (fits your RAM budget):")
+    _run(cmd, a.run)
+    if a.imatrix:
+        print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
+        _automap_mix(a, is_moe=is_moe)
     else:
-        print("   path: MoE -> automap trellis mix (imatrix supplied; auto-pins uncovered experts)")
-    binq = find_llama_bin("llama-quantize") if not a.bin else os.path.join(a.bin, "llama-quantize")
-    here = os.path.dirname(os.path.abspath(a.gguf)) or "."
-    tensors = os.path.join(here, "pollard_auto_tensors.txt")
-    print("   1) full tensor list (Q6_K dry-run — can't abort mid-list):")
-    print(f"   $ {binq} --dry-run {os.path.basename(a.gguf)} x.gguf Q6_K > pollard_auto_tensors.txt")
-    if a.run:
-        with open(tensors, "w") as f:
-            subprocess.run([binq, "--dry-run", a.gguf, "x.gguf", "Q6_K"],
-                           stdout=f, stderr=subprocess.STDOUT)
-    mode = "gold-card BENCHMARK (3 bars + PPL)" if a.benchmark else "fast build (PollardMix only, no eval)"
-    print(f"   2) automap emits the MoE build recipe -> {mode}:")
-    am = ["pollard-automap", "--tensors", tensors, "--model", a.gguf,
-          "--out", os.path.join(here, "pollard_auto_build.bat")]
-    am += ["--no-imatrix"] if kfree else ["--imatrix", a.imatrix]
-    if not a.benchmark:
-        am += ["--mix-only", "--no-eval"]   # a plain build = ONE model, no benchmark
-    if a.bin: am += ["--bin", a.bin]
-    _run(am, a.run, cwd=here)
-    if a.benchmark:
-        bars = "uniform-Q2_K / PollardMix / uniform-Q3_K_M" if kfree else "uniform-IQ1 / PollardMix / uniform-IQ2"
-        print(f"   3) run the emitted build script -> {bars} + PPL (the benchmark).")
-    else:
-        print("   3) run the emitted build script -> ONE PollardMix model, no eval (fast).")
-        print("      (want the published gold-card numbers? re-run with --benchmark.)")
-    print("      (pollard_auto_build.bat — run it on the box with a llama.cpp build.)")
+        print(f"   2) (supply --imatrix for the {flagship} mixed-precision flagship — the winning "
+              f"build; without one you get the stock K-quant ladder above, no losing mix)")
     if not a.run:
-        print("\n   plan only — re-run with --run to execute. (dense would run pollard-fit directly.)")
+        print("\n   plan only — re-run with --run to execute.")
 
 
 if __name__ == "__main__":

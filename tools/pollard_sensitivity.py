@@ -37,12 +37,14 @@ from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
 from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS, BPW
 
 
-def _kl(ppl, model, eval_f, base, rpc=None):
+def _kl(ppl, model, eval_f, base, rpc=None, ngl=99):
     """Mean KL-divergence of `model` vs the base logits, or None on failure.
     `rpc` (host:port[,host:port…]) pools RPC nodes so a model too big for one box
-    can run the forward pass — the only way to profile a 300B+ MoE on one Spark."""
+    can run the forward pass — the only way to profile a 300B+ MoE on one Spark.
+    `ngl` = GPU layers: lower it when the model is bigger than the GPU (KL is
+    offload-invariant, so partial offload keeps the numbers, just slower)."""
     cmd = [ppl, "-m", model, "-f", eval_f, "--kl-divergence",
-           "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
+           "--kl-divergence-base", base, "-ngl", str(ngl), "-c", "512"]
     if rpc:
         cmd += ["--rpc", rpc]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -127,6 +129,10 @@ def main():
     ap.add_argument("--ref", default="IQ4_XS", help="reference uniform preset (default IQ4_XS)")
     ap.add_argument("--llama-quantize", default="llama-quantize")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
+    ap.add_argument("--ngl", type=int, default=99,
+                    help="GPU layers for the forward passes. LOWER it when the model is bigger "
+                         "than the GPU (e.g. a 30B on a 16GB card -> --ngl 20) so the sweep "
+                         "doesn't OOM. KL is offload-invariant, so the numbers stay valid.")
     ap.add_argument("--rpc", help="RPC servers to pool for the forward pass, "
                                   "'host:port[,host:port…]' (run ggml-rpc-server on each "
                                   "peer). REQUIRED to profile a model too big for one node "
@@ -135,6 +141,10 @@ def main():
                                   "SMALL BOX: if f16 won't fit the forward pass, the base "
                                   "reference drops to the highest quant that fits — Pollard "
                                   "MAKES big models on small hardware, not just runs them.")
+    ap.add_argument("--allow-slow", action="store_true",
+                    help="force the sweep on a BIG model (>15B) even though it's many HOURS "
+                         "(len(groups)*layers full-model quantizes). Default refuses — use the "
+                         "automap trellis mix for a big MoE instead.")
     ap.add_argument("--allow-dense", action="store_true",
                     help="force the sweep on a DENSE model (it's the MoE tool; dense doesn't "
                          "benefit and this is a multi-hour sweep). Research only.")
@@ -174,6 +184,21 @@ def main():
                  "  Rule: imatrix = dense, automap/sensitivity = MoE. Pass --allow-dense to\n"
                  "  force the sweep anyway (research).")
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+
+    # FEASIBILITY GUARD: the sweep is len(groups)*layers FULL-MODEL quantize+KL passes.
+    # The knapsack pays off on a SMALL MoE (granite-3B: ~2 min/pass); on a BIG MoE each
+    # quantize is ~15-20 min, so a 30B sweep is ~20 HOURS — the trap that ate a whole
+    # session. Estimate + refuse for a big model unless --allow-slow (winning alternative:
+    # the automap trellis mix, minutes, no sweep).
+    passes = len(groups) * layers
+    params_b = (arch.get("total") or 0) / 1e9
+    est_min = passes * max(1.0, params_b / 1.5)          # rough min/pass scales with size
+    if params_b > 15 and est_min > 180 and not getattr(a, "allow_slow", False):
+        sys.exit(f"REFUSED (feasibility): {passes} full-model quantize+KL passes on a "
+                 f"{params_b:.0f}B model ~= {est_min/60:.0f}+ HOURS. The measured knapsack pays "
+                 f"off on a SMALL MoE (minutes/pass); on a big MoE it's a time sink.\n"
+                 f"  For a big MoE, ship the automap trellis mix instead (pollard-automap --mix-only,\n"
+                 f"  minutes) or run this on a small MoE / bigger box. Pass --allow-slow to force it.")
 
     # FAIL FAST — the KL step writes a base-logits file of (tokens x n_vocab x 4)
     # bytes. On a big-vocab model a large eval balloons that to tens of GB and the
@@ -231,7 +256,7 @@ def main():
         print(f"RPC pool: {a.rpc}  (forward passes span these nodes; quantize stays local)")
     # 1. base logits from the reference (f16, or the memory-fit quant)
     base_cmd = [a.llama_perplexity, "-m", base_src, "-f", a.eval,
-                "--kl-divergence-base", base, "-ngl", "99", "-c", "512"]
+                "--kl-divergence-base", base, "-ngl", str(a.ngl), "-c", "512"]
     if a.rpc:
         base_cmd += ["--rpc", a.rpc]
     r = _run(base_cmd)
@@ -246,7 +271,7 @@ def main():
              + [a.gguf, ref, a.ref])
     if not _valid_gguf(ref):
         sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — {_diagnose(r.stderr, 'llama-quantize')}")
-    kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc)
+    kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc, a.ngl)
     if kl_ref is None:
         sys.exit("ERROR: reference GGUF built fine but perplexity couldn't score it — "
                  "check the eval file, the tools, and free memory (the forward pass runs here).")
@@ -269,7 +294,7 @@ def main():
             cmd += PINARG                              # the IQ2 build doesn't crash
         cmd += [a.gguf, uni, PRESET[t]]
         subprocess.run(cmd, capture_output=True)
-        k = _kl(a.llama_perplexity, uni, a.eval, base, a.rpc)
+        k = _kl(a.llama_perplexity, uni, a.eval, base, a.rpc, a.ngl)
         noise[t] = k if k is not None else None
         os.path.exists(uni) and os.remove(uni)
         print(f"  {t:8} {noise[t]}{'  (uncovered-tensor build failed)' if noise[t] is None else ''}")
@@ -289,7 +314,7 @@ def main():
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix, "--tensor-type", pat]
                            + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
                            + [a.gguf, probe, a.ref], capture_output=True)
-            k = _kl(a.llama_perplexity, probe, a.eval, base, a.rpc)
+            k = _kl(a.llama_perplexity, probe, a.eval, base, a.rpc, a.ngl)
             # a FAILED probe (build/eval crashed) is UNMEASURED, not zero-cost —
             # recording 0 would tell the allocator this is the LEAST important group
             # and crush it hardest. Mark None; protect it after the sweep.
