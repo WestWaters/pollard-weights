@@ -58,6 +58,10 @@ def main():
     ap.add_argument("--eval", default="wikitext2_test.txt")
     ap.add_argument("--bin", help="llama.cpp bin dir (for the MoE dry-run/build)")
     ap.add_argument("--run", action="store_true", help="execute the path (default: plan/print it)")
+    ap.add_argument("--benchmark", "--reproduce", dest="benchmark", action="store_true",
+                    help="ALSO run the gold-card benchmark (3-bar comparison + PPL) — the "
+                         "hour-long validation. OFF by default: a normal build makes ONE model "
+                         "fast and skips the eval. Use this only to reproduce our published numbers.")
     ap.add_argument("--force-dense", action="store_true", help="override detection -> dense path")
     ap.add_argument("--force-moe", action="store_true", help="override detection -> MoE path")
     a = ap.parse_args()
@@ -105,14 +109,21 @@ def main():
         with open(tensors, "w") as f:
             subprocess.run([binq, "--dry-run", a.gguf, "x.gguf", "Q6_K"],
                            stdout=f, stderr=subprocess.STDOUT)
-    print("   2) automap emits the MoE build recipe:")
+    mode = "gold-card BENCHMARK (3 bars + PPL)" if a.benchmark else "fast build (PollardMix only, no eval)"
+    print(f"   2) automap emits the MoE build recipe -> {mode}:")
     am = ["pollard-automap", "--tensors", tensors, "--model", a.gguf,
           "--out", os.path.join(here, "pollard_auto_build.bat")]
     am += ["--no-imatrix"] if kfree else ["--imatrix", a.imatrix]
+    if not a.benchmark:
+        am += ["--mix-only", "--no-eval"]   # a plain build = ONE model, no benchmark
     if a.bin: am += ["--bin", a.bin]
     _run(am, a.run, cwd=here)
-    bars = "uniform-Q2_K / PollardMix / uniform-Q3_K_M" if kfree else "uniform-IQ1 / PollardMix / uniform-IQ2"
-    print(f"   3) run the emitted build script -> {bars} + PPL.")
+    if a.benchmark:
+        bars = "uniform-Q2_K / PollardMix / uniform-Q3_K_M" if kfree else "uniform-IQ1 / PollardMix / uniform-IQ2"
+        print(f"   3) run the emitted build script -> {bars} + PPL (the benchmark).")
+    else:
+        print("   3) run the emitted build script -> ONE PollardMix model, no eval (fast).")
+        print("      (want the published gold-card numbers? re-run with --benchmark.)")
     print("      (pollard_auto_build.bat — run it on the box with a llama.cpp build.)")
     if not a.run:
         print("\n   plan only — re-run with --run to execute. (dense would run pollard-fit directly.)")

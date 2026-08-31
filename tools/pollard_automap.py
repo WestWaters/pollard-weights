@@ -198,21 +198,27 @@ def emit_bat(a, n_layers, is_moe, names):
     if pins:
         L += [f"echo == pinned {len(pins)} imatrix-uncovered tensor(s) to q6_K "
               f"(covered={ncov}) == 1>> %LOG% 2>&1"]
-    # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
-    L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
-          build(f"u-{body}", _bar_type(body), pin_extra), ppl(f"u-{body}"), ""]
-    # ceiling (uniform at the protect tier)
-    L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
-          build(f"u-{protect}", _bar_type(protect), pin_extra), ppl(f"u-{protect}"), ""]
-    # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
-    if a.rival:
-        rv = _atom(a.rival)
-        L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
-              build(f"rival-{rv}", _bar_type(rv)), ppl(f"rival-{rv}"), ""]
-    # PollardMix: base fills with the body atom, custom-q protects the sensitive roles
+    # --no-eval skips PPL (a plain user BUILD doesn't need the benchmark); the 3-bar
+    # comparison (uniform baseline + ceiling) is the BENCHMARK, emitted only when NOT --mix-only.
+    def maybe_ppl(name):
+        return [] if a.no_eval else [ppl(name)]
+    if not a.mix_only:
+        # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
+        L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
+              build(f"u-{body}", _bar_type(body), pin_extra), *maybe_ppl(f"u-{body}"), ""]
+        # ceiling (uniform at the protect tier)
+        L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
+              build(f"u-{protect}", _bar_type(protect), pin_extra), *maybe_ppl(f"u-{protect}"), ""]
+        # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
+        if a.rival:
+            rv = _atom(a.rival)
+            L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
+                  build(f"rival-{rv}", _bar_type(rv)), *maybe_ppl(f"rival-{rv}"), ""]
+    # PollardMix: base fills with the body atom, custom-q protects the sensitive roles. This is
+    # the deliverable — always emitted; with --mix-only it's the ONLY thing built (the fast path).
     mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
     L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
-          build("mix", _bar_type(body), mix_extra), ppl("mix"), ""]
+          build("mix", _bar_type(body), mix_extra), *maybe_ppl("mix"), ""]
     L += [f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> %LOG% 2>&1"]
     return "\n".join(L)
 
@@ -235,6 +241,13 @@ def main():
                     help="imatrix-FREE MoE mix: K-quant atoms (body q2_k / protect q4_k) that "
                          "build straight off the F16 — no 6-hour, coverage-hungry imatrix step. "
                          "The robust default for a big MoE where a covered imatrix is impractical.")
+    ap.add_argument("--mix-only", dest="mix_only", action="store_true",
+                    help="emit ONLY the PollardMix build — the deliverable model. Skips the "
+                         "uniform baseline/ceiling bars (those are the BENCHMARK). This is the "
+                         "fast user-build path; without it you get the full 3-bar comparison.")
+    ap.add_argument("--no-eval", dest="no_eval", action="store_true",
+                    help="skip the PPL eval lines — a plain build doesn't need the benchmark. "
+                         "(Reproduce the gold-card numbers with the benchmark path instead.)")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
     ap.add_argument("--allow-dense", action="store_true",
                     help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
