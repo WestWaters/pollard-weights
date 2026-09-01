@@ -85,6 +85,13 @@ def test_detection():
 
 
 # ---- encoder rules (the casing bug) ----------------------------------------------------------
+def test_stq_alias():
+    # STQ1_0 (Hy4 MIX-STQ1_0's ~1.31-bit format) is NOT in ik_llama -> aliased to the nearest
+    # emittable ternary (iq1_bn, 1.62). Documents the approximation (main() warns at runtime).
+    assert A._atom("stq1_0") == "iq1_bn" and A._atom("stq2_0") == "iq2_bn"
+    assert A._atom("iq1_kt") == "iq1_kt"                              # a real atom passes through
+
+
 def test_cq_casing():
     assert A._cq("q3_k") == "q3_K" and A._cq("q2_k") == "q2_K"        # K-quants: capital K
     assert A._cq("iq1_kt") == "iq1_kt" and A._cq("iq2_kt") == "iq2_kt"  # trellis: lowercase

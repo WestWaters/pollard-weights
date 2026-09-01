@@ -352,6 +352,15 @@ def main():
                  "  expert-allocation here doesn't apply (no expert redundancy to reallocate).\n"
                  "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
                  "  research 1-bit-mix case (the gold-card).")
+    # Transparency: an aliased atom (e.g. Hy4's STQ1_0) is an APPROXIMATION, not the real format —
+    # say so, so nobody thinks they built a true 1.31-bit STQ1_0 when they built 1.62-bit iq1_bn.
+    for label, raw in [("--body", a.body), ("--protect", a.protect), ("--rival", a.rival)]:
+        if raw and raw.lower() in ALIASES:
+            real = ALIASES[raw.lower()]
+            print(f"(!) {label} {raw}: NOT emittable by this llama.cpp -> building {real} "
+                  f"({QUANT_BPW.get(real, '?')} bpw), the nearest ternary. True {raw} (Hy4 MIX-STQ1_0's "
+                  f"~1.31-bit forced-zero 3:4 pack) needs AngelSlim/upstream STQ kernels; this is an "
+                  f"approximation at a higher bpw.", file=sys.stderr)
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)
     kind = arch
