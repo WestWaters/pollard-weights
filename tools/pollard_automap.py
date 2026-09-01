@@ -66,17 +66,22 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
 
 
 def parse_tensors(path):
-    """Return (names, n_layers, is_moe). Accepts dry-run lines or bare tensor names."""
+    """Return (names, n_layers, is_moe, is_hyv4). Accepts dry-run lines or bare tensor names."""
     names = []
     for ln in open(path, encoding="utf-8", errors="ignore"):
-        m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output\.weight|output_norm\.weight)", ln)
+        m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output[\w.]*\.weight|output_norm\.weight)", ln)
         if m:
             names.append(m.group(1))
     names = sorted(set(names))
     layers = [int(m.group(1)) for n in names for m in [re.match(r"blk\.(\d+)\.", n)] if m]
     n_layers = (max(layers) + 1) if layers else 0
     is_moe = any("exps" in n or "ffn_gate_inp" in n for n in names)
-    return names, n_layers, is_moe
+    # HYV4 (Tencent Hy4-preview / hy_v4): a Deepseek-derived MLA + DSA-indexer + hyper-connection
+    # MoE. Its tensors (hc_*, indexer.*, attn_k_b/v_b, exp_probs_b) are named nothing like Qwen3-
+    # MoE, so it needs its OWN recipe — the THIRD canonical path.
+    is_hyv4 = any(".hc_" in n or ".indexer." in n or "attn_k_b" in n or "exp_probs_b" in n
+                  for n in names)
+    return names, n_layers, is_moe, is_hyv4
 
 
 # ---- the real ik_llama.cpp extreme-low ladder (from `llama-quantize --help`) ----
@@ -172,10 +177,51 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     return flags, cq
 
 
-def emit_bat(a, n_layers, is_moe, names):
+def recipe_flags_hyv4(n_layers, body="iq1_kt", protect="iq2_kt"):
+    """THE HYV4 canonical recipe (Tencent Hy4-preview / hy_v4) — the THIRD path. A Deepseek-
+    derived MLA + DSA-indexer + hyper-connection MoE, tensors named nothing like Qwen3-MoE.
+    Policy: crush the fat expert body (ffn_gate/up_exps); protect the residual writer
+    (ffn_down_exps), shared experts, dense block-0 FFN, router, ALL MLA attention, the
+    hyper-connections (hc_*_fn), the DSA indexer, and the output hc. Norms / base / scale /
+    exp_probs_b / attn_sinks stay F32 (llama-quantize keeps those F32 — no rule needed).
+    attn_k_b kept a tier HIGHER: Frank measured IQ4_XS regressed it (MLA absorption weight).
+    Rules use `\\.weight` so `attn_q_a` doesn't also grab `attn_q_a_norm`.  v1 — MEASURE on the
+    real model (Frank's rig) and tighten like any card; do NOT assume it's final."""
+    body, protect = _cq(body), _cq(protect)
+    kb = "q8_0" if is_kquant(protect) else _cq("iq3_kt")   # attn_k_b one tier up
+    flags = ["--output-tensor-type Q6_K", "--token-embedding-type Q4_K"]
+    cq = []
+    edge = [0, 1, n_layers - 2, n_layers - 1]
+    for i in sorted(set(x for x in edge if 0 <= x < n_layers)):
+        cq.append(rf"blk\.{i}\.={protect}")                # edge whole-block protect (incl. dense blk.0)
+    cq += [
+        # crush the fat expert body
+        f"ffn_gate_exps\\.weight={body}", f"ffn_up_exps\\.weight={body}",
+        # residual writer + shared experts + dense block-0 FFN + router
+        f"ffn_down_exps\\.weight={protect}",
+        f"ffn_gate_shexp\\.weight={protect}", f"ffn_up_shexp\\.weight={protect}",
+        f"ffn_down_shexp\\.weight={protect}",
+        f"ffn_gate\\.weight={protect}", f"ffn_up\\.weight={protect}", f"ffn_down\\.weight={protect}",
+        "ffn_gate_inp\\.weight=q6_K",
+        # MLA attention — all protected; k_b a tier higher
+        f"attn_q_a\\.weight={protect}", f"attn_q_b\\.weight={protect}", f"attn_k_b\\.weight={kb}",
+        f"attn_v_b\\.weight={protect}", f"attn_kv_a_mqa\\.weight={protect}",
+        f"attn_gate\\.weight={protect}", f"attn_output\\.weight={protect}",
+        # hyper-connections + DSA indexer + output hc
+        f"hc_attn_fn\\.weight={protect}", f"hc_ffn_fn\\.weight={protect}",
+        f"indexer\\.attn_k\\.weight={protect}", f"indexer\\.attn_q_b\\.weight={protect}",
+        f"indexer\\.proj\\.weight={protect}", f"output_hc_fn\\.weight={protect}",
+    ]
+    return flags, cq
+
+
+def emit_bat(a, n_layers, is_moe, names, is_hyv4=False):
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)     # imatrix-free (decoupled MoE) build?
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
+    if is_hyv4:
+        flags, cq = recipe_flags_hyv4(n_layers, body, protect)   # THE third canonical recipe
+    else:
+        flags, cq = recipe_flags(n_layers, is_moe, body, protect)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
     # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
@@ -270,12 +316,12 @@ def main():
     else:
         a.body = a.body or "iq1_kt"
         a.protect = a.protect or "iq2_kt"
-    names, n_layers, is_moe = parse_tensors(a.tensors)
+    names, n_layers, is_moe, is_hyv4 = parse_tensors(a.tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
     # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate — its
     # win is imatrix-guided K-quants, not this. Refuse dense (saves everyone the wrong-tool
-    # run) unless --allow-dense (the research 1-bit-mix / gold-card case).
+    # run) unless --allow-dense (the research 1-bit-mix / gold-card case). HYV4 IS a MoE.
     if not is_moe and not a.allow_dense:
         sys.exit("REFUSED: this is a DENSE model, and automap is the MoE path.\n"
                  "  Dense models -> imatrix-guided K-quants (IQ3_S/IQ4_XS/Q6_K); the measured\n"
@@ -284,11 +330,12 @@ def main():
                  "  research 1-bit-mix case (the gold-card).")
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)
-    print(f"parsed: {len(names)} tensors, {n_layers} layers, {'MoE' if is_moe else 'dense'}")
+    kind = "HYV4 (MLA+DSA+hyper-conn MoE)" if is_hyv4 else ("MoE" if is_moe else "dense")
+    print(f"parsed: {len(names)} tensors, {n_layers} layers, {kind}")
     print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)"
           f"  ->  {'imatrix-FREE (K-quant) build' if kfree else 'imatrix-guided (trellis) build'}")
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
-    print("Mix policy:")
+    flags, cq = recipe_flags_hyv4(n_layers, body, protect) if is_hyv4 else recipe_flags(n_layers, is_moe, body, protect)
+    print("Mix policy:" + ("  [HYV4 third canonical recipe — v1, measure on the real model]" if is_hyv4 else ""))
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
     if kfree:
@@ -307,7 +354,7 @@ def main():
                      if len(pins) > n_layers else ""))
         if not is_moe and pins:
             print("  (dense model with uncovered tensors — unusual; check the imatrix.)")
-    open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names))
+    open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names, is_hyv4=is_hyv4))
     print(f"wrote {a.out}")
 
 
