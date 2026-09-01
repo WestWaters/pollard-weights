@@ -34,6 +34,10 @@ drive a path yourself or understand what `pollard` chose.
 > - **Just make the model:** `pollard --gguf model.gguf --run` (one model, no eval).
 > - **Reproduce our gold-card numbers:** add `--benchmark`, or score an existing model with the
 >   drop-in **`pollard-bench --gguf model.gguf --ref f16.gguf`** (PPL + KLD + top-1; `--vs` for head-to-head).
+> - **If a build LOOPS on free-gen:** `pollard-bench --gguf model.gguf --coherence` runs the gate —
+>   generates, detects loops, sweeps sampling, and returns **PASS** (+the sampling to ship on the card)
+>   or **BELOW-FLOOR** (loops under every sampling → NOT a sampling problem; bump `--body` one tier and
+>   rebuild). `--quick` is a fast one-prompt post-build sanity. Sampling-first ALWAYS before a tier change.
 >
 > Never run the benchmark or the sensitivity sweep as part of a plain build — that's the
 > mistake that turned a minutes-long shrink into a 3-hour run. See `benchmarks/README.md`.
