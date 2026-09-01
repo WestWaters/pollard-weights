@@ -122,6 +122,34 @@ the chart from raw data: `python experiments/plot_kl_win.py`.
 - **The design, with receipts** — every claim in this README carries its
   experiment in `notes/`, failures and retractions included.
 
+## Three deployment lanes — one recipe, pick your runtime
+
+The measured allocation — protect attention / router / embeddings, crush the
+expert body, spend more bits where a routing profile says it matters — is the
+**same in every lane**. What changes is the *format*, because each runtime has
+its own fast path. Pick by where the model will actually run:
+
+| Lane | Build with | Format | Reach for it when |
+|---|---|---|---|
+| **GGUF** — llama.cpp / ik_llama.cpp | `pollard-fit`, `pollard-automap` | trellis mix to ~1-bit (IQ1_KT) | single node (and RPC clusters); you want the **smallest** build. The flagship — runs in stock llama.cpp / Ollama / LM Studio. |
+| **vLLM / SGLang** | `pollard-export` | GPTQ 4/8-bit `dynamic` mix (Marlin) | **GPU-cluster serving** where every token counts — vLLM's tensor-parallel over your fast interconnect. Then `vllm serve …-Pollard-GPTQ --quantization gptq`. |
+| **GPTQ** — torch / HF | `pollard-gptq` | INT3/INT4 error-feedback (full-Hessian) | GPU low-bit with the reconstruction lever an imatrix can't do (recovers ~46% of round-to-nearest's 4-bit error). |
+
+**Choosing:**
+- **Fits one box, want max compression** → GGUF (the 1-bit trellis flagship).
+- **Cluster / "every token counts" serving** → vLLM/SGLang via `pollard-export`.
+  vLLM does real **tensor-parallel** over the fast network — sidestepping
+  llama.cpp's slower RPC **pipeline-parallel** (that GGUF-cluster path still
+  exists — see [Across machines](#across-machines-pool-their-ram) — when you'd
+  rather keep the exact GGUF and just pool RAM).
+- **GPU, strongest low-bit reconstruction** → `pollard-gptq`.
+
+The ~1-bit **trellis** format is GGUF-only (vLLM/SGLang's Marlin kernel is
+4/8-bit), so the vLLM lane trades some compression for fast distributed tokens —
+same allocation, higher floor. The agent skill
+([`skills/pollard/SKILL.md`](skills/pollard/SKILL.md)) routes a model down the
+right lane automatically.
+
 ## Workflow — run these in order
 
 The win over uniform quants is a **calibration** step. Skip it and you get a

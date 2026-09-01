@@ -44,6 +44,7 @@ drive a path yourself or understand what `pollard` chose.
 |---|---|---|
 | **DENSE** | imatrix K-quant ladder (`pollard-fit`) **+ the IQ1_KT mixed-precision flagship** (the hand-coded mix — won 7B/14B) | ⛔ sensitivity SWEEP on dense = loses (no expert redundancy) → `pollard-sensitivity` refuses it |
 | **MoE** | the **trellis mixed-precision mix** (`automap` WITH an imatrix) | ⛔ `automap --no-imatrix` K-quant mix = **DEPRECATED**, does NOT beat stock `Q2_K` (imatrix-free build → just use a stock K-quant ladder) · ⛔ sensitivity SWEEP on a big MoE = ~2·layers full-model quantizes = HOURS → refused unless `--allow-slow` |
+| **MoE variants** (MLA / hyper-connection / DSA-indexer — Deepseek, Tencent Hy4/hy_v4, etc.) | **still just MoE → THE MoE recipe.** `automap` detects the features generically (labels e.g. `MoE +MLA+hyper-conn+DSA-indexer`) and routes by `is_moe`, NOT by model name. The MoE `attn_q/k/v` rules substring-match MLA (`k_b`/`kv_a_mqa`/`v_b`/`q_a`/`q_b`); the recipe also covers `attn_gate`/`hc_*_fn`/`indexer.proj`/`output_hc_fn`/dense-blk0 (no-op on Qwen3). Same policy, same tiers | ⛔ do NOT build a per-model recipe (esp. from a buggy run) · these need a COVERED imatrix (many experts — the coverage lesson at scale) |
 
 The **mixed-precision hand-coded mix** (crush body → protect attn/down/first-last) is the BUILD,
 proven by palette/lowbit and shipped across GGUF (`automap`), torch/GPU (`gptq --recipe`), and

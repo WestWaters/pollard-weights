@@ -48,8 +48,15 @@ def imatrix_covered(path):
 
 # matmul/expert tensors that a very-low-bit build needs an imatrix for; anything here
 # NOT covered by the imatrix must be pinned to a non-imatrix type or the build hard-fails.
+# Every matmul that a trellis (iq*_kt) build consults an imatrix for. Includes the MLA
+# up-/down-projections (attn_q_a/q_b, attn_k_b, attn_v_b, attn_kv_a_mqa, attn_kv_b) — ik_llama's
+# imatrix STRUCTURALLY skips attn_k_b/v_b/kv_b (its MLA forward path uses a different layout),
+# and they can't be copy-covered (their input is the compressed KV latent, shared with nothing),
+# so when uncovered they MUST be pinned to a K-quant or the low-bit build hard-fails ("Missing
+# importance matrix ... bailing out"). Norms (attn_*_norm) are excluded — they stay F32.
 _NEEDS_IMATRIX = re.compile(
-    r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?|attn_(q|k|v|qkv|output))\.weight$")
+    r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?"
+    r"|attn_(q|k|v|qkv|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
 
 
 def uncovered_pins(all_names, imatrix, fallback="q6_K"):
@@ -65,18 +72,72 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
     return pins, len(cov)
 
 
+def ensure_gate_coverage(imatrix_path):
+    """Auto-cover the SwiGLU gate side of a fused MoE ffn. ik_llama's imatrix routinely SKIPS
+    ffn_gate_exps / ffn_gate_shexp / the dense ffn_gate (observed on Qwen3-30B-A3B, DeepSeek-V2,
+    Hy4) — gate and up share the SAME input, so their importance is identical. Left uncovered,
+    the biggest param group (gate) either bloats to a q6 pin or hard-fails the low-bit build.
+    Copy every covered `ffn_up*` entry to its `ffn_gate*` name, write a sibling `*.gatefix.imatrix`,
+    and return its path so the whole flow (pins + build) uses the covered imatrix with NO manual
+    step. Returns (path_to_use, n_copied); the original path + 0 when nothing needed copying or the
+    file can't be parsed (caller then proceeds unchanged)."""
+    import struct, os
+    try:
+        d = open(imatrix_path, "rb").read()
+        n = struct.unpack_from("<i", d, 0)[0]; pos = 4
+        entries = []
+        for _ in range(n):
+            ln = struct.unpack_from("<i", d, pos)[0]; pos += 4
+            if ln <= 0 or ln > 512:
+                return imatrix_path, 0
+            name = d[pos:pos + ln]; pos += ln
+            ncall = struct.unpack_from("<i", d, pos)[0]; pos += 4
+            nval = struct.unpack_from("<i", d, pos)[0]; pos += 4
+            floats = d[pos:pos + 4 * nval]; pos += 4 * nval
+            entries.append((name, ncall, nval, floats))
+    except Exception:
+        return imatrix_path, 0
+    have = {e[0] for e in entries}
+    added = 0
+    for name, ncall, nval, floats in list(entries):
+        if b"ffn_up" in name:
+            g = name.replace(b"ffn_up", b"ffn_gate")
+            if g not in have:
+                entries.append((g, ncall, nval, floats)); have.add(g); added += 1
+    if not added:
+        return imatrix_path, 0
+    out = os.path.splitext(imatrix_path)[0] + ".gatefix.imatrix"
+    try:
+        buf = struct.pack("<i", len(entries))
+        for name, ncall, nval, floats in entries:
+            buf += struct.pack("<i", len(name)) + name + struct.pack("<i", ncall) + struct.pack("<i", nval) + floats
+        open(out, "wb").write(buf)
+    except Exception:
+        return imatrix_path, 0          # couldn't write -> proceed with the original (pins will cover)
+    return out, added
+
+
 def parse_tensors(path):
-    """Return (names, n_layers, is_moe). Accepts dry-run lines or bare tensor names."""
+    """Return (names, n_layers, is_moe, arch). Detect the architecture CLASS generically and
+    route by it — dense -> dense recipe; ANY MoE -> THE MoE recipe (which covers both the
+    Qwen-style tensor names AND the MLA / hyper-connection / DSA-indexer variants that Deepseek,
+    Hy4, etc. use). `arch` is a human descriptor for the label from the features present — never
+    a per-model special case. Accepts dry-run lines or bare tensor names."""
     names = []
     for ln in open(path, encoding="utf-8", errors="ignore"):
-        m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output\.weight|output_norm\.weight)", ln)
+        m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output[\w.]*\.weight|output_norm\.weight)", ln)
         if m:
             names.append(m.group(1))
     names = sorted(set(names))
     layers = [int(m.group(1)) for n in names for m in [re.match(r"blk\.(\d+)\.", n)] if m]
     n_layers = (max(layers) + 1) if layers else 0
     is_moe = any("exps" in n or "ffn_gate_inp" in n for n in names)
-    return names, n_layers, is_moe
+    feats = []                                             # generic architecture features
+    if any("attn_k_b" in n or "kv_a_mqa" in n or "attn_q_b" in n for n in names): feats.append("MLA")
+    if any(".hc_" in n for n in names): feats.append("hyper-conn")
+    if any(".indexer." in n for n in names): feats.append("DSA-indexer")
+    arch = ("MoE" if is_moe else "dense") + (f" +{'+'.join(feats)}" if feats else "")
+    return names, n_layers, is_moe, arch
 
 
 # ---- the real ik_llama.cpp extreme-low ladder (from `llama-quantize --help`) ----
@@ -162,6 +223,14 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
         cq += [f"ffn_gate_exps={body}", f"ffn_up_exps={body}", f"ffn_down_exps={protect}",
                "ffn_gate_inp=q6_K",                       # router: never crushed
                f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", f"ffn_down_shexp={shexp_down}"]
+        # (2b) HYV4 (MLA + hyper-connection + DSA-indexer MoE) runs through THIS recipe, not a
+        # separate one. Its MLA attn (attn_k_b/v_b/q_a/q_b/kv_a_mqa) is already caught by the
+        # attn_q/k/v rules below (substring); these add the tensors those rules MISS —
+        # attn_gate, the hyper-connections, indexer.proj, output hc, and the dense block-0 FFN —
+        # protected at the same tier. All no-ops on Qwen3-MoE (those tensors don't exist there).
+        cq += [f"attn_gate={protect}", f"hc_attn_fn={protect}", f"hc_ffn_fn={protect}",
+               f"indexer\\.proj={protect}", f"output_hc_fn={protect}",
+               f"ffn_gate\\.weight={protect}", f"ffn_up\\.weight={protect}"]
     # (3) general roles. Grok's policy: PROTECT attn v/o (they carry the distribution); q/k
     # are less critical. On DENSE the shipped 7B/14B recipe crushed k,v and still won, so keep
     # it. On MoE, crushing attn_v was measured to LOSE KLD vs uniform IQ1 (30B: mix 0.371 >
@@ -172,10 +241,11 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     return flags, cq
 
 
+
 def emit_bat(a, n_layers, is_moe, names):
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)     # imatrix-free (decoupled MoE) build?
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # dense/MoE (MoE covers MLA/hc/DSA)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
     # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
@@ -270,12 +340,12 @@ def main():
     else:
         a.body = a.body or "iq1_kt"
         a.protect = a.protect or "iq2_kt"
-    names, n_layers, is_moe = parse_tensors(a.tensors)
+    names, n_layers, is_moe, arch = parse_tensors(a.tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
     # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate — its
     # win is imatrix-guided K-quants, not this. Refuse dense (saves everyone the wrong-tool
-    # run) unless --allow-dense (the research 1-bit-mix / gold-card case).
+    # run) unless --allow-dense (the research 1-bit-mix / gold-card case). HYV4 IS a MoE.
     if not is_moe and not a.allow_dense:
         sys.exit("REFUSED: this is a DENSE model, and automap is the MoE path.\n"
                  "  Dense models -> imatrix-guided K-quants (IQ3_S/IQ4_XS/Q6_K); the measured\n"
@@ -284,17 +354,27 @@ def main():
                  "  research 1-bit-mix case (the gold-card).")
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)
-    print(f"parsed: {len(names)} tensors, {n_layers} layers, {'MoE' if is_moe else 'dense'}")
+    kind = arch
+    print(f"parsed: {len(names)} tensors, {n_layers} layers, {kind}")
     print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)"
           f"  ->  {'imatrix-FREE (K-quant) build' if kfree else 'imatrix-guided (trellis) build'}")
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
-    print("Mix policy:")
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # HY4 runs through THE MoE recipe
+    print(f"Mix policy: [{arch} -> {'MoE' if is_moe else 'dense'} recipe]")
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
     if kfree:
         print("  imatrix : NONE — every atom is a K-quant, so the build reads no importance "
               "matrix (no coverage problem, no 6-hour imatrix step, kill-proof).")
     else:
+        # AUTO gate-copy: cover the SwiGLU gate side (ik's imatrix skips it) BEFORE pinning, so the
+        # experts crush cleanly instead of bloating to q6 — no manual imatrix_fix_gate step. Uses
+        # the fixed imatrix for both the pins below AND the emitted build (a.imatrix is what set IM=).
+        if is_moe:
+            fixed, ncopied = ensure_gate_coverage(a.imatrix)
+            if ncopied:
+                print(f"  gate-copy: covered {ncopied} SwiGLU gate tensor(s) from up (wrote "
+                      f"{fixed.split(chr(92))[-1].split('/')[-1]}); build uses the covered imatrix.")
+                a.imatrix = fixed
         pins, ncov = uncovered_pins(names, a.imatrix)
         if ncov is None:
             print("  imatrix : could not read coverage (skipping pins — build may fail on "
