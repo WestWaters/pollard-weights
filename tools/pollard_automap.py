@@ -48,8 +48,15 @@ def imatrix_covered(path):
 
 # matmul/expert tensors that a very-low-bit build needs an imatrix for; anything here
 # NOT covered by the imatrix must be pinned to a non-imatrix type or the build hard-fails.
+# Every matmul that a trellis (iq*_kt) build consults an imatrix for. Includes the MLA
+# up-/down-projections (attn_q_a/q_b, attn_k_b, attn_v_b, attn_kv_a_mqa, attn_kv_b) — ik_llama's
+# imatrix STRUCTURALLY skips attn_k_b/v_b/kv_b (its MLA forward path uses a different layout),
+# and they can't be copy-covered (their input is the compressed KV latent, shared with nothing),
+# so when uncovered they MUST be pinned to a K-quant or the low-bit build hard-fails ("Missing
+# importance matrix ... bailing out"). Norms (attn_*_norm) are excluded — they stay F32.
 _NEEDS_IMATRIX = re.compile(
-    r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?|attn_(q|k|v|qkv|output))\.weight$")
+    r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?"
+    r"|attn_(q|k|v|qkv|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
 
 
 def uncovered_pins(all_names, imatrix, fallback="q6_K"):
@@ -63,6 +70,51 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
     pins = [rf"{re.escape(nm)}={fallback}" for nm in all_names
             if _NEEDS_IMATRIX.search(nm) and nm not in cov]
     return pins, len(cov)
+
+
+def ensure_gate_coverage(imatrix_path):
+    """Auto-cover the SwiGLU gate side of a fused MoE ffn. ik_llama's imatrix routinely SKIPS
+    ffn_gate_exps / ffn_gate_shexp / the dense ffn_gate (observed on Qwen3-30B-A3B, DeepSeek-V2,
+    Hy4) — gate and up share the SAME input, so their importance is identical. Left uncovered,
+    the biggest param group (gate) either bloats to a q6 pin or hard-fails the low-bit build.
+    Copy every covered `ffn_up*` entry to its `ffn_gate*` name, write a sibling `*.gatefix.imatrix`,
+    and return its path so the whole flow (pins + build) uses the covered imatrix with NO manual
+    step. Returns (path_to_use, n_copied); the original path + 0 when nothing needed copying or the
+    file can't be parsed (caller then proceeds unchanged)."""
+    import struct, os
+    try:
+        d = open(imatrix_path, "rb").read()
+        n = struct.unpack_from("<i", d, 0)[0]; pos = 4
+        entries = []
+        for _ in range(n):
+            ln = struct.unpack_from("<i", d, pos)[0]; pos += 4
+            if ln <= 0 or ln > 512:
+                return imatrix_path, 0
+            name = d[pos:pos + ln]; pos += ln
+            ncall = struct.unpack_from("<i", d, pos)[0]; pos += 4
+            nval = struct.unpack_from("<i", d, pos)[0]; pos += 4
+            floats = d[pos:pos + 4 * nval]; pos += 4 * nval
+            entries.append((name, ncall, nval, floats))
+    except Exception:
+        return imatrix_path, 0
+    have = {e[0] for e in entries}
+    added = 0
+    for name, ncall, nval, floats in list(entries):
+        if b"ffn_up" in name:
+            g = name.replace(b"ffn_up", b"ffn_gate")
+            if g not in have:
+                entries.append((g, ncall, nval, floats)); have.add(g); added += 1
+    if not added:
+        return imatrix_path, 0
+    out = os.path.splitext(imatrix_path)[0] + ".gatefix.imatrix"
+    try:
+        buf = struct.pack("<i", len(entries))
+        for name, ncall, nval, floats in entries:
+            buf += struct.pack("<i", len(name)) + name + struct.pack("<i", ncall) + struct.pack("<i", nval) + floats
+        open(out, "wb").write(buf)
+    except Exception:
+        return imatrix_path, 0          # couldn't write -> proceed with the original (pins will cover)
+    return out, added
 
 
 def parse_tensors(path):
@@ -314,6 +366,15 @@ def main():
         print("  imatrix : NONE — every atom is a K-quant, so the build reads no importance "
               "matrix (no coverage problem, no 6-hour imatrix step, kill-proof).")
     else:
+        # AUTO gate-copy: cover the SwiGLU gate side (ik's imatrix skips it) BEFORE pinning, so the
+        # experts crush cleanly instead of bloating to q6 — no manual imatrix_fix_gate step. Uses
+        # the fixed imatrix for both the pins below AND the emitted build (a.imatrix is what set IM=).
+        if is_moe:
+            fixed, ncopied = ensure_gate_coverage(a.imatrix)
+            if ncopied:
+                print(f"  gate-copy: covered {ncopied} SwiGLU gate tensor(s) from up (wrote "
+                      f"{fixed.split(chr(92))[-1].split('/')[-1]}); build uses the covered imatrix.")
+                a.imatrix = fixed
         pins, ncov = uncovered_pins(names, a.imatrix)
         if ncov is None:
             print("  imatrix : could not read coverage (skipping pins — build may fail on "

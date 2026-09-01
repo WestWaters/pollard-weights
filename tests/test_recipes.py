@@ -92,6 +92,41 @@ def test_cq_casing():
     assert A._bar_type("iq1_kt") == "IQ1_KT"
 
 
+# ---- MLA up-projections need imatrix (regression: build hard-fails if unpinned) --------------
+def test_mla_tensors_need_imatrix():
+    # ik_llama's imatrix structurally skips attn_k_b/v_b/kv_b; when uncovered they MUST be
+    # flagged (so uncovered_pins pins them to q6_K) or the trellis build bails out. This is the
+    # exact bug that killed the DeepSeek-V2-Lite board (blk.0.attn_v_b, "Missing importance
+    # matrix in a very low-bit quantization").
+    for nm in ["blk.0.attn_k_b.weight", "blk.5.attn_v_b.weight", "blk.9.attn_kv_b.weight",
+               "blk.3.attn_kv_a_mqa.weight", "blk.7.attn_q_a.weight", "blk.7.attn_q_b.weight",
+               "blk.1.ffn_gate_exps.weight", "blk.1.attn_output.weight"]:
+        assert A._NEEDS_IMATRIX.search(nm), f"{nm} must be flagged as imatrix-required"
+    # norms and 1D tensors stay F32 -> must NOT be flagged (would pin harmlessly but noisily)
+    for nm in ["blk.0.attn_norm.weight", "blk.0.attn_kv_a_norm.weight", "blk.0.attn_q_a_norm.weight",
+               "blk.0.ffn_norm.weight"]:
+        assert not A._NEEDS_IMATRIX.search(nm), f"{nm} is a norm, must NOT be flagged"
+
+
+# ---- auto gate-copy wired into automap (no manual imatrix_fix_gate step) ----------------------
+def test_auto_gate_copy():
+    import struct, tempfile
+    def entry(nm, vals):
+        return (struct.pack("<i", len(nm)) + nm + struct.pack("<i", 7)
+                + struct.pack("<i", len(vals)) + b"".join(struct.pack("<f", v) for v in vals))
+    ents = [entry(b"blk.0.ffn_up_exps.weight", [1.0, 2.0, 3.0]),      # up covered, gate MISSING
+            entry(b"blk.0.ffn_down_exps.weight", [4.0, 5.0])]
+    f = tempfile.NamedTemporaryFile(suffix=".imatrix", delete=False)
+    f.write(struct.pack("<i", len(ents)) + b"".join(ents)); f.close()
+    fixed, n = A.ensure_gate_coverage(f.name)
+    assert n == 1 and fixed.endswith(".gatefix.imatrix"), f"expected 1 gate copied, got {n} -> {fixed}"
+    cov = A.imatrix_covered(fixed)
+    assert "blk.0.ffn_gate_exps.weight" in cov, "gate must now be covered (copied from up)"
+    # idempotent: re-running on the fixed file copies nothing more
+    _, n2 = A.ensure_gate_coverage(fixed)
+    assert n2 == 0, f"gate already covered -> should copy 0, got {n2}"
+
+
 # ---- dense recipe (shipped, MUST NOT change: crush attn k/v, protect q/out/down) -------------
 def test_dense_recipe():
     _, cq = A.recipe_flags(4, is_moe=False, body="iq1_kt", protect="iq2_kt")

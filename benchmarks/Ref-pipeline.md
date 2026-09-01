@@ -113,7 +113,7 @@ To make the claim travel (method, not fluke): the same green board on **≥2 mod
 |---|---|---|
 | dense | mixed prose+code imatrix | the win IS the imatrix; no per-layer sweep (doesn't beat uniform on dense) |
 | MoE | **diverse** prose+code+varied, 200+ chunks | must route to the experts or low-bit fails; auto-pin covers the tail |
-| MLA/hyper-conn/DSA MoE (Deepseek, Hy4) | 🔬 verifying — likely = MoE calib | may need a coverage tweak (more chunks for more experts, or a tensor-copy like Hy4's gate/up). Lock whatever proves golden. **May need nothing.** |
+| MLA/hyper-conn/DSA MoE (Deepseek, Hy4) | ✅ = MoE calib, unchanged recipe | Verified on DeepSeek-V2-Lite: automap self-routes `MoE +MLA` → the MoE recipe, **quant win proven (−57% PPL / −61% KLD / +14.8 pt top-1 vs uniform-low @ +1.5% size), zero recipe changes.** Three MECHANICAL onboarding fixes, all now automatic + regression-tested (not recipe changes): (a) convert bails on an unknown tokenizer hash → add the hash→pre-tokenizer entry; (b) ik's imatrix skips the SwiGLU **gate** (`ffn_gate_exps/shexp`) → `automap` now **auto-copies `up→gate`** (`ensure_gate_coverage`, writes `*.gatefix.imatrix`) — no manual step; (c) ik's imatrix structurally skips MLA `attn_k_b/v_b/kv_b` (can't copy-cover) → `_NEEDS_IMATRIX` flags them so they pin to q6_K. ⚠️ **Size floor:** a *shippable* 1-bit card needs the model big enough that its coherence floor is ≤ 1-bit — small/sparse models (DeepSeek-V2-Lite = 2.4B active) loop on free-gen at 1-bit and need ≥2-bit (where the mix ≈ uniform). Big MLA-MoEs (Hy4) are above the floor. This is a per-model SIZE property, not a recipe/class limit. |
 
 ---
 
@@ -127,9 +127,16 @@ To make the claim travel (method, not fluke): the same green board on **≥2 mod
   here in `benchmarks/`, opt-in. Shipping them in the build is what caused the "3-hour" runs.
 - **Measure, don't assume.** `imatrix magnitude LIES` (big activations ≠ high KL). Protect what the
   measurement (KL / the decision table) says, not a guess.
-- **Infra bites:** disk-full truncates KL base logits mid-run; f16 won't fit RAM (use a Q6 host);
+- **Infra bites:** disk-full truncates KL base logits mid-run; f16 won't fit RAM (use a Q6/Q8 host);
   `-ngl 99` OOMs a big model on a small card (lower it — KL is offload-invariant); the case-sensitive
-  `q3_K` in `--custom-q`; `set VAR=x &&` in cmd captures a trailing space. Check the machine first.
+  `q3_K` in `--custom-q`; `set VAR=x &&` in cmd captures a trailing space; **ik_llama REFUSES a q8_0
+  source** for quantize → `--allow-requantize` (or build from f16). Check the machine first.
+- **Don't over-generalize from one model.** A too-small model failing the *chat* gate at 1-bit is a
+  per-model SIZE property (its coherence floor > 1-bit), NOT a recipe or class failure — do NOT write
+  class-level "no win" conclusions from it, and do NOT keep elevating the bit tier chasing a win.
+  Bank the two facts (recipe generalizes; this model is above the floor) and move to a properly-sized
+  model. And **sampling-first:** a low-bit mix that loops is usually sampling (rep-pen 1.15–1.18, temp
+  ≤0.7, correct stops) — exhaust that before ANY recipe/tier change.
 - **Compaction regresses this.** The winning method + this pipeline are banked to memory; read the
   anti-regression anchor before touching Pollard.
 
