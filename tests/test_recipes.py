@@ -108,6 +108,33 @@ def test_mla_tensors_need_imatrix():
         assert not A._NEEDS_IMATRIX.search(nm), f"{nm} is a norm, must NOT be flagged"
 
 
+# ---- coherence-gate loop detector (pure heuristic; the real mix failures vs coherent Q8) ------
+def test_loop_detector():
+    import pollard_bench as B
+    loops = [
+        "as big as the " * 15,                                              # phrase loop (the 1-bit mix)
+        "Sg" * 60,                                                          # char loop ('SgSgSg...')
+        "The largest planet in our solar system is the largest planet in our solar system. " * 6,
+        "Planet of France and Planet of France " * 8,
+    ]
+    for t in loops:
+        is_loop, m, why = B.detect_loop(t)
+        assert is_loop, f"should flag loop: {t[:40]!r} -> {why}"
+    coherent = [
+        "The largest planet in our solar system is Jupiter. There are eight planets: Mercury, "
+        "Venus, Earth, Mars, Jupiter, Saturn, Uranus, and Neptune, each orbiting the sun.",
+        "def fib(n):\n    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n"
+        "        return fib(n-1) + fib(n-2)\n\nfor i in range(10):\n    print(fib(i))",
+        "Photosynthesis is how green plants convert sunlight, water, and carbon dioxide into "
+        "glucose and oxygen, using chlorophyll in their leaves to capture the light energy.",
+    ]
+    for t in coherent:
+        is_loop, m, why = B.detect_loop(t)
+        assert not is_loop, f"should NOT flag coherent: {t[:40]!r} -> {why} (metric {m})"
+    # too-short output is undecided, not a loop
+    assert not B.detect_loop("Jupiter.")[0]
+
+
 # ---- auto gate-copy wired into automap (no manual imatrix_fix_gate step) ----------------------
 def test_auto_gate_copy():
     import struct, tempfile
