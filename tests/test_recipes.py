@@ -73,12 +73,15 @@ def _apply(cq, base, name):
 
 # ---- detection -------------------------------------------------------------------------------
 def test_detection():
-    for names, exp_moe, exp_hyv4 in [(_dense(), False, False), (_moe(), True, False),
-                                     (_hyv4(), True, True)]:
-        _, nl, is_moe, is_hyv4 = A.parse_tensors(_tensorfile(names))
+    # generic architecture-class detection (not per-model): dense / MoE / MoE +features
+    for names, exp_moe, feats in [(_dense(), False, []), (_moe(), True, []),
+                                  (_hyv4(), True, ["MLA", "hyper-conn", "DSA-indexer"])]:
+        _, nl, is_moe, arch = A.parse_tensors(_tensorfile(names))
         assert nl == 4, f"layers {nl}"
         assert is_moe == exp_moe, f"is_moe {is_moe} != {exp_moe}"
-        assert is_hyv4 == exp_hyv4, f"is_hyv4 {is_hyv4} != {exp_hyv4}"
+        assert arch.startswith("MoE" if exp_moe else "dense"), f"arch '{arch}'"
+        for f in feats:
+            assert f in arch, f"feature {f} not detected in arch '{arch}'"
 
 
 # ---- encoder rules (the casing bug) ----------------------------------------------------------

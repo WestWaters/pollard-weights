@@ -66,7 +66,11 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
 
 
 def parse_tensors(path):
-    """Return (names, n_layers, is_moe, is_hyv4). Accepts dry-run lines or bare tensor names."""
+    """Return (names, n_layers, is_moe, arch). Detect the architecture CLASS generically and
+    route by it — dense -> dense recipe; ANY MoE -> THE MoE recipe (which covers both the
+    Qwen-style tensor names AND the MLA / hyper-connection / DSA-indexer variants that Deepseek,
+    Hy4, etc. use). `arch` is a human descriptor for the label from the features present — never
+    a per-model special case. Accepts dry-run lines or bare tensor names."""
     names = []
     for ln in open(path, encoding="utf-8", errors="ignore"):
         m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output[\w.]*\.weight|output_norm\.weight)", ln)
@@ -76,12 +80,12 @@ def parse_tensors(path):
     layers = [int(m.group(1)) for n in names for m in [re.match(r"blk\.(\d+)\.", n)] if m]
     n_layers = (max(layers) + 1) if layers else 0
     is_moe = any("exps" in n or "ffn_gate_inp" in n for n in names)
-    # HYV4 (Tencent Hy4-preview / hy_v4): a Deepseek-derived MLA + DSA-indexer + hyper-connection
-    # MoE. It IS a MoE and runs through THE MoE recipe (extended to cover its MLA/hc/indexer
-    # tensor names); this flag is just for the label / awareness, not a separate recipe.
-    is_hyv4 = any(".hc_" in n or ".indexer." in n or "attn_k_b" in n or "exp_probs_b" in n
-                  for n in names)
-    return names, n_layers, is_moe, is_hyv4
+    feats = []                                             # generic architecture features
+    if any("attn_k_b" in n or "kv_a_mqa" in n or "attn_q_b" in n for n in names): feats.append("MLA")
+    if any(".hc_" in n for n in names): feats.append("hyper-conn")
+    if any(".indexer." in n for n in names): feats.append("DSA-indexer")
+    arch = ("MoE" if is_moe else "dense") + (f" +{'+'.join(feats)}" if feats else "")
+    return names, n_layers, is_moe, arch
 
 
 # ---- the real ik_llama.cpp extreme-low ladder (from `llama-quantize --help`) ----
@@ -186,12 +190,10 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
 
 
 
-def emit_bat(a, n_layers, is_moe, names, is_hyv4=False):
+def emit_bat(a, n_layers, is_moe, names):
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)     # imatrix-free (decoupled MoE) build?
-    # HYV4 IS a MoE — it runs through THE MoE recipe (which now covers its MLA/hc/indexer names),
-    # NOT a separate recipe. is_hyv4 is only used for the label.
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # dense/MoE (MoE covers MLA/hc/DSA)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
     # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
@@ -286,7 +288,7 @@ def main():
     else:
         a.body = a.body or "iq1_kt"
         a.protect = a.protect or "iq2_kt"
-    names, n_layers, is_moe, is_hyv4 = parse_tensors(a.tensors)
+    names, n_layers, is_moe, arch = parse_tensors(a.tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
     # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate — its
@@ -300,12 +302,12 @@ def main():
                  "  research 1-bit-mix case (the gold-card).")
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)
-    kind = "HYV4 (MLA+DSA+hyper-conn MoE)" if is_hyv4 else ("MoE" if is_moe else "dense")
+    kind = arch
     print(f"parsed: {len(names)} tensors, {n_layers} layers, {kind}")
     print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)"
           f"  ->  {'imatrix-FREE (K-quant) build' if kfree else 'imatrix-guided (trellis) build'}")
     flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # HY4 runs through THE MoE recipe
-    print("Mix policy:" + ("  [HYV4 detected — using the MoE recipe (MLA/hc/indexer covered)]" if is_hyv4 else ""))
+    print(f"Mix policy: [{arch} -> {'MoE' if is_moe else 'dense'} recipe]")
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
     if kfree:
@@ -324,7 +326,7 @@ def main():
                      if len(pins) > n_layers else ""))
         if not is_moe and pins:
             print("  (dense model with uncovered tensors — unusual; check the imatrix.)")
-    open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names, is_hyv4=is_hyv4))
+    open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names))
     print(f"wrote {a.out}")
 
 
