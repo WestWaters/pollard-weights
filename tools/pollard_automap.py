@@ -77,8 +77,8 @@ def parse_tensors(path):
     n_layers = (max(layers) + 1) if layers else 0
     is_moe = any("exps" in n or "ffn_gate_inp" in n for n in names)
     # HYV4 (Tencent Hy4-preview / hy_v4): a Deepseek-derived MLA + DSA-indexer + hyper-connection
-    # MoE. Its tensors (hc_*, indexer.*, attn_k_b/v_b, exp_probs_b) are named nothing like Qwen3-
-    # MoE, so it needs its OWN recipe — the THIRD canonical path.
+    # MoE. It IS a MoE and runs through THE MoE recipe (extended to cover its MLA/hc/indexer
+    # tensor names); this flag is just for the label / awareness, not a separate recipe.
     is_hyv4 = any(".hc_" in n or ".indexer." in n or "attn_k_b" in n or "exp_probs_b" in n
                   for n in names)
     return names, n_layers, is_moe, is_hyv4
@@ -167,6 +167,14 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
         cq += [f"ffn_gate_exps={body}", f"ffn_up_exps={body}", f"ffn_down_exps={protect}",
                "ffn_gate_inp=q6_K",                       # router: never crushed
                f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", f"ffn_down_shexp={shexp_down}"]
+        # (2b) HYV4 (MLA + hyper-connection + DSA-indexer MoE) runs through THIS recipe, not a
+        # separate one. Its MLA attn (attn_k_b/v_b/q_a/q_b/kv_a_mqa) is already caught by the
+        # attn_q/k/v rules below (substring); these add the tensors those rules MISS —
+        # attn_gate, the hyper-connections, indexer.proj, output hc, and the dense block-0 FFN —
+        # protected at the same tier. All no-ops on Qwen3-MoE (those tensors don't exist there).
+        cq += [f"attn_gate={protect}", f"hc_attn_fn={protect}", f"hc_ffn_fn={protect}",
+               f"indexer\\.proj={protect}", f"output_hc_fn={protect}",
+               f"ffn_gate\\.weight={protect}", f"ffn_up\\.weight={protect}"]
     # (3) general roles. Grok's policy: PROTECT attn v/o (they carry the distribution); q/k
     # are less critical. On DENSE the shipped 7B/14B recipe crushed k,v and still won, so keep
     # it. On MoE, crushing attn_v was measured to LOSE KLD vs uniform IQ1 (30B: mix 0.371 >
@@ -177,51 +185,13 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     return flags, cq
 
 
-def recipe_flags_hyv4(n_layers, body="iq1_kt", protect="iq2_kt"):
-    """THE HYV4 canonical recipe (Tencent Hy4-preview / hy_v4) — the THIRD path. A Deepseek-
-    derived MLA + DSA-indexer + hyper-connection MoE, tensors named nothing like Qwen3-MoE.
-    Policy: crush the fat expert body (ffn_gate/up_exps); protect the residual writer
-    (ffn_down_exps), shared experts, dense block-0 FFN, router, ALL MLA attention, the
-    hyper-connections (hc_*_fn), the DSA indexer, and the output hc. Norms / base / scale /
-    exp_probs_b / attn_sinks stay F32 (llama-quantize keeps those F32 — no rule needed).
-    attn_k_b kept a tier HIGHER: Frank measured IQ4_XS regressed it (MLA absorption weight).
-    Rules use `\\.weight` so `attn_q_a` doesn't also grab `attn_q_a_norm`.  v1 — MEASURE on the
-    real model (Frank's rig) and tighten like any card; do NOT assume it's final."""
-    body, protect = _cq(body), _cq(protect)
-    kb = "q8_0" if is_kquant(protect) else _cq("iq3_kt")   # attn_k_b one tier up
-    flags = ["--output-tensor-type Q6_K", "--token-embedding-type Q4_K"]
-    cq = []
-    edge = [0, 1, n_layers - 2, n_layers - 1]
-    for i in sorted(set(x for x in edge if 0 <= x < n_layers)):
-        cq.append(rf"blk\.{i}\.={protect}")                # edge whole-block protect (incl. dense blk.0)
-    cq += [
-        # crush the fat expert body
-        f"ffn_gate_exps\\.weight={body}", f"ffn_up_exps\\.weight={body}",
-        # residual writer + shared experts + dense block-0 FFN + router
-        f"ffn_down_exps\\.weight={protect}",
-        f"ffn_gate_shexp\\.weight={protect}", f"ffn_up_shexp\\.weight={protect}",
-        f"ffn_down_shexp\\.weight={protect}",
-        f"ffn_gate\\.weight={protect}", f"ffn_up\\.weight={protect}", f"ffn_down\\.weight={protect}",
-        "ffn_gate_inp\\.weight=q6_K",
-        # MLA attention — all protected; k_b a tier higher
-        f"attn_q_a\\.weight={protect}", f"attn_q_b\\.weight={protect}", f"attn_k_b\\.weight={kb}",
-        f"attn_v_b\\.weight={protect}", f"attn_kv_a_mqa\\.weight={protect}",
-        f"attn_gate\\.weight={protect}", f"attn_output\\.weight={protect}",
-        # hyper-connections + DSA indexer + output hc
-        f"hc_attn_fn\\.weight={protect}", f"hc_ffn_fn\\.weight={protect}",
-        f"indexer\\.attn_k\\.weight={protect}", f"indexer\\.attn_q_b\\.weight={protect}",
-        f"indexer\\.proj\\.weight={protect}", f"output_hc_fn\\.weight={protect}",
-    ]
-    return flags, cq
-
 
 def emit_bat(a, n_layers, is_moe, names, is_hyv4=False):
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)     # imatrix-free (decoupled MoE) build?
-    if is_hyv4:
-        flags, cq = recipe_flags_hyv4(n_layers, body, protect)   # THE third canonical recipe
-    else:
-        flags, cq = recipe_flags(n_layers, is_moe, body, protect)
+    # HYV4 IS a MoE — it runs through THE MoE recipe (which now covers its MLA/hc/indexer names),
+    # NOT a separate recipe. is_hyv4 is only used for the label.
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
     # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
@@ -334,8 +304,8 @@ def main():
     print(f"parsed: {len(names)} tensors, {n_layers} layers, {kind}")
     print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)"
           f"  ->  {'imatrix-FREE (K-quant) build' if kfree else 'imatrix-guided (trellis) build'}")
-    flags, cq = recipe_flags_hyv4(n_layers, body, protect) if is_hyv4 else recipe_flags(n_layers, is_moe, body, protect)
-    print("Mix policy:" + ("  [HYV4 third canonical recipe — v1, measure on the real model]" if is_hyv4 else ""))
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # HY4 runs through THE MoE recipe
+    print("Mix policy:" + ("  [HYV4 detected — using the MoE recipe (MLA/hc/indexer covered)]" if is_hyv4 else ""))
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
     if kfree:

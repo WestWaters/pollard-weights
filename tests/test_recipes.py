@@ -62,6 +62,15 @@ def _cq_map(cq):
     return dict(r.rsplit("=", 1) for r in cq)
 
 
+def _apply(cq, base, name):
+    """Simulate --custom-q (first-match-wins, ik uses re.search) on one tensor name."""
+    for rule in cq:
+        pat, typ = rule.rsplit("=", 1)
+        if re.search(pat, name):
+            return typ
+    return base
+
+
 # ---- detection -------------------------------------------------------------------------------
 def test_detection():
     for names, exp_moe, exp_hyv4 in [(_dense(), False, False), (_moe(), True, False),
@@ -99,22 +108,32 @@ def test_moe_recipe_protects_attn_v():
     assert m["ffn_gate_inp"] == "q6_K"                                       # router high
 
 
-# ---- HYV4 recipe (third path: MoE philosophy + MLA/hc/indexer; F32 norms untouched) ----------
-def test_hyv4_recipe():
-    _, cq = A.recipe_flags_hyv4(4, body="iq1_kt", protect="iq2_kt")
-    m = _cq_map(cq)
-    assert m["ffn_gate_exps\\.weight"] == "iq1_kt"                 # crush experts (MoE philosophy)
-    assert m["ffn_down_exps\\.weight"] == "iq2_kt"                 # protect residual writer
-    assert m["ffn_gate_inp\\.weight"] == "q6_K"                    # router high
-    assert m["attn_q_a\\.weight"] == "iq2_kt" and m["attn_v_b\\.weight"] == "iq2_kt"  # MLA protect
-    assert m["attn_k_b\\.weight"] == "iq3_kt"                      # MLA absorption a tier up
-    assert m["hc_attn_fn\\.weight"] == "iq2_kt" and m["hc_ffn_fn\\.weight"] == "iq2_kt"  # hyper-conn
-    assert m["indexer\\.attn_k\\.weight"] == "iq2_kt"             # DSA indexer
-    # F32 must stay F32: no custom-q rule may target a norm / base / scale / bias / sinks
-    joined = ",".join(cq)
-    for f32 in ["attn_norm", "ffn_norm", "attn_q_a_norm", "hc_attn_base", "hc_ffn_scale",
-                "exp_probs_b", "attn_sinks", "indexer.k_norm"]:
-        assert f32 not in joined, f"HYV4 recipe must NOT quantize F32 tensor {f32}"
+# ---- HYV4 runs through THE MoE recipe (no separate recipe; no Frank-buggy values) ------------
+def test_hyv4_via_moe_recipe():
+    # HY4 IS a MoE — the SAME recipe, applied to HY4's tensor names (8 layers so blk.4 is middle).
+    _, cq = A.recipe_flags(8, is_moe=True, body="iq1_kt", protect="iq2_kt")
+    ap = lambda n: _apply(cq, "iq1_kt", n)
+    # experts crush; residual writer + router protect (MoE policy, unchanged)
+    assert ap("blk.4.ffn_gate_exps.weight") == "iq1_kt" and ap("blk.4.ffn_up_exps.weight") == "iq1_kt"
+    assert ap("blk.4.ffn_down_exps.weight") == "iq2_kt" and ap("blk.4.ffn_gate_inp.weight") == "q6_K"
+    # HY4 MLA attention caught by the attn_q/k/v substring rules -> protected, same tier as attn
+    assert ap("blk.4.attn_k_b.weight") == "iq2_kt"       # attn_k substring (NOT a Frank iq3_kt special-case)
+    assert ap("blk.4.attn_v_b.weight") == "iq2_kt"       # attn_v
+    assert ap("blk.4.attn_q_a.weight") == "iq2_kt"       # attn_q
+    assert ap("blk.4.attn_kv_a_mqa.weight") == "iq2_kt"  # attn_k
+    # HY4-only tensors the substring rules miss -> explicit MoE-recipe protect rules
+    assert ap("blk.4.attn_gate.weight") == "iq2_kt"
+    assert ap("blk.4.hc_attn_fn.weight") == "iq2_kt" and ap("blk.4.hc_ffn_fn.weight") == "iq2_kt"
+    assert ap("blk.4.indexer.proj.weight") == "iq2_kt"
+    assert ap("blk.4.output_hc_fn.weight") == "iq2_kt"
+    # Non-norm special tensors that must NOT get a named rule (they fall through to base; llama-
+    # quantize then keeps them F32). Norms ARE substring-matched by attn_q/k rules but that's
+    # harmless — llama-quantize keeps norms/1D F32 regardless (proven on the 30B), so we don't
+    # over-assert on them here.
+    for f32 in ["exp_probs_b", "attn_sinks", "hc_attn_base", "hc_ffn_scale", "hc_attn_scale"]:
+        assert ap(f"blk.4.{f32}.weight") == "iq1_kt", f"{f32} must fall through to base, not a named rule"
+    # the removed separate recipe must be gone
+    assert not hasattr(A, "recipe_flags_hyv4"), "recipe_flags_hyv4 should be deleted — HY4 uses the MoE recipe"
 
 
 # ---- build vs benchmark (the split): --mix-only=1 build, --no-eval=0 PPL ----------------------
