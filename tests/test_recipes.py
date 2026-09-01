@@ -225,6 +225,16 @@ def test_build_vs_benchmark_split():
     assert bat_fast.count("llama-quantize") == 1 and bat_fast.count("llama-perplexity") == 0   # ONE model, no eval
 
 
+def test_gate_appended_to_oneshot_build():
+    # the one-shot (mix-only) build auto-appends the coherence gate on the finished mix
+    names = _moe()
+    bat = A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names)
+    assert "--coherence" in bat and "pollard_bench.py" in bat, "one-shot build must append the gate"
+    assert "deepseek" not in bat  # sanity: uses the emitted stem, not a stray path
+    bat_off = A.emit_bat(_Args(mix_only=True, no_eval=True, gate=False), 4, True, names)
+    assert "--coherence" not in bat_off, "--no-gate must omit the gate"
+
+
 # ---- guards (dense refused; deprecation warns) -----------------------------------------------
 def test_dense_guard():
     tf = _tensorfile(_dense())
