@@ -20,7 +20,7 @@ Usage:
   pollard-automap --tensors tensors.txt --model model-f16.gguf --imatrix ik.imatrix \
       --out build_mix.bat --bin C:\\pollard\\ik_llama.cpp\\build\\bin
 """
-import argparse, re, sys
+import argparse, os, re, sys
 
 
 def imatrix_covered(path):
@@ -293,6 +293,15 @@ def emit_bat(a, n_layers, is_moe, names):
     mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
     L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
           build("mix", _bar_type(body), mix_extra), *maybe_ppl("mix"), ""]
+    # Auto coherence gate on the finished mix — so a one-shot build also tells you if it's USABLE
+    # (coherent + which sampling to ship, or loops-under-every-sampling => bump a tier). Runs the
+    # quick loop-check + sampling sweep; resolved at emit time to this python + sibling pollard_bench.
+    if getattr(a, "gate", True):
+        gate_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pollard_bench.py")
+        cli = os.path.join(a.bin, "llama-cli.exe")
+        L += ["echo == coherence gate (loop check + sampling) == 1>> %LOG% 2>&1",
+              f'"{sys.executable}" "{gate_py}" --gguf {stem}-mix.gguf --coherence --ngl {a.ngl} '
+              f'--llama-cli "{cli}" 1>> %LOG% 2>&1', ""]
     L += [f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> %LOG% 2>&1"]
     return "\n".join(L)
 
@@ -327,6 +336,12 @@ def main():
     ap.add_argument("--allow-dense", action="store_true",
                     help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
                          "K-quants). Only for the research 1-bit-mix case (the gold-card).")
+    ap.add_argument("--no-gate", dest="gate", action="store_false",
+                    help="skip the auto coherence gate appended after the mix build. By default the "
+                         "emitted build runs a quick loop-check + sampling sweep on the finished mix "
+                         "(PASS+recommended sampling, or BELOW-FLOOR+bump-a-tier) so a one-shot build "
+                         "tells you if it's usable — no manual pollard-bench --coherence needed.")
+    ap.set_defaults(gate=True)
     a = ap.parse_args()
     # atom defaults: trellis (imatrix) by default; K-quant (imatrix-free) when --no-imatrix.
     if a.no_imatrix:
@@ -352,6 +367,15 @@ def main():
                  "  expert-allocation here doesn't apply (no expert redundancy to reallocate).\n"
                  "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
                  "  research 1-bit-mix case (the gold-card).")
+    # Transparency: an aliased atom (e.g. Hy4's STQ1_0) is an APPROXIMATION, not the real format —
+    # say so, so nobody thinks they built a true 1.31-bit STQ1_0 when they built 1.62-bit iq1_bn.
+    for label, raw in [("--body", a.body), ("--protect", a.protect), ("--rival", a.rival)]:
+        if raw and raw.lower() in ALIASES:
+            real = ALIASES[raw.lower()]
+            print(f"(!) {label} {raw}: NOT emittable by this llama.cpp -> building {real} "
+                  f"({QUANT_BPW.get(real, '?')} bpw), the nearest ternary. True {raw} (Hy4 MIX-STQ1_0's "
+                  f"~1.31-bit forced-zero 3:4 pack) needs AngelSlim/upstream STQ kernels; this is an "
+                  f"approximation at a higher bpw.", file=sys.stderr)
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)
     kind = arch

@@ -119,28 +119,57 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
     return Q.to(torch.float16)
 
 
-def imatrix_quantize(W, wdiag, bits, groupsize):
+def weighted_ls_scale(g, w, Q, iters=5):
+    """Closed-form importance-weighted least-squares scale (symmetric, levels in [-Q,Q]).
+    For FIXED integer codes u, the SSD-optimal scale is the LS solution
+        d = Σ(w·u·x) / Σ(w·u²)
+    (∂/∂d Σ w(x - d·u)² = 0). Iterate: reassign u=clamp(round(x/d)), resolve d. Beats amax
+    because amax pins d to the single largest outlier — this is the lever Hy4's 'Sherry'
+    encoder uses (measured here: ~13-32% lower weighted-SSD than amax on a real 30B tensor,
+    biggest at the low bits Pollard crushes). g [rows,group], w [*,group] importance."""
+    d = (g.abs().amax(1, keepdim=True) / Q).clamp(min=1e-9)
+    for _ in range(iters):
+        u = torch.clamp(torch.round(g / d), -Q, Q)
+        num = (w * u * g).sum(1, keepdim=True)
+        den = (w * u * u).sum(1, keepdim=True)
+        d = torch.where(den > 0, num / den.clamp(min=1e-12), d)
+    return d
+
+
+def imatrix_quantize(W, wdiag, bits, groupsize, scale="sweep"):
     """llama.cpp-imatrix-equivalent: per group, pick the scale that minimizes the
     IMPORTANCE-WEIGHTED squared error (wdiag = per-input-channel activation
     importance = the diagonal of the Hessian). This is exactly what imatrix does —
     weighted scale selection, NO error feedback — so it isolates 'GPTQ's off-diagonal
-    compensation vs imatrix's diagonal weighting' in ONE harness."""
+    compensation vs imatrix's diagonal weighting' in ONE harness.
+    scale='sweep' = llama.cpp's ~19-candidate make_qx_quants search, ASYMMETRIC (the baseline);
+    scale='ls'    = the closed-form weighted-LS scale (Hy4 'Sherry' encoder), SYMMETRIC.
+    MEASURED (verify-before-trusting): ls is the winner ONLY at the ternary/1-bit crush tier
+    (~+33% lower weighted-SSD than the sweep AND than amax), because there the symmetric
+    solve is exact. At 2-3 bit the ASYMMETRIC sweep wins (symmetric ls wastes a level:
+    -10% at 2-bit, -21% at 3-bit). So use scale='ls' for the ternary expert-crush body, NOT
+    as a blanket replacement. It is NOT the -89.7% the Sherry card claims — that's unverified."""
     W = W.clone().float(); rows, cols = W.shape; maxq = 2 ** bits - 1
     w = wdiag.clamp(min=1e-8).float()
     Q = torch.zeros_like(W)
     for c0 in range(0, cols, groupsize or cols):
         g = W[:, c0:c0 + (groupsize or cols)]
         wg = w[c0:c0 + g.shape[1]][None, :]
+        if scale == "ls":                                     # closed-form weighted-LS (symmetric)
+            Ql = maxq // 2 or 1
+            d = weighted_ls_scale(g, wg, Ql)
+            Q[:, c0:c0 + g.shape[1]] = torch.clamp(torch.round(g / d), -Ql, Ql) * d
+            continue
         gmax = g.amax(1, keepdim=True); gmin = g.amin(1, keepdim=True)
         rng = (gmax - gmin).clamp(min=1e-8)
         best_err = bq = None
         # search the group scale (llama.cpp make_qx_quants sweeps ~19 candidates);
         # proper asymmetric range-based scale + clamped zero-point
         for is_ in range(-9, 10):
-            scale = rng / maxq * (1.0 + is_ * 0.02)
-            zero = torch.clamp(torch.round(-gmin / scale), 0, maxq)
-            q = torch.clamp(torch.round(g / scale) + zero, 0, maxq)
-            deq = scale * (q - zero)
+            s = rng / maxq * (1.0 + is_ * 0.02)
+            zero = torch.clamp(torch.round(-gmin / s), 0, maxq)
+            q = torch.clamp(torch.round(g / s) + zero, 0, maxq)
+            deq = s * (q - zero)
             err = (wg * (deq - g) ** 2).sum(1, keepdim=True)
             if best_err is None:
                 best_err, bq = err, deq

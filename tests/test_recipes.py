@@ -85,6 +85,13 @@ def test_detection():
 
 
 # ---- encoder rules (the casing bug) ----------------------------------------------------------
+def test_stq_alias():
+    # STQ1_0 (Hy4 MIX-STQ1_0's ~1.31-bit format) is NOT in ik_llama -> aliased to the nearest
+    # emittable ternary (iq1_bn, 1.62). Documents the approximation (main() warns at runtime).
+    assert A._atom("stq1_0") == "iq1_bn" and A._atom("stq2_0") == "iq2_bn"
+    assert A._atom("iq1_kt") == "iq1_kt"                              # a real atom passes through
+
+
 def test_cq_casing():
     assert A._cq("q3_k") == "q3_K" and A._cq("q2_k") == "q2_K"        # K-quants: capital K
     assert A._cq("iq1_kt") == "iq1_kt" and A._cq("iq2_kt") == "iq2_kt"  # trellis: lowercase
@@ -216,6 +223,16 @@ def test_build_vs_benchmark_split():
     bat_fast = A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names)
     assert bat_full.count("llama-quantize") == 3 and bat_full.count("llama-perplexity") == 3  # 3-bar benchmark
     assert bat_fast.count("llama-quantize") == 1 and bat_fast.count("llama-perplexity") == 0   # ONE model, no eval
+
+
+def test_gate_appended_to_oneshot_build():
+    # the one-shot (mix-only) build auto-appends the coherence gate on the finished mix
+    names = _moe()
+    bat = A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names)
+    assert "--coherence" in bat and "pollard_bench.py" in bat, "one-shot build must append the gate"
+    assert "deepseek" not in bat  # sanity: uses the emitted stem, not a stray path
+    bat_off = A.emit_bat(_Args(mix_only=True, no_eval=True, gate=False), 4, True, names)
+    assert "--coherence" not in bat_off, "--no-gate must omit the gate"
 
 
 # ---- guards (dense refused; deprecation warns) -----------------------------------------------

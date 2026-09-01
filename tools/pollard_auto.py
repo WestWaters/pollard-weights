@@ -80,6 +80,8 @@ def _automap_mix(a, is_moe):
         am += ["--allow-dense"]                             # dense flagship = the hand-coded mix
     if not a.benchmark:
         am += ["--mix-only", "--no-eval"]                   # plain build = ONE model, no benchmark
+    if not getattr(a, "gate", True):
+        am += ["--no-gate"]                                 # user opted out of the auto coherence gate
     if a.bin:
         am += ["--bin", a.bin]
     _run(am, a.run, cwd=here)
@@ -104,6 +106,11 @@ def main():
                          "fast and skips the eval. Use this only to reproduce our published numbers.")
     ap.add_argument("--force-dense", action="store_true", help="override detection -> dense path")
     ap.add_argument("--force-moe", action="store_true", help="override detection -> MoE path")
+    ap.add_argument("--no-gate", dest="gate", action="store_false",
+                    help="skip the auto coherence gate (loop check + sampling sweep) the one-shot "
+                         "MoE build appends after the mix — by default it runs so you learn if the "
+                         "model is usable and which sampling to ship, without a manual step.")
+    ap.set_defaults(gate=True)
     a = ap.parse_args()
 
     arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
