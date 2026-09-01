@@ -44,6 +44,7 @@ drive a path yourself or understand what `pollard` chose.
 |---|---|---|
 | **DENSE** | imatrix K-quant ladder (`pollard-fit`) **+ the IQ1_KT mixed-precision flagship** (the hand-coded mix — won 7B/14B) | ⛔ sensitivity SWEEP on dense = loses (no expert redundancy) → `pollard-sensitivity` refuses it |
 | **MoE** | the **trellis mixed-precision mix** (`automap` WITH an imatrix) | ⛔ `automap --no-imatrix` K-quant mix = **DEPRECATED**, does NOT beat stock `Q2_K` (imatrix-free build → just use a stock K-quant ladder) · ⛔ sensitivity SWEEP on a big MoE = ~2·layers full-model quantizes = HOURS → refused unless `--allow-slow` |
+| **HYV4** (Tencent Hy4-preview / hy_v4 — MLA + DSA-indexer + hyper-connection MoE) | its OWN recipe: crush `ffn_gate/up_exps`; protect `ffn_down_exps` + shared + dense-blk0 + router + MLA attn (`q_a/q_b/k_b/v_b/kv_a_mqa/gate/output`, `k_b` a tier up) + hyper-connections (`hc_*_fn`) + DSA indexer; norms/base/scale/`exp_probs_b`/`sinks` stay F32. `automap` auto-detects it. **v1 — measure & tighten like any card** | ⛔ the MoE recipe (wrong tensor names → falls to defaults → BLOAT, as Frank's 762B run hit: 381 GB) · needs a COVERED imatrix (256 experts — the coverage lesson at scale) |
 
 The **mixed-precision hand-coded mix** (crush body → protect attn/down/first-last) is the BUILD,
 proven by palette/lowbit and shipped across GGUF (`automap`), torch/GPU (`gptq --recipe`), and
