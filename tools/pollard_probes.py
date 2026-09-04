@@ -14,7 +14,18 @@ must measure on code).
 
 Cross-platform (no Windows `timeout` — that errors under a redirected/SSH stdin, the bug that bit the
 box). Needs lm_eval + a built llama-server (auto-found, or --server-bin). The GGUF must load on this
-box's GPU/CPU (it's the eval runtime)."""
+box's GPU/CPU (it's the eval runtime).
+
+BACKEND NOTE (verified 2026-09-04, e2e — the reason this is not yet auto-run): lm-eval's server
+backends are version-fragile against current llama-server. `--model gguf` (this tool's default) hits
+llama-server's native /completion, but recent llama-server returns `completion_probabilities` while
+lm-eval's gguf.py still expects OpenAI-style `logprobs.token_logprobs` -> "Invalid logprobs data" on
+every request (results invalid). `--model local-completions` (needs `pip install lm-eval[api]`) hits
+/v1/completions but errored "Session is closed" against this build. Until a compatible lm-eval /
+llama-server pairing is pinned, run task probes with a matched pair (e.g. llama-cpp-python's in-process
+`--model gguf`, or a llama-server build known to match your lm-eval), or read the numbers off whichever
+backend validates. The board's decision-table verdict does NOT depend on this cell (size/PPL/KLD/top-1/
+chat already close it); this probe is EXTRA capability validation."""
 import argparse, json, os, shutil, subprocess, sys, time, urllib.request
 
 REASONING = ["arc_challenge", "arc_easy", "winogrande", "piqa", "hellaswag"]
