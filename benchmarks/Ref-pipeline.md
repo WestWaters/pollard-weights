@@ -135,6 +135,29 @@ it. Skip ahead to the winner. Users want a fast Pollard build, not our whole R&D
 **The rule:** a new arch/format tries the CLASS's WINNING method first; only a *measured* win gets
 locked as a new gold path; anything we proved loses is deleted from the flow, not retried.
 
+## 🆕 NEW LANE (new emit backend / atom class, e.g. EXL3) — TUNE lane-native, do NOT port-and-lock
+A new BACKEND (EXL3/MLX/GPTQ) is a **new atom class**. Porting the GGUF/IQ recipe onto it is only a
+first PROBE — it usually LOSES (K-quant priors ≠ trellis/other atoms), and **a port-failure NEVER
+justifies locking the lane compatibility-only.** You must run the lane-native Session-2 loop FIRST:
+- **Baseline to beat** = the lane's own default allocator (e.g. EXL3-budgeted), boarded at a target bpw.
+- **Model** = a MID model (**≥3B–8B**), NOT a 0.5B, and NOT Wiki-PPL-only — add the chat gate.
+- **Loop (ONE attributable change per run, re-board each):**
+  1. **CALIB for the lane** — Calib 3.0 (or lane-cal + Calib 3.0 mix) as the encode calibration; board vs default at same bpw.
+  2. **RETUNE protect/body in the LANE's atoms** — SOFT priors only (protect residual writers / attn-out /
+     embeddings / head; crush the coldest FFN body), with targets from a SHORT measured probe in the
+     lane's bpw atoms — NOT copied IQ gate/up rules.
+  3. **Attributable tuning** — one lever per run (protect bump | body floor | calib mix); reject if bpw
+     creeps or PPL worsens.
+  4. **Recovery** — one light repair pass only if coherent-but-soft AND the stack supports it; else skip
+     (no multi-day QAT side quest).
+  5. **Ship gate** — Wiki PPL + chat (fixed sampling: rep-pen 1.15, temp ≤0.7). **WIN = ≤ default bpw AND
+     (PPL ≤ default OR a clear chat win with PPL within ~5%).**
+- **Lock rule:** lock as a new gold lane ONLY on a matched-bpw win. Lock **compatibility-only** ONLY
+  after **≥3 consecutive lane-native TUNED attempts lose at matched bpw** on the mid model — never after
+  port failures alone. **Goal B (finish faster) stays weak** where the lane's default has no expensive
+  search (EXL3-budgeted is search-light) — don't chase it; the win is match-quality, and never reimplement
+  the lane's own optimizer.
+
 ## Traps (the weekend lessons — do not repeat)
 - **Don't build a per-model recipe** — especially not from a **buggy run's** numbers. Route through
   the class recipe; extend the class recipe additively only if measurement demands it.
