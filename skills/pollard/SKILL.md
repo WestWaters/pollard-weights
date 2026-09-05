@@ -42,9 +42,10 @@ MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the cover
   Calib 3.0 imatrix (minutes). The **measured-allocation** max quality is the opt-in `--benchmark` /
   `pollard-sensitivity` path (hours). The 10-minute path is excellent; the beats-uniform gold-card
   numbers come from the measured path.
-- **Output lanes, all smoke-tested:** GGUF (llama.cpp) · **MLX** (Apple — verified: Qwen0.5B mixed 4/8
-  generates coherently on M4) · **GPTQ** (vLLM/SGLang — export verified on the CUDA box). For a *specific*
-  model, a one-line load in the target runtime is still the final ship check.
+- **Output lanes, all smoke-tested** (Qwen2.5-0.5B, same Pollard allocation): **GGUF** (llama.cpp) ·
+  **MLX** (Apple — mixed 4/8 loads + generates "Paris" on M4 @ 233 tok/s) · **GPTQ** (vLLM/SGLang — 4/8
+  checkpoint loads + generates on the CUDA box). For a *specific* model, a one-line load in the target
+  runtime is still the sensible final ship check.
 
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
