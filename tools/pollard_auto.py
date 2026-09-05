@@ -17,8 +17,11 @@ WINNING PATH — the SAME for dense AND MoE (no losing fallback):
 
 Plans by default (prints the exact commands for THIS model); `--run` executes them.
 
-    pollard --gguf model-f16.gguf --run             # ONE-SHOT: auto-calib -> auto-imatrix -> flagship mix
-    pollard --gguf moe-f16.gguf --run               # same one command, any arch (dense / MoE / MLA-MoE)
+    pollard --gguf model-f16.gguf --run             # ONE-SHOT GGUF: auto-calib -> imatrix -> flagship mix
+    pollard --hf Qwen/Qwen3-8B --run                # ONE-SHOT from a HF repo: download -> convert -> build
+    pollard --hf ./my-local-model --run             # ...or a model already on disk (any arch)
+    pollard --hf Qwen/Qwen3-8B --format gptq --run  # export lane: GPTQ for vLLM/SGLang (from HF weights)
+    pollard --hf Qwen/Qwen3-8B --format mlx --run   # export lane: MLX for Apple Silicon
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
 """
@@ -93,6 +96,65 @@ def _automap_mix(a, is_moe):
     return out
 
 
+def _find_convert():
+    """Locate convert_hf_to_gguf.py (our runtime llama.cpp first, then PATH/common spots)."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for c in (os.path.join(repo, "runtime", "llama.cpp", "convert_hf_to_gguf.py"),
+              os.path.expanduser("~/llama.cpp/convert_hf_to_gguf.py")):
+        if os.path.exists(c):
+            return c
+    return "convert_hf_to_gguf.py"                          # assume on PATH / same dir
+
+
+def _resolve_hf(a):
+    """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either."""
+    if os.path.isdir(a.hf):
+        return a.hf
+    local = os.path.join(os.path.abspath(a.output or "."), a.hf.split("/")[-1])
+    print(f"   fetch HF repo: huggingface-cli download {a.hf} --local-dir {local}")
+    if a.run:
+        from huggingface_hub import snapshot_download
+        local = snapshot_download(a.hf, local_dir=local)
+    return local
+
+
+def _hf_to_gguf(a):
+    """HF weights -> f16 GGUF so the GGUF flagship pipeline can run one-shot from a repo/dir."""
+    hf_dir = _resolve_hf(a)
+    conv = _find_convert()
+    here = os.path.abspath(a.output) if a.output else os.path.dirname(os.path.abspath(hf_dir)) or "."
+    out = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + "-f16.gguf")
+    print(f"   convert HF -> f16 GGUF: python {os.path.basename(conv)} {hf_dir} --outtype f16 --outfile {out}")
+    if a.run:
+        subprocess.run([sys.executable, conv, hf_dir, "--outtype", "f16", "--outfile", out])
+    return out
+
+
+def _emit_nongguf(a):
+    """GPTQ (vLLM/SGLang) and MLX (Apple) emit straight from HF weights — no GGUF. Same Pollard
+    allocation, a different emitter. Calib 3.0 is auto-built for the GPTQ calibration."""
+    if not a.hf:
+        sys.exit(f"--format {a.format} exports from HF weights — pass --hf <repo-or-dir> "
+                 f"(a GGUF can't be re-exported to {a.format}; use --format gguf for a GGUF input).")
+    hf_dir = _resolve_hf(a)
+    out = a.output or (os.path.basename(hf_dir.rstrip("/\\")) + f"-Pollard-{a.format.upper()}")
+    if a.format == "gptq":
+        here = os.path.dirname(os.path.abspath(out)) or "."
+        calib = a.calib or os.path.join(here, "pollard_calib.txt")
+        if not a.calib:
+            print(f"   auto-calib (Calib 3.0): pollard-calib --out {os.path.basename(calib)}")
+            if a.run and not os.path.exists(calib):
+                _run(["pollard-calib", "--out", calib], True, cwd=here)
+        cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out]
+    else:                                                   # mlx
+        cmd = ["pollard-mlx", "--model", hf_dir, "--out", out]
+    if a.sensitivity:
+        cmd += ["--sensitivity", a.sensitivity]
+    print(f"   {a.format.upper()} export (same Pollard allocation, {a.format} emitter):")
+    _run(cmd, a.run)
+    print(f"   -> {out}  ({'vllm serve / sglang' if a.format=='gptq' else 'mlx_lm.generate'})")
+
+
 def _ensure_imatrix(a):
     """TRUE one-shot: if the user gave no --imatrix, auto-build one (Calib 3.0 multi-domain
     corpus -> llama-imatrix) so they never run a manual calibration step. Returns the imatrix
@@ -118,7 +180,13 @@ def _ensure_imatrix(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--gguf", required=True, help="f16/bf16 source GGUF (convert from HF first)")
+    ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
+    ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir — Pollard downloads/converts/"
+                    "routes it (so a user can one-shot straight from a repo or a model already on disk)")
+    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx"],
+                    help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple)")
+    ap.add_argument("--output", help="output dir/file for the gptq/mlx export (else auto-named)")
+    ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx allocation; else uniform)")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
     ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")
@@ -142,6 +210,23 @@ def main():
                          "model is usable and which sampling to ship, without a manual step.")
     ap.set_defaults(gate=True)
     a = ap.parse_args()
+    if not a.gguf and not a.hf:
+        ap.error("pass --gguf <file> or --hf <repo-or-dir>")
+
+    # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
+    if a.format in ("gptq", "mlx"):
+        print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
+        _emit_nongguf(a)
+        if not a.run:
+            print("\n   plan only — re-run with --run to execute.")
+        return
+
+    # GGUF lane: get an f16 GGUF (convert from HF if the user pointed at a repo/dir).
+    if not a.gguf:
+        a.gguf = _hf_to_gguf(a)
+        if not a.run:                                      # plan mode: the GGUF doesn't exist yet
+            print("\n   plan only — re-run with --run to execute (convert + build).")
+            return
 
     arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
     is_moe = (arch.get("n_experts") or 0) > 0 or "moe" in str(arch.get("kind", "")).lower()

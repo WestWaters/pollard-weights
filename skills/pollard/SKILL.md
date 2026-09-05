@@ -17,10 +17,15 @@ correct path for *this* model so results are good and no time is wasted.
 ## Don't know the model type? Use the autoaware entry point
 
 ```bash
-pollard --gguf model-f16.gguf --run          # ONE-SHOT: auto-calib -> auto-imatrix -> detect -> flagship mix
-pollard --gguf model-f16.gguf                 # same, but PLAN only (prints every step it will run)
+pollard --gguf model-f16.gguf --run          # ONE-SHOT GGUF: auto-calib -> auto-imatrix -> flagship mix
+pollard --hf Qwen/Qwen3-8B --run             # ONE-SHOT from a HF repo: download -> convert -> build
+pollard --hf ./my-local-model --run          # ...or a model already on disk (any arch)
+pollard --hf Qwen/Qwen3-8B --format gptq --run   # export lane: GPTQ for vLLM/SGLang (from HF weights)
+pollard --hf Qwen/Qwen3-8B --format mlx  --run   # export lane: MLX for Apple Silicon
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
+Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple). GPTQ/MLX emit straight from HF weights (no GGUF).
 **True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
 `pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
