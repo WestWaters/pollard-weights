@@ -41,6 +41,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", required=True, help="HF model dir or id (FP16/BF16 source)")
     ap.add_argument("--out", help="output EXL3 dir (required unless --plan-only)")
+    ap.add_argument("--work-dir", help="conversion work dir (checkpoints/resume; default: <out>_work)")
     ap.add_argument("--bpw", type=float, default=3.0, help="target average bits/weight (EXL3 budgeted)")
     ap.add_argument("--head-bits", type=int, default=6, help="output/head layer bits (protected)")
     ap.add_argument("--mtp-bits", type=int, default=4, help="MTP layer bits (GLM/DeepSeek MTP head)")
@@ -60,6 +61,9 @@ def main():
     cmd = [sys.executable, "-m", "exllamav3.conversion.convert_model", "-i", a.model]
     if a.out:
         cmd += ["-o", a.out]
+    work = a.work_dir or ((a.out.rstrip("/\\") + "_work") if a.out else None)
+    if work:
+        cmd += ["-w", work]                                 # exllamav3 REQUIRES a work dir (checkpoints/resume)
     if a.recipe:                                            # explicit Pollard per-tensor plan
         cmd += ["-rcp", a.recipe]
     else:                                                   # budgeted: Pollard intent -> EXL3 knobs
@@ -88,9 +92,16 @@ def main():
     except Exception as e:
         sys.exit(f"ERROR: exllamav3 not usable here ({repr(e)[:80]}). Install it AND make sure its CUDA "
                  f"ext loads (a bleeding-edge GPU may need a source build). Then rerun.")
+    if work:
+        os.makedirs(work, exist_ok=True)
     r = subprocess.run(cmd)
-    if r.returncode != 0:
-        sys.exit(f"exllamav3 convert exited {r.returncode}")
+    # verify REAL output (convert_model can print an arg error yet exit 0) — trust files, not returncode
+    made = a.out and os.path.isdir(a.out) and any(
+        f.endswith(".safetensors") for f in os.listdir(a.out)) and \
+        os.path.exists(os.path.join(a.out, "config.json"))
+    if r.returncode != 0 or not made:
+        sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
+                 f"— see console above.")
     print(f"wrote EXL3 model -> {a.out}\n  run:  exllamav3 / TabbyAPI loads {a.out}")
 
 
