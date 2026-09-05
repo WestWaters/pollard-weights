@@ -45,10 +45,16 @@ MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the cover
   numbers come from the measured path.
 - **All four output lanes smoke-tested** (Qwen2.5-0.5B, same Pollard allocation, loads + generates
   "…Paris…"): **GGUF** (llama.cpp) · **MLX** (Apple, mixed 4/8, M4 @ 233 tok/s) · **GPTQ** (vLLM/SGLang,
-  4/8, CUDA box) · **EXL3** (exllamav3, body 3bpw + head 6bpw, RTX 5070 Ti / Blackwell sm120). For a
-  *specific* model, a one-line load in the target runtime is still the sensible final ship check.
+  4/8, CUDA box) · **EXL3** (exllamav3, RTX 5070 Ti / Blackwell sm120). For a *specific* model, a
+  one-line load in the target runtime is still the sensible final ship check.
   (EXL3 on bleeding-edge Blackwell needed: manual MSVC env, CUDA 12.8 toolkit to match torch cu128,
   and Calib-3.0-generated `standard_cal_data` — the wheel omits it. See notes.)
+- ⚠️ **EXL3 allocation = EXL3's OWN budgeted allocator (the quality default), NOT a Pollard recipe.**
+  MEASURED (Qwen0.5B wikitext): EXL3-budgeted 3.38bpw → PPL 14.30; a naive port of Pollard's GGUF
+  role-map → 17.15 at *more* bits. K-quant priors don't transfer to EXL3's trellis atoms. So **Pollard's
+  allocation edge is proven on GGUF (role Mix beats uniform), not on EXL3** — EXL3 is a compatibility
+  lane. A winning EXL3-native recipe would be a separate *measured* project; `--recipe` stays experimental.
+  **Never claim "Pollard beats EXL3 allocation."**
 
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
