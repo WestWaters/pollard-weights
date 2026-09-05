@@ -559,6 +559,34 @@ def gb(nbytes):
     return nbytes / 1e9
 
 
+# Reference-accelerator (DGX Spark / GB10 class) quant BUILD-TIME rates — hours per billion
+# params — so users know the COMPUTE cost per format BEFORE running (the "no more guessing" ask).
+# Anchored to measured datapoints (order-of-magnitude, ±~2x; calibrate to your box via --build-hw):
+#   * GPTQ: Qwen2.5-0.5B = ~9 min on a 5090 (fast box) -> a Spark-class ~0.5 h/B
+#   * GGUF ladder + EXL3: a same-bit GGUF 2-6bit ladder of glm-flash ~1-2 h on ONE Spark, while
+#     EXL3 of ONE 2-bit output takes ~34 h on ONE Spark (community datapoint) -> EXL3 ~20-30x GGUF.
+_BUILD_RATE = {   # format: (basis, hours_per_billion_params_on_a_GB10_class_box)
+    "gguf": ("active", 0.12),   # imatrix pass + the 2-6bit K-quant ladder (imatrix is active-bound)
+    "gptq": ("total",  0.5),    # per-layer Hessian + error-feedback solve over the whole model
+    "mlx":  ("total",  0.05),   # group quant, no calib forward — the cheap lane
+    "exl3": ("total",  3.0),    # trellis optimization per tensor, ONE target bpw — the heavy lane
+}
+
+
+def estimate_build_time(arch, hw_scale=1.0):
+    """Rough quant build-time per output format, on a reference GB10/Spark-class box (hw_scale<1
+    for a faster box, e.g. ~0.4 for a 5090). ESTIMATE, not gospel — anchored to the datapoints
+    above; a real run calibrates it. MoE: GGUF scales with ACTIVE params (imatrix), the rest with total."""
+    aB = (arch.get("active") or arch.get("total") or 0) / 1e9
+    tB = (arch.get("total") or 0) / 1e9
+    return {f: max(0.02, r * (aB if basis == "active" else tB) * hw_scale)
+            for f, (basis, r) in _BUILD_RATE.items()}
+
+
+def _fmt_hours(h):
+    return f"~{h*60:.0f} min" if h < 1 else f"~{h:.1f} h"
+
+
 def report(a, ram_gb, flash_gbps, rambw_gbps, qbits, cache_gb):
     wb = qbits / 8.0
     total_b, active_b = a["total"] * wb, a["active"] * wb
@@ -700,6 +728,8 @@ def main():
                    help="what --gpu's number is: dedicated 'gpu' VRAM (~94%% usable, "
                         "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% — the OS "
                         "OOM-kills past ~half)")
+    p.add_argument("--build-hw", type=float, default=1.0,
+                   help="build-time scale vs a GB10/Spark-class box (e.g. ~0.4 for a 5090, ~0.5 A100)")
     a = p.parse_args()
 
     meta = None
@@ -739,6 +769,12 @@ def main():
         print(f"source quant        : {label} (~{qbits:.2f} bpw{shard_note})  "
               f"{'✅' if full else '⚠️'} {advice}\n")
     report(arch, a.ram, a.flash, a.rambw, qbits, cache)
+    bt = estimate_build_time(arch, a.build_hw)
+    hw = "GB10/Spark-class" if a.build_hw == 1.0 else f"{a.build_hw:.2f}x GB10-class"
+    print(f"est. quant build time ({hw}; ±~2x, calibrate to your box):")
+    print(f"   GGUF ladder {_fmt_hours(bt['gguf'])} · GPTQ {_fmt_hours(bt['gptq'])} · "
+          f"MLX {_fmt_hours(bt['mlx'])} · EXL3 {_fmt_hours(bt['exl3'])} (one bpw)  "
+          f"— the cheap→heavy spread: pick your lane before you run")
     if a.ctx:
         kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625}[a.kv_quant]
         rig_gb = None
