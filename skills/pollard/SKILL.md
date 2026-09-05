@@ -25,7 +25,8 @@ pollard --hf Qwen/Qwen3-8B --format mlx  --run   # export lane: MLX for Apple Si
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
 Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
-gguf` default · `gptq` vLLM/SGLang · `mlx` Apple). GPTQ/MLX emit straight from HF weights (no GGUF).
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3). GPTQ/MLX/EXL3 emit straight from HF
+weights (no GGUF). EXL3 is the heavy trellis lane (hours by format) — use it only for the exllama runtime.
 **True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
 `pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big

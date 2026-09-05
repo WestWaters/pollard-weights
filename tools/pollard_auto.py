@@ -22,6 +22,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --hf ./my-local-model --run             # ...or a model already on disk (any arch)
     pollard --hf Qwen/Qwen3-8B --format gptq --run  # export lane: GPTQ for vLLM/SGLang (from HF weights)
     pollard --hf Qwen/Qwen3-8B --format mlx --run   # export lane: MLX for Apple Silicon
+    pollard --hf Qwen/Qwen3-8B --format exl3 --run  # export lane: EXL3 (exllamav3 — heavy trellis)
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
 """
@@ -146,13 +147,18 @@ def _emit_nongguf(a):
             if a.run and not os.path.exists(calib):
                 _run(["pollard-calib", "--out", calib], True, cwd=here)
         cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out]
+        if a.sensitivity:
+            cmd += ["--sensitivity", a.sensitivity]
+    elif a.format == "exl3":
+        cmd = ["pollard-exl3", "--model", hf_dir, "--out", out]  # EXL3: budgeted (or --recipe)
     else:                                                   # mlx
         cmd = ["pollard-mlx", "--model", hf_dir, "--out", out]
-    if a.sensitivity:
-        cmd += ["--sensitivity", a.sensitivity]
+        if a.sensitivity:
+            cmd += ["--sensitivity", a.sensitivity]
     print(f"   {a.format.upper()} export (same Pollard allocation, {a.format} emitter):")
     _run(cmd, a.run)
-    print(f"   -> {out}  ({'vllm serve / sglang' if a.format=='gptq' else 'mlx_lm.generate'})")
+    _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate", "exl3": "exllamav3 / TabbyAPI"}
+    print(f"   -> {out}  ({_rt.get(a.format, '')})")
 
 
 def _ensure_imatrix(a):
@@ -183,8 +189,9 @@ def main():
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
     ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir — Pollard downloads/converts/"
                     "routes it (so a user can one-shot straight from a repo or a model already on disk)")
-    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx"],
-                    help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple)")
+    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3"],
+                    help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple) "
+                    "· exl3 (exllamav3 — the heavy trellis lane)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx export (else auto-named)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx allocation; else uniform)")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
@@ -214,7 +221,7 @@ def main():
         ap.error("pass --gguf <file> or --hf <repo-or-dir>")
 
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
-    if a.format in ("gptq", "mlx"):
+    if a.format in ("gptq", "mlx", "exl3"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
         _emit_nongguf(a)
         if not a.run:
