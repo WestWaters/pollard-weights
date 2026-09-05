@@ -117,6 +117,24 @@ To make the claim travel (method, not fluke): the same green board on **≥2 mod
 
 ---
 
+## ⛔ PROVEN-LOSING METHODS — NEVER RUN (skip straight to what wins)
+Pollard is a set of WINNING methods. If a method is on this list we already measured it losing — do
+NOT run it "to check," do NOT put it in the pipeline, do NOT spend a user's (or our) cycles/tokens on
+it. Skip ahead to the winner. Users want a fast Pollard build, not our whole R&D process.
+
+| ⛔ losing method | ✅ run this instead | proof |
+|---|---|---|
+| **local/proxy error for allocation** (imatrix MAGNITUDE, EXL3 `proxy_err`) | **measured MODEL-LEVEL KL** sensitivity → knapsack | magnitude misranks (e13); EXL3 proxy_err alloc 14.83–14.97 vs budgeted 14.36 |
+| **sensitivity SWEEP on a DENSE model** | dense imatrix K-quant ladder + IQ1_KT flagship | no expert redundancy → loses; tools refuse it |
+| **`--no-imatrix` K-quant "mix" on MoE** | automap trellis mix WITH a covered imatrix | loses to stock Q2_K |
+| **PTQ of STQ1_0** (uniform or recipe) | QAT+distill on wiki+CHAT mix (extreme lane only) | uniform ~1e6; iq1_s 1.56 beats STQ1_0-PTQ |
+| **porting the GGUF role-map onto EXL3** | EXL3 uses its OWN budgeted allocator (default) | role-port 17.15 vs budgeted 14.30 at more bits |
+| **per-model recipe from a buggy run** | route the class recipe; extend additively only if measured | the weekend loop |
+| **raising the mix tier to chase a 2-bit ceiling** | reject (Mix-v3); tighten the crush | leaves the size class, becomes a small IQ2 |
+
+**The rule:** a new arch/format tries the CLASS's WINNING method first; only a *measured* win gets
+locked as a new gold path; anything we proved loses is deleted from the flow, not retried.
+
 ## Traps (the weekend lessons — do not repeat)
 - **Don't build a per-model recipe** — especially not from a **buggy run's** numbers. Route through
   the class recipe; extend the class recipe additively only if measurement demands it.
