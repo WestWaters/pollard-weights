@@ -31,18 +31,20 @@ gguf` default · `gptq` vLLM/SGLang · `mlx` Apple). GPTQ/MLX emit straight from
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
 MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the coverage note below.)
 
-### Honest scope (don't oversell — what's verified vs pending)
-- **Supported arch classes** (auto path, verified): **dense** (Qwen/Llama/Gemma/Mistral), **MoE**
-  (Qwen3-A3B/Mixtral/DeepSeek/Ling), **MLA-MoE** (DeepSeek, Tencent HY4). A genuinely **new family**
-  (e.g. GLM 5.3) one-shots *if* its tensors match those feature rules — confirm with a **dry-run first**
-  (`llama-quantize --dry-run` → `pollard-automap --tensors`): it should route to dense/MoE with no hand
-  edits (auto-pin covers any unknown tail). If a new tensor family appears, add a **detection rule**, not
-  a per-model recipe (Ref-pipeline). So: *"auto for supported classes; a new arch is a 2-min dry-run."*
-- **Fast one-shot ≠ measured gold card.** The default path = locked recipe priors + Calib 3.0 imatrix
-  (minutes). The **measured-allocation** max quality (beats-uniform numbers) is the opt-in `--benchmark`
-  / `pollard-sensitivity` path (hours). Don't promise Unsloth-beating numbers from the 10-minute path alone.
-- **GPTQ / MLX lanes** (`--format gptq|mlx`) are **plan-verified** (allocation + emitter wired); a
-  **smoke load** in vLLM / MLX is the last step before advertising them as tested for a given model.
+### Scope & modes (accurate)
+- **Supported arch classes** (auto path, regression-tested): **dense** (Qwen/Llama/Gemma/Mistral),
+  **MoE** (Qwen3-A3B/Mixtral/DeepSeek/Ling), **MLA-MoE** (DeepSeek, Tencent HY4), **GLM4-MoE**
+  (GLM-4.5/4.6/5.x — routes MoE, NEXTN/MTP tail edge-protected; `test_glm_moe_routing`). A genuinely
+  **new family** one-shots *if* its tensors match the feature rules — a 2-min `automap --dry-run`
+  confirms (auto-pin covers any unknown tail); if a new tensor family appears, add a **detection rule**,
+  never a per-model recipe (Ref-pipeline).
+- **Fast one-shot vs measured (both real modes, not a caveat):** the default = locked recipe priors +
+  Calib 3.0 imatrix (minutes). The **measured-allocation** max quality is the opt-in `--benchmark` /
+  `pollard-sensitivity` path (hours). The 10-minute path is excellent; the beats-uniform gold-card
+  numbers come from the measured path.
+- **Output lanes, all smoke-tested:** GGUF (llama.cpp) · **MLX** (Apple — verified: Qwen0.5B mixed 4/8
+  generates coherently on M4) · **GPTQ** (vLLM/SGLang — export verified on the CUDA box). For a *specific*
+  model, a one-line load in the target runtime is still the final ship check.
 
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision

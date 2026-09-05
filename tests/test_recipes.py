@@ -245,6 +245,42 @@ def test_dense_guard():
     assert "REFUSED" in (r.stdout + r.stderr), "automap must REFUSE a dense model without --allow-dense"
 
 
+def _glm(nl=8):
+    """GLM4-MoE (GLM-4.5/4.6/5.x class) GGUF tensor names, from gguf-py's GLM4_MOE arch:
+    standard MoE + shared experts + q/k norms + the GLM-specific NEXTN (MTP) tail on the last layer."""
+    L = ["token_embd.weight", "output.weight", "output_norm.weight"]
+    for i in range(nl):
+        for t in ["attn_q", "attn_k", "attn_v", "attn_output", "attn_norm",
+                  "attn_q_norm", "attn_k_norm", "attn_post_norm"]:
+            L.append(f"blk.{i}.{t}.weight")
+        if i == 0:                                          # GLM MoE has dense first layer(s)
+            for t in ["ffn_gate", "ffn_up", "ffn_down", "ffn_norm"]:
+                L.append(f"blk.{i}.{t}.weight")
+        else:
+            for t in ["ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+                      "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "exp_probs_b", "ffn_norm"]:
+                L.append(f"blk.{i}.{t}.weight")
+    for t in ["nextn.eh_proj", "nextn.embed_tokens", "nextn.enorm", "nextn.hnorm",
+              "nextn.shared_head.head", "nextn.shared_head.norm"]:
+        L.append(f"blk.{nl-1}.{t}.weight")                 # MTP head on the last layer
+    return L
+
+
+def test_glm_moe_routing():
+    # A non-Qwen family (GLM) one-shots through THE MoE recipe by detected features, no hand edits.
+    _, nl, is_moe, arch = A.parse_tensors(_tensorfile(_glm(8)))
+    assert is_moe and arch.startswith("MoE"), f"GLM must detect MoE, got '{arch}'"
+    _, cq = A.recipe_flags(8, is_moe=True, body="iq1_kt", protect="iq2_kt")
+    ap = lambda n: _apply(cq, "iq1_kt", n)
+    assert ap("blk.4.ffn_gate_exps.weight") == "iq1_kt" and ap("blk.4.ffn_up_exps.weight") == "iq1_kt"
+    assert ap("blk.4.ffn_down_exps.weight") == "iq2_kt"    # residual writer protected
+    assert ap("blk.4.ffn_gate_inp.weight") == "q6_K"       # router protected
+    assert ap("blk.4.ffn_gate_shexp.weight") != "iq1_kt"   # shared experts NOT crushed to body
+    # GLM-specific NEXTN/MTP tail is on the LAST layer -> edge-protect tier, never the 1-bit body
+    assert ap("blk.7.nextn.eh_proj.weight") == "iq2_kt", "GLM MTP tail must be protected, not crushed"
+    assert ap("blk.7.nextn.shared_head.head.weight") == "iq2_kt"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
