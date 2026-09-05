@@ -31,6 +31,19 @@ gguf` default · `gptq` vLLM/SGLang · `mlx` Apple). GPTQ/MLX emit straight from
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
 MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the coverage note below.)
 
+### Honest scope (don't oversell — what's verified vs pending)
+- **Supported arch classes** (auto path, verified): **dense** (Qwen/Llama/Gemma/Mistral), **MoE**
+  (Qwen3-A3B/Mixtral/DeepSeek/Ling), **MLA-MoE** (DeepSeek, Tencent HY4). A genuinely **new family**
+  (e.g. GLM 5.3) one-shots *if* its tensors match those feature rules — confirm with a **dry-run first**
+  (`llama-quantize --dry-run` → `pollard-automap --tensors`): it should route to dense/MoE with no hand
+  edits (auto-pin covers any unknown tail). If a new tensor family appears, add a **detection rule**, not
+  a per-model recipe (Ref-pipeline). So: *"auto for supported classes; a new arch is a 2-min dry-run."*
+- **Fast one-shot ≠ measured gold card.** The default path = locked recipe priors + Calib 3.0 imatrix
+  (minutes). The **measured-allocation** max quality (beats-uniform numbers) is the opt-in `--benchmark`
+  / `pollard-sensitivity` path (hours). Don't promise Unsloth-beating numbers from the 10-minute path alone.
+- **GPTQ / MLX lanes** (`--format gptq|mlx`) are **plan-verified** (allocation + emitter wired); a
+  **smoke load** in vLLM / MLX is the last step before advertising them as tested for a given model.
+
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
 flagship** — the hand-coded mix, the dense repos' headline build; MoE → `pollard-automap`
