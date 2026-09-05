@@ -6,8 +6,9 @@ WINNING PATH — the SAME for dense AND MoE (no losing fallback):
   (1) the imatrix K-quant ladder (pollard-fit) — the honest fit-your-RAM baseline, plus
   (2) the mixed-precision FLAGSHIP mix (automap trellis) — the hand-coded winner (crush body,
       protect attn/down/first-last; MoE = expert-allocation) — WHEN an imatrix is present.
-  No imatrix -> just the ladder (stock K-quants). There is NO "imatrix-free mix": it loses
-  to stock Q2_K, so it's deprecated, not a path here.
+  No --imatrix supplied -> AUTO-BUILD one (Calib 3.0 corpus -> llama-imatrix) so the DEFAULT is the
+  flagship mix with ZERO manual steps. --no-auto-imatrix falls back to the stock K-quant ladder.
+  (There is NO "imatrix-free mix": it loses to stock Q2_K, so it's deprecated, not a path here.)
 
 ⛔ LOSING / TRAP paths — never the default, opt-in only:
   - sensitivity SWEEP on DENSE = loses (no expert redundancy) -> pollard-sensitivity refuses dense.
@@ -16,9 +17,10 @@ WINNING PATH — the SAME for dense AND MoE (no losing fallback):
 
 Plans by default (prints the exact commands for THIS model); `--run` executes them.
 
-    pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix           # plan
-    pollard --gguf moe-f16.gguf   --imatrix moe.imatrix --run                # detect + build (winning path)
-    pollard --gguf model-f16.gguf --imatrix m.imatrix --benchmark --run      # + the gold-card board (slow)
+    pollard --gguf model-f16.gguf --run             # ONE-SHOT: auto-calib -> auto-imatrix -> flagship mix
+    pollard --gguf moe-f16.gguf --run               # same one command, any arch (dense / MoE / MLA-MoE)
+    pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
+    pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
 """
 import argparse, os, subprocess, sys
 
@@ -91,10 +93,38 @@ def _automap_mix(a, is_moe):
     return out
 
 
+def _ensure_imatrix(a):
+    """TRUE one-shot: if the user gave no --imatrix, auto-build one (Calib 3.0 multi-domain
+    corpus -> llama-imatrix) so they never run a manual calibration step. Returns the imatrix
+    path (and, with --run, actually builds it). Plan mode just prints the exact commands."""
+    here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+    calib = a.calib or os.path.join(here, "pollard_calib.txt")
+    imat = os.path.join(here, os.path.splitext(os.path.basename(a.gguf))[0] + ".imatrix")
+    binim = (os.path.join(a.bin, "llama-imatrix") if a.bin
+             else find_llama_bin("llama-imatrix")) or "llama-imatrix"
+    print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) — no manual calibration step:")
+    if not a.calib:
+        print(f"      pollard-calib --out {os.path.basename(calib)}")
+    print(f"      {binim} -m {os.path.basename(a.gguf)} -f {os.path.basename(calib)} "
+          f"-o {os.path.basename(imat)} -ngl {a.ngl}")
+    if a.run:
+        if not a.calib and not os.path.exists(calib):
+            _run(["pollard-calib", "--out", calib], True, cwd=here)
+        subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", str(a.ngl)], cwd=here)
+    print("      (big MoE won't fit f16 for the forward pass -> compute on a Q6_K host at a "
+          "partial --ngl; see SKILL.md. Undercovered experts hard-fail low-bit — Calib 3.0 covers them.)")
+    return imat
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", required=True, help="f16/bf16 source GGUF (convert from HF first)")
-    ap.add_argument("--imatrix", help="importance matrix (required for the low-bit build)")
+    ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
+    ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
+    ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")
+    ap.add_argument("--no-auto-imatrix", dest="auto_imatrix", action="store_false",
+                    help="do NOT auto-generate an imatrix when --imatrix is omitted (K-quant ladder only)")
+    ap.set_defaults(auto_imatrix=True)
     ap.add_argument("--ram", default="16", help="RAM budget in GB for the dense memory-fit build")
     ap.add_argument("--out", help="output path (dense build)")
     ap.add_argument("--eval", default="wikitext2_test.txt")
@@ -134,6 +164,10 @@ def main():
     flagship = "PollardMix expert-allocation" if is_moe else "IQ1_KT"
     print(f"   path: {tag} -> K-quant ladder (pollard-fit) + the {flagship} mixed-precision "
           f"flagship (the hand-coded winner) when an imatrix is present")
+    # TRUE one-shot: auto-build the imatrix (Calib 3.0) if none supplied, so the DEFAULT output
+    # is the flagship mix — no manual calib/fit/calc step. --no-auto-imatrix opts back to ladder-only.
+    if not a.imatrix and a.auto_imatrix:
+        a.imatrix = _ensure_imatrix(a)
     cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
     if a.imatrix: cmd += ["--imatrix", a.imatrix]
     if a.out: cmd += ["--out", a.out]
@@ -144,8 +178,8 @@ def main():
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
         _automap_mix(a, is_moe=is_moe)
     else:
-        print(f"   2) (supply --imatrix for the {flagship} mixed-precision flagship — the winning "
-              f"build; without one you get the stock K-quant ladder above, no losing mix)")
+        print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
+              f"flag for the {flagship} flagship — the winning build, auto-calibrated.)")
     if not a.run:
         print("\n   plan only — re-run with --run to execute.")
 

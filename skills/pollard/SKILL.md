@@ -17,9 +17,15 @@ correct path for *this* model so results are good and no time is wasted.
 ## Don't know the model type? Use the autoaware entry point
 
 ```bash
-pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix        # plan (prints the right path)
-pollard --gguf model-f16.gguf --imatrix model.imatrix --run           # detect + build automatically
+pollard --gguf model-f16.gguf --run          # ONE-SHOT: auto-calib -> auto-imatrix -> detect -> flagship mix
+pollard --gguf model-f16.gguf                 # same, but PLAN only (prints every step it will run)
+pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
+**True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
+`pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
+steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
+MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the coverage note below.)
+
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
 flagship** — the hand-coded mix, the dense repos' headline build; MoE → `pollard-automap`
