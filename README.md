@@ -479,6 +479,8 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 | `pollard-run` | Measured expert placement for llama.cpp (RAM-streaming runtime) |
 | `pollard-calib` | Multi-domain calibration corpus (Calib 3.0) |
 | `pollard-ls` | List your workspace builds — lane, bpw, size, PPL, verified✓ |
+| `pollard-card` | Generate the standard HF model card from a build's manifest (every PollardWeights repo matches) |
+| `pollard-onboard` | Audit a new/custom architecture and emit a PR-ready contribution (`--contribute`) — scales arch coverage |
 | `install.sh` | Builds the llama.cpp runtime (Metal on macOS + RPC backend) so the chain runs end-to-end; Pollard builds are standard GGUFs — the whole llama.cpp ecosystem is their runtime |
 
 ## Roadmap

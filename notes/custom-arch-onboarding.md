@@ -5,6 +5,13 @@ Most models are a known arch (llama/qwen/mistral/mixtral/deepseek/glm) and one-s
 pointing at its own `modeling_*.py` — needs a short, GENERIC onboarding. This is the playbook, written
 against the first one we did: **Spark-X2.5-4B** (`Spark2_5ForCausalLM`, XHToken).
 
+## The one command: `pollard-onboard`
+This whole audit is automated — `pollard-onboard --model <repo-or-dir>` pulls the config + tensor names,
+checks coverage against Pollard's matchers, flags custom features, and prints a verdict
+(READY / LIKELY-READY / NEEDS-ONBOARDING). Add `--contribute` and it writes a PR-ready
+`onboarding/<model_type>.md` + the exact git/gh steps to submit it, so each onboarding grows the tool.
+The rest of this doc is what that tool checks (and what to do when it says NEEDS-ONBOARDING).
+
 ## Rule: audit the real tensor names first
 Don't guess from the arch name. Pull the actual names and decide from them:
 
