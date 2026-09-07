@@ -540,14 +540,20 @@ def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"
             print("   note: phones OOM-kill past ~half their RAM; iOS is practical only to "
                   "~3B, flagship Android to ~7B. Target a 1-3B at q4 for a smooth phone run.")
     print("reference tiers — dedicated VRAM, ~6% for the OS (phones give an app ~half):")
-    for name, cap in [("8 GB   (4060 / 8GB card)", 8), ("12 GB  (3060 / 4070)", 12),
-                      ("16 GB  (4080 / 5080)", 16), ("24 GB  (4090 / 3090)", 24),
-                      ("32 GB  (5090)", 32), ("48 GB  (2x24 / A6000)", 48),
-                      ("96 GB  (RTX 6000 Pro / 4x24)", 96), ("128 GB (DGX Spark)", 128),
-                      ("192 GB (B200 / 6x32)", 192), ("256 GB (2x Spark)", 256)]:
-        print(f"  [{'YES' if total_gb <= cap * 0.94 else 'no ':<3}] {name}")
+    tiers = [("8 GB   (4060 / 8GB card)", 8), ("12 GB  (3060 / 4070)", 12),
+             ("16 GB  (4080 / 5080)", 16), ("24 GB  (4090 / 3090)", 24),
+             ("32 GB  (5090)", 32), ("48 GB  (2x24 / A6000)", 48),
+             ("96 GB  (RTX 6000 Pro / 4x24)", 96), ("128 GB (DGX Spark)", 128),
+             ("192 GB (B200 / 6x32)", 192), ("256 GB (2x Spark)", 256)]
+    # put the USER's actual rig on the ladder — but only add a row if it isn't already a listed tier
+    if rig_gb and not any(abs(cap - rig_gb) < 1.0 for _, cap in tiers):
+        tiers = sorted(tiers + [(f"{rig_gb:.0f} GB  (YOUR rig, --ram)", rig_gb)], key=lambda t: t[1])
+    for name, cap in tiers:
+        star = "  <- your rig" if rig_gb and abs(cap - rig_gb) < 1.0 else ""
+        print(f"  [{'YES' if total_gb <= cap * 0.94 else 'no ':<3}] {name}{star}")
     if total_gb > 256 * 0.94:
-        print("  -> over 256 GB: stack more cards, pool nodes (--rpc), or a smaller quant")
+        print("  -> over one tier: N boxes/Sparks are ONE memory pool via tensor-parallel (vLLM) or "
+              "--rpc (llama.cpp) — e.g. 8x Spark = ~1 TB; or use a smaller quant.")
     if kv_bytes >= 2:
         kv_q8 = kv_cache_bytes(a, ctx, 1.0) / 1e9
         if kv_gb - kv_q8 > 0.5:
@@ -719,8 +725,8 @@ def main():
     p.add_argument("--ctx", type=int, default=0,
                    help="context length for a 'will it fit?' pre-flight: adds KV-cache "
                         "size + total RAM-to-run + device fit (e.g. --ctx 262144 for 256k)")
-    p.add_argument("--kv-quant", default="f16", choices=["f16", "q8", "q4"],
-                   help="KV cache precision for the --ctx estimate (default f16)")
+    p.add_argument("--kv-quant", default="f16", choices=["f16", "q8", "q4", "nvfp4"],
+                   help="KV cache precision for the --ctx estimate (default f16; nvfp4 = Blackwell 4-bit KV)")
     p.add_argument("--gpu", help="your rig for the fit verdict: total VRAM GB, a card "
                                  "name, or CARDxCOUNT — e.g. '96', '5090x4', '3090x8', "
                                  "'rtx6000prox2'. Any stack of any card.")
@@ -776,12 +782,14 @@ def main():
           f"MLX {_fmt_hours(bt['mlx'])} · EXL3 {_fmt_hours(bt['exl3'])} (one bpw)  "
           f"— the cheap→heavy spread: pick your lane before you run")
     if a.ctx:
-        kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625}[a.kv_quant]
+        kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}[a.kv_quant]
         rig_gb = None
         if a.gpu:
             rig_gb = parse_gpu(a.gpu)
             if rig_gb is None:
                 print(f"(could not parse --gpu '{a.gpu}'; skipping the rig verdict)")
+        if rig_gb is None and a.ram:                      # no discrete card given -> the user's own --ram
+            rig_gb = float(a.ram)                          # is the rig (unified memory: Spark/Mac/pooled)
         fit_report(arch, arch["total"] * qbits / 8 / 1e9, a.ctx, kv_bytes, a.kv_quant,
                    rig_gb, a.device)
 

@@ -43,6 +43,18 @@ def detect_moe(model_id, layers_hint=0):
         return False, layers_hint
 
 
+def detect_mla(model_id):
+    """True if the model uses Multi-head Latent Attention (DeepSeek-V2/V3, GLM-4.5/5.3) — its
+    attention is q_a/q_b/kv_a/kv_b_proj, not q/k/v_proj. ATTN_PROJ matches both; this is only
+    for the user-facing note. Detected from the low-rank KV config field."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+        return getattr(cfg, "kv_lora_rank", None) is not None
+    except Exception:
+        return False
+
+
 def allocate(sens, n_layers, hot_frac):
     """Pollard profile -> {layer: {group: bits}}. The most-sensitive `hot_frac` of layers
     keep their group at 8-bit; the rest go 4-bit. Fused groups get ONE bit-width (constraint).
@@ -60,15 +72,24 @@ def allocate(sens, n_layers, hot_frac):
                 "ffn": HIGH if i in hot_ffn else LOW} for i in range(n_layers)}
 
 
+# Arch-agnostic projection matchers. Standard attention is q/k/v/o_proj; MLA (DeepSeek-V2/V3,
+# GLM-4.5/5.3) replaces them with q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj — all still end in
+# "proj", none of the norms do — so "any *proj* under self_attn" catches both without a per-arch table.
+ATTN_PROJ = r"self_attn\.[a-z_]*proj[a-z0-9_]*"
+# Dense FFN is gate/up/down_proj; MoE also carries the same names under experts.<i>. — this catches both.
+FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.\d+)?\.(?:gate|up|down)_proj"
+
+
 def dynamic_config(alloc):
     """gptqmodel `dynamic` regex map. Base is LOW (4-bit); we add 8-bit overrides for the
-    hot groups. q/k/v+o share the attn bit; gate/up+down share the ffn bit (fused-safe)."""
+    hot groups. q/k/v+o (or MLA's a/b projections) share the attn bit; gate/up+down share the
+    ffn bit (fused-safe). Projection names are matched arch-agnostically (see ATTN_PROJ/FFN_PROJ)."""
     dyn = {}
     for i, g in alloc.items():
         if g["attn"] == HIGH:
-            dyn[rf".*\.layers\.{i}\.self_attn\.(q|k|v|o)_proj"] = {"bits": HIGH}
+            dyn[rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
         if g["ffn"] == HIGH:
-            dyn[rf".*\.layers\.{i}\.mlp\.(gate|up|down)_proj"] = {"bits": HIGH}
+            dyn[rf".*\.layers\.{i}\.{FFN_PROJ}"] = {"bits": HIGH}
     return dyn
 
 
@@ -81,12 +102,13 @@ def moe_dynamic_config(alloc):
     never catches an expert's `gate_proj`."""
     dyn = {}
     # ALWAYS protect the router (selection integrity) and the shared expert (every-token path).
+    # `shared_experts?` covers Qwen-MoE's singular `shared_expert` and DeepSeek/GLM's plural `shared_experts`.
     dyn[r".*\.(mlp|block_sparse_moe)\.gate$"] = {"bits": HIGH}
-    dyn[r".*\.mlp\.shared_expert(_gate|\.(gate_proj|up_proj|down_proj))"] = {"bits": HIGH}
+    dyn[r".*\.mlp\.shared_experts?(_gate|\.(gate_proj|up_proj|down_proj))"] = {"bits": HIGH}
     for i, g in alloc.items():
-        if g["attn"] == HIGH:
-            dyn[rf".*\.layers\.{i}\.self_attn\.(q|k|v|o)_proj"] = {"bits": HIGH}
-        if g["ffn"] == HIGH:                       # hot-layer experts kept at 8-bit
+        if g["attn"] == HIGH:                      # standard OR MLA attention (see ATTN_PROJ)
+            dyn[rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
+        if g["ffn"] == HIGH:                       # hot-layer experts kept at 8-bit (Mixtral w1/w2/w3 too)
             dyn[rf".*\.layers\.{i}\.(mlp|block_sparse_moe)\.experts\.\d+\."
                 r"(gate_proj|up_proj|down_proj|w1|w2|w3)"] = {"bits": HIGH}
     return dyn
@@ -141,6 +163,8 @@ def main():
           f" · group_size {a.group_size} · desc_act False · sym True")
     if is_moe and not a.uniform:
         print("   MoE: router + shared experts pinned 8-bit (selection integrity); cold experts 4-bit")
+    if detect_mla(a.model) and not a.uniform:
+        print("   MLA attention detected (q_a/q_b/kv_a/kv_b_proj) — allocation matches it arch-agnostically")
     print(f"   8-bit modules: {len(dyn)} groups (sensitivity-ranked hot set)")
     print(f"   NOTE (KV/memory): {kv_note(a.model)}")
     if a.plan_only:

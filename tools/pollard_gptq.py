@@ -91,18 +91,38 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
     rows, cols = W.shape
     maxq = 2 ** bits - 1
     H = H.clone().float()
-    dead = torch.diag(H) == 0
+    # Dead channels: exactly zero OR negligible vs the mean diagonal. A big o_proj Hessian
+    # (e.g. 16384-dim on GLM-5.3) has near-dead channels that aren't exactly 0 yet still wreck the
+    # Cholesky — pin them out too, not just the exact zeros.
+    diagH = torch.diag(H)
+    meandiag = diagH[diagH > 0].mean().clamp(min=1e-8) if bool((diagH > 0).any()) else diagH.new_tensor(1.0)
+    dead = diagH <= 1e-10 * meandiag
     H[dead, dead] = 1.0; W[:, dead] = 0.0
     if act_order:
         perm = torch.argsort(torch.diag(H), descending=True)
         W = W[:, perm]; H = H[perm][:, perm]
         invperm = torch.argsort(perm)
-    damp = percdamp * torch.mean(torch.diag(H)).clamp(min=1e-8)
-    H[range(cols), range(cols)] += damp
-    # H^-1, upper-Cholesky (GPTQ's stable column ordering)
-    L = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(L)
-    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    # H^-1 via upper-Cholesky (GPTQ's stable column ordering). A near-singular Hessian (huge o_proj,
+    # massive-activation channels) can be non-PD even after nominal damping — escalate the damping
+    # ×10 up to ×100, then fall back to fp64, rather than crashing the whole layer.
+    base = torch.mean(torch.diag(H)).clamp(min=1e-8)
+    Hinv = None
+    for attempt in range(6):
+        use64 = attempt >= 3                        # after 3 float tries, retry in double precision
+        damp = percdamp * (10 ** (attempt % 3)) * base
+        Hd = (H.double() if use64 else H).clone()
+        Hd[range(cols), range(cols)] += damp
+        try:
+            L = torch.linalg.cholesky(Hd)
+            Hinv = torch.cholesky_inverse(L)
+            Hinv = torch.linalg.cholesky(Hinv, upper=True).to(W.dtype)
+            break
+        except Exception:
+            continue
+    if Hinv is None:
+        raise RuntimeError(f"GPTQ: Hessian stayed non-positive-definite for a {cols}-col layer even "
+                           "after damping ×100 and an fp64 fallback — raise --percdamp or widen the "
+                           "calibration set (this layer's activations barely moved).")
     Q = torch.zeros_like(W)
     scale = zero = None
     for i in range(cols):
