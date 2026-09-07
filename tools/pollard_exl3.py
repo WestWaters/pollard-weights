@@ -161,8 +161,8 @@ def main():
     try:
         import pollard_workspace as ws
         ws.record_build(a.model, "exl3", a.out, tag=f"{a.bpw}bpw", bpw=a.bpw)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote EXL3 model -> {a.out}\n  run:  exllamav3 / TabbyAPI loads {a.out}"
           f"\n  VERIFY:  pollard-verify --model {a.out} --source {a.model} --end-to-end")
 

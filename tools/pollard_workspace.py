@@ -179,3 +179,27 @@ def list_models() -> list:
     if not os.path.isdir(root):
         return []
     return sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+
+
+def resolve_trust_remote_code(model_id, mode="auto") -> bool:
+    """Custom architectures (Spark2_5, etc.) ship their own modeling code that transformers must be
+    allowed to run to load them. 'auto' enables it ONLY when the model's config.json declares an
+    `auto_map` (i.e. it actually has custom code) and says so; 'on'/'off' force it. Reads config.json
+    as plain JSON — no code is executed to make the decision. Shared by every export lane."""
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    try:
+        import json
+        if os.path.isdir(model_id):
+            cfg = json.load(open(os.path.join(model_id, "config.json")))
+        else:
+            from huggingface_hub import hf_hub_download
+            cfg = json.load(open(hf_hub_download(model_id, "config.json")))
+        if cfg.get("auto_map"):
+            print("   [trust-remote-code] custom architecture (auto_map) detected — enabling remote code")
+            return True
+        return False
+    except Exception:
+        return False

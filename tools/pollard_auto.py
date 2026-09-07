@@ -144,13 +144,15 @@ def _resolve_hf(a):
     """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
     Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
-        return _precondition_hf(a, a.hf)
+        a._hf_dir = _precondition_hf(a, a.hf)
+        return a._hf_dir
     local = os.path.join(os.path.abspath(a.output or "."), a.hf.split("/")[-1])
     print(f"   fetch HF repo: huggingface-cli download {a.hf} --local-dir {local}")
     if a.run:
         from huggingface_hub import snapshot_download
         local = snapshot_download(a.hf, local_dir=local)
-    return _precondition_hf(a, local)
+    a._hf_dir = _precondition_hf(a, local)
+    return a._hf_dir
 
 
 def _hf_to_gguf(a):
@@ -209,16 +211,17 @@ def _emit_nongguf(a):
     out = a.output or (os.path.basename(hf_dir.rstrip("/\\")) + f"-Pollard-{a.format.upper()}")
     here = os.path.dirname(os.path.abspath(out)) or "."
 
+    trc = ["--trust-remote-code", a.trust_remote_code]     # custom-arch passthrough (Spark2_5 etc.)
     if a.format == "gptq":
         calib = _ensure_calib_text(a, here)
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
-        cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out]
+        cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
     elif a.format == "mx":                                  # Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
         calib = _ensure_calib_text(a, here)                # NVFP4 activation scales need calibration
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
-        cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out]
+        cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
     elif a.format == "exl3":
@@ -228,7 +231,7 @@ def _emit_nongguf(a):
     else:                                                   # mlx (Apple) — measured 4/8 mix; smoothing N/A
         calib = _ensure_calib_text(a, here)                # only for the probe's held-out eval corpus
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
-        cmd = ["pollard-mlx", "--model", hf_dir, "--out", out]
+        cmd = ["pollard-mlx", "--model", hf_dir, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
     print(f"   {a.format.upper()} export (Pollard method — smoothing default + measured allocation):")
@@ -276,6 +279,9 @@ def main():
                     help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "
                          "allocation). By default the one-shot measures allocation (pollard-probe) — the gold path.")
     ap.set_defaults(measure=True)
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code for custom archs (Spark2_5 etc.); 'auto' enables "
+                         "it only when config.json declares an auto_map. Passed through to the export lanes.")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
     ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")
@@ -361,11 +367,19 @@ def main():
     # is the flagship mix — no manual calib/fit/calc step. --no-auto-imatrix opts back to ladder-only.
     if not a.imatrix and a.auto_imatrix:
         a.imatrix = _ensure_imatrix(a)
+    # MEASURED allocation for the ladder too (not just uniform K-quants): if we have the HF weights
+    # (came from --hf) and no profile was given, auto-probe one — same gold lever as the export lanes.
+    hf_dir = getattr(a, "_hf_dir", None)
+    if hf_dir and not a.sensitivity and a.measure:
+        here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+        calib = a.calib or os.path.join(here, "pollard_calib.txt")
+        a.sensitivity = _ensure_sensitivity(a, hf_dir, calib, here)
     cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
     if a.imatrix: cmd += ["--imatrix", a.imatrix]
+    if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]   # measured per-layer allocation
     if a.out: cmd += ["--out", a.out]
     if not a.run: cmd += ["--plan-only"]
-    print("   1) the K-quant ladder (fits your RAM budget):")
+    print("   1) the K-quant ladder (measured allocation, fits your RAM budget):")
     _run(cmd, a.run)
     if a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
