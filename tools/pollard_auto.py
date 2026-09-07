@@ -144,13 +144,15 @@ def _resolve_hf(a):
     """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
     Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
-        return _precondition_hf(a, a.hf)
+        a._hf_dir = _precondition_hf(a, a.hf)
+        return a._hf_dir
     local = os.path.join(os.path.abspath(a.output or "."), a.hf.split("/")[-1])
     print(f"   fetch HF repo: huggingface-cli download {a.hf} --local-dir {local}")
     if a.run:
         from huggingface_hub import snapshot_download
         local = snapshot_download(a.hf, local_dir=local)
-    return _precondition_hf(a, local)
+    a._hf_dir = _precondition_hf(a, local)
+    return a._hf_dir
 
 
 def _hf_to_gguf(a):
@@ -365,11 +367,19 @@ def main():
     # is the flagship mix — no manual calib/fit/calc step. --no-auto-imatrix opts back to ladder-only.
     if not a.imatrix and a.auto_imatrix:
         a.imatrix = _ensure_imatrix(a)
+    # MEASURED allocation for the ladder too (not just uniform K-quants): if we have the HF weights
+    # (came from --hf) and no profile was given, auto-probe one — same gold lever as the export lanes.
+    hf_dir = getattr(a, "_hf_dir", None)
+    if hf_dir and not a.sensitivity and a.measure:
+        here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+        calib = a.calib or os.path.join(here, "pollard_calib.txt")
+        a.sensitivity = _ensure_sensitivity(a, hf_dir, calib, here)
     cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
     if a.imatrix: cmd += ["--imatrix", a.imatrix]
+    if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]   # measured per-layer allocation
     if a.out: cmd += ["--out", a.out]
     if not a.run: cmd += ["--plan-only"]
-    print("   1) the K-quant ladder (fits your RAM budget):")
+    print("   1) the K-quant ladder (measured allocation, fits your RAM budget):")
     _run(cmd, a.run)
     if a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
