@@ -57,10 +57,15 @@ def build_recipe(hot_layers, scheme, protect_scheme, protect_down):
     }
 
 
-def avg_bits(n_layers, hot_frac, protect_down):
-    body = 4.0
+def scheme_bits(scheme):
+    """Nominal weight bits for a scheme name (FP4/NVFP4/MXFP4/W4A16 -> 4; FP8/W8A16 -> 8)."""
+    return 4.0 if "4" in scheme else 8.0
+
+
+def avg_bits(n_layers, hot_frac, protect_down, scheme="NVFP4", protect_scheme="FP8"):
+    body = scheme_bits(scheme)
     frac_protected = min(1.0, hot_frac + (0.14 if protect_down else 0.0))   # down_proj ~1/7 of linears
-    return round(body * (1 - frac_protected) + 8.0 * frac_protected, 2)
+    return round(body * (1 - frac_protected) + scheme_bits(protect_scheme) * frac_protected, 2)
 
 
 def main():
@@ -70,9 +75,14 @@ def main():
     ap.add_argument("--out", help="output compressed-tensors dir (required unless --plan-only)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (pollard-probe/-sensitivity)")
     ap.add_argument("--calib", help="calibration text (required for real emit; NVFP4 activations need it)")
-    ap.add_argument("--scheme", default="NVFP4", choices=["NVFP4", "MXFP4"],
-                    help="FP4 scheme: NVFP4 (vLLM-validated, default) or MXFP4 (OCP MX, experimental)")
-    ap.add_argument("--protect-scheme", default="FP8", choices=["FP8", "FP8_DYNAMIC"],
+    ap.add_argument("--scheme", default="NVFP4", choices=["NVFP4", "MXFP4", "W4A16", "W8A16"],
+                    help="body scheme: NVFP4 (Blackwell FP4, vLLM-validated default) / MXFP4 (OCP MX, "
+                         "experimental) / W4A16 / W8A16 (INT weight-only compressed-tensors — runs on any "
+                         "vLLM GPU, not just Blackwell)")
+    ap.add_argument("--gptq", action="store_true",
+                    help="for INT schemes (W4A16/W8A16): use GPTQ error-feedback for the body (more "
+                         "accurate than RTN); needs --calib. Ignored for the FP4 schemes.")
+    ap.add_argument("--protect-scheme", default="FP8", choices=["FP8", "FP8_DYNAMIC", "W8A16"],
                     help="precision for the protected (hot) layers")
     ap.add_argument("--hot-frac", type=float, default=0.25, help="fraction of layers kept at FP8 (not FP4)")
     ap.add_argument("--protect-down", action="store_true",
@@ -95,15 +105,17 @@ def main():
 
     hot = allocate(sens, n_layers or 32, a.hot_frac)
     rec = build_recipe(hot, a.scheme, a.protect_scheme, a.protect_down)
-    ab = avg_bits(n_layers or 32, a.hot_frac, a.protect_down)
+    ab = avg_bits(n_layers or 32, a.hot_frac, a.protect_down, a.scheme, a.protect_scheme)
+    is_int = a.scheme in ("W4A16", "W8A16")
 
     if a.scheme == "MXFP4":
         print(" !! MXFP4 is EXPERIMENTAL upstream (MXFP4PackedCompressor; vLLM validation pending). "
               "NVFP4 is the vLLM-validated default.")
     print(f"== pollard-mx :: {a.model}  scheme={a.scheme}  ~{ab} bpw avg  "
-          f"(body FP4 · {len(hot)} hot layers + {'down_proj ' if a.protect_down else ''}@ {a.protect_scheme})")
-    print("   Pollard intent -> compressed-tensors: crush the cold bulk to FP4, keep measured-hot layers "
-          "at FP8, lm_head high-precision.")
+          f"(body {a.scheme} · {len(hot)} hot layers + {'down_proj ' if a.protect_down else ''}@ {a.protect_scheme})")
+    print(f"   Pollard intent -> compressed-tensors: crush the cold bulk to {a.scheme}, keep measured-hot "
+          f"layers at {a.protect_scheme}, lm_head high-precision."
+          + ("  [INT weight-only: runs on any vLLM GPU, not just Blackwell]" if is_int else ""))
     print("   recipe:")
     print(f"     body:    QuantizationModifier(targets='Linear', scheme='{a.scheme}', ignore={rec['ignore'] + rec['protect']})")
     if rec["protect"]:
@@ -113,22 +125,35 @@ def main():
     if not a.out:
         a.out = ws.resolve_out(a.model, "mx", tag=f"{a.scheme}-{ab}bpw")
         print(f"   (no --out) -> workspace: {a.out}")
-    if not a.calib:
+    if not a.calib and not is_int:
         sys.exit("ERROR: --calib required for real emit (FP4 activation scales need calibration).")
+    if a.gptq and not a.calib:
+        sys.exit("ERROR: --gptq needs --calib (error feedback is measured on the calibration set).")
     try:
         from llmcompressor import oneshot
         from llmcompressor.modifiers.quantization import QuantizationModifier
     except Exception:
-        sys.exit("ERROR: llm-compressor not installed here. On the Blackwell/CUDA box: "
+        sys.exit("ERROR: llm-compressor not installed here. On the target CUDA box: "
                  "pip install llmcompressor ; then rerun. It writes a compressed-tensors checkpoint "
-                 "that `vllm serve` loads on the FP4 tensor cores.")
-    # body FP4 (ignore lm_head + protected globs) + a second modifier pinning protected globs to FP8
-    mods = [QuantizationModifier(targets="Linear", scheme=a.scheme, ignore=rec["ignore"] + rec["protect"])]
+                 "that `vllm serve` loads (FP4 on Blackwell tensor cores; W4A16/W8A16 on any vLLM GPU).")
+    # body (ignore lm_head + protected globs) + a second modifier pinning the protected globs high.
+    # For INT schemes, --gptq swaps the body to GPTQ error-feedback (more accurate than RTN at W4A16).
+    BodyMod = QuantizationModifier
+    if a.gptq and is_int:
+        try:
+            from llmcompressor.modifiers.quantization import GPTQModifier as BodyMod
+        except Exception:
+            print("   (GPTQModifier unavailable — falling back to RTN QuantizationModifier for the body)")
+    mods = [BodyMod(targets="Linear", scheme=a.scheme, ignore=rec["ignore"] + rec["protect"])]
     if rec["protect"]:
         mods.append(QuantizationModifier(targets=rec["protect"], scheme=a.protect_scheme))
-    cal = [l for l in open(a.calib, encoding="utf-8", errors="ignore").read().splitlines() if l.strip()]
-    print(f"   emitting via llm-compressor ({len(cal)} calib rows) -> {a.out}")
-    oneshot(model=a.model, recipe=mods, dataset=cal, output_dir=a.out)
+    cal = ([l for l in open(a.calib, encoding="utf-8", errors="ignore").read().splitlines() if l.strip()]
+           if a.calib else None)
+    print(f"   emitting via llm-compressor ({len(cal) if cal else 'no'} calib rows) -> {a.out}")
+    if cal:                                        # FP4 activation scales / GPTQ error-feedback need it
+        oneshot(model=a.model, recipe=mods, dataset=cal, output_dir=a.out)
+    else:                                          # INT weight-only RTN: no calibration set required
+        oneshot(model=a.model, recipe=mods, output_dir=a.out)
     ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{ab}bpw", bpw=ab)
     print(f"wrote MX checkpoint -> {a.out}\n  run:  vllm serve {a.out}"
           f"\n  VERIFY:  pollard-verify --model {a.out} --source {a.model} --end-to-end")

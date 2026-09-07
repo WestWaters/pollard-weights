@@ -368,6 +368,14 @@ otherwise. Force one with `POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh`. Throughpu
 tracks the slowest peer and the link, but the RAM adds up regardless of who made
 the chips.
 
+For the **vLLM/GPTQ** side of clustering — models too big to even *quantize* on one
+box (a 744B is ~1.5 TB in BF16) — `pollard-export --shard-plan N` prints the
+contiguous layer band each node owns plus the boundary-handoff contract, and
+`pollard-serve-eval` A/Bs the result on the served stack. The full unified-memory
+runbook (memory-pressure modeling, one-GPU-job-per-node, band-parallel export,
+byte-accounting, gate hygiene) is in
+[notes/unified-memory-playbook.md](notes/unified-memory-playbook.md).
+
 ## Wafer-scale (Cerebras): capacity planning
 
 `pollard-pack` points Pollard's hot-set ranking at an SRAM machine (Cerebras
@@ -441,7 +449,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-fit` · `pollard-automap` · `pollard-fit-dit` | GGUF (memory-fit mix; MoE recipe; any-arch pure-Python) |
 | `pollard-export` · `pollard-gptq` | GPTQ (vLLM/SGLang; full-Hessian error-feedback) |
-| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · MX/NVFP4 (Blackwell) |
+| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors: NVFP4/MXFP4 (Blackwell) + W4A16/W8A16 INT (any vLLM GPU) |
 
 **Precondition — compose across every lane**
 | Command | What it does |
@@ -462,6 +470,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-verify` · `pollard-doctor` | Correctness gate (real reconstruction); diagnose/predict/repair any model any lane |
 | `pollard-eval` · `pollard-bench` · `pollard-kl` · `pollard-scorecard` | Top-1+KL eval (`--chart`); gold-card benchmark; KL-to-f16; standardized scorecard |
+| `pollard-serve-eval` | A/B a quantized model vs its baseline on the **served** stack (vLLM/SGLang) — teacher-forced PPL, top-1 agreement, KL; stdlib only |
 | `pollard-probes` · `pollard-health` | Task-accuracy MCQ probes; is your accelerator at full speed or silently degraded? |
 
 **Runtime & workspace**

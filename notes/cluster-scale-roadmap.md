@@ -21,33 +21,28 @@ processed 307K routing rows fine.
       Cholesky escalates damping ×10→×100 then falls back to fp64, raising a clear error only if all fail.
       Tested on rank-deficient + massive-activation Hessians. (Was crashing the 16384-dim o_proj layer.)
 
-## Phase 2 — the big cluster frontier (buildable; needs THEIR hardware to verify end-to-end)
-- [ ] **Band-parallel / layer-streaming export** — models too big for one box (744B = 1.5TB BF16).
-      `pollard-export` loads the whole model via `GPTQModel.load`; need each node owning a contiguous layer
-      range, boundary hidden states handed off. (Storage egress was the wall-clock wall: ~118 MB/s/box.)
-- [ ] **GPU-side layer-streaming sensitivity** — the GGUF sensitivity path needs `len(groups)×layers` full
-      requantize+KL passes (156 at 744B over 1.5TB → its own guard refuses). Need a Hessian-weighted /
-      shaped-noise estimator, one pass over ~1M calib tokens.
-- [ ] **MoE-aware per-expert Hessians** in production GPTQ (router-replicated + token-floor/identity
-      fallback + batched). Memory: 256×6144² fp32 = 38.7 GB/layer → two-set trick (+3 min/layer).
-- [ ] **Both-width candidate emit + allocation-as-config** — write int4 AND int8 once, allocation is a
-      config.json + re-pack, so A/B on the cluster is "a boot, not a cook."
-- [ ] **compressed-tensors output for the GPTQ lane** (per-target mixed widths natively; pollard-mx
-      already does this for FP4 — extend to the INT path).
-- [ ] **Served-model A/B eval harness** — vLLM echo+logprobs perplexity, top-1, HumanEval+/MBPP+,
-      long-context needle, spec-decode acceptance, mixed-workload throughput.
+## Phase 2 — the big cluster frontier  — DONE (2026-09-07; generic+robust, cluster verification is theirs)
+- [x] **Band-parallel / layer-streaming export** — `pollard-export --shard-plan N --bf16-gb G` prints the
+      contiguous band each node owns + byte budget + the boundary-handoff contract (offload path per band,
+      last hidden state handed to the next node). Storage egress flagged as the wall-clock wall.
+- [x] **GPU-side layer-streaming sensitivity** — `pollard-probe --stream`: ONE forward pass, Hessian-diagonal
+      estimator (Σ ΔW²·E[x²]) scores every group at once. Same ranking as perturb+KL, no layers×groups sweep.
+      Tolerates unused/pruned modules. Unit-tested (flags the amplified layer; monotone noise curve).
+- [x] **MoE-aware per-expert Hessians** — per-module hooks already give per-expert H; added a **token floor**
+      in `gptq_quantize` (n_tokens < cols → diagonal H, drops unreliable off-diagonal). Threaded through both
+      the sequential and collect-Hessians paths. Tested cold vs warm expert.
+- [x] **Allocation-as-config** — `pollard-export` writes `pollard-allocation.json` beside the checkpoint
+      (full dynamic bit map + metadata), so re-A/B'ing an allocation is a re-pack, not a re-cook.
+- [x] **compressed-tensors output for the INT path** — `pollard-mx` gained `W4A16`/`W8A16` schemes (+`--gptq`
+      body via GPTQModifier, `W8A16` protect); per-target mixed widths natively, runs on any vLLM GPU.
+- [x] **Served-model A/B eval harness** — `pollard-serve-eval` (stdlib only): teacher-forced PPL, top-1
+      agreement, KL(base‖cand) against any OpenAI-compatible endpoint (vLLM/SGLang). Tested vs a mock server.
 
-## Phase 3 — docs & hygiene
-- [ ] **Unified-memory playbook** (`notes/`): page-cache drop (`posix_fadvise DONTNEED`), one GPU job per
-      node, meta-device dtype (cast on meta before `to_empty` to avoid fp32 reserve), damped-Cholesky
-      escalation. Covers DGX Spark/GB10, Grace-Blackwell, Apple.
-- [ ] **Byte-accounting as a first-class report** — bytes-per-decoded-token IS the speed model on
-      bandwidth-bound hosts (on GLM-5.3, int8 attention reads more bytes/token than routed experts).
-- [ ] **Gate hygiene**: held-out/calibration overlap detection (158 of 162 held-out texts were in replay
-      corpora) — exclude records whose reference completion hashes to a held-out text.
-- [ ] **CUDA leak note**: on unified-memory hosts, `empty_cache()` under-reports; `cudaMemGetInfo` free
-      falls — one process per layer (fresh context) is the workaround.
-- [ ] **Spec-decode head note**: ship the model authors' STOCK MTP head with the new quantized body;
-      retraining the head on quantized-body captures did NOT close the acceptance gap (1.80→1.36).
+## Phase 3 — docs & hygiene  — DONE (2026-09-07)
+All consolidated into **[unified-memory-playbook.md](unified-memory-playbook.md)** (one doc, not scattered):
+memory-pressure modeling + page-cache drop, one-GPU-job-per-node, meta-device dtype, damped-Cholesky (now
+implemented — §4), CUDA free-memory under-report + one-process-per-band workaround, band-parallel export,
+byte-accounting as the speed model, served-model A/B, calibration/held-out overlap (gate hygiene), and the
+spec-decode "ship the stock MTP head" note.
 
 Rule: generic + robust first; hardware-specific quirks (like the GB10 None-guard) added as reports arrive.

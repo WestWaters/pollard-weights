@@ -119,6 +119,38 @@ def avg_bits(alloc):
     return sum(b) / len(b) if b else LOW
 
 
+def shard_ranges(n_layers, n_nodes):
+    """Split n_layers into n_nodes contiguous ranges, remainder spread over the first nodes.
+    Contiguous (not round-robin) so each node holds a band and only ONE boundary hidden state
+    crosses the wire between neighbours. Returns [(start, end_exclusive), ...]."""
+    n_nodes = max(1, min(n_nodes, n_layers))
+    base, rem = divmod(n_layers, n_nodes)
+    ranges, s = [], 0
+    for k in range(n_nodes):
+        span = base + (1 if k < rem else 0)
+        ranges.append((s, s + span)); s += span
+    return ranges
+
+
+def print_shard_plan(model_id, n_layers, n_nodes, bf16_gb):
+    """Band-parallel layer-streaming plan: which contiguous layer band each node owns, its byte
+    budget, and the boundary-handoff contract. The actual per-node quantize is the existing offload
+    path restricted to that band; only the boundary hidden state crosses between neighbours."""
+    ranges = shard_ranges(n_layers, n_nodes)
+    per_layer_gb = (bf16_gb / n_layers) if (bf16_gb and n_layers) else 0.0
+    print(f"== pollard-export band-parallel plan :: {model_id}")
+    print(f"   {n_layers} decoder layers over {len(ranges)} node(s) — contiguous bands, "
+          "one boundary hidden state handed to the next node:")
+    for k, (s, e) in enumerate(ranges):
+        budget = f" · ~{per_layer_gb*(e-s):.1f} GB bf16 resident" if per_layer_gb else ""
+        print(f"   node {k}: layers [{s}..{e-1}]  ({e-s} layers){budget}")
+    print("   handoff contract: node k quantizes its band with the offload path, re-runs the quantized"
+          "\n     band to produce the hidden state at its last layer, and passes THAT to node k+1 as"
+          "\n     its input (node 0 starts from the embedded calibration tokens).")
+    print("   NOTE: verify end-to-end on your own cluster — storage egress (~100 MB/s/box in the field)"
+          " is usually the wall-clock wall, not compute.")
+
+
 def kv_note(model_id):
     """Victor's point: vLLM pre-allocates KV hard (gpu_memory_utilization ~0.9, paged
     attention) — far more headroom than llama.cpp. Flag it so the target VRAM is realistic."""
@@ -133,7 +165,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", required=True, help="HF model dir or id (FP16/BF16)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (pollard-probe/-sensitivity)")
-    ap.add_argument("--calib", required=True, help="calibration text (one sample per line or a corpus)")
+    ap.add_argument("--calib", help="calibration text (one sample per line or a corpus); "
+                    "required to build, not for --plan-only / --shard-plan")
     ap.add_argument("--out", help="output dir for the GPTQ checkpoint (default: workspace)")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
     ap.add_argument("--hot-frac", type=float, default=0.35, help="fraction of layers kept at 8-bit")
@@ -144,6 +177,11 @@ def main():
     ap.add_argument("--dense", dest="moe", action="store_false",
                     help="force the dense dynamic map")
     ap.add_argument("--plan-only", action="store_true", help="print the allocation + dynamic map, build nothing")
+    ap.add_argument("--shard-plan", type=int, default=0, metavar="N",
+                    help="band-parallel: print the contiguous layer range + byte budget each of N nodes owns "
+                         "(for models too big for one box), then exit. Add --bf16-gb for the byte estimate.")
+    ap.add_argument("--bf16-gb", type=float, default=0.0,
+                    help="total BF16 size (GB) of the source model, for the --shard-plan byte budget")
     a = ap.parse_args()
 
     sens = json.load(open(a.sensitivity)) if a.sensitivity else {}
@@ -153,6 +191,10 @@ def main():
     if not n_layers:
         sys.exit("ERROR: could not read layer count — pass --layers.")
     is_moe = auto_moe if a.moe is None else a.moe
+
+    if a.shard_plan:
+        print_shard_plan(a.model, n_layers, a.shard_plan, a.bf16_gb)
+        return
 
     alloc = allocate(sens, n_layers, a.hot_frac)
     dyn = {} if a.uniform else (moe_dynamic_config(alloc) if is_moe else dynamic_config(alloc))
@@ -181,6 +223,8 @@ def main():
     except Exception:
         sys.exit("ERROR: gptqmodel not installed here. Run this on the CUDA box: "
                  "pip install gptqmodel ; the checkpoint it writes loads in vLLM/SGLang.")
+    if not a.calib:
+        sys.exit("ERROR: --calib is required to build (use --plan-only / --shard-plan for planning only).")
     calib = [ln.strip() for ln in open(a.calib, encoding="utf-8") if ln.strip()]
     qcfg = QuantizeConfig(bits=LOW, group_size=a.group_size, desc_act=False, sym=True,
                           dynamic=(dyn or None))
@@ -190,6 +234,17 @@ def main():
         a.out = ws.resolve_out(a.model, "gptq", tag="int4")
         print(f"   (no --out) -> workspace: {a.out}")
     model.save(a.out)
+    # allocation-as-config: drop the exact bit plan beside the checkpoint. A/B'ing a different
+    # allocation is then a re-pack against this record, not a full re-cook.
+    try:
+        import os
+        cfg_path = os.path.join(a.out, "pollard-allocation.json")
+        json.dump({"model": a.model, "kind": kind, "layers": n_layers, "group_size": a.group_size,
+                   "low_bits": LOW, "high_bits": HIGH, "uniform": bool(a.uniform),
+                   "avg_bits": round(ab, 3), "dynamic": dyn}, open(cfg_path, "w"), indent=2)
+        print(f"   allocation recorded -> {cfg_path}")
+    except Exception as e:
+        print(f"   (could not write allocation sidecar: {e})")
     ws.record_build(a.model, "gptq", a.out, tag="int4")
     print(f"wrote GPTQ checkpoint -> {a.out}\n"
           f"  vLLM:   vllm serve {a.out} --quantization gptq\n"

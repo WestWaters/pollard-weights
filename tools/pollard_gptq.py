@@ -79,7 +79,7 @@ def _col_quant(w, scale, zero, maxq, qmode):
     raise ValueError(qmode)
 
 
-def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="int"):
+def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="int", n_tokens=None):
     """GPTQ on one linear weight W [rows, cols] with Hessian H [cols, cols].
     act_order: quantize columns in decreasing-Hessian-diagonal order (most
     important first) — recovers markedly more of RTN's loss.
@@ -98,6 +98,11 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
     meandiag = diagH[diagH > 0].mean().clamp(min=1e-8) if bool((diagH > 0).any()) else diagH.new_tensor(1.0)
     dead = diagH <= 1e-10 * meandiag
     H[dead, dead] = 1.0; W[:, dead] = 0.0
+    # MoE token floor: an expert that saw fewer tokens than it has input channels has a
+    # rank-deficient Hessian — the off-diagonal cross-channel structure is noise. Keep the diagonal
+    # (per-channel importance, like imatrix) and drop the unreliable off-diagonal rather than trust it.
+    if n_tokens is not None and n_tokens < cols:
+        H = torch.diag(torch.diag(H))
     if act_order:
         perm = torch.argsort(torch.diag(H), descending=True)
         W = W[:, perm]; H = H[perm][:, perm]
@@ -323,7 +328,8 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
             if qm == "skip":                                          # leave this tensor fp16
                 del H[n]; continue
             m.weight.data = gptq_quantize(m.weight.data, H[n] / max(cnt[n], 1),
-                                          b, groupsize, act_order=act_order, qmode=qm).to(dev)
+                                          b, groupsize, act_order=act_order, qmode=qm,
+                                          n_tokens=cnt[n]).to(dev)   # token-floor guards cold experts
             del H[n]
         empty()
         # re-run the now-QUANTIZED block to produce inputs for the next block (back to CPU)
@@ -399,7 +405,7 @@ def main():
             for c in calib:
                 model(c.unsqueeze(0).to(dev))
         for h in hooks: h.remove()
-        return {n: H[n] / max(cnt[n], 1) for n in lins}
+        return {n: (H[n] / max(cnt[n], 1), cnt[n]) for n in lins}   # (Hessian, token count)
 
     def run(method):
         if fp16_state is not None:
@@ -412,15 +418,16 @@ def main():
                             act_order=method.endswith("-ao"), offload=a.offload, qmode=a.qmode,
                             recipe=rec, nlayers=len(model.model.layers))
         elif method in ("gptq", "gptq-ao"):
-            Hs = collect_hessians(lins)                       # Hessians from the fp16 activations
+            Hs = collect_hessians(lins)                       # {n: (Hessian, token count)}
             ao = (method == "gptq-ao")
             for n, m in lins.items():
-                m.weight.data = gptq_quantize(m.weight.data, Hs[n], a.bits, a.groupsize,
-                                              act_order=ao, qmode=a.qmode).to(m.weight.device)
+                Hn, cn = Hs[n]
+                m.weight.data = gptq_quantize(m.weight.data, Hn, a.bits, a.groupsize,
+                                              act_order=ao, qmode=a.qmode, n_tokens=cn).to(m.weight.device)
         elif method == "imatrix":
             Hs = collect_hessians(lins)                       # diagonal = per-channel importance
             for n, m in lins.items():
-                m.weight.data = imatrix_quantize(m.weight.data, torch.diag(Hs[n]),
+                m.weight.data = imatrix_quantize(m.weight.data, torch.diag(Hs[n][0]),
                                                  a.bits, a.groupsize).to(m.weight.device)
         else:                                                 # rtn (alphabet-aware)
             for n, m in lins.items():
