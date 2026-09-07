@@ -209,16 +209,17 @@ def _emit_nongguf(a):
     out = a.output or (os.path.basename(hf_dir.rstrip("/\\")) + f"-Pollard-{a.format.upper()}")
     here = os.path.dirname(os.path.abspath(out)) or "."
 
+    trc = ["--trust-remote-code", a.trust_remote_code]     # custom-arch passthrough (Spark2_5 etc.)
     if a.format == "gptq":
         calib = _ensure_calib_text(a, here)
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
-        cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out]
+        cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
     elif a.format == "mx":                                  # Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
         calib = _ensure_calib_text(a, here)                # NVFP4 activation scales need calibration
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
-        cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out]
+        cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
     elif a.format == "exl3":
@@ -228,7 +229,7 @@ def _emit_nongguf(a):
     else:                                                   # mlx (Apple) — measured 4/8 mix; smoothing N/A
         calib = _ensure_calib_text(a, here)                # only for the probe's held-out eval corpus
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
-        cmd = ["pollard-mlx", "--model", hf_dir, "--out", out]
+        cmd = ["pollard-mlx", "--model", hf_dir, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
     print(f"   {a.format.upper()} export (Pollard method — smoothing default + measured allocation):")
@@ -276,6 +277,9 @@ def main():
                     help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "
                          "allocation). By default the one-shot measures allocation (pollard-probe) — the gold path.")
     ap.set_defaults(measure=True)
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code for custom archs (Spark2_5 etc.); 'auto' enables "
+                         "it only when config.json declares an auto_map. Passed through to the export lanes.")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
     ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")

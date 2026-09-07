@@ -88,6 +88,9 @@ def main():
     ap.add_argument("--protect-down", action="store_true",
                     help="also keep every down_proj (residual writer) at FP8 — usually worth it at 4-bit")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code (custom archs like Spark2_5); 'auto' = only if "
+                         "config.json has an auto_map")
     ap.add_argument("--plan-only", action="store_true", help="print the recipe + avg bits, build nothing")
     a = ap.parse_args()
 
@@ -95,7 +98,7 @@ def main():
     if not n_layers:
         try:
             from transformers import AutoConfig
-            n_layers = getattr(AutoConfig.from_pretrained(a.model), "num_hidden_layers", 0)
+            n_layers = getattr(AutoConfig.from_pretrained(a.model, trust_remote_code=True), "num_hidden_layers", 0)
         except Exception:
             n_layers = 0
     sens = {}
@@ -150,10 +153,19 @@ def main():
     cal = ([l for l in open(a.calib, encoding="utf-8", errors="ignore").read().splitlines() if l.strip()]
            if a.calib else None)
     print(f"   emitting via llm-compressor ({len(cal) if cal else 'no'} calib rows) -> {a.out}")
+    trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
+    def _oneshot(**kw):
+        # llm-compressor exposes trust_remote_code as trust_remote_code_model; tolerate older versions
+        try:
+            oneshot(trust_remote_code_model=trc, **kw)
+        except TypeError:
+            if trc:
+                print("   (this llm-compressor lacks trust_remote_code_model; custom arch may not load)")
+            oneshot(**kw)
     if cal:                                        # FP4 activation scales / GPTQ error-feedback need it
-        oneshot(model=a.model, recipe=mods, dataset=cal, output_dir=a.out)
+        _oneshot(model=a.model, recipe=mods, dataset=cal, output_dir=a.out)
     else:                                          # INT weight-only RTN: no calibration set required
-        oneshot(model=a.model, recipe=mods, output_dir=a.out)
+        _oneshot(model=a.model, recipe=mods, output_dir=a.out)
     ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{ab}bpw", bpw=ab)
     print(f"wrote MX checkpoint -> {a.out}\n  run:  vllm serve {a.out}"
           f"\n  VERIFY:  pollard-verify --model {a.out} --source {a.model} --end-to-end")

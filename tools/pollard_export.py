@@ -20,7 +20,7 @@ Hard runtime constraints baked in (verified Aug 2026):
         --calib calib.txt --out ./Qwen2.5-7B-Instruct-Pollard-GPTQ
     # then: vllm serve ./...-Pollard-GPTQ --quantization gptq
 """
-import argparse, json, re, sys
+import argparse, json, os, re, sys
 import pollard_workspace as ws
 
 HIGH, LOW = 8, 4                       # Marlin supports only these
@@ -34,7 +34,7 @@ def detect_moe(model_id, layers_hint=0):
     num_experts / Mixtral num_local_experts / DeepSeek n_routed_experts)."""
     try:
         from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id)
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         n = getattr(cfg, "num_hidden_layers", 0) or layers_hint
         moe = any(getattr(cfg, k, 0) for k in
                   ("num_experts", "num_local_experts", "n_routed_experts"))
@@ -43,13 +43,16 @@ def detect_moe(model_id, layers_hint=0):
         return False, layers_hint
 
 
+resolve_trust_remote_code = ws.resolve_trust_remote_code   # shared across every export lane
+
+
 def detect_mla(model_id):
     """True if the model uses Multi-head Latent Attention (DeepSeek-V2/V3, GLM-4.5/5.3) — its
     attention is q_a/q_b/kv_a/kv_b_proj, not q/k/v_proj. ATTN_PROJ matches both; this is only
     for the user-facing note. Detected from the low-rank KV config field."""
     try:
         from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id)
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         return getattr(cfg, "kv_lora_rank", None) is not None
     except Exception:
         return False
@@ -85,6 +88,9 @@ def dynamic_config(alloc):
     hot groups. q/k/v+o (or MLA's a/b projections) share the attn bit; gate/up+down share the
     ffn bit (fused-safe). Projection names are matched arch-agnostically (see ATTN_PROJ/FFN_PROJ)."""
     dyn = {}
+    # Head-wise attention output gate (Spark2_5 `self_attn.g_proj`): selection-critical, always high.
+    # No-op for arches without it. Placed first so it holds regardless of per-layer attn allocation.
+    dyn[r".*\.self_attn\.[a-z_]*g_proj"] = {"bits": HIGH}
     for i, g in alloc.items():
         if g["attn"] == HIGH:
             dyn[rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
@@ -172,6 +178,9 @@ def main():
     ap.add_argument("--hot-frac", type=float, default=0.35, help="fraction of layers kept at 8-bit")
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--uniform", action="store_true", help="plain uniform W4 (for SGLang mixed-bit fragility)")
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code (custom archs like Spark2_5). 'auto' enables it "
+                         "only when config.json has an auto_map (default)")
     ap.add_argument("--moe", dest="moe", action="store_true", default=None,
                     help="force the MoE dynamic map (default: auto-detect from config)")
     ap.add_argument("--dense", dest="moe", action="store_false",
@@ -228,7 +237,8 @@ def main():
     calib = [ln.strip() for ln in open(a.calib, encoding="utf-8") if ln.strip()]
     qcfg = QuantizeConfig(bits=LOW, group_size=a.group_size, desc_act=False, sym=True,
                           dynamic=(dyn or None))
-    model = GPTQModel.load(a.model, qcfg)
+    trc = resolve_trust_remote_code(a.model, a.trust_remote_code)
+    model = GPTQModel.load(a.model, qcfg, trust_remote_code=trc)
     model.quantize(calib)
     if not a.out:
         a.out = ws.resolve_out(a.model, "gptq", tag="int4")

@@ -21,7 +21,7 @@ HIGH, LOW = 8, 4
 def detect_moe(model_id, layers_hint=0):
     try:
         from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id)
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         n = getattr(cfg, "num_hidden_layers", 0) or layers_hint
         moe = any(getattr(cfg, k, 0) for k in
                   ("num_experts", "num_local_experts", "n_routed_experts"))
@@ -54,11 +54,13 @@ def bits_for(path, alloc, is_moe, gsize):
     """Per-module bit-width for MLX (returns a {'bits','group_size'} dict, or False to skip).
     Mirrors the Pollard policy: attn follows the attn profile; the FFN/expert body follows ffn;
     MoE router (`.gate`, not `gate_proj`) and shared experts are pinned HIGH; embeddings kept HIGH."""
-    if "embed_tokens" in path or path.endswith("lm_head"):
+    if "embed" in path or path.endswith("lm_head"):    # embed_tokens (llama) OR embedding (Spark2_5, tied)
         return {"bits": HIGH, "group_size": gsize}      # vocab carriers: keep high
     if is_moe and (re.search(r"\.(mlp|block_sparse_moe)\.gate$", path)
                    or "shared_expert" in path):
         return {"bits": HIGH, "group_size": gsize}      # router + shared: selection integrity
+    if "self_attn" in path and path.endswith("g_proj"):  # head-wise attn output gate (Spark2_5): selection-critical
+        return {"bits": HIGH, "group_size": gsize}
     li = layer_of(path)
     if li is None or li not in alloc:
         return {"bits": LOW, "group_size": gsize}
@@ -78,6 +80,9 @@ def main():
     ap.add_argument("--layers", type=int, default=0)
     ap.add_argument("--hot-frac", type=float, default=0.35)
     ap.add_argument("--group-size", type=int, default=64, help="MLX quant group size (default 64)")
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map. "
+                         "Note: MLX needs the arch supported in mlx_lm to convert a truly custom model.")
     ap.add_argument("--moe", dest="moe", action="store_true", default=None,
                     help="force MoE policy (default: auto-detect)")
     ap.add_argument("--dense", dest="moe", action="store_false", help="force dense policy")
@@ -129,8 +134,15 @@ def main():
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
         return bits_for(path, alloc, is_moe, a.group_size)
 
-    convert(a.model, mlx_path=a.out, quantize=True, q_bits=LOW, q_group_size=a.group_size,
-            quant_predicate=predicate)
+    import pollard_workspace as ws
+    trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
+    ckw = dict(mlx_path=a.out, quantize=True, q_bits=LOW, q_group_size=a.group_size, quant_predicate=predicate)
+    try:
+        convert(a.model, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
+    except TypeError:
+        if trc:
+            print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
+        convert(a.model, **ckw)
     try:
         import pollard_workspace as ws
         ws.record_build(a.model, "mlx", a.out, tag=f"{LOW}.{HIGH}")
