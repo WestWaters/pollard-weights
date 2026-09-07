@@ -107,16 +107,45 @@ def _find_convert():
     return "convert_hf_to_gguf.py"                          # assume on PATH / same dir
 
 
+def _precondition_hf(a, hf_dir):
+    """OPT-IN FP16-level transforms applied BEFORE any lane, so they compose across ALL lanes:
+      --abliterate : uncensor (orthogonalize residual writers vs the refusal direction). Behaviour-
+                     changing, the user's own model; measure the quality delta (pollard-kl), don't assume.
+      --smooth     : SmoothQuant preconditioning (reliable low-bit quality lever; GGUF has its own).
+    Returns the (possibly transformed) HF dir."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cur = hf_dir
+    if getattr(a, "abliterate", False):
+        out = cur.rstrip("/\\") + "-abliterated"
+        cmd = [sys.executable, os.path.join(here, "pollard_abliterate.py"), "--model", cur, "--out", out]
+        if a.harmful: cmd += ["--harmful", a.harmful]
+        if a.harmless: cmd += ["--harmless", a.harmless]
+        print(f"   [precondition] abliterate (uncensor, FP16, opt-in): {' '.join(cmd)}")
+        if a.run and subprocess.run(cmd).returncode != 0:
+            sys.exit("   abliterate failed.")
+        cur = out
+    if getattr(a, "smooth", False):
+        out = cur.rstrip("/\\") + "-smoothed"
+        cmd = [sys.executable, os.path.join(here, "pollard_hf_smooth.py"), "--model", cur, "--out", out]
+        if a.calib: cmd += ["--calib", a.calib]
+        print(f"   [precondition] smooth (SmoothQuant, FP16): {' '.join(cmd)}")
+        if a.run and subprocess.run(cmd).returncode != 0:
+            sys.exit("   smooth failed.")
+        cur = out
+    return cur
+
+
 def _resolve_hf(a):
-    """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either."""
+    """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
+    Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
-        return a.hf
+        return _precondition_hf(a, a.hf)
     local = os.path.join(os.path.abspath(a.output or "."), a.hf.split("/")[-1])
     print(f"   fetch HF repo: huggingface-cli download {a.hf} --local-dir {local}")
     if a.run:
         from huggingface_hub import snapshot_download
         local = snapshot_download(a.hf, local_dir=local)
-    return local
+    return _precondition_hf(a, local)
 
 
 def _hf_to_gguf(a):
@@ -204,6 +233,17 @@ def main():
     ap.add_argument("--out", help="output path (dense build)")
     ap.add_argument("--eval", default="wikitext2_test.txt")
     ap.add_argument("--bin", help="llama.cpp bin dir (for the MoE dry-run/build)")
+    ap.add_argument("--smooth", dest="smooth", action="store_true", default=None,
+                    help="SmoothQuant preconditioning (pollard-hf-smooth) on the FP16 model before the lane. "
+                         "DEFAULT-ON for the low-bit trellis/error-feedback lanes (EXL3/GPTQ/MX) — it's the "
+                         "locked gold recipe there (prevents the massive-activation broken build). Use --no-smooth to skip.")
+    ap.add_argument("--no-smooth", dest="smooth", action="store_false",
+                    help="skip the default preconditioning on the EXL3/GPTQ/MX lanes")
+    ap.add_argument("--abliterate", action="store_true",
+                    help="OPT-IN: uncensor the FP16 model (pollard-abliterate) before the lane — composes "
+                         "across ALL lanes. Behaviour-changing, your own model; measure quality with pollard-kl")
+    ap.add_argument("--harmful", help="abliterate: prompts to stop refusing (one/line)")
+    ap.add_argument("--harmless", help="abliterate: matched benign prompts (one/line)")
     ap.add_argument("--run", action="store_true", help="execute the path (default: plan/print it)")
     ap.add_argument("--benchmark", "--reproduce", dest="benchmark", action="store_true",
                     help="ALSO run the gold-card benchmark (3-bar comparison + PPL) — the "
@@ -219,6 +259,14 @@ def main():
     a = ap.parse_args()
     if not a.gguf and not a.hf:
         ap.error("pass --gguf <file> or --hf <repo-or-dir>")
+
+    # LOCKED gold default: precondition (smooth) the low-bit trellis/error-feedback lanes unless opted out.
+    # These lanes silently break on massive-activation outliers without it (EXL3 3090→8.699); smoothing +
+    # our Calib 3.0 is the measured EXL3 win (8.670 < exl3-default 8.699). GGUF has its own smoothing; MLX not needed.
+    if a.smooth is None:
+        a.smooth = a.format in ("exl3", "gptq", "mx")
+        if a.smooth:
+            print(f"   [{a.format}] LOCKED default: preconditioning ON (--no-smooth to skip)")
 
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
     if a.format in ("gptq", "mlx", "exl3"):

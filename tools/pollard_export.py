@@ -21,6 +21,7 @@ Hard runtime constraints baked in (verified Aug 2026):
     # then: vllm serve ./...-Pollard-GPTQ --quantization gptq
 """
 import argparse, json, re, sys
+import pollard_workspace as ws
 
 HIGH, LOW = 8, 4                       # Marlin supports only these
 # module groups within a decoder layer. q/k/v are ONE fused unit; gate/up are ONE fused unit.
@@ -111,7 +112,7 @@ def main():
     ap.add_argument("--model", required=True, help="HF model dir or id (FP16/BF16)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (pollard-probe/-sensitivity)")
     ap.add_argument("--calib", required=True, help="calibration text (one sample per line or a corpus)")
-    ap.add_argument("--out", required=True, help="output dir for the GPTQ checkpoint")
+    ap.add_argument("--out", help="output dir for the GPTQ checkpoint (default: workspace)")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
     ap.add_argument("--hot-frac", type=float, default=0.35, help="fraction of layers kept at 8-bit")
     ap.add_argument("--group-size", type=int, default=128)
@@ -161,7 +162,11 @@ def main():
                           dynamic=(dyn or None))
     model = GPTQModel.load(a.model, qcfg)
     model.quantize(calib)
+    if not a.out:
+        a.out = ws.resolve_out(a.model, "gptq", tag="int4")
+        print(f"   (no --out) -> workspace: {a.out}")
     model.save(a.out)
+    ws.record_build(a.model, "gptq", a.out, tag="int4")
     print(f"wrote GPTQ checkpoint -> {a.out}\n"
           f"  vLLM:   vllm serve {a.out} --quantization gptq\n"
           f"  SGLang: python -m sglang.launch_server --model-path {a.out} --quantization gptq\n"

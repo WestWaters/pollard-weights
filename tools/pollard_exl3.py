@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """pollard-exl3 — emit an EXL3 (exllamav3) model with Pollard's allocation, same as the other lanes.
 
+🔒 LOCKED GOLD RECIPE (EXL3): **smoothing + our Calib 3.0 (256 rows) + exl3-native budgeted allocator.**
+MEASURED (Qwen2.5-3B @4bpw): broken 3090 → smoothed 8.699 → smoothed+Calib3.0 **8.670** (beats exl3
+out-of-box 8.699). `pollard --format exl3` preconditions by DEFAULT (--no-smooth to skip). Do NOT port a
+GGUF role recipe here (measured-loses: 8.794/8.862); allocation stays exl3-native. Never trust proxy_err (legacy/).
+
+LOW-BIT mechanics: precondition first with `pollard-hf-smooth` (SmoothQuant folded into the RMSNorms).
+Massive-activation input channels otherwise collapse the trellis global scale and silently wreck a layer
+(measured: layer sqnr -14 -> +18 after smoothing). One-shot: `pollard-doctor --source <fp16> --repair
+--lane exl3` (smooth → reconvert → verify), or `pollard --format exl3 --run`.
+
 The GPU desktop lane: GGUF (llama.cpp), GPTQ (vLLM/SGLang), MLX (Apple), and THIS — EXL3 for the
 exllamav3 runtime. It's the compatibility lane: same one command into a 4th runtime.
 
@@ -9,8 +19,9 @@ fallback. MEASURED (Qwen0.5B, wikitext): EXL3-budgeted 3.38bpw -> PPL 14.30; a n
 GGUF/K-quant role map onto EXL3 -> 17.15 at MORE bits (3.43). **Pollard's role priors were measured for
 K-quants and do NOT transfer to EXL3's trellis atoms** — porting them HURTS. So: EXL3 = its native
 allocator by default; Pollard's allocation edge is proven on GGUF (role Mix beats uniform), NOT on EXL3.
-Do NOT claim "Pollard beats EXL3 allocation." A winning EXL3-native Pollard recipe would be a separate
-MEASURED project (sensitivity in EXL3's atom space, must beat budgeted at <= same bpw) — not this port.
+Do NOT claim "Pollard beats EXL3 allocation." MEASURED (Qwen2.5-3B, smoothed, equal 4.00 bpw): budgeted
+PPL 8.699 vs a Pollard sqnr-driven integer recipe 8.794 — budgeted wins ~1%. A finer per-tensor-KL recipe
+in EXL3's atom space is the open attempt; the coarse version loses. EXL3's native allocator stays default.
 
 Two allocation modes:
   * budgeted (DEFAULT): EXL3's allocator via --bits + --head_bits/--mtp_bits + --hq. The quality default.
@@ -58,6 +69,10 @@ def main():
     ap.add_argument("--plan-only", action="store_true", help="print the exllamav3 command, build nothing")
     a = ap.parse_args()
 
+    if not a.out and not a.plan_only:                       # no --out -> organized workspace path
+        import pollard_workspace as ws
+        a.out = ws.resolve_out(a.model, "exl3", tag=f"{a.bpw}bpw")
+        print(f"   (no --out) -> workspace: {a.out}")
     is_moe, _ = detect_moe(a.model)
     hq = is_moe if a.hq is None else a.hq
     kind = "MoE" if is_moe else "dense"
@@ -109,7 +124,13 @@ def main():
     if r.returncode != 0 or not made:
         sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
                  f"— see console above.")
-    print(f"wrote EXL3 model -> {a.out}\n  run:  exllamav3 / TabbyAPI loads {a.out}")
+    try:
+        import pollard_workspace as ws
+        ws.record_build(a.model, "exl3", a.out, tag=f"{a.bpw}bpw", bpw=a.bpw)
+    except Exception:
+        pass
+    print(f"wrote EXL3 model -> {a.out}\n  run:  exllamav3 / TabbyAPI loads {a.out}"
+          f"\n  VERIFY:  pollard-verify --model {a.out} --source {a.model} --end-to-end")
 
 
 if __name__ == "__main__":

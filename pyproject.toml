@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pollard-weights"
-version = "0.2.0-dev"
+version = "1.3.0"
 description = "Know what your hardware can do with any model BEFORE you download it — byte-economics calculator + measurement harnesses for running frontier models on small hardware."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -15,6 +15,23 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# Core stays light: the calculator (pollard-calc) is pure stdlib; gguf+numpy cover the GGUF/imatrix path.
+# Heavy, lane-specific deps are lazy-imported and live in the extras below (each tool errors clearly if
+# its extra isn't installed). Install what you need, e.g.  pip install "pollard-weights[exl3]".
+dependencies = [
+    "numpy",
+    "gguf",
+]
+
+[project.optional-dependencies]
+convert = ["torch", "transformers", "safetensors"]                 # measure/precondition/verify/probe/sensitivity/gptq
+charts = ["matplotlib"]                                             # pollard-eval --chart / experiments/plot_*.py
+exl3 = ["torch", "transformers", "safetensors", "exllamav3", "datasets"]
+mlx = ["mlx-lm"]
+mx = ["torch", "transformers", "llmcompressor"]
+hf = ["huggingface-hub", "hf-transfer"]                            # publishing to the Hub
+all = ["torch", "transformers", "safetensors", "exllamav3", "datasets",
+       "mlx-lm", "llmcompressor", "huggingface-hub", "hf-transfer", "matplotlib"]
 
 [project.scripts]
 pollard = "pollard_auto:main"
@@ -40,8 +57,17 @@ pollard-probe = "pollard_probe:main"
 pollard-scorecard = "pollard_scorecard:main"
 pollard-kl = "pollard_kl:main"
 pollard-lowbit = "pollard_lowbit:main"
+pollard-verify = "pollard_verify:main"
+pollard-doctor = "pollard_doctor:main"
+pollard-ls = "pollard_ls:main"
+pollard-hf-smooth = "pollard_hf_smooth:main"
+pollard-mx = "pollard_mx:main"
+pollard-mlx = "pollard_mlx:main"
+pollard-exl3 = "pollard_exl3:main"
+pollard-calib = "pollard_calib:main"
 pollard-palette = "pollard_palette:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
-py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_pack", "pollard_export", "pollard_gptq", "pollard_automap"]
+py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
+    "imatrix_fix_gate"]

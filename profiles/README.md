@@ -48,4 +48,4 @@ published whether a 5.5T-parameter router concentrates. And the stakes are
 visible: the curve below is pure bandwidth arithmetic — where K3 sits on the
 x-axis decides everything, and only a capture can say.
 
-![K3 conditional curve](../assets/k3_conditional.png)
+![K3 conditional curve](../assets/benchmarks/k3_conditional.png)

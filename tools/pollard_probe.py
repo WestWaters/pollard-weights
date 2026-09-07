@@ -131,7 +131,15 @@ def main():
             row.append(f"{g}={profile[g][str(i)]:.4f}")
         print(f"  layer {i:>3}/{layers}  " + "  ".join(row), flush=True)
 
-    out = a.out or (a.model.rstrip("/").split("/")[-1] + ".sensitivity.json")
+    if a.out:
+        out = a.out
+    else:
+        try:
+            import pollard_workspace as ws, os
+            out = os.path.join(ws.calibration_dir(a.model, create=True),
+                               ws.model_basename(a.model) + ".sensitivity.json")
+        except Exception:
+            out = a.model.rstrip("/").split("/")[-1] + ".sensitivity.json"
     payload = {**profile, "noise": noise, "probe": f"rtn{a.probe_bits}",
                "layers": layers, "source": a.model, "method": "pollard-probe (torch RTN proxy)"}
     json.dump(payload, open(out, "w"), indent=2)

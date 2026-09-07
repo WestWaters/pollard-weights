@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""assets/gptq_h2h.png — 4-bit reconstruction head-to-head on Qwen2.5-7B (W4g128):
+"""assets/benchmarks/gptq_h2h.png — 4-bit reconstruction head-to-head on Qwen2.5-7B (W4g128):
 Pollard's full-Hessian error-feedback GPTQ vs round-to-nearest, PPL vs the f16 model.
 Same dataviz system as plot_kl_win.py.
 
@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(__file__)
-OUT = os.path.join(HERE, "..", "assets", "gptq_h2h.png")
+OUT = os.path.join(HERE, "..", "assets", "benchmarks", "gptq_h2h.png")
 SURFACE = "#ffffff"; INK = "#0b0b0b"; INK_2 = "#52514e"; MUTED = "#8a8f98"
 POLLARD = "#2a78d6"; WIN = "#0ca30c"; GRID = "#ececea"
 plt.rcParams.update({

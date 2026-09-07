@@ -118,8 +118,15 @@ def main():
                     help="mechanism canary on the benign smoke sets — writes nothing")
     a = ap.parse_args()
 
-    if not a.selftest and not (a.harmful and a.harmless and a.out):
-        sys.exit("ERROR: real use needs --harmful, --harmless and --out (or use --selftest).")
+    if not a.selftest and not (a.harmful and a.harmless):
+        sys.exit("ERROR: real use needs --harmful and --harmless (or use --selftest).")
+    if not a.selftest and not a.out:                        # default output into the workspace
+        try:
+            import pollard_workspace as ws
+            a.out = os.path.join(ws.model_dir(a.model, create=True), ws.model_basename(a.model) + "-abliterated")
+            print(f"   (no --out) -> workspace: {a.out}")
+        except Exception:
+            sys.exit("ERROR: pass --out for the abliterated model.")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"

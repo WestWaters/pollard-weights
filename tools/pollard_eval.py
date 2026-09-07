@@ -93,7 +93,9 @@ def main():
                     help="generate reference continuations first, then score on them "
                          "(Divergence-300 @N style); needs --prompts")
     ap.add_argument("--gen-tokens", type=int, default=32, help="tokens to generate per prompt")
-    ap.add_argument("--out", help="CSV out (label,size_gb,top1_agree,mean_kl) for the chart")
+    ap.add_argument("--out", help="CSV out (label,size_gb,top1_agree,mean_kl); default: workspace charts/")
+    ap.add_argument("--chart", action="store_true",
+                    help="also render a PNG chart (KL + top-1 per quant) into the workspace charts/ folder")
     ap.add_argument("--rpc", help="RPC servers to pool, 'host:port[,host:port…]'")
     ap.add_argument("--llama-cli", default="llama-cli")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
@@ -151,13 +153,41 @@ def main():
     for f in (base,):
         os.path.exists(f) and os.remove(f)
 
-    if a.out:
-        with open(a.out, "w") as f:
-            f.write("label,size_gb,top1_agree,mean_kl\n")
-            for name, gb, top1, kld in rows:
-                f.write(f"{name},{gb:.3f},{top1 if top1 is not None else ''},"
-                        f"{kld if kld is not None else ''}\n")
-        print(f"\nwrote {a.out} — feed it to experiments/plot_kl_win.py or plot_eval.py")
+    # always save results to an organized place (workspace charts/) unless the user named --out
+    import time
+    try:
+        import pollard_workspace as ws
+        cdir = ws.charts_dir(create=True)
+    except Exception:
+        cdir = "."
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = a.out or os.path.join(cdir, f"eval-{stamp}.csv")
+    with open(out, "w") as f:
+        f.write("label,size_gb,top1_agree,mean_kl\n")
+        for name, gb, top1, kld in rows:
+            f.write(f"{name},{gb:.3f},{top1 if top1 is not None else ''},"
+                    f"{kld if kld is not None else ''}\n")
+    print(f"\nwrote {out}")
+
+    if a.chart:
+        png = os.path.splitext(out)[0] + ".png"
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            labels = [r[0] for r in rows]
+            kls = [r[3] if r[3] is not None else 0 for r in rows]
+            t1s = [r[2] if r[2] is not None else 0 for r in rows]
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5), facecolor="white")
+            ax1.barh(labels, kls, color="#6C4CF1"); ax1.set_xlabel("mean KL vs reference (lower=better)")
+            ax1.invert_yaxis(); ax1.set_title("KL divergence")
+            ax2.barh(labels, t1s, color="#22B8CF"); ax2.set_xlabel("top-1 agreement % (higher=better)")
+            ax2.invert_yaxis(); ax2.set_title("Top-1 agreement")
+            fig.tight_layout(); fig.savefig(png, dpi=150, bbox_inches="tight")
+            print(f"rendered chart -> {png}")
+        except Exception as e:
+            print(f"(--chart skipped: matplotlib not available — {type(e).__name__}. "
+                  f"pip install \"pollard-weights[charts]\" then rerun with --chart)")
     if any(t is None for _, _, t, _ in rows):
         print("\nNOTE: some 'top-1 agree' came back blank — this llama-perplexity build "
               "may word the agreement line differently; mean KL still ranks them.")

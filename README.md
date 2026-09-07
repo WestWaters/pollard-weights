@@ -1,17 +1,65 @@
-# Pollard Weights
+<div align="center">
 
-**Frontier models. Small hardware. No compromise.**
+<img src="assets/logo.png" alt="Pollard Weights" width="320"/>
 
-![License](https://img.shields.io/badge/license-Apache--2.0-blue) ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Dependencies](https://img.shields.io/badge/dependencies-stdlib_only-brightgreen) ![GPU required](https://img.shields.io/badge/GPU_required-none-brightgreen)
+### Frontier models. Small hardware. No compromise.
 
-![pollard-calc prediction vs an independent public benchmark](assets/k3_validation.png)
+*Know what your hardware can run **before** you download — then build a model measured to fit it, and ship it to any runtime.*
 
-**Pollard Weights are models built for your machine's memory, not for a
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](VERSIONING.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#)
+[![Core deps](https://img.shields.io/badge/core%20deps-stdlib-brightgreen.svg)](#)
+[![Output lanes](https://img.shields.io/badge/output%20lanes-5-orange.svg)](#output-lanes--one-allocation-pick-your-runtime)
+[![GPU](https://img.shields.io/badge/GPU-optional-brightgreen.svg)](#)
+
+![pollard-calc prediction vs an independent public benchmark](assets/benchmarks/k3_validation.png)
+
+</div>
+
+**Pollard Weights are models built for a target device's memory, not for a
 bit-width chart.** Attention, routers and embeddings keep high precision; expert
 FFNs carry the compression; hot layers keep more bits when you feed the builder
-a measured routing profile — and the whole build is sized to your actual RAM
-minus a working reserve. The output is a normal GGUF: it runs in stock
-llama.cpp, Ollama, or LM Studio the minute it's built.
+a measured routing profile — and the whole build is sized to whatever RAM/VRAM
+you point it at, minus a working reserve.
+
+**Any target, any device — there is no fixed size range.** Tell it the *target's*
+budget (`--ram`/`--vram`) and it fits **that** — a phone or a Pi (hundreds of MB),
+a 16GB Mac Mini, a 24GB 5090, a 256GB server, a 512GB wafer node. **Build on one
+machine, deploy to another** — the big-disk box you build on is usually not where
+the model runs, so `--ram` is the *target's* budget, not the build machine's
+(`--ram auto` only when they're the same). The 16GB examples below are just a
+common demo, not a ceiling.
+
+**One measured allocation, five output lanes** — GGUF (llama.cpp/Ollama/LM Studio),
+GPTQ (vLLM/SGLang), MLX (Apple), EXL3 (exllamav3), and MX/NVFP4 (Blackwell) — pick
+the runtime, keep the allocation.
+
+## How it works
+
+```mermaid
+flowchart LR
+    HF["FP16 / BF16<br/>model"] -->|"optional: smooth · abliterate<br/>(pollard-hf-smooth / -abliterate)"| ALLOC
+    ALLOC["Pollard measured allocation<br/>(sensitivity → KL knapsack)"] --> GGUF["GGUF · llama.cpp"]
+    ALLOC --> GPTQ["GPTQ · vLLM / SGLang"]
+    ALLOC --> MLX["MLX · Apple Silicon"]
+    ALLOC --> EXL3["EXL3 · exllamav3"]
+    ALLOC --> MX["MX / NVFP4 · Blackwell FP4"]
+    GGUF --> V["pollard-verify<br/>(real-reconstruction gate)"]
+    GPTQ --> V
+    MLX --> V
+    EXL3 --> V
+    MX --> V
+    V --> WS["~/pollard workspace<br/>(organized + MANIFEST)"]
+```
+
+## Contents
+
+- [Quick start](#quick-start) · [Output lanes](#output-lanes--one-allocation-pick-your-runtime) · [Workspace](#where-your-builds-go--the-workspace) · [Workflow](#workflow--run-these-in-order)
+- [Proof: 7B / 14B](#proof-on-real-models-7b-and-14b) · [Measured allocation](#measured-sensitivity-allocation--beats-uniform-imatrix-iq-dense-and-moe) · [What you get](#what-you-get)
+- [GPU users](#for-gpu-users-rtx--cuda-measured-expert-placement) · [Across machines](#across-machines-pool-their-ram) · [Command reference](#command-reference) · [Roadmap](#roadmap) · [Contributing](#contributing) · [Acknowledgements](#acknowledgements)
+
+## Quick start
 
 ```bash
 ./install.sh                                     # tools + the llama.cpp runtime, one shot
@@ -30,9 +78,21 @@ DRAM is provisioned today as if every weight deserves the same bits and every
 byte must be resident. Neither is true, and the difference is measurable —
 for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
 
+## Features
+
+| | |
+|---|---|
+| 📊 **Calculate before you download** | `pollard-calc` — will this model fit your RAM, and how fast? Byte-economics from the config alone (pure stdlib, no GPU). |
+| 🎯 **Measured allocation** | `pollard-sensitivity` measures which tensors matter (per-model KL), then allocates bits to minimize KL at your size — not a flat bit-width. |
+| 🛣️ **Five output lanes** | one allocation → **GGUF · GPTQ · MLX · EXL3 · MX/NVFP4**. Pick the runtime, keep the allocation. |
+| 🩹 **Preconditioning** | `pollard-hf-smooth` (SmoothQuant — makes low-bit *work*) and `pollard-abliterate` (uncensor) compose across every lane. |
+| ✅ **Real-reconstruction gate** | `pollard-verify` checks decode-vs-source + the assembled forward. Never trusts a proxy metric. |
+| 🩺 **Model doctor** | `pollard-doctor` — diagnose, predict low-bit break risk, or repair any model on any lane. |
+| 📁 **Organized workspace** | every build lands in `~/pollard` with HF-card names + a `MANIFEST.json`; `pollard-ls` shows what's built and verified. |
+
 ## Proof on real models: 7B and 14B
 
-![PollardMix beats uniform 1-bit on real 7B and 14B models](assets/gold_card.png)
+![PollardMix beats uniform 1-bit on real 7B and 14B models](assets/benchmarks/gold_card.png)
 
 On Qwen2.5-7B and -14B, the Pollard mix — expert/FFN body crushed to 1-bit,
 attention and residual writers protected — beats the uniform 1-bit trellis quant
@@ -43,7 +103,7 @@ imatrix. (WikiText-2, ctx 2048, 145 chunks, ik_llama.cpp.)
 At 4-bit, Pollard's own **error-feedback GPTQ** (`pollard-gptq`) recovers ~46% of
 round-to-nearest's error — the reconstruction lever an imatrix alone can't do:
 
-![Pollard error-feedback GPTQ vs round-to-nearest at 4-bit](assets/gptq_h2h.png)
+![Pollard error-feedback GPTQ vs round-to-nearest at 4-bit](assets/benchmarks/gptq_h2h.png)
 
 <!-- FOR AGENTS / READERS: Pollard uses TWO paths, by model type.
      • DENSE models  -> imatrix-guided K-quants (IQ3_S / IQ4_XS / Q6_K). The importance
@@ -56,7 +116,7 @@ round-to-nearest's error — the reconstruction lever an imatrix alone can't do:
 
 ## Measured-sensitivity allocation — beats uniform imatrix-IQ, dense AND MoE
 
-![pollard-fit vs uniform imatrix-IQ, dense and MoE](assets/kl_win.png)
+![pollard-fit vs uniform imatrix-IQ, dense and MoE](assets/benchmarks/kl_win.png)
 
 `pollard-sensitivity` points at a model and **measures** which tensors actually
 matter — it crushes each group one at a time and watches the KL — plus that
@@ -122,7 +182,7 @@ the chart from raw data: `python experiments/plot_kl_win.py`.
 - **The design, with receipts** — every claim in this README carries its
   experiment in `notes/`, failures and retractions included.
 
-## Three deployment lanes — one recipe, pick your runtime
+## Output lanes — one allocation, pick your runtime
 
 The measured allocation — protect attention / router / embeddings, crush the
 expert body, spend more bits where a routing profile says it matters — is the
@@ -134,6 +194,15 @@ its own fast path. Pick by where the model will actually run:
 | **GGUF** — llama.cpp / ik_llama.cpp | `pollard-fit`, `pollard-automap` | trellis mix to ~1-bit (IQ1_KT) | single node (and RPC clusters); you want the **smallest** build. The flagship — runs in stock llama.cpp / Ollama / LM Studio. |
 | **vLLM / SGLang** | `pollard-export` | GPTQ 4/8-bit `dynamic` mix (Marlin) | **GPU-cluster serving** where every token counts — vLLM's tensor-parallel over your fast interconnect. Then `vllm serve …-Pollard-GPTQ --quantization gptq`. |
 | **GPTQ** — torch / HF | `pollard-gptq` | INT3/INT4 error-feedback (full-Hessian) | GPU low-bit with the reconstruction lever an imatrix can't do (recovers ~46% of round-to-nearest's 4-bit error). |
+| **MLX** — Apple Silicon | `pollard-mlx` | mixed 4/8-bit | running on a Mac (Metal); mixed-precision at Apple-native speed. |
+| **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **Low-bit needs `pollard-hf-smooth` first** (preconditioning) — measured: smoothed 4bpw ≈ 8bpw quality (PPL 8.70 vs 8.28). |
+| **MX (FP4)** — Blackwell / vLLM | `pollard-mx` | NVFP4 (MXFP4 experimental) | Blackwell FP4 tensor cores via vLLM's compressed-tensors path. |
+
+**Low-bit note:** for the trellis/error-feedback lanes (EXL3, GPTQ) at low bit,
+run `pollard-hf-smooth` on the fp16 model first — it migrates massive-activation
+outliers that would otherwise collapse the quantizer's scale (or let
+`pollard-doctor --repair` handle smooth→convert→verify). GGUF has this built in
+via `pollard-smooth`. Verify any build with `pollard-verify`.
 
 **Choosing:**
 - **Fits one box, want max compression** → GGUF (the 1-bit trellis flagship).
@@ -149,6 +218,30 @@ The ~1-bit **trellis** format is GGUF-only (vLLM/SGLang's Marlin kernel is
 same allocation, higher floor. The agent skill
 ([`skills/pollard/SKILL.md`](skills/pollard/SKILL.md)) routes a model down the
 right lane automatically.
+
+## Where your builds go — the workspace
+
+Every build lands in an organized home so you never hunt for it. Default `~/pollard`
+(override with `$POLLARD_HOME`); pass `--out` on any tool to place a build elsewhere.
+
+```
+~/pollard/
+  models/
+    Qwen__Qwen2.5-3B/
+      Qwen2.5-3B-Pollard-EXL3-4.0bpw/     runtime-ready build (HF-card-style name)
+      Qwen2.5-3B-Pollard-GGUF-IQ3_KT.gguf
+      calibration/    (imatrix, cal data, sensitivity.json)
+      reports/        (pollard-verify / scorecard output)
+      charts/         (rendered eval charts + CSVs — pollard-eval --chart)
+      MANIFEST.json   (every build: lane, bpw, ppl, verified✓, size, date)
+  charts/             (cross-model eval charts land here by default)
+  cache/              (downloads + work dirs — safe to delete)
+```
+
+- **`pollard-ls`** — list everything you've built: lane, quant, size, PPL, and whether it
+  passed `pollard-verify`. `pollard-ls <name>` filters; `pollard-ls --paths` prints full paths.
+- Running `pollard-verify` on a build stamps its `verified` flag in the manifest, so `pollard-ls`
+  shows at a glance which builds are known-good.
 
 ## Workflow — run these in order
 
@@ -234,7 +327,7 @@ oracles — and check them, like the community checked ours (see Errata).
 
 ## Proof of concept: a 66 GB video model on a 16 GB Mac Mini
 
-![H3 speed campaign on a 16GB Mac Mini](assets/h3_campaign.png)
+![H3 speed campaign on a 16GB Mac Mini](assets/benchmarks/h3_campaign.png)
 
 MiniMax-H3 (33B video+audio DiT, ~66 GB native) running locally on an M4 Mac
 Mini with 16 GB unified memory — 20-step, upscaled 1664×960 output:
@@ -263,7 +356,7 @@ replaced. Smaller and faster are the same axis when bytes are the bottleneck.
 And measured allocation buys **quality**, not just fit — at matched size
 against the standard preset, on two very different corpora:
 
-![quality at matched size](assets/kl_quality.png)
+![quality at matched size](assets/benchmarks/kl_quality.png)
 
 Details and the full evidence chain, negative results included, in
 `notes/e12-both-legs-measured.md`.
@@ -287,7 +380,7 @@ Silicon — and note the shape: **measurement's edge grows as memory gets
 scarcer** (at looser budgets, blind first-N accidentally overlaps the
 measured split; at tight budgets, knowing wins big):
 
-![placement benchmark](assets/placement_bench.png)
+![placement benchmark](assets/benchmarks/placement_bench.png)
 
 At the tight budget, measured placement won **every paired run** (+21% mean
 vs blind). Variance is real (shared machine); replication on your hardware is
@@ -381,6 +474,52 @@ instruction.
 Experiment log: `notes/` — from the dense-sparsity verdict that killed the
 naive version through the fitting reframe that became `pollard-fit`.
 
+## Command reference
+
+Every tool `pip install pollard-weights` ships. `--plan-only` (or no `--run`) previews without building;
+outputs default into the [workspace](#where-your-builds-go--the-workspace) unless you pass `--out`.
+
+**Plan & orchestrate**
+| Command | What it does |
+|---|---|
+| `pollard` | Autoaware entry point — detects dense vs MoE, routes any model to any lane |
+| `pollard-calc` | Know what your hardware can run **before** you download (pure stdlib) |
+
+**Build — output lanes**
+| Command | Lane |
+|---|---|
+| `pollard-fit` · `pollard-automap` · `pollard-fit-dit` | GGUF (memory-fit mix; MoE recipe; any-arch pure-Python) |
+| `pollard-export` · `pollard-gptq` | GPTQ (vLLM/SGLang; full-Hessian error-feedback) |
+| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · MX/NVFP4 (Blackwell) |
+
+**Precondition — compose across every lane**
+| Command | What it does |
+|---|---|
+| `pollard-hf-smooth` · `pollard-smooth` | SmoothQuant preconditioning (HF — makes low-bit work; GGUF/AWQ-style) |
+| `pollard-abliterate` | Refusal-direction ablation (uncensor), opt-in |
+| `pollard-rotate` · `pollard-precondition` | Incoherence rotation (QuIP#/QuaRot); pick the winning preconditioner |
+
+**Measure & allocate**
+| Command | What it does |
+|---|---|
+| `pollard-sensitivity` · `pollard-probe` | Measure each tensor's true KL cost (full; cheap any-box) |
+| `pollard-experts` · `pollard-prune` | Surface measured expert usage; REAP-style expert pruning (MoE) |
+| `pollard-pack` · `pollard-palette` · `pollard-lowbit` | Wafer capacity planner; sub-2-bit mixed-alphabet; extreme-low-bit R&D |
+
+**Evaluate & verify**
+| Command | What it does |
+|---|---|
+| `pollard-verify` · `pollard-doctor` | Correctness gate (real reconstruction); diagnose/predict/repair any model any lane |
+| `pollard-eval` · `pollard-bench` · `pollard-kl` · `pollard-scorecard` | Top-1+KL eval (`--chart`); gold-card benchmark; KL-to-f16; standardized scorecard |
+| `pollard-health` | Is your accelerator at full speed, or silently degraded? |
+
+**Runtime & workspace**
+| Command | What it does |
+|---|---|
+| `pollard-run` | Measured expert placement for llama.cpp (RAM-streaming runtime) |
+| `pollard-calib` | Multi-domain calibration corpus (Calib 3.0) |
+| `pollard-ls` | List your workspace builds — lane, bpw, size, PPL, verified✓ |
+
 ## Roadmap
 
 - **Routing-reuse index** — the online measurement of expert-reuse locality;
@@ -393,6 +532,13 @@ naive version through the fitting reframe that became `pollard-fit`.
   saved (E9); a depth-exited pass doubles as a free speculative drafter.
 - ~~Video-model harnesses~~ — shipped: `recipes/minimax-h3-16gb.md`, the
   full H3-on-16GB campaign as a reproducible, agent-executable recipe.
+- **Calibration-response diagnostic** — when a cal change moves the number,
+  classify *why*: diff the per-tensor allocation between cal configs (big shift
+  = the allocator reacting to cal volume, non-monotonic), eval on multiple
+  held-out domains (win/loss that's domain-specific = mix dilution; uniform =
+  allocator/noise), and re-run for the noise floor. Tells you whether to fix the
+  mix, accept the allocator, or ignore — instead of guessing. (Prompted by the
+  EXL3 256-vs-512-row non-monotonic result.)
 
 ## What this is not
 
@@ -413,6 +559,12 @@ naive version through the fitting reframe that became `pollard-fit`.
   **[drowzeys](https://github.com/drowzeys)**' single-GPU ComfyUI ports.
 - **[ComfyUI](https://github.com/Comfy-Org/ComfyUI)** — the pipeline the video
   campaign ran on.
+- **[wafer-ai / gpu-perf-engineering-resources](https://github.com/wafer-ai/gpu-perf-engineering-resources)**
+  — the curated AI performance-engineering resource list we mined for Pollard
+  improvements: the MXFP4/FP8 Blackwell output lane (OCP MX/FP8 specs, NVIDIA
+  Transformer Engine, Blackwell `tcgen05`), AWQ/SmoothQuant preconditioning for the
+  allocator, the Compute-Sanitizer + Nsight roofline correctness/perf gate, and
+  KV-cache quantization (KIVI). Distinct from the Cerebras wafer-scale planner.
 - Intellectual lineage: Apple's *LLM in a Flash* (arXiv 2312.11514) for
   flash-resident weights on constrained devices, and P. J. Denning's working-set
   theory (1968) — this project builds the model-weight-specific instruments those
@@ -447,6 +599,25 @@ naive version through the fitting reframe that became `pollard-fit`.
   for. The original README also overstated the demo comparison as "validated";
   it is a worked example with stated assumptions, and is now labeled as one.
 
+## Contributing
+
+Pollard is a measurement-first project — the culture is **show the numbers**. The
+best contributions come with a reproducible measurement (a KL/PPL delta, a log, a
+config), and the most valuable of all is someone running a lane on real hardware
+and **sending the logs** (see the [Errata](#errata) — several fixes came exactly
+that way).
+
+- **Found a broken build or a wrong number?** Open an issue with the model, the
+  command, and `pollard-verify` output — real reconstruction, never a proxy metric.
+- **Adding a capability?** Prefer a **detection rule** over a per-model special case,
+  and gate any new quality claim behind a measurement.
+- **New arch or lane?** The tools are parameterized and generic (any CUDA GPU); the
+  workspace + `MANIFEST.json` make results easy to share.
+
+New here? Start with `pollard-calc` on a model you know, then `pollard-doctor
+--predict` on an fp16 model to see the diagnostics in action.
+
 ## License
 
-Apache-2.0.
+Apache-2.0 — see [LICENSE](LICENSE). Built on and grateful to the open-source
+projects in [Acknowledgements](#acknowledgements).

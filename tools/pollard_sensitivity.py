@@ -346,7 +346,15 @@ def main():
         os.path.exists(f) and os.remove(f)
     os.rmdir(tmp) if not os.listdir(tmp) else None
 
-    out = a.out or a.gguf.rsplit(".gguf", 1)[0] + ".sensitivity.json"
+    if a.out:
+        out = a.out
+    else:
+        try:
+            import pollard_workspace as ws
+            out = os.path.join(ws.calibration_dir(a.gguf, create=True),
+                               ws.model_basename(a.gguf) + ".sensitivity.json")
+        except Exception:
+            out = a.gguf.rsplit(".gguf", 1)[0] + ".sensitivity.json"
     payload = {**profile, "noise": noise, "ref": a.ref, "probe": a.probe,
                "layers": layers, "source": os.path.basename(a.gguf), "base": base_note}
     with open(out, "w") as f:

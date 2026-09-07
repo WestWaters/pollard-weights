@@ -293,7 +293,15 @@ def main():
     sensitivity = json.load(open(a.sensitivity)) if a.sensitivity else None
     overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
         arch, a.ram, a.reserve, sensitivity, a.allow_1bit)
-    out = a.out or a.gguf.rsplit(".gguf", 1)[0] + "-pollard.gguf"
+    if a.out:
+        out = a.out
+    else:
+        try:                                                 # no --out -> organized workspace path
+            import pollard_workspace as ws
+            out = ws.resolve_out(a.gguf, "gguf", tag=base_preset, ext=".gguf")
+            print(f"   (no --out) -> workspace: {out}")
+        except Exception:
+            out = a.gguf.rsplit(".gguf", 1)[0] + "-pollard.gguf"
 
     # ---- source facts + safety guards (hardened after Frank's DeepSeek/Qwen30B logs) ----
     src_bytes = cfg.get("_gguf_file_bytes") or 0
@@ -426,6 +434,12 @@ def main():
     r = subprocess.run(cmd)
     if r.returncode != 0:
         sys.exit(r.returncode)
+    try:
+        import pollard_workspace as ws
+        bpw = round(os.path.getsize(out) * 8.0 / arch["total"], 2) if arch.get("total") else None
+        ws.record_build(a.gguf, "gguf", out, tag=base_preset, bpw=bpw)
+    except Exception:
+        pass
     print(f"\ndone: {out}")
     print("run it with stock llama.cpp / Ollama / LM Studio — it is a normal GGUF.")
 
