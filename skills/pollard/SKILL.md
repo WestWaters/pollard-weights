@@ -17,9 +17,36 @@ correct path for *this* model so results are good and no time is wasted.
 ## Don't know the model type? Use the autoaware entry point
 
 ```bash
-pollard --gguf model-f16.gguf --ram 16 --imatrix model.imatrix        # plan (prints the right path)
-pollard --gguf model-f16.gguf --imatrix model.imatrix --run           # detect + build automatically
+pollard --gguf model-f16.gguf --run          # ONE-SHOT GGUF: auto-calib -> auto-imatrix -> flagship mix
+pollard --hf Qwen/Qwen3-8B --run             # ONE-SHOT from a HF repo: download -> convert -> build
+pollard --hf ./my-local-model --run          # ...or a model already on disk (any arch)
+pollard --hf Qwen/Qwen3-8B --format gptq --run   # export lane: GPTQ for vLLM/SGLang (from HF weights)
+pollard --hf Qwen/Qwen3-8B --format mlx  --run   # export lane: MLX for Apple Silicon
+pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
+Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple). GPTQ/MLX emit straight from HF weights (no GGUF).
+**True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
+`pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
+steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
+MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the coverage note below.)
+
+### Scope & modes (accurate)
+- **Supported arch classes** (auto path, regression-tested): **dense** (Qwen/Llama/Gemma/Mistral),
+  **MoE** (Qwen3-A3B/Mixtral/DeepSeek/Ling), **MLA-MoE** (DeepSeek, Tencent HY4), **GLM4-MoE**
+  (GLM-4.5/4.6/5.x — routes MoE, NEXTN/MTP tail edge-protected; `test_glm_moe_routing`). A genuinely
+  **new family** one-shots *if* its tensors match the feature rules — a 2-min `automap --dry-run`
+  confirms (auto-pin covers any unknown tail); if a new tensor family appears, add a **detection rule**,
+  never a per-model recipe (Ref-pipeline).
+- **Fast one-shot vs measured (both real modes, not a caveat):** the default = locked recipe priors +
+  Calib 3.0 imatrix (minutes). The **measured-allocation** max quality is the opt-in `--benchmark` /
+  `pollard-sensitivity` path (hours). The 10-minute path is excellent; the beats-uniform gold-card
+  numbers come from the measured path.
+- **Output lanes, all smoke-tested** (Qwen2.5-0.5B, same Pollard allocation): **GGUF** (llama.cpp) ·
+  **MLX** (Apple — mixed 4/8 loads + generates "Paris" on M4 @ 233 tok/s) · **GPTQ** (vLLM/SGLang — 4/8
+  checkpoint loads + generates on the CUDA box). For a *specific* model, a one-line load in the target
+  runtime is still the sensible final ship check.
+
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
 flagship** — the hand-coded mix, the dense repos' headline build; MoE → `pollard-automap`
