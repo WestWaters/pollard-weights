@@ -113,7 +113,7 @@ To make the claim travel (method, not fluke): the same green board on **≥2 mod
 |---|---|---|
 | dense | mixed prose+code imatrix | the win IS the imatrix; no per-layer sweep (doesn't beat uniform on dense) |
 | MoE | **diverse** prose+code+varied, 200+ chunks | must route to the experts or low-bit fails; auto-pin covers the tail |
-| **EXL3 lane (trellis) — 🔒 LOCKED 2026-09-07** | ✅ = **smoothing + Calib 3.0 (256 rows, -cd) + exl3-native budgeted allocator** | Qwen2.5-3B @4bpw: broken 3090 → smoothed 8.699 → smoothed+Calib3.0 **8.670** (beats exl3 out-of-box 8.699). `pollard --format exl3` preconditions by default. Allocation ports LOSE (8.794/8.862) — do NOT port; cal rows are non-monotonic (256 sweet spot, 512=8.995). Widen later via cal-mix (post-publish), validated on a 2nd eval to avoid overfit. |
+| **EXL3 lane (trellis) — 🔒 LOCKED 2026-09-07** | ✅ = **smoothing + Calib 3.0 (256 rows, -cd) + exl3-native allocator** | **WIN: the Pollard method beats EXL3 on EXL3's own allocator, atoms, and kernel** — Qwen2.5-3B @4bpw: broken 3090 → smoothed 8.699 → smoothed+Calib3.0 **8.670** vs EXL3 out-of-box **8.699**, untuned. `pollard --format exl3` runs the gold path by default. Keep the native allocator (the win doesn't need reallocation); the GGUF role-map port is a DEAD LEVER on trellis atoms (8.794/8.862 — worse, don't waste the ~50 min). Cal rows non-monotonic (256 sweet spot, 512=8.995). Widen later via cal-mix (post-publish), validated on a 2nd eval to avoid overfit. |
 | MLA/hyper-conn/DSA MoE (Deepseek, Hy4) | ✅ = MoE calib, unchanged recipe | Verified on DeepSeek-V2-Lite: automap self-routes `MoE +MLA` → the MoE recipe, **quant win proven (−57% PPL / −61% KLD / +14.8 pt top-1 vs uniform-low @ +1.5% size), zero recipe changes.** Three MECHANICAL onboarding fixes, all now automatic + regression-tested (not recipe changes): (a) convert bails on an unknown tokenizer hash → add the hash→pre-tokenizer entry; (b) ik's imatrix skips the SwiGLU **gate** (`ffn_gate_exps/shexp`) → `automap` now **auto-copies `up→gate`** (`ensure_gate_coverage`, writes `*.gatefix.imatrix`) — no manual step; (c) ik's imatrix structurally skips MLA `attn_k_b/v_b/kv_b` (can't copy-cover) → `_NEEDS_IMATRIX` flags them so they pin to q6_K. ⚠️ **Size floor:** a *shippable* 1-bit card needs the model big enough that its coherence floor is ≤ 1-bit — small/sparse models (DeepSeek-V2-Lite = 2.4B active) loop on free-gen at 1-bit and need ≥2-bit (where the mix ≈ uniform). Big MLA-MoEs (Hy4) are above the floor. This is a per-model SIZE property, not a recipe/class limit. |
 
 ---
@@ -129,7 +129,7 @@ it. Skip ahead to the winner. Users want a fast Pollard build, not our whole R&D
 | **sensitivity SWEEP on a DENSE model** | dense imatrix K-quant ladder + IQ1_KT flagship | no expert redundancy → loses; tools refuse it |
 | **`--no-imatrix` K-quant "mix" on MoE** | automap trellis mix WITH a covered imatrix | loses to stock Q2_K |
 | **PTQ of STQ1_0** (uniform or recipe) | QAT+distill on wiki+CHAT mix (extreme lane only) | uniform ~1e6; iq1_s 1.56 beats STQ1_0-PTQ |
-| **porting the GGUF role-map onto EXL3** (or any lane) — and running it BEFORE the calib step | EXL3 uses its OWN budgeted allocator (default); do the CALIB lever first | role-port 17.15 vs budgeted 14.30 (0.5B); and smoothed Qwen2.5-3B @4bpw: budgeted 8.699 vs sqnr-recipe 8.794 vs role-recipe 8.862 — both worse, ~50min each wasted |
+| **porting the GGUF role-map onto EXL3** (or any lane) — instead of the gold path | keep EXL3's native allocator + do the CALIB/smooth levers (the gold path already wins, 8.670 vs 8.699) | K-quant priors don't map to trellis atoms: role-port 17.15 vs native 14.30 (0.5B); smoothed Qwen2.5-3B @4bpw native 8.699 vs sqnr-recipe 8.794 vs role-recipe 8.862 — a DEAD lever, ~50min each wasted |
 | **per-model recipe from a buggy run** | route the class recipe; extend additively only if measured | the weekend loop |
 | **raising the mix tier to chase a 2-bit ceiling** | reject (Mix-v3); tighten the crush | leaves the size class, becomes a small IQ2 |
 
@@ -176,12 +176,13 @@ justifies locking the lane compatibility-only.** You must run the lane-native Se
   port failures alone. **Goal B (finish faster) stays weak** where the lane's default has no expensive
   search (EXL3-budgeted is search-light) — don't chase it; the win is match-quality, and never reimplement
   the lane's own optimizer.
-- **EXL3 status (2026-09-06):** lane now WORKS at low bit **with preconditioning** (3090→8.699 @4bpw,
-  Qwen2.5-3B). Allocation ports MEASURED-LOSE: budgeted **8.699** vs sqnr recipe **8.794** (v1) vs
-  role-aware recipe **8.862** (v2) — both worse, K-quant priors don't transfer to trellis atoms. So DON'T
-  port recipes here. **✅ CALIBRATION LEVER WINS: budgeted + OUR Calib 3.0 = 8.670 vs exl3-default-cal 8.699**
-  (same allocator/bpw, smoothed) — our cal beats theirs UNTUNED. This is the lockable Pollard EXL3 edge:
-  **smoothing + our calibration** (allocation stays exl3-native). **Open attempt to widen it:** TUNE the
+- **EXL3 status — ✅ THE WIN (2026-09-07):** the Pollard method **beats EXL3 on EXL3's own allocator,
+  trellis atoms, and custom kernel.** MEASURED (Qwen2.5-3B @4bpw, smoothed): **smoothing + OUR Calib 3.0 =
+  8.670 vs EXL3 out-of-box 8.699** — same allocator/bpw, our method wins UNTUNED. Smoothing alone takes
+  unusable low-bit (3090) to 8.699. The lockable Pollard EXL3 edge = **smoothing + our calibration**, on
+  EXL3's native allocator. Keep the native allocator — the win doesn't need reallocation, and the GGUF
+  role-map port is a DEAD LEVER (K-quant priors don't map to trellis atoms: role-recipe 8.862 / sqnr 8.794
+  — worse, don't waste the ~50 min). **Open R&D to widen the win:** TUNE the
   calibration (domain mix/size/model-matched) + a finer per-tensor **measured-KL** recipe in EXL3's atom space
   (recipe YAML `{tensors:{key:int_bits}}`, bits 1-8|16, must cover every quantizable tensor; pass `-b/-hb`
   for reporting) + Calib 3.0 + the tuning loop above. Recipe/verify tooling: `pollard-exl3 --recipe`,

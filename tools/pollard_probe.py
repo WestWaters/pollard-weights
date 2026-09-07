@@ -75,6 +75,57 @@ def _linears(model, layer, group):
     return [getattr(mod, n) for n in names if hasattr(mod, n)]
 
 
+@torch.no_grad()
+def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_bits):
+    """ONE forward pass over the calib set, sensitivity for EVERY group at once — for models where
+    the perturb+KL loop (layers×groups full passes) is infeasible (744B over 1.5TB).
+
+    For a linear y=Wx, the expected output error from quantizing W->Ŵ is
+        E‖(W-Ŵ)x‖² = Σ_ij (W-Ŵ)_ij² · E[x_j²]
+    i.e. the squared quant error weighted by the Hessian DIAGONAL h_j = E[x_j²]. We accumulate h_j
+    per target linear with hooks in a single pass (no per-group forward), then score each group as
+    Σ ΔW² · h. Same ranking the perturb+KL probe gives, at a fraction of the cost."""
+    h, cnt, index = {}, {}, {}
+    hooks = []
+
+    def mk(lid):
+        def hook(mod, inp, out):
+            x = inp[0].reshape(-1, inp[0].shape[-1]).float()
+            s = (x * x).sum(0)
+            h[lid] = s if lid not in h else h[lid] + s
+            cnt[lid] = cnt.get(lid, 0) + x.shape[0]
+        return hook
+
+    for i in range(layers):
+        for g in groups:
+            for lin in _linears(model, i, g):
+                lid = id(lin); index[lid] = (g, i)
+                hooks.append(lin.register_forward_hook(mk(lid)))
+    for c in chunks:
+        model(c.unsqueeze(0).to(dev))
+    for hk in hooks:
+        hk.remove()
+
+    def cost_at(bits):
+        cost = {g: {} for g in groups}
+        for i in range(layers):
+            for g in groups:
+                tot = 0.0
+                for lin in _linears(model, i, g):
+                    lid = id(lin)
+                    if lid not in h or cnt.get(lid, 0) == 0:      # module never fired (unused/pruned expert)
+                        continue
+                    hj = (h[lid] / cnt[lid]).to(lin.weight.device)   # E[x_j²]
+                    dW = lin.weight.data.float() - _rtn(lin.weight.data, bits).float()
+                    tot += float((dW * dW * hj.unsqueeze(0)).sum().item())
+                cost[g][str(i)] = tot
+        return cost
+
+    profile = cost_at(probe_bits)
+    noise = {t: sum(sum(cost_at(bits)[g].values()) for g in groups) for t, bits in ladder_bits}
+    return profile, noise
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -86,6 +137,9 @@ def main():
     ap.add_argument("--chunks", type=int, default=4)
     ap.add_argument("--seqlen", type=int, default=1024)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--stream", action="store_true",
+                    help="ONE-pass Hessian-diagonal estimator instead of per-group perturb+KL — for "
+                         "models too big to run layers×groups forward passes (744B-scale)")
     a = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -96,40 +150,50 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(dev).eval()
     layers = len(model.model.layers)
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
-    ref = _logits(model, ch, dev)
-    print(f"  {layers} layers, {len(ch)} eval chunks, clean logits cached", flush=True)
 
-    # per-model noise curve: RTN-crush EVERY group to each rung, measure KL. Cheap
-    # (len(LADDER) forwards) and it's what lets the allocator see catastrophic rungs.
-    noise = {}
-    saved_all = {}
-    for t, bits in LADDER_BITS:
-        for i in range(layers):
-            for g in groups:
-                for lin in _linears(model, i, g):
-                    saved_all.setdefault(id(lin), lin.weight.data.clone())
-                    lin.weight.data = _rtn(saved_all[id(lin)], bits)
-        noise[t] = _kl_vs(model, ch, ref, dev)
-        for i in range(layers):                                  # restore
-            for g in groups:
-                for lin in _linears(model, i, g):
-                    lin.weight.data = saved_all[id(lin)].clone()
-        print(f"  noise {t:8} ({bits}b): KL={noise[t]:.4f}", flush=True)
-
-    # per-(group,layer) sensitivity: crush ONE group at ONE layer, measure KL hit.
-    profile = {g: {} for g in groups}
-    for i in range(layers):
-        row = []
+    if a.stream:
+        print(f"  {layers} layers, {len(ch)} calib chunks — one-pass Hessian-diagonal estimator", flush=True)
+        profile, noise = _stream_sensitivity(model, ch, dev, groups, layers, a.probe_bits, LADDER_BITS)
+        method = "pollard-probe stream (Hessian-diagonal proxy)"
         for g in groups:
-            lins = _linears(model, i, g)
-            saved = [l.weight.data.clone() for l in lins]
-            for l in lins:
-                l.weight.data = _rtn(l.weight.data, a.probe_bits)
-            profile[g][str(i)] = _kl_vs(model, ch, ref, dev)
-            for l, w in zip(lins, saved):
-                l.weight.data = w
-            row.append(f"{g}={profile[g][str(i)]:.4f}")
-        print(f"  layer {i:>3}/{layers}  " + "  ".join(row), flush=True)
+            vals = list(profile[g].values())
+            print(f"  {g}: streamed {len(vals)} layers", flush=True)
+    else:
+        method = "pollard-probe (torch RTN proxy)"
+        ref = _logits(model, ch, dev)
+        print(f"  {layers} layers, {len(ch)} eval chunks, clean logits cached", flush=True)
+
+        # per-model noise curve: RTN-crush EVERY group to each rung, measure KL. Cheap
+        # (len(LADDER) forwards) and it's what lets the allocator see catastrophic rungs.
+        noise = {}
+        saved_all = {}
+        for t, bits in LADDER_BITS:
+            for i in range(layers):
+                for g in groups:
+                    for lin in _linears(model, i, g):
+                        saved_all.setdefault(id(lin), lin.weight.data.clone())
+                        lin.weight.data = _rtn(saved_all[id(lin)], bits)
+            noise[t] = _kl_vs(model, ch, ref, dev)
+            for i in range(layers):                                  # restore
+                for g in groups:
+                    for lin in _linears(model, i, g):
+                        lin.weight.data = saved_all[id(lin)].clone()
+            print(f"  noise {t:8} ({bits}b): KL={noise[t]:.4f}", flush=True)
+
+        # per-(group,layer) sensitivity: crush ONE group at ONE layer, measure KL hit.
+        profile = {g: {} for g in groups}
+        for i in range(layers):
+            row = []
+            for g in groups:
+                lins = _linears(model, i, g)
+                saved = [l.weight.data.clone() for l in lins]
+                for l in lins:
+                    l.weight.data = _rtn(l.weight.data, a.probe_bits)
+                profile[g][str(i)] = _kl_vs(model, ch, ref, dev)
+                for l, w in zip(lins, saved):
+                    l.weight.data = w
+                row.append(f"{g}={profile[g][str(i)]:.4f}")
+            print(f"  layer {i:>3}/{layers}  " + "  ".join(row), flush=True)
 
     if a.out:
         out = a.out
@@ -141,7 +205,7 @@ def main():
         except Exception:
             out = a.model.rstrip("/").split("/")[-1] + ".sensitivity.json"
     payload = {**profile, "noise": noise, "probe": f"rtn{a.probe_bits}",
-               "layers": layers, "source": a.model, "method": "pollard-probe (torch RTN proxy)"}
+               "layers": layers, "source": a.model, "method": method}
     json.dump(payload, open(out, "w"), indent=2)
     for g in groups:
         vals = list(profile[g].values())

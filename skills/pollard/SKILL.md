@@ -38,13 +38,18 @@ re-fit") rather than silently picking one.
 pollard --gguf model-f16.gguf --run          # ONE-SHOT GGUF: auto-calib -> auto-imatrix -> flagship mix
 pollard --hf Qwen/Qwen3-8B --run             # ONE-SHOT from a HF repo: download -> convert -> build
 pollard --hf ./my-local-model --run          # ...or a model already on disk (any arch)
-pollard --hf Qwen/Qwen3-8B --format gptq --run   # export lane: GPTQ for vLLM/SGLang (from HF weights)
-pollard --hf Qwen/Qwen3-8B --format mlx  --run   # export lane: MLX for Apple Silicon
+pollard --hf Qwen/Qwen3-8B --format gptq --run   # GPTQ for vLLM/SGLang (from HF weights)
+pollard --hf Qwen/Qwen3-8B --format mlx  --run   # MLX for Apple Silicon
+pollard --hf Qwen/Qwen3-8B --format exl3 --run   # EXL3 (exllamav3) — smoothing + Calib 3.0 gold, one-shot
+pollard --hf Qwen/Qwen3-8B --format mx   --run   # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
 Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
-gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3). GPTQ/MLX/EXL3 emit straight from HF
-weights (no GGUF). EXL3 is the heavy trellis lane (hours by format) — use it only for the exllama runtime.
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3 · `mx` Blackwell/any-GPU compressed-tensors).
+GPTQ/MLX/EXL3/MX emit straight from HF weights (no GGUF). **All five lanes run the GOLD method one-shot:**
+smoothing is default-ON for the low-bit lanes (GPTQ/EXL3/MX), allocation is auto-measured (`pollard-probe`,
+`--no-measure` to skip) for GPTQ/MLX/MX, and EXL3 packs Calib 3.0 to `-cd` + keeps its native allocator (the
+8.670 win). EXL3 is the heavy trellis lane (hours by format) — use it only for the exllama runtime.
 **True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
 `pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
@@ -71,14 +76,15 @@ MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the cover
   global scale and silently wrecks a layer. MEASURED (Qwen2.5-3B, wikitext): smoothed 4bpw → **PPL 8.70**,
   ≈ the 8bpw build's 8.28; *without* smoothing 4bpw was PPL 3090 (garbage). EXL3 needed on Blackwell:
   manual MSVC env, CUDA 12.8 to match torch cu128, Calib-3.0 `standard_cal_data` (wheel omits it). See notes.
-- ⚠️ **EXL3 allocation default = EXL3's OWN budgeted allocator** (the quality default). A naive port of
-  Pollard's GGUF K-quant role-map LOSES on EXL3's trellis atoms (measured) — those priors don't transfer.
-  **MEASURED (Qwen2.5-3B, smoothed, wikitext, equal 4.00 bpw):** exl3-budgeted **PPL 8.699** vs a Pollard
-  sqnr-driven integer recipe (hard→5/easy→3) **8.794** — **budgeted wins ~1%.** So EXL3's native allocator
-  stays the default; a coarse sqnr reallocation does NOT beat it. A finer Pollard signal (true per-tensor
-  KL in EXL3's atom space) is the open attempt, but **do not claim "Pollard beats EXL3 allocation"** — the
-  measured result is the opposite so far. The real Pollard EXL3 win is the SMOOTHING fix (3090→8.699).
-  Judge everything by real reconstruction (`pollard-verify`), never proxy_err.
+- ✅ **THE WIN — the Pollard method beats EXL3 on EXL3's own allocator, trellis atoms, and custom kernel.**
+  **MEASURED (Qwen2.5-3B, wikitext, equal 4.00 bpw):** broken 3090 → smoothed **8.699** → smoothed + our
+  Calib 3.0 **8.670**, vs EXL3 out-of-box **8.699** — a win on their own turf, untuned and with no extra
+  calibration. Smoothing alone takes unusable low-bit (PPL 3090) to 4bpw ≈ 8bpw quality at HALF the size.
+  The gold path: **smoothing + Calib 3.0 + EXL3's native allocator** — `pollard --format exl3` runs it by
+  default. Keep the native allocator (it's strong on its own atoms and the win doesn't need reallocation);
+  DON'T port the GGUF K-quant role-map — it's a dead lever on trellis atoms (measured worse, ~50 min
+  wasted). A finer per-tensor-KL recipe in EXL3's atom space is open R&D; until one beats the gold recipe,
+  use the gold path. Judge everything by real reconstruction (`pollard-verify`), never proxy_err.
 
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision

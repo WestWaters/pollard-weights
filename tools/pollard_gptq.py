@@ -79,7 +79,7 @@ def _col_quant(w, scale, zero, maxq, qmode):
     raise ValueError(qmode)
 
 
-def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="int"):
+def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="int", n_tokens=None):
     """GPTQ on one linear weight W [rows, cols] with Hessian H [cols, cols].
     act_order: quantize columns in decreasing-Hessian-diagonal order (most
     important first) — recovers markedly more of RTN's loss.
@@ -91,18 +91,43 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
     rows, cols = W.shape
     maxq = 2 ** bits - 1
     H = H.clone().float()
-    dead = torch.diag(H) == 0
+    # Dead channels: exactly zero OR negligible vs the mean diagonal. A big o_proj Hessian
+    # (e.g. 16384-dim on GLM-5.3) has near-dead channels that aren't exactly 0 yet still wreck the
+    # Cholesky — pin them out too, not just the exact zeros.
+    diagH = torch.diag(H)
+    meandiag = diagH[diagH > 0].mean().clamp(min=1e-8) if bool((diagH > 0).any()) else diagH.new_tensor(1.0)
+    dead = diagH <= 1e-10 * meandiag
     H[dead, dead] = 1.0; W[:, dead] = 0.0
+    # MoE token floor: an expert that saw fewer tokens than it has input channels has a
+    # rank-deficient Hessian — the off-diagonal cross-channel structure is noise. Keep the diagonal
+    # (per-channel importance, like imatrix) and drop the unreliable off-diagonal rather than trust it.
+    if n_tokens is not None and n_tokens < cols:
+        H = torch.diag(torch.diag(H))
     if act_order:
         perm = torch.argsort(torch.diag(H), descending=True)
         W = W[:, perm]; H = H[perm][:, perm]
         invperm = torch.argsort(perm)
-    damp = percdamp * torch.mean(torch.diag(H)).clamp(min=1e-8)
-    H[range(cols), range(cols)] += damp
-    # H^-1, upper-Cholesky (GPTQ's stable column ordering)
-    L = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(L)
-    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    # H^-1 via upper-Cholesky (GPTQ's stable column ordering). A near-singular Hessian (huge o_proj,
+    # massive-activation channels) can be non-PD even after nominal damping — escalate the damping
+    # ×10 up to ×100, then fall back to fp64, rather than crashing the whole layer.
+    base = torch.mean(torch.diag(H)).clamp(min=1e-8)
+    Hinv = None
+    for attempt in range(6):
+        use64 = attempt >= 3                        # after 3 float tries, retry in double precision
+        damp = percdamp * (10 ** (attempt % 3)) * base
+        Hd = (H.double() if use64 else H).clone()
+        Hd[range(cols), range(cols)] += damp
+        try:
+            L = torch.linalg.cholesky(Hd)
+            Hinv = torch.cholesky_inverse(L)
+            Hinv = torch.linalg.cholesky(Hinv, upper=True).to(W.dtype)
+            break
+        except Exception:
+            continue
+    if Hinv is None:
+        raise RuntimeError(f"GPTQ: Hessian stayed non-positive-definite for a {cols}-col layer even "
+                           "after damping ×100 and an fp64 fallback — raise --percdamp or widen the "
+                           "calibration set (this layer's activations barely moved).")
     Q = torch.zeros_like(W)
     scale = zero = None
     for i in range(cols):
@@ -303,7 +328,8 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
             if qm == "skip":                                          # leave this tensor fp16
                 del H[n]; continue
             m.weight.data = gptq_quantize(m.weight.data, H[n] / max(cnt[n], 1),
-                                          b, groupsize, act_order=act_order, qmode=qm).to(dev)
+                                          b, groupsize, act_order=act_order, qmode=qm,
+                                          n_tokens=cnt[n]).to(dev)   # token-floor guards cold experts
             del H[n]
         empty()
         # re-run the now-QUANTIZED block to produce inputs for the next block (back to CPU)
@@ -379,7 +405,7 @@ def main():
             for c in calib:
                 model(c.unsqueeze(0).to(dev))
         for h in hooks: h.remove()
-        return {n: H[n] / max(cnt[n], 1) for n in lins}
+        return {n: (H[n] / max(cnt[n], 1), cnt[n]) for n in lins}   # (Hessian, token count)
 
     def run(method):
         if fp16_state is not None:
@@ -392,15 +418,16 @@ def main():
                             act_order=method.endswith("-ao"), offload=a.offload, qmode=a.qmode,
                             recipe=rec, nlayers=len(model.model.layers))
         elif method in ("gptq", "gptq-ao"):
-            Hs = collect_hessians(lins)                       # Hessians from the fp16 activations
+            Hs = collect_hessians(lins)                       # {n: (Hessian, token count)}
             ao = (method == "gptq-ao")
             for n, m in lins.items():
-                m.weight.data = gptq_quantize(m.weight.data, Hs[n], a.bits, a.groupsize,
-                                              act_order=ao, qmode=a.qmode).to(m.weight.device)
+                Hn, cn = Hs[n]
+                m.weight.data = gptq_quantize(m.weight.data, Hn, a.bits, a.groupsize,
+                                              act_order=ao, qmode=a.qmode, n_tokens=cn).to(m.weight.device)
         elif method == "imatrix":
             Hs = collect_hessians(lins)                       # diagonal = per-channel importance
             for n, m in lins.items():
-                m.weight.data = imatrix_quantize(m.weight.data, torch.diag(Hs[n]),
+                m.weight.data = imatrix_quantize(m.weight.data, torch.diag(Hs[n][0]),
                                                  a.bits, a.groupsize).to(m.weight.device)
         else:                                                 # rtn (alphabet-aware)
             for n, m in lins.items():

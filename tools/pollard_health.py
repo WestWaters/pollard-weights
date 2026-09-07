@@ -39,6 +39,25 @@ def _num(s):
     return float(m.group()) if m else None
 
 
+def _fmt(v, suf=""):
+    """Format a metric, or 'N/A' — unified-memory hosts (GB10/DGX Spark) report power/temp as N/A;
+    never crash formatting None (the reported GB10 bug)."""
+    return f"{v:.0f}{suf}" if v is not None else "N/A"
+
+
+def _aarch64_temp():
+    """nvidia-smi often reports temp N/A on GB10/Grace-Blackwell — read the SoC thermal zones instead
+    (critical on aarch64: the EC hard-powers the unit off near ~98°C). Returns max zone °C, or None."""
+    import glob
+    temps = []
+    for z in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            temps.append(int(open(z).read().strip()) / 1000.0)
+        except Exception:
+            pass
+    return max(temps) if temps else None
+
+
 # ---------------- NVIDIA ----------------
 
 def check_nvidia():
@@ -66,12 +85,14 @@ def check_nvidia():
         sm, sm_max = _num(f[2]), _num(f[3])
         pdraw, plim, pstate = _num(f[4]), _num(f[5]), f[6]
         util, temp = _num(f[7]), _num(f[8])
+        if temp is None:                       # GB10/aarch64: nvidia-smi temp N/A -> SoC thermal zones
+            temp = _aarch64_temp()
         throttle = f[9] if len(f) > 9 else ""
         pct = (sm / sm_max * 100) if sm and sm_max else None
         active_throttle = throttle not in ("0x0000000000000000", "Not Active", "", "N/A")
-        detail = (f"SM {sm:.0f}/{sm_max:.0f} MHz"
+        detail = (f"SM {_fmt(sm)}/{_fmt(sm_max)} MHz"
                   + (f" ({pct:.0f}% of max)" if pct is not None else "")
-                  + f" · {pdraw:.0f}/{plim:.0f} W · {pstate} · util {util:.0f}% · {temp:.0f}°C")
+                  + f" · {_fmt(pdraw)}/{_fmt(plim)} W · {pstate} · util {_fmt(util)}% · {_fmt(temp)}°C")
         # THE WEDGE: high util, no throttle flag, yet the clock is far below the max.
         if (util and util > 40 and pct is not None and pct < 65 and not active_throttle):
             state = ("DEGRADED", f"stuck at {pct:.0f}% clock despite {util:.0f}% util — you're "

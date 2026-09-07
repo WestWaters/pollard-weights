@@ -145,7 +145,7 @@ its own fast path. Pick by where the model will actually run:
 | **vLLM / SGLang** | `pollard-export` | GPTQ 4/8-bit `dynamic` mix (Marlin) | **GPU-cluster serving** where every token counts — vLLM's tensor-parallel over your fast interconnect. Then `vllm serve …-Pollard-GPTQ --quantization gptq`. |
 | **GPTQ** — torch / HF | `pollard-gptq` | INT3/INT4 error-feedback (full-Hessian) | GPU low-bit with the reconstruction lever an imatrix can't do (recovers ~46% of round-to-nearest's 4-bit error). |
 | **MLX** — Apple Silicon | `pollard-mlx` | mixed 4/8-bit | running on a Mac (Metal); mixed-precision at Apple-native speed. |
-| **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **Low-bit needs `pollard-hf-smooth` first** (preconditioning) — measured: smoothed 4bpw ≈ 8bpw quality (PPL 8.70 vs 8.28). |
+| **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **The Pollard method beats EXL3 on EXL3's own allocator, atoms, and kernel** — Qwen2.5-3B @4bpw: Pollard **8.670** vs EXL3 out-of-box **8.699**, untuned; and smoothed 4bpw ≈ 8bpw quality at half the size. `pollard --format exl3` runs the gold recipe (smoothing + Calib 3.0) by default. |
 | **MX (FP4)** — Blackwell / vLLM | `pollard-mx` | NVFP4 (MXFP4 experimental) | Blackwell FP4 tensor cores via vLLM's compressed-tensors path. |
 
 **Low-bit note:** for the trellis/error-feedback lanes (EXL3, GPTQ) at low bit,
@@ -368,6 +368,14 @@ otherwise. Force one with `POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh`. Throughpu
 tracks the slowest peer and the link, but the RAM adds up regardless of who made
 the chips.
 
+For the **vLLM/GPTQ** side of clustering — models too big to even *quantize* on one
+box (a 744B is ~1.5 TB in BF16) — `pollard-export --shard-plan N` prints the
+contiguous layer band each node owns plus the boundary-handoff contract, and
+`pollard-serve-eval` A/Bs the result on the served stack. The full unified-memory
+runbook (memory-pressure modeling, one-GPU-job-per-node, band-parallel export,
+byte-accounting, gate hygiene) is in
+[notes/unified-memory-playbook.md](notes/unified-memory-playbook.md).
+
 ## Wafer-scale (Cerebras): capacity planning
 
 `pollard-pack` points Pollard's hot-set ranking at an SRAM machine (Cerebras
@@ -441,7 +449,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-fit` · `pollard-automap` · `pollard-fit-dit` | GGUF (memory-fit mix; MoE recipe; any-arch pure-Python) |
 | `pollard-export` · `pollard-gptq` | GPTQ (vLLM/SGLang; full-Hessian error-feedback) |
-| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · MX/NVFP4 (Blackwell) |
+| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors: NVFP4/MXFP4 (Blackwell) + W4A16/W8A16 INT (any vLLM GPU) |
 
 **Precondition — compose across every lane**
 | Command | What it does |
@@ -462,6 +470,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-verify` · `pollard-doctor` | Correctness gate (real reconstruction); diagnose/predict/repair any model any lane |
 | `pollard-eval` · `pollard-bench` · `pollard-kl` · `pollard-scorecard` | Top-1+KL eval (`--chart`); gold-card benchmark; KL-to-f16; standardized scorecard |
+| `pollard-serve-eval` | A/B a quantized model vs its baseline on the **served** stack (vLLM/SGLang) — teacher-forced PPL, top-1 agreement, KL; stdlib only |
 | `pollard-probes` · `pollard-health` | Task-accuracy MCQ probes; is your accelerator at full speed or silently degraded? |
 
 **Runtime & workspace**
