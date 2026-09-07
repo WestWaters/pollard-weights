@@ -279,6 +279,26 @@ def test_glm_moe_routing():
     # GLM-specific NEXTN/MTP tail is on the LAST layer -> edge-protect tier, never the 1-bit body
     assert ap("blk.7.nextn.eh_proj.weight") == "iq2_kt", "GLM MTP tail must be protected, not crushed"
     assert ap("blk.7.nextn.shared_head.head.weight") == "iq2_kt"
+# ---- alloc-v2: finer granular FFN allocation (gate+up vs down) -------------------------------
+def test_alloc_granular_protects_down():
+    import pollard_fit as F
+    h = 2048; ffn = 3 * h * 5632; attn = 4 * h * h; L = 12
+    arch = dict(kind="dense", layers=L, hidden=h, total=L * (ffn + attn) + 2 * h * 32000,
+                expert_params=0, n_experts=0, dense_ffn_params=ffn, attn_params=attn)
+    def down_type(sens):
+        ov, *_ = F.plan_allocation(arch, 0.55, 0.05, sensitivity=sens)
+        m = {p.replace("\\", ""): t for p, t in ov}
+        return m.get("blk.0.ffn_gate.weight"), m.get("blk.0.ffn_down.weight")
+    # lumped profile: gate and down share a rung
+    g0, d0 = down_type(dict(layers=L, ffn={str(i): 0.5 for i in range(L)},
+                            attn={str(i): 0.2 for i in range(L)}))
+    assert g0 == d0, f"non-granular should share a rung, got gate={g0} down={d0}"
+    # granular profile with down MORE sensitive: down must land on a HIGHER rung than gate/up
+    gg, dg = down_type(dict(layers=L, ffn={str(i): 0.5 for i in range(L)},
+                            attn={str(i): 0.2 for i in range(L)},
+                            ffn_gateup={str(i): 0.2 for i in range(L)},
+                            ffn_down={str(i): 0.95 for i in range(L)}))
+    assert F.BPW[dg] > F.BPW[gg], f"granular must protect down above gate/up, got gate={gg} down={dg}"
 
 
 def main():

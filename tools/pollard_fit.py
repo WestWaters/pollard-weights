@@ -85,6 +85,13 @@ EXPERT_FRAGS = ["blk.{layer}.ffn_up_exps", "blk.{layer}.ffn_down_exps",
 # (this is how per-layer sensitivity allocation reaches a dense model)
 DENSE_FFN_FRAGS = [r"blk\.{layer}\.ffn_up\.weight", r"blk\.{layer}\.ffn_down\.weight",
                    r"blk\.{layer}\.ffn_gate\.weight"]
+# finer-grained (alloc-v2): split the FFN into the crushable gate+up half and the
+# protect-worthy down half, so a granular sensitivity profile can put them on DIFFERENT
+# ladder rungs (measured down-protection, not a rule). SwiGLU => gate=up=down ~ 1/3 each.
+EXPERT_FRAGS_GATEUP = ["blk.{layer}.ffn_up_exps", "blk.{layer}.ffn_gate_exps"]
+EXPERT_FRAGS_DOWN = ["blk.{layer}.ffn_down_exps"]
+DENSE_FFN_GATEUP = [r"blk\.{layer}\.ffn_up\.weight", r"blk\.{layer}\.ffn_gate\.weight"]
+DENSE_FFN_DOWN = [r"blk\.{layer}\.ffn_down\.weight"]
 
 
 def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
@@ -183,13 +190,21 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     # says "protect attention" when attention is only 0.48x as sensitive as FFN), so
     # a magnitude-ranked build can land WORSE than uniform. The imatrix still feeds
     # llama-quantize for IQ-type quality; it just never (mis)decides the allocation.
+    # alloc-v2: a GRANULAR profile carries per-layer ffn_down (and optionally ffn_gateup)
+    # separately, so the crushable gate+up and the protect-worthy down land on different rungs.
+    granular = bool(sensitivity and sensitivity.get("ffn_down"))
     if sensitivity:
         ffn_imp = {int(k): float(v) for k, v in sensitivity.get("ffn", {}).items()}
         attn_imp = {int(k): float(v) for k, v in sensitivity.get("attn", {}).items()}
-        src = "measured KL sensitivity (pollard-sensitivity profile)"
+        down_imp = {int(k): float(v) for k, v in (sensitivity.get("ffn_down") or {}).items()}
+        gu_imp = {int(k): float(v) for k, v in
+                  (sensitivity.get("ffn_gateup") or sensitivity.get("ffn") or {}).items()}
+        src = ("measured KL sensitivity (pollard-sensitivity profile"
+               + (", granular gate+up / down)" if granular else ")"))
     else:
         ffn_imp = {i: 1.0 for i in range(layers)}
         attn_imp = {i: 1.0 for i in range(layers)}
+        down_imp = gu_imp = {}
         src = ("uniform (no --sensitivity profile — run pollard-sensitivity for the "
                "per-layer win; any --imatrix is used for IQ quality only)")
 
@@ -204,12 +219,23 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     for t in ladder:                                    # every rung needs a noise value
         noise.setdefault(t, NOISE[t])
 
-    # items: per-layer bulk + per-layer attention (embeddings handled separately)
-    bulk_frag = EXPERT_FRAGS if arch["kind"] == "moe" else DENSE_FFN_FRAGS
+    # items: per-layer bulk + per-layer attention (embeddings handled separately). In granular
+    # mode the FFN bulk splits into gate+up (~2/3 of params) and down (~1/3) as SEPARATE items.
+    moe = arch["kind"] == "moe"
+    bulk_frag = EXPERT_FRAGS if moe else DENSE_FFN_FRAGS
+    gu_frag = EXPERT_FRAGS_GATEUP if moe else DENSE_FFN_GATEUP
+    down_frag = EXPERT_FRAGS_DOWN if moe else DENSE_FFN_DOWN
     items, meta = [], []                                # meta: (kind, [patterns])
     for i in range(layers):
-        items.append((bulk_pl, max(ffn_imp.get(i, 1.0), 1e-9)))
-        meta.append(("bulk", [f.format(layer=i) for f in bulk_frag]))
+        if granular:
+            gu_p = max(bulk_pl * 2 // 3, 1)
+            items.append((gu_p, max(gu_imp.get(i, 1.0), 1e-9)))
+            meta.append(("bulk", [f.format(layer=i) for f in gu_frag]))
+            items.append((max(bulk_pl - gu_p, 1), max(down_imp.get(i, 1.0), 1e-9)))
+            meta.append(("bulk", [f.format(layer=i) for f in down_frag]))
+        else:
+            items.append((bulk_pl, max(ffn_imp.get(i, 1.0), 1e-9)))
+            meta.append(("bulk", [f.format(layer=i) for f in bulk_frag]))
         if attn_pl > 0:
             items.append((attn_pl, max(attn_imp.get(i, 1.0), 1e-9)))
             meta.append(("attn", [rf"blk\.{i}\.attn_.*"]))
