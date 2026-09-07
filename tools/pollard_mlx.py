@@ -146,8 +146,8 @@ def main():
     try:
         import pollard_workspace as ws
         ws.record_build(a.model, "mlx", a.out, tag=f"{LOW}.{HIGH}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote MLX model -> {a.out}\n"
           f"  run:  mlx_lm.generate --model {a.out} --prompt \"hello\"\n"
           f"  (mixed {LOW}/{HIGH}-bit, Pollard-allocated; runs on Apple Silicon via MLX/Metal.)")

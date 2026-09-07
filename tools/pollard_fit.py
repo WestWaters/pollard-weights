@@ -20,6 +20,7 @@ import argparse
 import heapq
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -464,8 +465,8 @@ def main():
         import pollard_workspace as ws
         bpw = round(os.path.getsize(out) * 8.0 / arch["total"], 2) if arch.get("total") else None
         ws.record_build(a.gguf, "gguf", out, tag=base_preset, bpw=bpw)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"\ndone: {out}")
     print("run it with stock llama.cpp / Ollama / LM Studio — it is a normal GGUF.")
 
