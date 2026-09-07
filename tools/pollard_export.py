@@ -28,6 +28,20 @@ FUSED = {"attn_qkv": ["q_proj", "k_proj", "v_proj"], "gate_up": ["gate_proj", "u
 FREE = {"attn_o": ["o_proj"], "ffn_down": ["down_proj"]}
 
 
+def detect_moe(model_id, layers_hint=0):
+    """Return (is_moe, n_layers). MoE if the config advertises experts (Qwen-MoE
+    num_experts / Mixtral num_local_experts / DeepSeek n_routed_experts)."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+        n = getattr(cfg, "num_hidden_layers", 0) or layers_hint
+        moe = any(getattr(cfg, k, 0) for k in
+                  ("num_experts", "num_local_experts", "n_routed_experts"))
+        return bool(moe), int(n)
+    except Exception:
+        return False, layers_hint
+
+
 def allocate(sens, n_layers, hot_frac):
     """Pollard profile -> {layer: {group: bits}}. The most-sensitive `hot_frac` of layers
     keep their group at 8-bit; the rest go 4-bit. Fused groups get ONE bit-width (constraint).
@@ -57,6 +71,26 @@ def dynamic_config(alloc):
     return dyn
 
 
+def moe_dynamic_config(alloc):
+    """MoE `dynamic` map (Qwen-MoE / Mixtral / DeepSeek naming). The Pollard MoE policy carried
+    into the GPTQ lane: base LOW (4-bit) crushes the cold experts; the ROUTER and SHARED experts
+    are ALWAYS protected at HIGH (8-bit) — crushing the router scrambles expert selection — and the
+    experts of the most-sensitive (`ffn`-hot) layers go HIGH. Attention follows the `attn` profile.
+    Router = `mlp.gate` (Qwen) / `block_sparse_moe.gate` (Mixtral) — matched with `\\.gate$` so it
+    never catches an expert's `gate_proj`."""
+    dyn = {}
+    # ALWAYS protect the router (selection integrity) and the shared expert (every-token path).
+    dyn[r".*\.(mlp|block_sparse_moe)\.gate$"] = {"bits": HIGH}
+    dyn[r".*\.mlp\.shared_expert(_gate|\.(gate_proj|up_proj|down_proj))"] = {"bits": HIGH}
+    for i, g in alloc.items():
+        if g["attn"] == HIGH:
+            dyn[rf".*\.layers\.{i}\.self_attn\.(q|k|v|o)_proj"] = {"bits": HIGH}
+        if g["ffn"] == HIGH:                       # hot-layer experts kept at 8-bit
+            dyn[rf".*\.layers\.{i}\.(mlp|block_sparse_moe)\.experts\.\d+\."
+                r"(gate_proj|up_proj|down_proj|w1|w2|w3)"] = {"bits": HIGH}
+    return dyn
+
+
 def avg_bits(alloc):
     b = [g["attn"] for g in alloc.values()] + [g["ffn"] for g in alloc.values()]
     return sum(b) / len(b) if b else LOW
@@ -82,24 +116,30 @@ def main():
     ap.add_argument("--hot-frac", type=float, default=0.35, help="fraction of layers kept at 8-bit")
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--uniform", action="store_true", help="plain uniform W4 (for SGLang mixed-bit fragility)")
+    ap.add_argument("--moe", dest="moe", action="store_true", default=None,
+                    help="force the MoE dynamic map (default: auto-detect from config)")
+    ap.add_argument("--dense", dest="moe", action="store_false",
+                    help="force the dense dynamic map")
     ap.add_argument("--plan-only", action="store_true", help="print the allocation + dynamic map, build nothing")
     a = ap.parse_args()
 
     sens = json.load(open(a.sensitivity)) if a.sensitivity else {}
     n_layers = a.layers or int(sens.get("layers") or 0)
+    auto_moe, det_layers = detect_moe(a.model, n_layers)
+    n_layers = n_layers or det_layers
     if not n_layers:
-        try:
-            from transformers import AutoConfig
-            n_layers = AutoConfig.from_pretrained(a.model).num_hidden_layers
-        except Exception:
-            sys.exit("ERROR: could not read layer count — pass --layers.")
+        sys.exit("ERROR: could not read layer count — pass --layers.")
+    is_moe = auto_moe if a.moe is None else a.moe
 
     alloc = allocate(sens, n_layers, a.hot_frac)
-    dyn = {} if a.uniform else dynamic_config(alloc)
+    dyn = {} if a.uniform else (moe_dynamic_config(alloc) if is_moe else dynamic_config(alloc))
     ab = LOW if a.uniform else avg_bits(alloc)
-    print(f"== pollard-export :: {a.model}")
+    kind = "MoE" if is_moe else "dense"
+    print(f"== pollard-export :: {a.model}  [{kind}{' auto' if a.moe is None else ''}]")
     print(f"   {n_layers} layers · {'UNIFORM W4 (SGLang-safe)' if a.uniform else f'4/8 dynamic mix, avg {ab:.2f} bits'}"
           f" · group_size {a.group_size} · desc_act False · sym True")
+    if is_moe and not a.uniform:
+        print("   MoE: router + shared experts pinned 8-bit (selection integrity); cold experts 4-bit")
     print(f"   8-bit modules: {len(dyn)} groups (sensitivity-ranked hot set)")
     print(f"   NOTE (KV/memory): {kv_note(a.model)}")
     if a.plan_only:
