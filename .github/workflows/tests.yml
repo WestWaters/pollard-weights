@@ -1,0 +1,39 @@
+name: tests
+
+# Enforced merge gate: every PR to main must compile clean and pass the recipe regression suite.
+# Turn this into a required status check: Settings -> Rules -> your ruleset -> Require status checks -> add "tests".
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (core deps + package)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .          # core deps: numpy, gguf
+          pip install pytest
+      - name: Syntax gate — every tool compiles
+        run: python -m py_compile tools/*.py
+      - name: pyproject consistency (scripts == modules == files)
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))
+          sc = {v.split(":")[0] for v in d["project"]["scripts"].values()}
+          mo = set(d["tool"]["setuptools"]["py-modules"])
+          fi = {f[:-3] for f in os.listdir("tools") if f.endswith(".py")}
+          bad = (sc - mo) | (mo - fi) | (fi - mo)
+          assert not bad, f"pyproject/tools mismatch: {bad}"
+          print("pyproject consistent:", len(mo), "modules")
+          PY
+      - name: Regression suite (locked recipes can't silently drift)
+        run: pytest tests/ -v
