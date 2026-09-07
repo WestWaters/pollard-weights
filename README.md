@@ -56,7 +56,7 @@ flowchart LR
 ## Contents
 
 - [Quick start](#quick-start) · [Output lanes](#output-lanes--one-allocation-pick-your-runtime) · [Workspace](#where-your-builds-go--the-workspace) · [Workflow](#workflow--run-these-in-order)
-- [Proof: 7B / 14B](#proof-on-real-models-7b-and-14b) · [Measured allocation](#measured-sensitivity-allocation--beats-uniform-imatrix-iq-dense-and-moe) · [What you get](#what-you-get)
+- [Features](#features) · [Proof: 7B / 14B](#proof-on-real-models-7b-and-14b) · [Measured allocation](#measured-sensitivity-allocation--beats-uniform-imatrix-iq-dense-and-moe)
 - [GPU users](#for-gpu-users-rtx--cuda-measured-expert-placement) · [Across machines](#across-machines-pool-their-ram) · [Command reference](#command-reference) · [Roadmap](#roadmap) · [Contributing](#contributing) · [Acknowledgements](#acknowledgements)
 
 ## Quick start
@@ -131,56 +131,6 @@ noise curve runs ~2× Qwen's). "Uniform at size" is the honest naive-mix baselin
 use log-log, it manufactures fake losses). It loses only at the extreme IQ2_S floor,
 where nothing smaller exists to compare and nothing's left to allocate. Regenerate
 the chart from raw data: `python experiments/plot_kl_win.py`.
-
-## What you get
-
-- **`pollard-fit`** — the builder. Any GGUF in, a memory-fit build out:
-  per-layer, per-tensor-type bit allocation computed for YOUR RAM budget by a
-  KL-aware knapsack (minimize importance-weighted quant error under the size
-  budget), executed through llama.cpp's per-tensor quantization. With a
-  `--sensitivity` profile it **beats uniform imatrix-IQ** at matched size on both
-  dense (+6–27%, 5/5) and MoE (+21–43%, 4/5) — see the chart above. `--plan-only`
-  shows the full allocation first.
-- **`pollard-sensitivity`** — the calibration that makes the win real. It crushes
-  each tensor group one at a time and **measures** the actual KL cost, per model —
-  because imatrix magnitude (big activations) is *not* the same as KL sensitivity
-  (it told us to protect attention; measurement showed attention is half as
-  sensitive as FFN). Emits a profile `pollard-fit --sensitivity` allocates on.
-  This is the per-model calibration the strong quantizers pay for.
-- **`pollard-fit-dit`** — the builder for everything llama-quantize rejects:
-  diffusion/video/image models in GGUF. Pure-Python per-tensor quantization
-  (F32/F16/Q8_0/Q5_0/Q4_0 ladder) with the same protection-policy + byte-budget
-  planning — validated end-to-end (build → load → coherent generation).
-- **`pollard-calc`** — the planner. Any Hugging Face id, config.json, or GGUF
-  on disk; computes the memory economics and the verdict for your hardware
-  before you download a byte. No GPU required. Knows MoE, dense, and the newer
-  hybrid **linear-attention / SSM** stacks (Qwen3.5-class) — it flags where an
-  arch makes the estimate approximate or conservative (multimodal towers, MTP
-  multi-token decode) instead of silently reporting a plain-dense number.
-- **`pollard-experts`** — the routing report. Point it at an `experiments/e2`
-  capture and it lists the experts your workload actually runs hot, per layer,
-  with an honest coverage read: a load-balanced router touches nearly the whole
-  pool, so you can't prune experts by topic — "hot" is a live residency signal,
-  not a skip list. Emits a keep-list for a residency planner.
-- **`pollard-health`** — the "is my accelerator actually at full speed?" check.
-  96% GPU utilisation and P0 do *not* mean healthy: a wedged GB10 / DGX Spark (or
-  a throttling RTX, or a Mac drowning in page-outs) shows "busy" while the real
-  clock sits at a third of max and power at a fifth — you quietly lose half your
-  throughput. It reads the signals that matter (NVIDIA: real SM clock vs the
-  card's own max, power vs limit, throttle reasons; Apple Silicon: swap/page-out
-  thrash + thermal speed-cap) and calls it plainly. `--fix` prints an escalating
-  **no-reboot** recovery plan (dry-run; `--yes` to run) — honestly labeled, since a
-  deep firmware wedge may still need a power-cycle. The root cause is usually an
-  over-commit that `pollard-calc --ctx --gpu` would have caught first.
-- **The runtime** — `install.sh` builds llama.cpp (Metal on macOS, plus the RPC
-  backend for multi-machine runs) so the chain runs end-to-end from a fresh
-  clone. Pollard builds are standard GGUFs by design: the entire llama.cpp
-  ecosystem is their runtime.
-- **The instruments** — harnesses that capture expert routing, measure reuse on
-  your workload, and simulate hot-cache residency (`experiments/`). These are
-  what turn the builder's allocation from heuristic to measured.
-- **The design, with receipts** — every claim in this README carries its
-  experiment in `notes/`, failures and retractions included.
 
 ## Output lanes — one allocation, pick your runtime
 
@@ -472,7 +422,8 @@ instruction.
    a null test for every cache.
 
 Experiment log: `notes/` — from the dense-sparsity verdict that killed the
-naive version through the fitting reframe that became `pollard-fit`.
+naive version through the fitting reframe that became `pollard-fit`. Corrections
+and retractions live in [`notes/errata.md`](notes/errata.md).
 
 ## Command reference
 
@@ -511,7 +462,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-verify` · `pollard-doctor` | Correctness gate (real reconstruction); diagnose/predict/repair any model any lane |
 | `pollard-eval` · `pollard-bench` · `pollard-kl` · `pollard-scorecard` | Top-1+KL eval (`--chart`); gold-card benchmark; KL-to-f16; standardized scorecard |
-| `pollard-health` | Is your accelerator at full speed, or silently degraded? |
+| `pollard-probes` · `pollard-health` | Task-accuracy MCQ probes; is your accelerator at full speed or silently degraded? |
 
 **Runtime & workspace**
 | Command | What it does |
@@ -519,6 +470,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 | `pollard-run` | Measured expert placement for llama.cpp (RAM-streaming runtime) |
 | `pollard-calib` | Multi-domain calibration corpus (Calib 3.0) |
 | `pollard-ls` | List your workspace builds — lane, bpw, size, PPL, verified✓ |
+| `install.sh` | Builds the llama.cpp runtime (Metal on macOS + RPC backend) so the chain runs end-to-end; Pollard builds are standard GGUFs — the whole llama.cpp ecosystem is their runtime |
 
 ## Roadmap
 
@@ -530,15 +482,9 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
   granularity, with custom Metal/GPU kernels for the hot path.
 - **Depth-collapse** — post-training layer skipping priced in expert-fetches
   saved (E9); a depth-exited pass doubles as a free speculative drafter.
-- ~~Video-model harnesses~~ — shipped: `recipes/minimax-h3-16gb.md`, the
-  full H3-on-16GB campaign as a reproducible, agent-executable recipe.
-- **Calibration-response diagnostic** — when a cal change moves the number,
-  classify *why*: diff the per-tensor allocation between cal configs (big shift
-  = the allocator reacting to cal volume, non-monotonic), eval on multiple
-  held-out domains (win/loss that's domain-specific = mix dilution; uniform =
-  allocator/noise), and re-run for the noise floor. Tells you whether to fix the
-  mix, accept the allocator, or ignore — instead of guessing. (Prompted by the
-  EXL3 256-vs-512-row non-monotonic result.)
+- **Cross-lane calibration tuning** — widen the measured EXL3 calibration win
+  (our Calib 3.0 already beats the stock cal) via domain-mix tuning, validated on
+  a 2nd held-out eval, and extend the same lever to the GPTQ/MX lanes.
 
 ## What this is not
 
@@ -569,35 +515,6 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
   flash-resident weights on constrained devices, and P. J. Denning's working-set
   theory (1968) — this project builds the model-weight-specific instruments those
   ideas point toward.
-
-## Errata
-
-- **2026-08-17 — robustness fixes from field testing on a DGX Spark (GB10).**
-  Real runs on DeepSeek-V4 (284B MoE, 5 shards) and Qwen3-30B surfaced three bugs,
-  now fixed: (1) `pollard-calc` read only the **first shard** of a multi-shard model
-  → reported 0.00 bpw / absurd tok/s; it now sums params and bytes across every
-  shard. (2) Aggressive IQ2 builds could **crash partway** when the base preset hit
-  a tensor the imatrix doesn't cover (e.g. DeepSeek's `output_hc_fn`,
-  `indexer_compressor`); pollard-fit now auto-pins those to `q6_K`. (3) With no
-  calibration signal, a build could come out **larger and slower than the source**
-  silently; pollard-fit now warns loudly (no signal = no benefit) and refuses to
-  build larger than an already-quantized source. (4) `pollard-run --vram auto`
-  read **free** VRAM, which is ~0 when a model is already resident → a useless 0
-  budget; it now plans against **total** VRAM when the GPU is occupied (placement
-  runs once the resident model is unloaded anyway). (5) `pollard-sensitivity` (the
-  measured signal itself) was hardened the same way: a **failed probe build now
-  PROTECTS that group (max sensitivity), never records it as 0** — a crash used to
-  silently read as "least important, crush hardest" — and its uniform IQ2 noise
-  builds pin uncoverable tensors so the aggressive end of the curve actually gets
-  measured on exotic models. Thanks to the tester who ran it on real hardware and
-  sent the logs — this is the culture this repo asks for.
-- **2026-08-08 — K3 expert dimensions were 2× too large.** The formula ignored
-  `routed_expert_hidden_size` (K3 runs experts in a half-width latent space:
-  3584 vs hidden 7168), doubling total params (5.48T → correct **2.75T**),
-  active bytes, and the residency tier (3.7TB → correct **~1.9TB**). Found by
-  community review within a day of launch — exactly the culture this repo asks
-  for. The original README also overstated the demo comparison as "validated";
-  it is a worked example with stated assumptions, and is now labeled as one.
 
 ## Contributing
 
