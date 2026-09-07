@@ -91,9 +91,10 @@ usually a KV-quant or kernel-path artifact, not the weights.
 ## 9. Gate hygiene — exclude calibration/held-out overlap
 
 A held-out "eval" set that overlaps the calibration/replay corpus inflates every number (158 of 162
-held-out texts turned up in the replay corpora on one run). Before trusting a held-out score, exclude
-any record whose reference completion hashes to a text that appears in the calibration set. Pass a
-genuinely disjoint corpus to `pollard-probe --eval` / `pollard-serve-eval --text`.
+held-out texts turned up in the replay corpora on one run). `pollard-serve-eval --calib <file>` does this
+for you: it normalizes (whitespace + case) and hashes every calib line and **drops any eval line that
+matches**, printing how many it excluded — so an accidental overlap can't quietly inflate the score. Pass
+your calibration corpus with `--calib` whenever the eval set might share text with it.
 
 ## 10. Spec-decode head — ship the authors' stock MTP head
 

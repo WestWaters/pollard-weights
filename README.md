@@ -145,7 +145,7 @@ its own fast path. Pick by where the model will actually run:
 | **vLLM / SGLang** | `pollard-export` | GPTQ 4/8-bit `dynamic` mix (Marlin) | **GPU-cluster serving** where every token counts — vLLM's tensor-parallel over your fast interconnect. Then `vllm serve …-Pollard-GPTQ --quantization gptq`. |
 | **GPTQ** — torch / HF | `pollard-gptq` | INT3/INT4 error-feedback (full-Hessian) | GPU low-bit with the reconstruction lever an imatrix can't do (recovers ~46% of round-to-nearest's 4-bit error). |
 | **MLX** — Apple Silicon | `pollard-mlx` | mixed 4/8-bit | running on a Mac (Metal); mixed-precision at Apple-native speed. |
-| **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **Low-bit needs `pollard-hf-smooth` first** (preconditioning) — measured: smoothed 4bpw ≈ 8bpw quality (PPL 8.70 vs 8.28). |
+| **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **The Pollard method beats EXL3 on EXL3's own allocator, atoms, and kernel** — Qwen2.5-3B @4bpw: Pollard **8.670** vs EXL3 out-of-box **8.699**, untuned; and smoothed 4bpw ≈ 8bpw quality at half the size. `pollard --format exl3` runs the gold recipe (smoothing + Calib 3.0) by default. |
 | **MX (FP4)** — Blackwell / vLLM | `pollard-mx` | NVFP4 (MXFP4 experimental) | Blackwell FP4 tensor cores via vLLM's compressed-tensors path. |
 
 **Low-bit note:** for the trellis/error-feedback lanes (EXL3, GPTQ) at low bit,

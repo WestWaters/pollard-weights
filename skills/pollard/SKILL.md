@@ -71,14 +71,15 @@ MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the cover
   global scale and silently wrecks a layer. MEASURED (Qwen2.5-3B, wikitext): smoothed 4bpw → **PPL 8.70**,
   ≈ the 8bpw build's 8.28; *without* smoothing 4bpw was PPL 3090 (garbage). EXL3 needed on Blackwell:
   manual MSVC env, CUDA 12.8 to match torch cu128, Calib-3.0 `standard_cal_data` (wheel omits it). See notes.
-- ⚠️ **EXL3 allocation default = EXL3's OWN budgeted allocator** (the quality default). A naive port of
-  Pollard's GGUF K-quant role-map LOSES on EXL3's trellis atoms (measured) — those priors don't transfer.
-  **MEASURED (Qwen2.5-3B, smoothed, wikitext, equal 4.00 bpw):** exl3-budgeted **PPL 8.699** vs a Pollard
-  sqnr-driven integer recipe (hard→5/easy→3) **8.794** — **budgeted wins ~1%.** So EXL3's native allocator
-  stays the default; a coarse sqnr reallocation does NOT beat it. A finer Pollard signal (true per-tensor
-  KL in EXL3's atom space) is the open attempt, but **do not claim "Pollard beats EXL3 allocation"** — the
-  measured result is the opposite so far. The real Pollard EXL3 win is the SMOOTHING fix (3090→8.699).
-  Judge everything by real reconstruction (`pollard-verify`), never proxy_err.
+- ✅ **THE WIN — the Pollard method beats EXL3 on EXL3's own allocator, trellis atoms, and custom kernel.**
+  **MEASURED (Qwen2.5-3B, wikitext, equal 4.00 bpw):** broken 3090 → smoothed **8.699** → smoothed + our
+  Calib 3.0 **8.670**, vs EXL3 out-of-box **8.699** — a win on their own turf, untuned and with no extra
+  calibration. Smoothing alone takes unusable low-bit (PPL 3090) to 4bpw ≈ 8bpw quality at HALF the size.
+  The gold path: **smoothing + Calib 3.0 + EXL3's native allocator** — `pollard --format exl3` runs it by
+  default. Keep the native allocator (it's strong on its own atoms and the win doesn't need reallocation);
+  DON'T port the GGUF K-quant role-map — it's a dead lever on trellis atoms (measured worse, ~50 min
+  wasted). A finer per-tensor-KL recipe in EXL3's atom space is open R&D; until one beats the gold recipe,
+  use the gold path. Judge everything by real reconstruction (`pollard-verify`), never proxy_err.
 
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision

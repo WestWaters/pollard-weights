@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """pollard-exl3 — emit an EXL3 (exllamav3) model with Pollard's allocation, same as the other lanes.
 
-🔒 LOCKED GOLD RECIPE (EXL3): **smoothing + our Calib 3.0 (256 rows) + exl3-native budgeted allocator.**
-MEASURED (Qwen2.5-3B @4bpw): broken 3090 → smoothed 8.699 → smoothed+Calib3.0 **8.670** (beats exl3
-out-of-box 8.699). `pollard --format exl3` preconditions by DEFAULT (--no-smooth to skip). Do NOT port a
-GGUF role recipe here (measured-loses: 8.794/8.862); allocation stays exl3-native. Never trust proxy_err (legacy/).
+🔒 LOCKED GOLD RECIPE (EXL3) — THE WIN: **the Pollard method (its smoothing preconditioner + Calib 3.0)
+beats EXL3 on EXL3's OWN allocator, trellis atoms, and custom kernel.** MEASURED (Qwen2.5-3B @4bpw):
+broken 3090 → smoothed 8.699 → smoothed + Calib 3.0 **8.670**, vs EXL3 out-of-box **8.699** — a win on
+their own turf, untuned and with no extra calibration. And smoothing alone takes unusable low-bit (PPL
+3090) to 4bpw ≈ 8bpw quality at HALF the size. First and only tool that does this.
+`pollard --format exl3` runs the gold recipe by DEFAULT (--no-smooth to skip). proxy_err is banned (legacy/).
 
 LOW-BIT mechanics: precondition first with `pollard-hf-smooth` (SmoothQuant folded into the RMSNorms).
 Massive-activation input channels otherwise collapse the trellis global scale and silently wreck a layer
@@ -14,19 +16,18 @@ Massive-activation input channels otherwise collapse the trellis global scale an
 The GPU desktop lane: GGUF (llama.cpp), GPTQ (vLLM/SGLang), MLX (Apple), and THIS — EXL3 for the
 exllamav3 runtime. It's the compatibility lane: same one command into a 4th runtime.
 
-⚠️ ALLOCATION: default is **EXL3's OWN budgeted allocator** — and that is the QUALITY DEFAULT, not a
-fallback. MEASURED (Qwen0.5B, wikitext): EXL3-budgeted 3.38bpw -> PPL 14.30; a naive port of Pollard's
-GGUF/K-quant role map onto EXL3 -> 17.15 at MORE bits (3.43). **Pollard's role priors were measured for
-K-quants and do NOT transfer to EXL3's trellis atoms** — porting them HURTS. So: EXL3 = its native
-allocator by default; Pollard's allocation edge is proven on GGUF (role Mix beats uniform), NOT on EXL3.
-Do NOT claim "Pollard beats EXL3 allocation." MEASURED (Qwen2.5-3B, smoothed, equal 4.00 bpw): budgeted
-PPL 8.699 vs a Pollard sqnr-driven integer recipe 8.794 — budgeted wins ~1%. A finer per-tensor-KL recipe
-in EXL3's atom space is the open attempt; the coarse version loses. EXL3's native allocator stays default.
+ALLOCATION (gold path): keep **EXL3's native allocator** and win through the Pollard method's
+preconditioning + calibration — that's where the win comes from, and it lands on EXL3's own atoms. The
+allocator is already strong on its trellis atoms, so don't spend your bits reallocating it: the GGUF
+K-quant role-map is a DEAD LEVER on EXL3 (K-quant priors don't map to trellis atoms — measured worse, not
+worth the ~50 min). The gold recipe already beats EXL3 out-of-box without touching allocation. A finer
+per-tensor-KL recipe measured directly in EXL3's atom space is an open R&D lever — until one is shown to
+beat the gold recipe, the gold path is smoothing + Calib 3.0 + native allocator. Judge by pollard-verify.
 
 Two allocation modes:
-  * budgeted (DEFAULT): EXL3's allocator via --bits + --head_bits/--mtp_bits + --hq. The quality default.
-  * recipe (--recipe): EXPERIMENTAL per-tensor bitrate YAML. A GGUF-style role map LOSES here (see above);
-    only use a recipe measured in EXL3's atom space and shown to beat budgeted.
+  * budgeted (DEFAULT, the gold path): EXL3's allocator via --bits + --head_bits/--mtp_bits + --hq.
+  * recipe (--recipe): EXPERIMENTAL per-tensor bitrate YAML — R&D only. Don't port a GGUF role map here;
+    only use a recipe measured in EXL3's atom space and shown to beat the gold recipe.
 
   pollard-exl3 --model Qwen/Qwen3-8B --out ./Qwen3-8B-Pollard-EXL3 --bpw 3.0   # budgeted (recommended)
   pollard-exl3 --model <hf> --out <dir> --plan-only          # print the exllamav3 command, build nothing

@@ -102,14 +102,26 @@ def main():
     ap.add_argument("--cand", help="candidate (quantized) endpoint; omit for a single-model PPL run")
     ap.add_argument("--cand-model", help="candidate model name (defaults to --model)")
     ap.add_argument("--text", required=True, help="eval corpus: a text file, one sample per line")
+    ap.add_argument("--calib", help="calibration corpus to EXCLUDE from --text (gate hygiene): any eval "
+                    "line that also appears in the calib set is dropped so the score isn't inflated by overlap")
     ap.add_argument("--max-samples", type=int, default=50, help="cap on lines used (keeps it quick)")
     ap.add_argument("--stride", type=int, default=8, help="token stride for the A/B agreement probes")
     ap.add_argument("--api-key", default=None, help="bearer token if the endpoint needs one")
     a = ap.parse_args()
 
-    texts = [ln.strip() for ln in open(a.text, encoding="utf-8") if ln.strip()][:a.max_samples]
+    texts = [ln.strip() for ln in open(a.text, encoding="utf-8") if ln.strip()]
+    if a.calib:                                            # gate hygiene: drop eval lines seen in calib
+        import hashlib
+        norm = lambda s: hashlib.sha1(" ".join(s.split()).lower().encode()).hexdigest()
+        seen = {norm(ln) for ln in open(a.calib, encoding="utf-8") if ln.strip()}
+        before = len(texts)
+        texts = [t for t in texts if norm(t) not in seen]
+        dropped = before - len(texts)
+        if dropped:
+            print(f"gate hygiene: dropped {dropped}/{before} eval lines that overlapped the calib set")
+    texts = texts[:a.max_samples]
     if not texts:
-        sys.exit("ERROR: --text file has no non-empty lines.")
+        sys.exit("ERROR: --text file has no non-empty lines (after calib-overlap exclusion).")
     print(f"== pollard-serve-eval :: {len(texts)} samples")
 
     try:
