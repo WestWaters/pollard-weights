@@ -20,11 +20,16 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --gguf model-f16.gguf --run             # ONE-SHOT GGUF: auto-calib -> imatrix -> flagship mix
     pollard --hf Qwen/Qwen3-8B --run                # ONE-SHOT from a HF repo: download -> convert -> build
     pollard --hf ./my-local-model --run             # ...or a model already on disk (any arch)
-    pollard --hf Qwen/Qwen3-8B --format gptq --run  # export lane: GPTQ for vLLM/SGLang (from HF weights)
-    pollard --hf Qwen/Qwen3-8B --format mlx --run   # export lane: MLX for Apple Silicon
-    pollard --hf Qwen/Qwen3-8B --format exl3 --run  # export lane: EXL3 (exllamav3 — heavy trellis)
+    pollard --hf Qwen/Qwen3-8B --format gptq --run  # GPTQ for vLLM/SGLang
+    pollard --hf Qwen/Qwen3-8B --format mlx --run   # MLX for Apple Silicon
+    pollard --hf Qwen/Qwen3-8B --format exl3 --run  # EXL3 (exllamav3 — heavy trellis)
+    pollard --hf Qwen/Qwen3-8B --format mx --run    # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
+
+EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix -> measured automap mix
+-> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
+pollard-probe, --no-measure to skip); EXL3 = smoothing + Calib 3.0 packed to -cd + EXL3's native allocator.
 """
 import argparse, os, subprocess, sys
 
@@ -160,33 +165,76 @@ def _hf_to_gguf(a):
     return out
 
 
+def _ensure_calib_text(a, here):
+    """Return a Calib 3.0 text corpus path, auto-building it if the user gave none (one-shot = no
+    manual calibration step). Shared by the gptq / mx / exl3 lanes."""
+    calib = a.calib or os.path.join(here, "pollard_calib.txt")
+    if not a.calib:
+        print(f"   auto-calib (Calib 3.0): pollard-calib --out {os.path.basename(calib)} --held-out {os.path.basename(calib)}.heldout")
+        if a.run and not os.path.exists(calib):
+            _run(["pollard-calib", "--out", calib, "--held-out", calib + ".heldout"], True, cwd=here)
+    return calib
+
+
+def _ensure_sensitivity(a, hf_dir, calib, here):
+    """The GOLD lever for the export lanes: a measured sensitivity profile so allocation is Pollard's,
+    not uniform. Uses --sensitivity if given; else (unless --no-measure) auto-runs the cheap any-box
+    probe (pollard-probe) against a held-out slice of Calib 3.0. Returns a path or None (uniform)."""
+    if a.sensitivity:
+        return a.sensitivity
+    if not a.measure:
+        print("   (--no-measure: uniform allocation for this lane)")
+        return None
+    prof = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + ".sensitivity.json")
+    heldout = (calib + ".heldout") if calib else None
+    evalf = heldout if (heldout and (not a.run or os.path.exists(heldout))) else calib
+    print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
+    if a.run:
+        # tolerate a probe failure — fall back to uniform rather than killing the whole build
+        r = subprocess.run(["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof], cwd=here)
+        if r.returncode != 0 or not os.path.exists(prof):
+            print("   (probe unavailable/failed — falling back to uniform allocation for this lane)")
+            return None
+    return prof
+
+
 def _emit_nongguf(a):
-    """GPTQ (vLLM/SGLang) and MLX (Apple) emit straight from HF weights — no GGUF. Same Pollard
-    allocation, a different emitter. Calib 3.0 is auto-built for the GPTQ calibration."""
+    """GPTQ (vLLM/SGLang), MLX (Apple), EXL3 (exllamav3), and MX (Blackwell/any-GPU compressed-tensors)
+    emit straight from HF weights — same Pollard method (smoothing default + measured allocation), a
+    different emitter. Calib 3.0 and the sensitivity profile are auto-built so it's a true one-shot."""
     if not a.hf:
         sys.exit(f"--format {a.format} exports from HF weights — pass --hf <repo-or-dir> "
                  f"(a GGUF can't be re-exported to {a.format}; use --format gguf for a GGUF input).")
     hf_dir = _resolve_hf(a)
     out = a.output or (os.path.basename(hf_dir.rstrip("/\\")) + f"-Pollard-{a.format.upper()}")
+    here = os.path.dirname(os.path.abspath(out)) or "."
+
     if a.format == "gptq":
-        here = os.path.dirname(os.path.abspath(out)) or "."
-        calib = a.calib or os.path.join(here, "pollard_calib.txt")
-        if not a.calib:
-            print(f"   auto-calib (Calib 3.0): pollard-calib --out {os.path.basename(calib)}")
-            if a.run and not os.path.exists(calib):
-                _run(["pollard-calib", "--out", calib], True, cwd=here)
+        calib = _ensure_calib_text(a, here)
+        sens = _ensure_sensitivity(a, hf_dir, calib, here)
         cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out]
-        if a.sensitivity:
-            cmd += ["--sensitivity", a.sensitivity]
+        if sens:
+            cmd += ["--sensitivity", sens]
+    elif a.format == "mx":                                  # Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
+        calib = _ensure_calib_text(a, here)                # NVFP4 activation scales need calibration
+        sens = _ensure_sensitivity(a, hf_dir, calib, here)
+        cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out]
+        if sens:
+            cmd += ["--sensitivity", sens]
     elif a.format == "exl3":
-        cmd = ["pollard-exl3", "--model", hf_dir, "--out", out]  # EXL3: budgeted (or --recipe)
-    else:                                                   # mlx
+        # GOLD EXL3 = smoothing (applied in _resolve_hf) + Calib 3.0 (-cd) + EXL3's native allocator.
+        calib = _ensure_calib_text(a, here)
+        cmd = ["pollard-exl3", "--model", hf_dir, "--out", out, "--calib-text", calib]
+    else:                                                   # mlx (Apple) — measured 4/8 mix; smoothing N/A
+        calib = _ensure_calib_text(a, here)                # only for the probe's held-out eval corpus
+        sens = _ensure_sensitivity(a, hf_dir, calib, here)
         cmd = ["pollard-mlx", "--model", hf_dir, "--out", out]
-        if a.sensitivity:
-            cmd += ["--sensitivity", a.sensitivity]
-    print(f"   {a.format.upper()} export (same Pollard allocation, {a.format} emitter):")
+        if sens:
+            cmd += ["--sensitivity", sens]
+    print(f"   {a.format.upper()} export (Pollard method — smoothing default + measured allocation):")
     _run(cmd, a.run)
-    _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate", "exl3": "exllamav3 / TabbyAPI"}
+    _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate",
+           "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)"}
     print(f"   -> {out}  ({_rt.get(a.format, '')})")
 
 
@@ -218,11 +266,16 @@ def main():
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
     ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir — Pollard downloads/converts/"
                     "routes it (so a user can one-shot straight from a repo or a model already on disk)")
-    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3"],
+    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3", "mx"],
                     help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple) "
-                    "· exl3 (exllamav3 — the heavy trellis lane)")
-    ap.add_argument("--output", help="output dir/file for the gptq/mlx export (else auto-named)")
-    ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx allocation; else uniform)")
+                    "· exl3 (exllamav3 — the heavy trellis lane) · mx (Blackwell NVFP4 / any-GPU W4A16, "
+                    "compressed-tensors)")
+    ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
+    ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx/mx allocation; else auto-measured)")
+    ap.add_argument("--no-measure", dest="measure", action="store_false",
+                    help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "
+                         "allocation). By default the one-shot measures allocation (pollard-probe) — the gold path.")
+    ap.set_defaults(measure=True)
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
     ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")
@@ -269,7 +322,7 @@ def main():
             print(f"   [{a.format}] LOCKED default: preconditioning ON (--no-smooth to skip)")
 
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
-    if a.format in ("gptq", "mlx", "exl3"):
+    if a.format in ("gptq", "mlx", "exl3", "mx"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
         _emit_nongguf(a)
         if not a.run:

@@ -50,6 +50,22 @@ def detect_moe(model_id, layers_hint=0):
         return False, layers_hint
 
 
+def pack_calib(model, text_path, out_path, rows=256, cols=2048):
+    """Tokenize a TEXT corpus with the model's own tokenizer and pack it into the -cd safetensors
+    EXL3 wants: {input_ids: int64[rows, cols]}. Real tokens only — NEVER tile; if the corpus is short,
+    emit fewer rows. 256 rows is the measured sweet spot (more shifts the Hessian → worse allocation)."""
+    from transformers import AutoTokenizer
+    import torch
+    from safetensors.torch import save_file
+    tok = AutoTokenizer.from_pretrained(model)
+    ids = tok(open(text_path, encoding="utf-8", errors="ignore").read(), return_tensors="pt").input_ids[0]
+    if ids.numel() < rows * cols:                              # not enough real tokens -> fewer rows, no tiling
+        rows = max(1, ids.numel() // cols)
+    ids = ids[:rows * cols].reshape(rows, cols).contiguous().to(torch.long)
+    save_file({"input_ids": ids}, out_path)
+    return out_path, rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -65,7 +81,12 @@ def main():
     ap.add_argument("--hq", dest="hq", action="store_true", default=None,
                     help="bump bitrate of select layers (MoE) — default: auto-on for MoE")
     ap.add_argument("--no-hq", dest="hq", action="store_false")
-    ap.add_argument("--cal-data", help="calibration data (safetensors token rows); else EXL3's bundled mix")
+    ap.add_argument("--cal-data", help="calibration data (safetensors token rows, -cd); else EXL3's bundled mix")
+    ap.add_argument("--calib-text", help="a TEXT corpus (e.g. Calib 3.0) — tokenized+packed to the -cd "
+                    "safetensors here, so the locked gold recipe (smoothing + Calib 3.0) runs one-shot")
+    ap.add_argument("--cal-rows", type=int, default=256, help="rows to pack from --calib-text (256 = the "
+                    "measured EXL3 sweet spot; more is NON-monotonic and can hurt)")
+    ap.add_argument("--cal-cols", type=int, default=2048, help="tokens per row for --calib-text packing")
     ap.add_argument("--devices", default="0", help="CUDA device list for the convert, e.g. 0,1")
     ap.add_argument("--plan-only", action="store_true", help="print the exllamav3 command, build nothing")
     a = ap.parse_args()
@@ -74,6 +95,18 @@ def main():
         import pollard_workspace as ws
         a.out = ws.resolve_out(a.model, "exl3", tag=f"{a.bpw}bpw")
         print(f"   (no --out) -> workspace: {a.out}")
+    # gold recipe: pack a TEXT calib (Calib 3.0) into the -cd safetensors, unless one was given directly
+    if a.calib_text and not a.cal_data:
+        packed = (a.out.rstrip("/\\") + ".cal.safetensors") if a.out else "pollard_exl3_cal.safetensors"
+        if a.plan_only:
+            print(f"   [cal] would pack {a.calib_text} -> {packed} ({a.cal_rows}x{a.cal_cols} tokens) for -cd")
+            a.cal_data = packed
+        else:
+            try:
+                a.cal_data, rows = pack_calib(a.model, a.calib_text, packed, a.cal_rows, a.cal_cols)
+                print(f"   [cal] packed Calib 3.0 -> {a.cal_data} ({rows}x{a.cal_cols} real tokens, -cd)")
+            except Exception as e:
+                print(f"   [cal] could not pack --calib-text ({repr(e)[:70]}); using EXL3's bundled cal")
     is_moe, _ = detect_moe(a.model)
     hq = is_moe if a.hq is None else a.hq
     kind = "MoE" if is_moe else "dense"

@@ -38,13 +38,18 @@ re-fit") rather than silently picking one.
 pollard --gguf model-f16.gguf --run          # ONE-SHOT GGUF: auto-calib -> auto-imatrix -> flagship mix
 pollard --hf Qwen/Qwen3-8B --run             # ONE-SHOT from a HF repo: download -> convert -> build
 pollard --hf ./my-local-model --run          # ...or a model already on disk (any arch)
-pollard --hf Qwen/Qwen3-8B --format gptq --run   # export lane: GPTQ for vLLM/SGLang (from HF weights)
-pollard --hf Qwen/Qwen3-8B --format mlx  --run   # export lane: MLX for Apple Silicon
+pollard --hf Qwen/Qwen3-8B --format gptq --run   # GPTQ for vLLM/SGLang (from HF weights)
+pollard --hf Qwen/Qwen3-8B --format mlx  --run   # MLX for Apple Silicon
+pollard --hf Qwen/Qwen3-8B --format exl3 --run   # EXL3 (exllamav3) — smoothing + Calib 3.0 gold, one-shot
+pollard --hf Qwen/Qwen3-8B --format mx   --run   # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
 Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
-gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3). GPTQ/MLX/EXL3 emit straight from HF
-weights (no GGUF). EXL3 is the heavy trellis lane (hours by format) — use it only for the exllama runtime.
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3 · `mx` Blackwell/any-GPU compressed-tensors).
+GPTQ/MLX/EXL3/MX emit straight from HF weights (no GGUF). **All five lanes run the GOLD method one-shot:**
+smoothing is default-ON for the low-bit lanes (GPTQ/EXL3/MX), allocation is auto-measured (`pollard-probe`,
+`--no-measure` to skip) for GPTQ/MLX/MX, and EXL3 packs Calib 3.0 to `-cd` + keeps its native allocator (the
+8.670 win). EXL3 is the heavy trellis lane (hours by format) — use it only for the exllama runtime.
 **True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
 `pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
