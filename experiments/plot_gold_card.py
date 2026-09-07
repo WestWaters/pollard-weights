@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate assets/gold_card.png — the multi-model board: Pollard's mixed build
+"""Regenerate assets/benchmarks/gold_card.png — the multi-model board: Pollard's mixed build
 vs the uniform 1-bit / 2-bit trellis quants it sits between, on real 7B and 14B
 models. Quality-vs-size: the uniform IQ1_KT->IQ2_KT slide (recessive gray) and the
 Pollard mix (hero blue) landing BELOW the naive interpolation at its size. Same
@@ -14,7 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(__file__)
-OUT = os.path.join(HERE, "..", "assets", "gold_card.png")
+OUT = os.path.join(HERE, "..", "assets", "benchmarks", "gold_card.png")
 
 SURFACE = "#ffffff"; INK = "#0b0b0b"; INK_2 = "#52514e"; MUTED = "#8a8f98"
 POLLARD = "#2a78d6"; WIN = "#0ca30c"; GRID = "#ececea"

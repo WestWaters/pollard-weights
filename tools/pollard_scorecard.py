@@ -121,12 +121,20 @@ def md(r):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--results", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", help="output card path (default: workspace reports/)")
     ap.add_argument("--format", choices=["md"], default="md")
     a = ap.parse_args()
     r = json.load(open(a.results))
-    open(a.out, "w").write(md(r))
-    print(f"wrote {a.out}")
+    out = a.out
+    if not out:
+        try:
+            import pollard_workspace as ws, os as _os, time as _t
+            model = r.get("model") or (r.get("rows") or [{}])[0].get("label")
+            out = _os.path.join(ws.reports_dir(model, create=True), f"scorecard-{_t.strftime('%Y%m%d-%H%M%S')}.md")
+        except Exception:
+            out = "scorecard.md"
+    open(out, "w").write(md(r))
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":

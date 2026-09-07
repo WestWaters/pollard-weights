@@ -22,6 +22,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --hf ./my-local-model --run             # ...or a model already on disk (any arch)
     pollard --hf Qwen/Qwen3-8B --format gptq --run  # export lane: GPTQ for vLLM/SGLang (from HF weights)
     pollard --hf Qwen/Qwen3-8B --format mlx --run   # export lane: MLX for Apple Silicon
+    pollard --hf Qwen/Qwen3-8B --format exl3 --run  # export lane: EXL3 (exllamav3 — heavy trellis)
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
 """
@@ -106,16 +107,45 @@ def _find_convert():
     return "convert_hf_to_gguf.py"                          # assume on PATH / same dir
 
 
+def _precondition_hf(a, hf_dir):
+    """OPT-IN FP16-level transforms applied BEFORE any lane, so they compose across ALL lanes:
+      --abliterate : uncensor (orthogonalize residual writers vs the refusal direction). Behaviour-
+                     changing, the user's own model; measure the quality delta (pollard-kl), don't assume.
+      --smooth     : SmoothQuant preconditioning (reliable low-bit quality lever; GGUF has its own).
+    Returns the (possibly transformed) HF dir."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cur = hf_dir
+    if getattr(a, "abliterate", False):
+        out = cur.rstrip("/\\") + "-abliterated"
+        cmd = [sys.executable, os.path.join(here, "pollard_abliterate.py"), "--model", cur, "--out", out]
+        if a.harmful: cmd += ["--harmful", a.harmful]
+        if a.harmless: cmd += ["--harmless", a.harmless]
+        print(f"   [precondition] abliterate (uncensor, FP16, opt-in): {' '.join(cmd)}")
+        if a.run and subprocess.run(cmd).returncode != 0:
+            sys.exit("   abliterate failed.")
+        cur = out
+    if getattr(a, "smooth", False):
+        out = cur.rstrip("/\\") + "-smoothed"
+        cmd = [sys.executable, os.path.join(here, "pollard_hf_smooth.py"), "--model", cur, "--out", out]
+        if a.calib: cmd += ["--calib", a.calib]
+        print(f"   [precondition] smooth (SmoothQuant, FP16): {' '.join(cmd)}")
+        if a.run and subprocess.run(cmd).returncode != 0:
+            sys.exit("   smooth failed.")
+        cur = out
+    return cur
+
+
 def _resolve_hf(a):
-    """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either."""
+    """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
+    Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
-        return a.hf
+        return _precondition_hf(a, a.hf)
     local = os.path.join(os.path.abspath(a.output or "."), a.hf.split("/")[-1])
     print(f"   fetch HF repo: huggingface-cli download {a.hf} --local-dir {local}")
     if a.run:
         from huggingface_hub import snapshot_download
         local = snapshot_download(a.hf, local_dir=local)
-    return local
+    return _precondition_hf(a, local)
 
 
 def _hf_to_gguf(a):
@@ -146,13 +176,18 @@ def _emit_nongguf(a):
             if a.run and not os.path.exists(calib):
                 _run(["pollard-calib", "--out", calib], True, cwd=here)
         cmd = ["pollard-export", "--model", hf_dir, "--calib", calib, "--out", out]
+        if a.sensitivity:
+            cmd += ["--sensitivity", a.sensitivity]
+    elif a.format == "exl3":
+        cmd = ["pollard-exl3", "--model", hf_dir, "--out", out]  # EXL3: budgeted (or --recipe)
     else:                                                   # mlx
         cmd = ["pollard-mlx", "--model", hf_dir, "--out", out]
-    if a.sensitivity:
-        cmd += ["--sensitivity", a.sensitivity]
+        if a.sensitivity:
+            cmd += ["--sensitivity", a.sensitivity]
     print(f"   {a.format.upper()} export (same Pollard allocation, {a.format} emitter):")
     _run(cmd, a.run)
-    print(f"   -> {out}  ({'vllm serve / sglang' if a.format=='gptq' else 'mlx_lm.generate'})")
+    _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate", "exl3": "exllamav3 / TabbyAPI"}
+    print(f"   -> {out}  ({_rt.get(a.format, '')})")
 
 
 def _ensure_imatrix(a):
@@ -183,8 +218,9 @@ def main():
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
     ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir — Pollard downloads/converts/"
                     "routes it (so a user can one-shot straight from a repo or a model already on disk)")
-    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx"],
-                    help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple)")
+    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3"],
+                    help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple) "
+                    "· exl3 (exllamav3 — the heavy trellis lane)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx export (else auto-named)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx allocation; else uniform)")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
@@ -197,6 +233,17 @@ def main():
     ap.add_argument("--out", help="output path (dense build)")
     ap.add_argument("--eval", default="wikitext2_test.txt")
     ap.add_argument("--bin", help="llama.cpp bin dir (for the MoE dry-run/build)")
+    ap.add_argument("--smooth", dest="smooth", action="store_true", default=None,
+                    help="SmoothQuant preconditioning (pollard-hf-smooth) on the FP16 model before the lane. "
+                         "DEFAULT-ON for the low-bit trellis/error-feedback lanes (EXL3/GPTQ/MX) — it's the "
+                         "locked gold recipe there (prevents the massive-activation broken build). Use --no-smooth to skip.")
+    ap.add_argument("--no-smooth", dest="smooth", action="store_false",
+                    help="skip the default preconditioning on the EXL3/GPTQ/MX lanes")
+    ap.add_argument("--abliterate", action="store_true",
+                    help="OPT-IN: uncensor the FP16 model (pollard-abliterate) before the lane — composes "
+                         "across ALL lanes. Behaviour-changing, your own model; measure quality with pollard-kl")
+    ap.add_argument("--harmful", help="abliterate: prompts to stop refusing (one/line)")
+    ap.add_argument("--harmless", help="abliterate: matched benign prompts (one/line)")
     ap.add_argument("--run", action="store_true", help="execute the path (default: plan/print it)")
     ap.add_argument("--benchmark", "--reproduce", dest="benchmark", action="store_true",
                     help="ALSO run the gold-card benchmark (3-bar comparison + PPL) — the "
@@ -213,8 +260,16 @@ def main():
     if not a.gguf and not a.hf:
         ap.error("pass --gguf <file> or --hf <repo-or-dir>")
 
+    # LOCKED gold default: precondition (smooth) the low-bit trellis/error-feedback lanes unless opted out.
+    # These lanes silently break on massive-activation outliers without it (EXL3 3090→8.699); smoothing +
+    # our Calib 3.0 is the measured EXL3 win (8.670 < exl3-default 8.699). GGUF has its own smoothing; MLX not needed.
+    if a.smooth is None:
+        a.smooth = a.format in ("exl3", "gptq", "mx")
+        if a.smooth:
+            print(f"   [{a.format}] LOCKED default: preconditioning ON (--no-smooth to skip)")
+
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
-    if a.format in ("gptq", "mlx"):
+    if a.format in ("gptq", "mlx", "exl3"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
         _emit_nongguf(a)
         if not a.run:

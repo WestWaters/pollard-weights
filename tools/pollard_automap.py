@@ -16,9 +16,10 @@ the GGUF), detects layer count + dense/MoE, and emits the three build commands
 (uniform IQ1_KT baseline / PollardMix / uniform IQ2_KT ceiling) as a ready .bat.
 
 Usage:
-  # on the box:  llama-quantize --dry-run ... model-f16.gguf x.gguf IQ1_KT > tensors.txt
+  # first:  llama-quantize --dry-run ... model-f16.gguf x.gguf IQ1_KT > tensors.txt
+  # point --bin at YOUR ik_llama.cpp build (or set $POLLARD_IK_BIN):
   pollard-automap --tensors tensors.txt --model model-f16.gguf --imatrix ik.imatrix \
-      --out build_mix.bat --bin C:\\pollard\\ik_llama.cpp\\build\\bin
+      --out build_mix.bat --bin path/to/ik_llama.cpp/build/bin
 """
 import argparse, os, re, sys
 
@@ -315,8 +316,11 @@ def main():
     ap.add_argument("--ngl", type=int, default=99,
                     help="GPU layers for the PPL eval. Lower it for a big build that would OOM "
                          "the card (PPL is offload-invariant, so bars stay comparable).")
-    ap.add_argument("--bin", default=r"C:\pollard\ik_llama.cpp\build\bin")
-    ap.add_argument("--log", default=r"C:\pollard\bench\automap.log")
+    ap.add_argument("--bin", default=os.environ.get("POLLARD_IK_BIN", r"ik_llama.cpp\build\bin"),
+                    help="dir holding ik_llama.cpp binaries (llama-quantize/-perplexity/-cli); "
+                         "override with $POLLARD_IK_BIN or point it at YOUR build")
+    ap.add_argument("--log", default=os.environ.get("POLLARD_AUTOMAP_LOG", "automap.log"),
+                    help="build/eval log path (default: ./automap.log; or $POLLARD_AUTOMAP_LOG)")
     ap.add_argument("--out", default="build_automap.bat")
     ap.add_argument("--body", default=None, help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
     ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")

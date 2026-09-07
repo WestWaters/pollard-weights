@@ -113,9 +113,79 @@ To make the claim travel (method, not fluke): the same green board on **≥2 mod
 |---|---|---|
 | dense | mixed prose+code imatrix | the win IS the imatrix; no per-layer sweep (doesn't beat uniform on dense) |
 | MoE | **diverse** prose+code+varied, 200+ chunks | must route to the experts or low-bit fails; auto-pin covers the tail |
+| **EXL3 lane (trellis) — 🔒 LOCKED 2026-09-07** | ✅ = **smoothing + Calib 3.0 (256 rows, -cd) + exl3-native budgeted allocator** | Qwen2.5-3B @4bpw: broken 3090 → smoothed 8.699 → smoothed+Calib3.0 **8.670** (beats exl3 out-of-box 8.699). `pollard --format exl3` preconditions by default. Allocation ports LOSE (8.794/8.862) — do NOT port; cal rows are non-monotonic (256 sweet spot, 512=8.995). Widen later via cal-mix (post-publish), validated on a 2nd eval to avoid overfit. |
 | MLA/hyper-conn/DSA MoE (Deepseek, Hy4) | ✅ = MoE calib, unchanged recipe | Verified on DeepSeek-V2-Lite: automap self-routes `MoE +MLA` → the MoE recipe, **quant win proven (−57% PPL / −61% KLD / +14.8 pt top-1 vs uniform-low @ +1.5% size), zero recipe changes.** Three MECHANICAL onboarding fixes, all now automatic + regression-tested (not recipe changes): (a) convert bails on an unknown tokenizer hash → add the hash→pre-tokenizer entry; (b) ik's imatrix skips the SwiGLU **gate** (`ffn_gate_exps/shexp`) → `automap` now **auto-copies `up→gate`** (`ensure_gate_coverage`, writes `*.gatefix.imatrix`) — no manual step; (c) ik's imatrix structurally skips MLA `attn_k_b/v_b/kv_b` (can't copy-cover) → `_NEEDS_IMATRIX` flags them so they pin to q6_K. ⚠️ **Size floor:** a *shippable* 1-bit card needs the model big enough that its coherence floor is ≤ 1-bit — small/sparse models (DeepSeek-V2-Lite = 2.4B active) loop on free-gen at 1-bit and need ≥2-bit (where the mix ≈ uniform). Big MLA-MoEs (Hy4) are above the floor. This is a per-model SIZE property, not a recipe/class limit. |
 
 ---
+
+## ⛔ PROVEN-LOSING METHODS — NEVER RUN (skip straight to what wins)
+Pollard is a set of WINNING methods. If a method is on this list we already measured it losing — do
+NOT run it "to check," do NOT put it in the pipeline, do NOT spend a user's (or our) cycles/tokens on
+it. Skip ahead to the winner. Users want a fast Pollard build, not our whole R&D process.
+
+| ⛔ losing method | ✅ run this instead | proof |
+|---|---|---|
+| **local/proxy error for anything** (imatrix MAGNITUDE, EXL3 `proxy_err` — **BANNED**, see `legacy/PROXY_ERR_BANNED.md`) | **measured MODEL-LEVEL KL** sensitivity → knapsack; gate builds with **`pollard-verify`** (real reconstruction) | magnitude misranks (e13); proxy_err stayed ~0 while a layer was garbage (cost days) — never read it |
+| **sensitivity SWEEP on a DENSE model** | dense imatrix K-quant ladder + IQ1_KT flagship | no expert redundancy → loses; tools refuse it |
+| **`--no-imatrix` K-quant "mix" on MoE** | automap trellis mix WITH a covered imatrix | loses to stock Q2_K |
+| **PTQ of STQ1_0** (uniform or recipe) | QAT+distill on wiki+CHAT mix (extreme lane only) | uniform ~1e6; iq1_s 1.56 beats STQ1_0-PTQ |
+| **porting the GGUF role-map onto EXL3** (or any lane) — and running it BEFORE the calib step | EXL3 uses its OWN budgeted allocator (default); do the CALIB lever first | role-port 17.15 vs budgeted 14.30 (0.5B); and smoothed Qwen2.5-3B @4bpw: budgeted 8.699 vs sqnr-recipe 8.794 vs role-recipe 8.862 — both worse, ~50min each wasted |
+| **per-model recipe from a buggy run** | route the class recipe; extend additively only if measured | the weekend loop |
+| **raising the mix tier to chase a 2-bit ceiling** | reject (Mix-v3); tighten the crush | leaves the size class, becomes a small IQ2 |
+
+**The rule:** a new arch/format tries the CLASS's WINNING method first; only a *measured* win gets
+locked as a new gold path; anything we proved loses is deleted from the flow, not retried.
+
+## 🆕 NEW LANE (new emit backend / atom class, e.g. EXL3) — TUNE lane-native, do NOT port-and-lock
+A new BACKEND (EXL3/MLX/GPTQ) is a **new atom class**. Porting the GGUF/IQ recipe onto it is only a
+first PROBE — it usually LOSES (K-quant priors ≠ trellis/other atoms), and **a port-failure NEVER
+justifies locking the lane compatibility-only.** You must run the lane-native Session-2 loop FIRST:
+- **Baseline to beat** = the lane's own default allocator (e.g. EXL3-budgeted), boarded at a target bpw.
+- **Model** = a MID model (**≥3B–8B**), NOT a 0.5B, and NOT Wiki-PPL-only — add the chat gate.
+- **⚠️ PREREQUISITE for low-bit trellis/error-feedback lanes (EXL3/GPTQ) — PRECONDITION FIRST.** These
+  lanes have NO input-outlier protection: one massive-activation input channel collapses the encode's
+  global scale and **silently produces a broken layer** (both the convert's per-tensor error AND the
+  banned `proxy_err` miss it — the layer's real-activation `sqnr` goes negative). Run `pollard-hf-smooth`
+  (SmoothQuant → RMSNorms, exact identity) on the fp16 model BEFORE the convert; confirm with
+  `pollard-verify` (real reconstruction) / per-layer sqnr. MEASURED (EXL3, Qwen2.5-3B @4bpw): unsmoothed
+  **PPL 3090 (broken)** → smoothed **8.699 (works, ≈8bpw quality)**. This is separate from allocation —
+  do it before you even compare allocators, or you're tuning on a broken build.
+- **⚠️⚠️ ORDER IS MANDATORY — START AT CALIBRATION (Step 1). DO NOT run an allocation/recipe port first.**
+  A ported protect/crush recipe (GGUF/IQ priors → the lane's atoms) **LOSES** and wastes a ~50-min convert
+  each: MEASURED on EXL3 @4bpw — budgeted (default) **8.699**, ported sqnr recipe (v1) **8.794**, ported
+  role recipe (v2) **8.862** — both *worse*. The native allocator is strong on ITS OWN atoms; your first
+  real lever that's actually YOURS is **your calibration**, not a recipe port. Only after the calib run do
+  you touch allocation — and only with a MEASURED probe in the lane's atoms, NEVER ported priors (Step 2).
+- **Loop (ONE attributable change per run, re-board each; gate every build with `pollard-verify`, NEVER proxy_err):**
+  1. **CALIB for the lane — DO THIS FIRST** — Calib 3.0 (`pollard-calib` → tokenize → `-cd` packed safetensors
+     `{input_ids:[rows,cols]}`, real tokens only, NEVER tiled) as the encode calibration; board vs default at same bpw.
+     ⚠️ **Cal row-count is NON-MONOTONIC — do NOT just crank it.** MEASURED (EXL3, Qwen2.5-3B @4bpw): 256 rows
+     = **8.670** (beats exl3-default 8.699) but 512 rows = **8.995** (WORSE than both — more rows shift the
+     Hessian → worse allocation). Find the sweet spot (~250-256 default is a good start); more is not better.
+  2. **RETUNE protect/body in the LANE's atoms** — SOFT priors only (protect residual writers / attn-out /
+     embeddings / head; crush the coldest FFN body), with targets from a SHORT measured probe in the
+     lane's bpw atoms — NOT copied IQ gate/up rules.
+  3. **Attributable tuning** — one lever per run (protect bump | body floor | calib mix); reject if bpw
+     creeps or PPL worsens.
+  4. **Recovery** — one light repair pass only if coherent-but-soft AND the stack supports it; else skip
+     (no multi-day QAT side quest).
+  5. **Ship gate** — Wiki PPL + chat (fixed sampling: rep-pen 1.15, temp ≤0.7). **WIN = ≤ default bpw AND
+     (PPL ≤ default OR a clear chat win with PPL within ~5%).**
+- **Lock rule:** lock as a new gold lane ONLY on a matched-bpw win. Lock **compatibility-only** ONLY
+  after **≥3 consecutive lane-native TUNED attempts lose at matched bpw** on the mid model — never after
+  port failures alone. **Goal B (finish faster) stays weak** where the lane's default has no expensive
+  search (EXL3-budgeted is search-light) — don't chase it; the win is match-quality, and never reimplement
+  the lane's own optimizer.
+- **EXL3 status (2026-09-06):** lane now WORKS at low bit **with preconditioning** (3090→8.699 @4bpw,
+  Qwen2.5-3B). Allocation ports MEASURED-LOSE: budgeted **8.699** vs sqnr recipe **8.794** (v1) vs
+  role-aware recipe **8.862** (v2) — both worse, K-quant priors don't transfer to trellis atoms. So DON'T
+  port recipes here. **✅ CALIBRATION LEVER WINS: budgeted + OUR Calib 3.0 = 8.670 vs exl3-default-cal 8.699**
+  (same allocator/bpw, smoothed) — our cal beats theirs UNTUNED. This is the lockable Pollard EXL3 edge:
+  **smoothing + our calibration** (allocation stays exl3-native). **Open attempt to widen it:** TUNE the
+  calibration (domain mix/size/model-matched) + a finer per-tensor **measured-KL** recipe in EXL3's atom space
+  (recipe YAML `{tensors:{key:int_bits}}`, bits 1-8|16, must cover every quantizable tensor; pass `-b/-hb`
+  for reporting) + Calib 3.0 + the tuning loop above. Recipe/verify tooling: `pollard-exl3 --recipe`,
+  `pollard-hf-smooth`, `pollard-verify`, `pollard-doctor`.
 
 ## Traps (the weekend lessons — do not repeat)
 - **Don't build a per-model recipe** — especially not from a **buggy run's** numbers. Route through
@@ -126,7 +196,15 @@ To make the claim travel (method, not fluke): the same green board on **≥2 mod
 - **Build ≠ benchmark.** A plain build is ONE model, minutes. The 3-bar / KLD / sensitivity are
   here in `benchmarks/`, opt-in. Shipping them in the build is what caused the "3-hour" runs.
 - **Measure, don't assume.** `imatrix magnitude LIES` (big activations ≠ high KL). Protect what the
-  measurement (KL / the decision table) says, not a guess.
+  measurement (KL / the decision table) says, not a guess. And **never trust the convert's own printed
+  error** — `proxy_err`/per-tensor nmse can read perfect while the assembled model is garbage (a massive
+  outlier dominates those metrics). Gate EVERY build with `pollard-verify` (real reconstruction: decode-
+  vs-source + end-to-end forward), never a proxy. proxy_err is BANNED (`legacy/PROXY_ERR_BANNED.md`).
+- **Low-bit lanes need preconditioning FIRST.** Trellis/error-feedback encoders (EXL3/GPTQ) have no
+  input-outlier protection — a massive-activation channel (emerges in the first couple of layers)
+  collapses the global scale and silently breaks a layer. `pollard-hf-smooth` before the convert fixes
+  it (measured: EXL3 3090→8.699). It composes across all lanes; abliterate is the same FP16-pre-convert
+  pattern. `pollard-doctor --predict` flags at-risk layers on the fp16 model before you build.
 - **Infra bites:** disk-full truncates KL base logits mid-run; f16 won't fit RAM (use a Q6/Q8 host);
   `-ngl 99` OOMs a big model on a small card (lower it — KL is offload-invariant); the case-sensitive
   `q3_K` in `--custom-q`; `set VAR=x &&` in cmd captures a trailing space; **ik_llama REFUSES a q8_0

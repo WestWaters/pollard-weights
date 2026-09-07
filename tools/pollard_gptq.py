@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """pollard-gptq — full-Hessian error-feedback quantization (GPTQ-class), our own impl.
 
+LOW-BIT: precondition first with `pollard-hf-smooth`. Like EXL3's LDLQ, GPTQ error-feedback has no
+input-outlier protection — a massive-activation channel collapses the scale and breaks a layer at low
+bit. Smooth the fp16 model, then convert. (`pollard-doctor --source <fp16> --repair --lane gptq`.)
+
 The lever llama.cpp's imatrix CANNOT replicate. imatrix stores only the DIAGONAL of
 the activation second moment (per-channel importance) and bends the rounding toward
 hot channels. GPTQ uses the FULL Hessian H = X Xᵀ: it quantizes one column at a time

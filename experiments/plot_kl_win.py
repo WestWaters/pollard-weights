@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate assets/kl_win.png from the firm KL sweeps in experiments/data/.
+"""Regenerate assets/benchmarks/kl_win.png from the firm KL sweeps in experiments/data/.
 
 Two panels — dense and MoE — each a quality-vs-size Pareto view: the uniform
 imatrix-IQ curve (recessive gray) and the pollard measured-sensitivity builds
@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 
 HERE = os.path.dirname(__file__)
-OUT = os.path.join(HERE, "..", "assets", "kl_win.png")
+OUT = os.path.join(HERE, "..", "assets", "benchmarks", "kl_win.png")
 
 # --- dataviz palette (validated reference instance) ---
 SURFACE = "#ffffff"

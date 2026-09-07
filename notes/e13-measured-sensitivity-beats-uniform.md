@@ -79,7 +79,7 @@ the K-quant per byte, measured).
   nothing is left to allocate, pollard *loses* — on granite at ~1.06 GB (that's the
   one red point on the MoE chart). Above the floor it wins across the board.
 - Firm 48K-token eval; `experiments/plot_kl_win.py` + `experiments/data/*.csv`
-  regenerate `assets/kl_win.png` end-to-end from the raw numbers.
+  regenerate `assets/benchmarks/kl_win.png` end-to-end from the raw numbers.
 - Per-EXPERT (not per-layer) allocation is still the open lever (E12's open item);
   fused expert tensors in GGUF block it — a runtime/kernel project.
 

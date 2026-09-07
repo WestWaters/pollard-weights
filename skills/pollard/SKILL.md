@@ -14,6 +14,24 @@ Pollard makes a frontier model fit a given machine's memory by **deciding where 
 bits go** instead of painting every weight the same. This skill tells an agent the
 correct path for *this* model so results are good and no time is wasted.
 
+## ⚠️ STEP 0 — ASK THE USER (do this before building; don't assume)
+
+The machine you BUILD on is usually **not** the machine the model will RUN on (users build on a big-disk
+box for a phone, a Pi, another server, a 5090, a wafer…). `--ram`/`--vram` is the **TARGET device's**
+budget, NOT this machine's — so you cannot infer it. **Before building, ask the user two things** (unless
+they already gave them in the prompt):
+
+1. **Target device & budget** — where will the model RUN, and how much RAM/VRAM does it have? (e.g. "iPhone
+   ~6GB", "Jetson 8GB", "a box with 24GB", "a 256GB server", "512GB wafer node"). Pollard targets **ANY**
+   size — MB to TB — there is NO fixed 16–24GB range; that's just a common demo number.
+2. **Preference** — *fit-a-budget* (best quality that fits that device, default) or **max-shrink** (smallest
+   possible, quality be damned — `--ram <small>` / `--allow-1bit`)?
+
+Then build for the TARGET: `pollard-fit --ram <TARGET_GB>` (or `pollard-calc --ram <TARGET_GB>` first to
+show what fits). Use `--ram auto` ONLY when the build machine IS the target. If you truly can't ask (no
+interactive user), state your assumption explicitly ("assuming a 16GB target — tell me the real target to
+re-fit") rather than silently picking one.
+
 ## Don't know the model type? Use the autoaware entry point
 
 ```bash
@@ -25,7 +43,8 @@ pollard --hf Qwen/Qwen3-8B --format mlx  --run   # export lane: MLX for Apple Si
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
 Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
-gguf` default · `gptq` vLLM/SGLang · `mlx` Apple). GPTQ/MLX emit straight from HF weights (no GGUF).
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3). GPTQ/MLX/EXL3 emit straight from HF
+weights (no GGUF). EXL3 is the heavy trellis lane (hours by format) — use it only for the exllama runtime.
 **True one-shot:** with no `--imatrix`, `pollard` auto-builds one (a Calib 3.0 multi-domain corpus via
 `pollard-calib` → `llama-imatrix`), so the DEFAULT output is the flagship mix with **zero manual
 steps** — the user supplies only the f16 GGUF. (`--no-auto-imatrix` = stock K-quant ladder only; big
@@ -42,10 +61,24 @@ MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the cover
   Calib 3.0 imatrix (minutes). The **measured-allocation** max quality is the opt-in `--benchmark` /
   `pollard-sensitivity` path (hours). The 10-minute path is excellent; the beats-uniform gold-card
   numbers come from the measured path.
-- **Output lanes, all smoke-tested** (Qwen2.5-0.5B, same Pollard allocation): **GGUF** (llama.cpp) ·
-  **MLX** (Apple — mixed 4/8 loads + generates "Paris" on M4 @ 233 tok/s) · **GPTQ** (vLLM/SGLang — 4/8
-  checkpoint loads + generates on the CUDA box). For a *specific* model, a one-line load in the target
-  runtime is still the sensible final ship check.
+- **Five output lanes** (same Pollard allocation, one command each): **GGUF** (llama.cpp) · **GPTQ**
+  (vLLM/SGLang) · **MLX** (Apple Silicon, mixed 4/8; real emit needs `mlx_lm`) · **EXL3** (exllamav3,
+  Blackwell) · **MX** (NVFP4/MXFP4 on Blackwell FP4 cores, via llm-compressor). GGUF is the flagship;
+  the rest emit straight from HF weights. For a *specific* model, a one-line load in the target runtime
+  is still the sensible final ship check.
+- ✅ **EXL3 low-bit WORKS — with preconditioning.** At low bit, run `pollard-hf-smooth` on the fp16 model
+  first (or `pollard-doctor --repair`): a massive-activation input channel otherwise collapses the trellis
+  global scale and silently wrecks a layer. MEASURED (Qwen2.5-3B, wikitext): smoothed 4bpw → **PPL 8.70**,
+  ≈ the 8bpw build's 8.28; *without* smoothing 4bpw was PPL 3090 (garbage). EXL3 needed on Blackwell:
+  manual MSVC env, CUDA 12.8 to match torch cu128, Calib-3.0 `standard_cal_data` (wheel omits it). See notes.
+- ⚠️ **EXL3 allocation default = EXL3's OWN budgeted allocator** (the quality default). A naive port of
+  Pollard's GGUF K-quant role-map LOSES on EXL3's trellis atoms (measured) — those priors don't transfer.
+  **MEASURED (Qwen2.5-3B, smoothed, wikitext, equal 4.00 bpw):** exl3-budgeted **PPL 8.699** vs a Pollard
+  sqnr-driven integer recipe (hard→5/easy→3) **8.794** — **budgeted wins ~1%.** So EXL3's native allocator
+  stays the default; a coarse sqnr reallocation does NOT beat it. A finer Pollard signal (true per-tensor
+  KL in EXL3's atom space) is the open attempt, but **do not claim "Pollard beats EXL3 allocation"** — the
+  measured result is the opposite so far. The real Pollard EXL3 win is the SMOOTHING fix (3090→8.699).
+  Judge everything by real reconstruction (`pollard-verify`), never proxy_err.
 
 `pollard` reads the arch, decides **dense vs MoE**, and dispatches to the correct path
 (dense → the imatrix K-quant ladder via `pollard-fit` **plus the IQ1_KT mixed-precision
@@ -128,7 +161,7 @@ The quality win on a MoE (and on dense) is **`pollard-sensitivity` → `pollard-
 it CRUSHES one tensor group at a time and measures the *true KL cost*, then a knapsack spends
 bits where the measurement — not a guess — says they matter. **Measured, shipped, and proven
 to beat uniform imatrix-IQ at matched size on both a MoE (granite-3B-a800m, 40 experts) AND a
-dense (Qwen2.5-1.5B)** — see `assets/kl_win.png`. Do not build a second allocator; use this one.
+dense (Qwen2.5-1.5B)** — see `assets/benchmarks/kl_win.png`. Do not build a second allocator; use this one.
 ```bash
 pollard-sensitivity --gguf moe-f16.gguf --imatrix moe.imatrix --eval held.txt --out moe.sens.json
 pollard-fit --gguf moe-f16.gguf --ram 16 --imatrix moe.imatrix --sensitivity moe.sens.json --out moe-pollard.gguf

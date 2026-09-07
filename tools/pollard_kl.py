@@ -79,10 +79,17 @@ def main():
     tag = f"{a.recipe if a.recipe!='none' else a.qmode}"
     print(f"\n{tag}: KL(f16||q) = {kl:.4f} nats   top-1 agree = {t1:.1f}%   "
           f"[{int(time.time()-t0)}s, {a.kl_chunks} chunks]", flush=True)
-    if a.out:
+    out = a.out
+    if not out:
+        try:
+            import pollard_workspace as ws, os as _os, time as _t
+            out = _os.path.join(ws.reports_dir(a.model, create=True), f"kl-{_t.strftime('%Y%m%d-%H%M%S')}.json")
+        except Exception:
+            out = None
+    if out:
         json.dump({"model": a.model, "recipe": tag, "kl_nats": kl, "top1_pct": t1,
-                   "kl_chunks": a.kl_chunks}, open(a.out, "w"), indent=1)
-        print(f"wrote {a.out}", flush=True)
+                   "kl_chunks": a.kl_chunks}, open(out, "w"), indent=1)
+        print(f"wrote {out}", flush=True)
 
 
 if __name__ == "__main__":

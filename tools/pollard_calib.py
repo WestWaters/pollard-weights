@@ -26,13 +26,17 @@ DOMAINS = ["prose", "code", "math", "chat", "multilingual"]
 
 # HF datasets to try per domain (id, split, config, text-field or (a,b) pair to join).
 # Kept small/streamable; any that fails to load just falls back to the bundled seed.
+# Proven-working source FIRST per domain, then fallbacks, then bundled seed. Updated for `datasets` 5.x
+# (bare "wikitext", bigcode/the-stack-smol, and script-based flores200 all broke — do not restore them).
 _HF = {
-    "prose":        [("wikitext", "test", "wikitext-2-raw-v1", "text"),
+    "prose":        [("Salesforce/wikitext", "train", "wikitext-103-raw-v1", "text"),  # large real prose
                      ("Salesforce/wikitext", "test", "wikitext-2-raw-v1", "text")],
-    "code":         [("bigcode/the-stack-smol", "train", "data/python", "content")],
+    "code":         [("codeparrot/codeparrot-clean-valid", "train", None, "content"),
+                     ("bigcode/the-stack-smol-xs", "train", "python", "content")],
     "math":         [("openai/gsm8k", "train", "main", ("question", "answer"))],
     "chat":         [("tatsu-lab/alpaca", "train", None, ("instruction", "output"))],
-    "multilingual": [("Muennighoff/flores200", "dev", None, "sentence")],
+    "multilingual": [("papluca/language-identification", "train", None, "text"),
+                     ("Salesforce/wikitext", "validation", "wikitext-2-raw-v1", "text")],
 }
 
 # Bundled seeds — always available so the tool never emits an empty domain. Short but real,
@@ -117,7 +121,7 @@ def build_domain(domain, need, min_chars, rng):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--out", required=True, help="output corpus (raw text, newline-separated samples)")
+    ap.add_argument("--out", help="output corpus (raw text; default: workspace calibration/)")
     ap.add_argument("--domains", default=",".join(DOMAINS),
                     help=f"comma list from {DOMAINS} (default: all)")
     ap.add_argument("--per-domain", type=int, default=300, help="target samples per domain")
@@ -145,6 +149,12 @@ def main():
     rng.shuffle(train)
     rng.shuffle(held)
     chars = sum(len(s) for _, s in train)
+    if not a.out:
+        try:
+            import pollard_workspace as ws, os
+            a.out = os.path.join(ws.calibration_dir(create=True), "calib-3.0.txt")
+        except Exception:
+            a.out = "calib-3.0.txt"
     with open(a.out, "w", encoding="utf-8") as f:
         f.write("\n".join(s for _, s in train))
     print(f"== pollard-calib :: Calib 3.0 multi-domain corpus")

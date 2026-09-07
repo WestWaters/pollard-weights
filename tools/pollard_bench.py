@@ -227,10 +227,17 @@ def main():
                               else "Pollard is lower PPL, competitor smaller."))
             print(f"\nHead-to-head: {verdict}")
 
-    if a.out:
+    out = a.out
+    if not out:
+        try:
+            import pollard_workspace as ws, os as _os, time as _t
+            out = _os.path.join(ws.reports_dir(a.gguf, create=True), f"bench-{_t.strftime('%Y%m%d-%H%M%S')}.json")
+        except Exception:
+            out = None
+    if out:
         import json
-        json.dump({"eval": a.eval, "ref": a.ref, "rows": rows}, open(a.out, "w"), indent=2)
-        print(f"\nwrote {a.out}  (feed pollard-scorecard for the card)")
+        json.dump({"eval": a.eval, "ref": a.ref, "rows": rows}, open(out, "w"), indent=2)
+        print(f"\nwrote {out}  (feed pollard-scorecard for the card)")
 
 
 if __name__ == "__main__":
