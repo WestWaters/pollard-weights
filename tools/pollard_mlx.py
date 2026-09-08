@@ -145,7 +145,9 @@ def main():
         convert(a.model, **ckw)
     try:
         import pollard_workspace as ws
-        ws.record_build(a.model, "mlx", a.out, tag=f"{LOW}.{HIGH}")
+        # record the ACTUAL avg bpw + a distinct tag so each ladder rung is listable on the card
+        # (was always "4.8" regardless of the mix, so rungs collided)
+        ws.record_build(a.model, "mlx", a.out, tag=f"mlx-{avg:.1f}bpw", bpw=round(avg, 2))
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote MLX model -> {a.out}\n"
