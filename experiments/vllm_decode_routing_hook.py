@@ -4,7 +4,8 @@ from a running vLLM server. Answers the e10 question ("does decode concentrate m
 on vLLM — the fused MoE path exports nothing per token, so this wraps the router's expert selection.
 
 STATUS: written against vLLM 0.28 (`FusedMoERouter.select_experts` in
-`vllm/model_executor/layers/fused_moe/router/fused_moe_router.py`); UNTESTED on a live server at the time of this commit —
+`vllm/model_executor/layers/fused_moe/router/fused_moe_router.py`); import-tested in the 0.28 image (installs and patches the
+method); NOT yet exercised on a live server at the time of this commit —
 verification on a GLM-5.3 TP8 deployment is scheduled; results will be appended to the GLM-5.3 note.
 
 How it works: wraps `select_experts` to record the returned (topk_weights, topk_ids); classifies each token as decode or

@@ -49,8 +49,8 @@ than the quantization). Two things the contract should say explicitly, both meas
   the head's acceptance moved single-stream speed by +16 %, and offline head metrics ranked six retrained heads *opposite* to
   serving — the served number is the only one that counts.
 - `experiments/vllm_decode_routing_hook.py` — decode-vs-prefill routing capture from a live vLLM server (wraps the router's
-  expert selection; CUDA graphs must be off during capture). Written against 0.28; **untested on a live server at commit
-  time** — our next fleet window runs it on GLM-5.3 and the e10 decode/prefill ratio for a 256-expert router goes in the data note.
+  expert selection; CUDA graphs must be off during capture). Written against 0.28; import-tested inside the 0.28 image (installs, patches `FusedMoERouter.select_experts`);
+  **not yet exercised on a live server** — our next fleet window runs it on GLM-5.3 and the e10 decode/prefill ratio for a 256-expert router goes in the data note.
 
 ## 4. Still open (cluster-only, on our list)
 
