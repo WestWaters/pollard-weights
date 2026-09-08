@@ -353,7 +353,12 @@ def main():
                     py = em.ensure_env(target, a.format)
                     if py:
                         argv = [py, os.path.abspath(__file__)] + sys.argv[1:] + ["--match-transformers", "off"]
-                        sys.exit(subprocess.run(argv).returncode)
+                        # the re-invoked build calls pollard-calib/-probe/-hf-smooth by bare name, so the
+                        # matched env's Scripts/bin must be FIRST on PATH or they'd resolve to the base env
+                        # (wrong transformers). Prepend it for the delegated run.
+                        env = dict(os.environ)
+                        env["PATH"] = os.path.dirname(py) + os.pathsep + env.get("PATH", "")
+                        sys.exit(subprocess.run(argv, env=env).returncode)
                     print("   [match-transformers] env setup failed — falling back to the current env")
             except Exception as e:
                 print(f"   [match-transformers] skipped ({e}); using the current env")
