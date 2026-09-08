@@ -3,7 +3,7 @@
 Companion to `glm-5.3-cluster-verification.md`. The EXL3 3.2 bpw GLM-5.3 body from the band-parallel run (`experiments/exl3_band.py`)
 went to a TP4 serving gate on vLLM 0.28 with the `cuda-exl3` plugin (its sparse-MLA attention backend is the only one that runs a
 DSA model on GB10). It loaded, every counter was healthy, throughput was fine — and the output was gibberish. Five boots and one
-afternoon later, four distinct gaps. None is a quantization-quality problem; all three bite anyone who follows the Pollard EXL3
+afternoon later, four distinct gaps. None is a quantization-quality problem; all four bite anyone who follows the Pollard EXL3
 lane *past* what the public GLM-5.3 EXL3 builds do (they keep attention bf16 and quantize only the routed experts).
 
 ## 1. exllamav3 ≥ 1.4 pads every linear's `out_features` to a multiple of 128 — decode the stored width, then trim
