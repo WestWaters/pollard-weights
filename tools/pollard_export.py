@@ -230,8 +230,9 @@ def main():
     try:
         from gptqmodel import GPTQModel, QuantizeConfig
     except Exception:
-        sys.exit("ERROR: gptqmodel not installed here. Run this on the CUDA box: "
-                 "pip install gptqmodel ; the checkpoint it writes loads in vLLM/SGLang.")
+        sys.exit("ERROR: gptqmodel not installed here. On the CUDA box: "
+                 "pip install 'pollard-weights[gptq]' (or pip install gptqmodel). "
+                 "The checkpoint it writes loads in vLLM/SGLang.")
     if not a.calib:
         sys.exit("ERROR: --calib is required to build (use --plan-only / --shard-plan for planning only).")
     calib = [ln.strip() for ln in open(a.calib, encoding="utf-8") if ln.strip()]

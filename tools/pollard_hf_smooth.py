@@ -48,12 +48,18 @@ def main():
     ap.add_argument("--rows", type=int, default=12, help="calibration chunks")
     ap.add_argument("--cols", type=int, default=512, help="calibration chunk length (tokens)")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code (custom archs like Spark2_5); 'auto' = only if "
+                         "config.json has an auto_map")
     a = ap.parse_args()
 
     import torch
+    import pollard_workspace as ws
+    trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16, device_map=a.device)
+    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=trc)
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16, device_map=a.device,
+                                                trust_remote_code=trc)
     model.eval()
     try:
         layers = model.model.layers

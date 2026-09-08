@@ -120,9 +120,10 @@ def _precondition_hf(a, hf_dir):
     Returns the (possibly transformed) HF dir."""
     here = os.path.dirname(os.path.abspath(__file__))
     cur = hf_dir
+    trc = ["--trust-remote-code", getattr(a, "trust_remote_code", "auto")]   # custom-arch passthrough
     if getattr(a, "abliterate", False):
         out = cur.rstrip("/\\") + "-abliterated"
-        cmd = [sys.executable, os.path.join(here, "pollard_abliterate.py"), "--model", cur, "--out", out]
+        cmd = [sys.executable, os.path.join(here, "pollard_abliterate.py"), "--model", cur, "--out", out] + trc
         if a.harmful: cmd += ["--harmful", a.harmful]
         if a.harmless: cmd += ["--harmless", a.harmless]
         print(f"   [precondition] abliterate (uncensor, FP16, opt-in): {' '.join(cmd)}")
@@ -131,7 +132,7 @@ def _precondition_hf(a, hf_dir):
         cur = out
     if getattr(a, "smooth", False):
         out = cur.rstrip("/\\") + "-smoothed"
-        cmd = [sys.executable, os.path.join(here, "pollard_hf_smooth.py"), "--model", cur, "--out", out]
+        cmd = [sys.executable, os.path.join(here, "pollard_hf_smooth.py"), "--model", cur, "--out", out] + trc
         if a.calib: cmd += ["--calib", a.calib]
         print(f"   [precondition] smooth (SmoothQuant, FP16): {' '.join(cmd)}")
         if a.run and subprocess.run(cmd).returncode != 0:

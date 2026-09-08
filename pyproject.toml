@@ -24,13 +24,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-convert = ["torch", "transformers", "safetensors"]                 # measure/precondition/verify/probe/sensitivity/gptq
+convert = ["torch", "transformers", "safetensors", "datasets"]     # measure/precondition/verify/probe/sensitivity/calib
+gptq = ["torch", "transformers", "safetensors", "gptqmodel", "datasets"]   # pollard-export (vLLM/SGLang GPTQ lane)
 charts = ["matplotlib"]                                             # pollard-eval --chart / experiments/plot_*.py
 exl3 = ["torch", "transformers", "safetensors", "exllamav3", "datasets"]
 mlx = ["mlx-lm"]
-mx = ["torch", "transformers", "llmcompressor"]
+mx = ["torch", "transformers", "llmcompressor", "datasets"]
 hf = ["huggingface-hub", "hf-transfer"]                            # publishing to the Hub
-all = ["torch", "transformers", "safetensors", "exllamav3", "datasets",
+all = ["torch", "transformers", "safetensors", "exllamav3", "datasets", "gptqmodel",
        "mlx-lm", "llmcompressor", "huggingface-hub", "hf-transfer", "matplotlib"]
 
 [project.scripts]
