@@ -58,19 +58,24 @@ def detect_mla(model_id):
         return False
 
 
-def allocate(sens, n_layers, hot_frac):
+parse_layers = ws.parse_layers   # shared layer-spec parser
+
+
+def allocate(sens, n_layers, hot_frac, focus=None):
     """Pollard profile -> {layer: {group: bits}}. The most-sensitive `hot_frac` of layers
     keep their group at 8-bit; the rest go 4-bit. Fused groups get ONE bit-width (constraint).
     'attn' sensitivity drives q/k/v+o; 'ffn' sensitivity drives gate/up+down."""
+    focus = set(focus or ())                       # user-chosen layers to force HIGH (steer the budget)
     ffn = {int(k): float(v) for k, v in (sens.get("ffn") or {}).items()}
     attn = {int(k): float(v) for k, v in (sens.get("attn") or {}).items()}
-    if not ffn and not attn:                       # no profile -> uniform W4 (still valid)
-        return {i: {"attn": LOW, "ffn": LOW} for i in range(n_layers)}
+    if not ffn and not attn:                       # no profile -> uniform W4, but honor --focus-layers
+        return {i: {"attn": HIGH if i in focus else LOW,
+                    "ffn": HIGH if i in focus else LOW} for i in range(n_layers)}
 
     def hot_layers(d):
         k = max(1, int(round(hot_frac * len(d))))
         return set(sorted(d, key=lambda i: d[i], reverse=True)[:k])
-    hot_attn, hot_ffn = hot_layers(attn or ffn), hot_layers(ffn or attn)
+    hot_attn, hot_ffn = hot_layers(attn or ffn) | focus, hot_layers(ffn or attn) | focus
     return {i: {"attn": HIGH if i in hot_attn else LOW,
                 "ffn": HIGH if i in hot_ffn else LOW} for i in range(n_layers)}
 
@@ -176,6 +181,9 @@ def main():
     ap.add_argument("--out", help="output dir for the GPTQ checkpoint (default: workspace)")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
     ap.add_argument("--hot-frac", type=float, default=0.35, help="fraction of layers kept at 8-bit")
+    ap.add_argument("--focus-layers", help="force these layer indices to HIGH bits regardless of the "
+                    "sensitivity profile — steer the budget to layers you care about, e.g. '3,4,8' or "
+                    "'3-8,16'. Unions into the measured hot set (works even with no profile).")
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--uniform", action="store_true", help="plain uniform W4 (for SGLang mixed-bit fragility)")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
@@ -205,7 +213,10 @@ def main():
         print_shard_plan(a.model, n_layers, a.shard_plan, a.bf16_gb)
         return
 
-    alloc = allocate(sens, n_layers, a.hot_frac)
+    focus = parse_layers(a.focus_layers)
+    if focus:
+        print(f"   focus-layers: forcing layers {sorted(focus)} to HIGH (steered budget)")
+    alloc = allocate(sens, n_layers, a.hot_frac, focus=focus)
     dyn = {} if a.uniform else (moe_dynamic_config(alloc) if is_moe else dynamic_config(alloc))
     ab = LOW if a.uniform else avg_bits(alloc)
     kind = "MoE" if is_moe else "dense"

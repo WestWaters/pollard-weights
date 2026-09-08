@@ -30,17 +30,20 @@ def detect_moe(model_id, layers_hint=0):
         return False, layers_hint
 
 
-def allocate(sens, n_layers, hot_frac):
-    """Pollard profile -> {layer: {"attn":bits, "ffn":bits}}. Top `hot_frac` of layers stay HIGH."""
+def allocate(sens, n_layers, hot_frac, focus=None):
+    """Pollard profile -> {layer: {"attn":bits, "ffn":bits}}. Top `hot_frac` of layers stay HIGH.
+    `focus` (layer indices) are forced HIGH regardless of the profile (steer the budget)."""
+    focus = set(focus or ())
     ffn = {int(k): float(v) for k, v in (sens.get("ffn") or {}).items()}
     attn = {int(k): float(v) for k, v in (sens.get("attn") or {}).items()}
     if not ffn and not attn:
-        return {i: {"attn": LOW, "ffn": LOW} for i in range(n_layers)}
+        return {i: {"attn": HIGH if i in focus else LOW,
+                    "ffn": HIGH if i in focus else LOW} for i in range(n_layers)}
 
     def hot(d):
         k = max(1, int(round(hot_frac * len(d))))
         return set(sorted(d, key=lambda i: d[i], reverse=True)[:k])
-    ha, hf = hot(attn or ffn), hot(ffn or attn)
+    ha, hf = hot(attn or ffn) | focus, hot(ffn or attn) | focus
     return {i: {"attn": HIGH if i in ha else LOW, "ffn": HIGH if i in hf else LOW}
             for i in range(n_layers)}
 
@@ -79,6 +82,8 @@ def main():
     ap.add_argument("--out", help="output MLX model dir (required unless --plan-only)")
     ap.add_argument("--layers", type=int, default=0)
     ap.add_argument("--hot-frac", type=float, default=0.35)
+    ap.add_argument("--focus-layers", help="force these layers to HIGH (8-bit) regardless of the profile, "
+                    "e.g. '3,4,8' or '3-8,16' — steer the budget to layers you care about")
     ap.add_argument("--group-size", type=int, default=64, help="MLX quant group size (default 64)")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map. "
@@ -96,7 +101,11 @@ def main():
     if not n_layers:
         sys.exit("ERROR: could not read layer count — pass --layers.")
     is_moe = auto_moe if a.moe is None else a.moe
-    alloc = allocate(sens, n_layers, a.hot_frac)
+    import pollard_workspace as ws
+    focus = ws.parse_layers(a.focus_layers)
+    if focus:
+        print(f"   focus-layers: forcing layers {sorted(focus)} to 8-bit (steered budget)")
+    alloc = allocate(sens, n_layers, a.hot_frac, focus=focus)
     avg = sum(g["attn"] + g["ffn"] for g in alloc.values()) / (2 * len(alloc))
     kind = "MoE" if is_moe else "dense"
     print(f"== pollard-mlx :: {a.model}  [{kind}]  {n_layers} layers · mix {LOW}/{HIGH}-bit "

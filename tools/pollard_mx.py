@@ -28,9 +28,10 @@ import argparse, json, os, sys
 import pollard_workspace as ws
 
 
-def allocate(sens, n_layers, hot_frac):
+def allocate(sens, n_layers, hot_frac, focus=None):
     """Rank layers by measured sensitivity; the hottest `hot_frac` stay FP8, the rest go FP4.
-    Mirrors pollard-export's hot/cold split so the FP4 lane inherits the same measured allocation."""
+    Mirrors pollard-export's hot/cold split so the FP4 lane inherits the same measured allocation.
+    `focus` (layer indices) are forced HIGH regardless of the profile (steer the budget)."""
     if sens:
         order = sorted(sens.items(), key=lambda kv: -float(kv[1]))
         hot = set(k for k, _ in order[:max(1, int(round(hot_frac * len(order))))])
@@ -38,6 +39,7 @@ def allocate(sens, n_layers, hot_frac):
         # no profile -> protect the ends (embeddings-adjacent + final layers empirically most sensitive)
         n_hot = max(1, int(round(hot_frac * n_layers)))
         hot = set(str(i) for i in list(range(n_hot // 2)) + list(range(n_layers - (n_hot - n_hot // 2), n_layers)))
+    hot |= {str(i) for i in (focus or ())}         # user-steered layers, always HIGH
     return hot
 
 
@@ -85,6 +87,8 @@ def main():
     ap.add_argument("--protect-scheme", default="FP8", choices=["FP8", "FP8_DYNAMIC", "W8A16"],
                     help="precision for the protected (hot) layers")
     ap.add_argument("--hot-frac", type=float, default=0.25, help="fraction of layers kept at FP8 (not FP4)")
+    ap.add_argument("--focus-layers", help="force these layers to HIGH (FP8) regardless of the profile, "
+                    "e.g. '3,4,8' or '3-8,16' — steer the budget to layers you care about")
     ap.add_argument("--protect-down", action="store_true",
                     help="also keep every down_proj (residual writer) at FP8 — usually worth it at 4-bit")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
@@ -106,7 +110,10 @@ def main():
         sens = json.load(open(a.sensitivity))
         sens = sens.get("layers", sens) if isinstance(sens, dict) else {}
 
-    hot = allocate(sens, n_layers or 32, a.hot_frac)
+    focus = ws.parse_layers(a.focus_layers)
+    if focus:
+        print(f"   focus-layers: forcing layers {sorted(focus)} to FP8 (steered budget)")
+    hot = allocate(sens, n_layers or 32, a.hot_frac, focus=focus)
     rec = build_recipe(hot, a.scheme, a.protect_scheme, a.protect_down)
     ab = avg_bits(n_layers or 32, a.hot_frac, a.protect_down, a.scheme, a.protect_scheme)
     is_int = a.scheme in ("W4A16", "W8A16")
