@@ -10,6 +10,10 @@ over plain HTTP — no torch, no transformers, stdlib only — and reports:
   * top-1 agreement — how often the quantized model's greedy next token matches the baseline's
                       (the metric that actually predicts "does it still behave like the original")
   * KL (optional)   — mean KL(baseline || quantized) over next-token logprobs, if both serve logprobs
+  * spec-decode acceptance (optional, vLLM) — with --metrics <url>/metrics and --accept-gen N: generates N tokens per
+                      sample and reads the delta of vLLM's spec_decode counters → accepted draft tokens per step and
+                      per-position acceptance. Teacher-forced PPL never decodes, so this is the only way to see the
+                      speculative head's contribution on the real stack (and it dominates single-stream speed).
 
   # one endpoint, absolute perplexity:
   pollard-serve-eval --base http://localhost:8000/v1 --model my-int4 --text calib.txt
@@ -61,6 +65,42 @@ def corpus_ppl(base, model, texts, key=None):
     return math.exp(total_nll / total_tok), total_tok
 
 
+def spec_counters(metrics_url):
+    """Snapshot vLLM's speculative-decoding Prometheus counters (returns None if the server has none)."""
+    import re, urllib.request
+    txt = urllib.request.urlopen(metrics_url, timeout=20).read().decode()
+    def val(name):
+        tot = 0.0; seen = False
+        for ln in txt.splitlines():
+            if ln.startswith(name + "{") or ln.startswith(name + " "):
+                try: tot += float(ln.rsplit(" ", 1)[1]); seen = True
+                except ValueError: pass
+        return tot if seen else None
+    c = {"drafts": val("vllm:spec_decode_num_drafts_total"), "draft_tokens": val("vllm:spec_decode_num_draft_tokens_total"),
+         "accepted": val("vllm:spec_decode_num_accepted_tokens_total"), "per_pos": {}}
+    for ln in txt.splitlines():
+        m = re.match(r'vllm:spec_decode_num_accepted_tokens_per_pos\{.*?position="(\d+)".*?\} ([0-9.e+]+)', ln)
+        if m: c["per_pos"][int(m.group(1))] = c["per_pos"].get(int(m.group(1)), 0.0) + float(m.group(2))
+    return None if c["drafts"] is None else c
+
+
+def spec_acceptance(base, model, texts, metrics_url, gen_tokens, key=None):
+    """Generate gen_tokens per sample (real decode) and return the acceptance derived from the counter deltas."""
+    before = spec_counters(metrics_url)
+    if before is None:
+        return None
+    for t in texts:
+        completion(base, model, t[:2000], key=key, max_tokens=gen_tokens, temperature=0.0)
+    after = spec_counters(metrics_url)
+    d = (after["drafts"] or 0) - (before["drafts"] or 0); a = (after["accepted"] or 0) - (before["accepted"] or 0)
+    dt = (after["draft_tokens"] or 0) - (before["draft_tokens"] or 0)
+    if d <= 0:
+        return {"drafts": 0}
+    pos = {k: (after["per_pos"].get(k, 0) - before["per_pos"].get(k, 0)) / d for k in sorted(after["per_pos"])}
+    return {"drafts": d, "draft_tokens": dt, "accepted": a, "accepted_per_step": a / d, "tokens_per_step": 1 + a / d,
+            "draft_accept_rate": (a / dt) if dt else float("nan"), "per_position": pos}
+
+
 def _greedy_next(base, model, prompt, key=None):
     """The server's greedy next token + its top logprobs dict (for KL)."""
     r = completion(base, model, prompt, key=key, echo=False, max_tokens=1, logprobs=20, temperature=0.0)
@@ -107,6 +147,9 @@ def main():
     ap.add_argument("--max-samples", type=int, default=50, help="cap on lines used (keeps it quick)")
     ap.add_argument("--stride", type=int, default=8, help="token stride for the A/B agreement probes")
     ap.add_argument("--api-key", default=None, help="bearer token if the endpoint needs one")
+    ap.add_argument("--metrics", help="vLLM Prometheus endpoint of the model under test, e.g. http://host:8000/metrics — "
+                    "enables the speculative-decoding acceptance read (counter deltas around real generations)")
+    ap.add_argument("--accept-gen", type=int, default=128, help="tokens to generate per sample for the acceptance read")
     a = ap.parse_args()
 
     texts = [ln.strip() for ln in open(a.text, encoding="utf-8") if ln.strip()]
@@ -142,6 +185,20 @@ def main():
         print(f"top-1 agreement: {agree*100:.2f}%  over {n} positions")
         if kl is not None:
             print(f"mean KL(base||cand): {kl:.4f} nats  (lower = closer to the original distribution)")
+    if a.metrics:
+        tgt_base = a.cand or a.base; tgt_model = (a.cand_model or a.model) if a.cand else a.model
+        try:
+            acc = spec_acceptance(tgt_base, tgt_model, texts, a.metrics, a.accept_gen, key=a.api_key)
+            if acc is None:
+                print("spec-decode: no spec_decode counters at --metrics (server runs without a drafter?)")
+            elif not acc["drafts"]:
+                print("spec-decode: counters did not move — is the drafter enabled on this model?")
+            else:
+                pp = " ".join(f"p{k}={v:.3f}" for k, v in acc["per_position"].items())
+                print(f"spec-decode [{tgt_model}]: {acc['drafts']} drafts, accepted {acc['accepted_per_step']:.3f} draft tokens/step "
+                      f"(=> {acc['tokens_per_step']:.2f} tokens/step), draft accept rate {acc['draft_accept_rate']*100:.1f}%  {pp}")
+        except Exception as e:  # noqa: BLE001 — report, don't abort the other metrics
+            print(f"(spec-decode acceptance skipped: {e})")
         print("\nverdict: >99% top-1 agreement and KL < ~0.05 means the quant behaves like the original;"
               "\n         a big PPL gap with high agreement usually means a KV-quant or a kernel path, not"
               " the weights.")
