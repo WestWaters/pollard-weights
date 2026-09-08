@@ -1,9 +1,9 @@
-# Serving an EXL3 cook that quantizes attention — three artifact/runtime gaps, measured on GLM-5.3 744B
+# Serving an EXL3 cook that quantizes attention — four artifact/runtime gaps, measured on GLM-5.3 744B
 
 Companion to `glm-5.3-cluster-verification.md`. The EXL3 3.2 bpw GLM-5.3 body from the band-parallel run (`experiments/exl3_band.py`)
 went to a TP4 serving gate on vLLM 0.28 with the `cuda-exl3` plugin (its sparse-MLA attention backend is the only one that runs a
-DSA model on GB10). It loaded, every counter was healthy, throughput was fine — and the output was gibberish. Four boots and one
-afternoon later, three distinct gaps. None is a quantization-quality problem; all three bite anyone who follows the Pollard EXL3
+DSA model on GB10). It loaded, every counter was healthy, throughput was fine — and the output was gibberish. Five boots and one
+afternoon later, four distinct gaps. None is a quantization-quality problem; all three bite anyone who follows the Pollard EXL3
 lane *past* what the public GLM-5.3 EXL3 builds do (they keep attention bf16 and quantize only the routed experts).
 
 ## 1. exllamav3 ≥ 1.4 pads every linear's `out_features` to a multiple of 128 — decode the stored width, then trim
@@ -54,6 +54,24 @@ exllamav3's index pointed `eh_proj` at shard 45; the tensors were physically in 
 (`enorm`, `hnorm`, `shared_head.norm`) are written twice across shard boundaries (byte-identical, harmless). vLLM's loader walks
 the *files*, so an index-driven fixer rewrote the wrong shard and did nothing — two failed boots before we noticed. Any post-cook
 surgery on an exllamav3 artifact must resolve tensors by reading safetensors headers, not the index (the tool above does).
+
+## 4. A quantized `lm_head` under tensor parallelism must be sharded on 128-row boundaries
+
+With gap 1 fixed the body was fluent, but teacher-forced perplexity was still 31 (int4 body: 4.8), flat over position and with
+6–9 % of positions catastrophically wrong (NLL > 10, confident substitutes, one stray CJK token recurring). vLLM shards the
+154,880-row vocabulary as 4 × 38,720 rows at TP4 — 302.5 Hadamard blocks per rank. The output Hadamard's 128-row blocks are
+counted from global row 0, so ranks 1 and 3 decoded every block 64 rows out of phase: half the vocabulary as noise logits.
+Measured on the real head, rank 1's slice: relative error 1.73 against the full-width decode. Fix (runtime): each rank loads the
+block-aligned superset of its rows, decodes it, and trims the logits to its slice — error 0 after the fix. Public GLM-5.3 EXL3
+builds keep `lm_head` in bf16, so this too had never been exercised.
+
+The rule generalises gap 1: **a trellis may only be cut on 128-column boundaries — of the tensor's global column index.** Any
+partition (fused-shard boundary, tensor-parallel vocab split, padded tail) that lands inside a block must be widened to the block
+and trimmed after the output Hadamard. A static check in `pollard-exl3` could print, for a given TP degree, every quantized
+linear whose per-rank output width or vocab shard start is not a multiple of 128.
+
+For completeness the kernel itself was checked against exllamav3's own reconstruction (`ext.reconstruct` followed by the two-sided
+Hadamard and the `suh`/`svh` scales) on real 4-, 5- and 6-bit tensors: relative error 1.8 × 10⁻³, i.e. bf16 input rounding.
 
 ## Also measured on this line
 
