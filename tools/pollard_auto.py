@@ -350,14 +350,15 @@ def main():
                     if not a.run:
                         print("   (plan) --run would provision the matched env and build the lane there.")
                         return
-                    py = em.ensure_env(target, a.format)
-                    if py:
-                        argv = [py, os.path.abspath(__file__)] + sys.argv[1:] + ["--match-transformers", "off"]
-                        # the re-invoked build calls pollard-calib/-probe/-hf-smooth by bare name, so the
-                        # matched env's Scripts/bin must be FIRST on PATH or they'd resolve to the base env
-                        # (wrong transformers). Prepend it for the delegated run.
+                    tdir = em.ensure_overlay(target, a.format)
+                    if tdir:
+                        # Re-run the SAME python with the transformers-overlay dir prepended to PYTHONPATH,
+                        # so this build (and its calib/probe/smooth subprocesses, which inherit the env)
+                        # imports the pinned transformers while torch/gptqmodel stay from the base env.
+                        argv = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + \
+                               ["--match-transformers", "off"]
                         env = dict(os.environ)
-                        env["PATH"] = os.path.dirname(py) + os.pathsep + env.get("PATH", "")
+                        env["PYTHONPATH"] = tdir + os.pathsep + env.get("PYTHONPATH", "")
                         sys.exit(subprocess.run(argv, env=env).returncode)
                     print("   [match-transformers] env setup failed — falling back to the current env")
             except Exception as e:
