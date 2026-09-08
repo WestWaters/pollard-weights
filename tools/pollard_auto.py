@@ -213,6 +213,8 @@ def _emit_nongguf(a):
     here = os.path.dirname(os.path.abspath(out)) or "."
 
     trc = ["--trust-remote-code", a.trust_remote_code]     # custom-arch passthrough (Spark2_5 etc.)
+    if a.focus_layers:                                     # user-steered budget passthrough
+        trc += ["--focus-layers", a.focus_layers]
     if a.format == "gptq":
         calib = _ensure_calib_text(a, here)
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
@@ -283,6 +285,8 @@ def main():
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code for custom archs (Spark2_5 etc.); 'auto' enables "
                          "it only when config.json declares an auto_map. Passed through to the export lanes.")
+    ap.add_argument("--focus-layers", help="steer the budget: force these layer indices to HIGH bits on "
+                    "the export lanes (gptq/mlx/mx), e.g. '3,4,8' or '3-8,16'. Unions into the measured hot set.")
     ap.add_argument("--match-transformers", default="auto", choices=["auto", "on", "off"],
                     help="build a custom-arch model in a cached env pinned to the transformers version it was "
                          "SAVED with (config.json), so its remote code doesn't crash on a newer transformers. "

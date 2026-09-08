@@ -213,3 +213,18 @@ def resolve_trust_remote_code(model_id, mode="auto") -> bool:
         return False
     except Exception:
         return False
+
+
+def parse_layers(spec) -> set:
+    """Parse a layer spec like '3,4,8' or '3-8,16,20-22' into a set of ints. Empty -> empty set.
+    Shared by the allocation lanes for --focus-layers (steer the budget to chosen layers)."""
+    out = set()
+    for part in str(spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
