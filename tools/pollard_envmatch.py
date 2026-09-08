@@ -89,11 +89,17 @@ def ensure_env(version, lane, pollard_repo=None):
         return py
     if not os.path.exists(py):
         print(f"   [envmatch] creating matched env (transformers=={version}) at {envdir}")
-        subprocess.run([sys.executable, "-m", "venv", envdir], check=True)
+        # --system-site-packages so the matched env INHERITS the base env's heavy CUDA stack (the right
+        # cu-tagged torch, gptqmodel, exllamav3) and we only overlay the pinned transformers. A plain venv
+        # would pull CPU-only torch from PyPI and the GPU lanes would fail.
+        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", envdir], check=True)
         py = _env_python(envdir)
     repo = pollard_repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # transformers is pinned (shadows the inherited one); the rest are installed only if the base env
+    # doesn't already satisfy them (pip skips inherited torch/gptqmodel/etc. via --system-site-packages).
     deps = ["transformers==" + version] + LANE_DEPS.get(lane, ["torch", "safetensors"])
-    print(f"   [envmatch] installing transformers=={version} + {lane} deps + pollard (cached after first run)")
+    print(f"   [envmatch] pinning transformers=={version} (inheriting torch/CUDA from the base env); "
+          "installing {lane} deps + pollard as needed (cached after first run)".replace("{lane}", lane))
     subprocess.run([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
     r = subprocess.run([py, "-m", "pip", "install", "-q", *deps, "-e", repo])
     if r.returncode != 0:
