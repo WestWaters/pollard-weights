@@ -115,17 +115,22 @@ def main():
     pct = (1 - small_gb / f16_gb) * 100 if f16_gb else 0
     x = f16_gb / small_gb if small_gb else 0
 
+    primary = a.lane or (lanes[0] if lanes else "gguf")
+    lane_word = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
+                 "mx": " for Blackwell/vLLM", "exl3": " for exllamav3"}.get(primary, "")
     # ---- frontmatter + hero
     out = [frontmatter(base_model, lic, lanes, mtype), "", f"# {name} — Pollard", ""]
     if f16_gb and small_gb:
-        out += [f"> ### Pollard shrank this model: **{f16_gb:.1f} GB (f16) → {small_gb:.2f} GB** — "
+        out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.1f} GB (f16) → {small_gb:.2f} GB** — "
                 f"**{pct:.0f}% smaller, {x:.1f}× down**.",
-                f"> The smallest rung here; larger, higher-fidelity rungs are listed below.", ">",
-                "> | format | this model's size |", "> |---|---:|", f"> | f16 | {f16_gb:.1f} GB |"]
-        for fmt, mult in FMT_BPP.items():
-            if fmt in ("Q8_0", "Q6_K", "Q4_K_M"):
-                out.append(f"> | {fmt} | ~{pb*mult:.1f} GB |")
-        out += [f"> | **PollardMix (this repo's {smallest.get('tag','best')})** | **{small_gb:.2f} GB** |", ""]
+                "> The smallest rung here; larger, higher-fidelity rungs are listed below."]
+        if primary == "gguf":          # the format size table is GGUF-specific
+            out += [">", "> | format | this model's size |", "> |---|---:|", f"> | f16 | {f16_gb:.1f} GB |"]
+            for fmt, mult in FMT_BPP.items():
+                if fmt in ("Q8_0", "Q6_K", "Q4_K_M"):
+                    out.append(f"> | {fmt} | ~{pb*mult:.1f} GB |")
+            out.append(f"> | **PollardMix (this repo's {smallest.get('tag','best')})** | **{small_gb:.2f} GB** |")
+        out.append("")
     out += [f"Pollard builds of [{base_model}](https://huggingface.co/{base_model}) made with "
             "[Pollard Weights](https://github.com/WestWaters/pollard-weights) — a ladder of "
             "**measured-allocation** quants (bits placed by per-layer sensitivity, not a uniform crush).", ""]
