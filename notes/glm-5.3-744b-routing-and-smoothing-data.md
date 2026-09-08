@@ -83,7 +83,65 @@ MoE seam s ∈ [0.07, 6.1]; no channel hit the clamp in any layer.
   the fold rewrites only the shards holding a layer's tensors (idempotent via per-layer markers) and is exactly invertible at
   α = 0.5 (`s = x / max|W_folded|`). Happy to upstream a streaming mode if in scope.
 
-## 3. Hardware profile — DGX Spark (GB10) cluster
+## 4. EXL3 allocator depth heuristic vs measured per-layer error — and a self-QC fix (new)
+
+exllamav3's budgeted allocator (`-b 3.2 -hq`, no recipe) assigned bits from config alone: routed experts **4 bits in layers 3–7
+and 70–77, 3 bits in the other 62 MoE layers**; attention and shared experts 5 bits; dense MLP 4; overall 3.21 bpw. The converter
+then reports each module's output error on the calibration rows as it goes. Measured at 384 × 2048 rows (first two layers of
+every band; the full 78-layer profile follows when the cook completes):
+
+| layers | allocator bpw | sqnr (dB) | rfn | wall per layer (one GB10) |
+|---|---|---|---|---|
+| 0–2 (dense) | 5.05 | 39–41 | 0.010–0.012 | ~4 min |
+| 3–4 | 4.06 | 52.4 / 45.9 | 0.003 / 0.007 | 42 min |
+| 8–9 | 3.07 | 37.8 / 37.7 | 0.026 / 0.005 | 53 min |
+| 16–17 | 3.07 | 35.0 / 34.7 | 0.003 / 0.004 | 53 min |
+| 24–25 | 3.07 | 35.2 / 34.6 | 0.007 / 0.008 | 52 min |
+| **32–33** | 3.07 | **27.9 / 27.7** | 0.014 / 0.016 | 53 min |
+| **40–41** | 3.07 | **27.9 / 28.4** | 0.025 / 0.025 | 53 min |
+| **48–49** | 3.07 | **29.5 / 30.2** | 0.029 / 0.027 | 52 min |
+| 56–57 | 3.07 | 32.7 / 33.4 | 0.024 / 0.022 | 53 min |
+| 64–65 | 3.07 | 32.8 / 32.6 | 0.025 / 0.026 | 53 min |
+| 71–73 | 4.06 | 36.3 / 35.8 / 36.3 | 0.017–0.019 | 42 min |
+
+(rfn is relative to the layer's *full* output and shrinks with depth as the residual stream grows — compare within a depth
+region; sqnr is the depth-independent column.)
+
+**Reading.** At fixed bits the error is not flat with depth: layers 32–49 sit 7–10 dB below layers 8–25, then recover
+partially by 56–65. The allocator spent its extra bits at the ends, where the error is already lowest. The same shape exists in
+our GPTQ int4/int8 cook of the same model (Hessian-weighted int4 weight error, attention: 5.9e-4 in layers 3–15 → 2.6e-3 in
+32–49 → 2.7e-3 in 50–65, peak layer 64; shared experts peak 32–49), so it is a property of GLM-5.3's weights — the mid-stack is
+less compressible — not of the EXL3 converter. At 4.25 bpw (GPTQ int4 g128) it was invisible at the output; at 3.07 bpw it is
+the dominant error term.
+
+**Fix method, and why band-parallel makes it cheap.** `experiments/exl3_depth_recipe.py` reads the converter's per-layer lines,
+flags base-bit layers whose sqnr is > 4 dB below the median of the base class (or rfn > 2.5× the class median), and writes an explicit
+per-tensor recipe (`--recipe` for exllamav3) that lifts the flagged layers' routed experts by one bit and drops the same number
+of the allocator's easiest above-base layers by one bit — budget-neutral (validated with exllamav3's own recipe loader: 3.211 →
+3.211 bpw for the 13-up/13-down move; the 18-up/8-down variant is 3.341). Because every band restarts from the exact bf16
+residual stream, only the bands containing changed layers are re-cooked (the budget-neutral move touches 5 of 10 bands here — the lifted mid-stack plus the end bands that give up a bit; a lift-only move touches 3 — ~7 h on as many nodes), then re-merged;
+the two artifacts differ only in where the bits went. That is the experiment your EXL3 note asks for (does a measured allocation
+beat the allocator?) at the depth axis, and it runs as a self-QC step at the end of the cook. Results will be appended here.
+
+**Open question for the allocator:** it is a pure function of config + flags. A cheap per-layer sensitivity pre-pass (our
+weight-space Hessian proxy from the GPTQ cook already ranks the layers correctly) could steer the depth allocation before the
+first bit is spent.
+
+## 5. Tooling details worth upstreaming
+
+- **Exactly invertible fold** for `pollard-hf-smooth` at α = 0.5: `s_j = max|X_j| / max_i|W_folded[i,j]|`; we verified the
+  unfold reproduces the recorded fold scales on a live layer (0.201–3.01 attention seam, 0.147–3.57 MoE seam, layer 8). This is
+  what makes a smoothed-vs-unsmoothed control possible without keeping a second 1.5 TB copy.
+- **Band-parallel exllamav3 conversion** (the converter's `ckpt/state.safetensors` is one F32 `[1, cols, hidden]` tensor per
+  calibration row; inject the band-start residual stream, set `next_module_idx`, `--resume --max_module`): 78 layers in ~7 h on
+  ten single-GPU nodes; smoke-tested by resuming through layer 0 from a fabricated 16-row checkpoint.
+- **MTP draft precision lane**: the MTP module is quantized uncalibrated after the body, so 8-bit and 4-bit draft variants come
+  from one cook; at TP4 the draft, not the body, decides the KV pool (12 GB vs 6.5 GB per node).
+- **aarch64 build patch** for exllamav3 (DGX Spark / GB10, torch 2.13 + cu130): `notes/exllamav3-aarch64.patch` — excludes the
+  x86-only CPU inference sources and adds a stub TU for their bound symbols; `__builtin_ia32_pause()` → `yield`; `cusparse.h`
+  from the CUDA-13 pip layout via `CPATH`/`LIBRARY_PATH`.
+
+## 6. Hardware profile — DGX Spark (GB10) cluster
 
 - Node: 121.6 GB unified memory, one GPU; usable serving budget ≈ 0.81 × RAM (higher wedges long prefills); NVMe ~2–3 GB/s.
 - bf16 streaming forward at 786K tokens/layer: dense layer ~45 s; MoE layer ~80–95 s, of which 20–47 s is loading ~19 GB of
