@@ -283,6 +283,10 @@ def main():
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code for custom archs (Spark2_5 etc.); 'auto' enables "
                          "it only when config.json declares an auto_map. Passed through to the export lanes.")
+    ap.add_argument("--match-transformers", default="auto", choices=["auto", "on", "off"],
+                    help="build a custom-arch model in a cached env pinned to the transformers version it was "
+                         "SAVED with (config.json), so its remote code doesn't crash on a newer transformers. "
+                         "'auto' = only when the majors differ; 'off' = always use the current env.")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
     ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")
@@ -331,6 +335,28 @@ def main():
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
     if a.format in ("gptq", "mlx", "exl3", "mx"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
+        # Auto-version onboarding: a custom-arch model saved with an older transformers major will crash
+        # its remote code under the current one. Build the whole lane in a cached env pinned to the model's
+        # transformers_version instead (Spark2_5 needs 4.57.1 vs a 5.x box). Re-invoke this same one-shot
+        # under that env (with --match-transformers off to avoid recursion) so smooth/probe/export all match.
+        if a.hf and a.match_transformers != "off":
+            try:
+                import pollard_envmatch as em
+                target = (em.needs_matched_env(a.hf) if a.match_transformers == "auto"
+                          else em.model_transformers_version(a.hf))
+                if target:
+                    print(f"   [match-transformers] {a.hf} was saved with transformers {target}; "
+                          f"building in a matched env (its remote code needs it)")
+                    if not a.run:
+                        print("   (plan) --run would provision the matched env and build the lane there.")
+                        return
+                    py = em.ensure_env(target, a.format)
+                    if py:
+                        argv = [py, os.path.abspath(__file__)] + sys.argv[1:] + ["--match-transformers", "off"]
+                        sys.exit(subprocess.run(argv).returncode)
+                    print("   [match-transformers] env setup failed — falling back to the current env")
+            except Exception as e:
+                print(f"   [match-transformers] skipped ({e}); using the current env")
         _emit_nongguf(a)
         if not a.run:
             print("\n   plan only — re-run with --run to execute.")

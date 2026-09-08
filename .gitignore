@@ -70,3 +70,11 @@ Thumbs.db
 *.mov
 *.webm
 *.wav
+
+# Pollard workspace / matched envs — created at $POLLARD_HOME (default ~/pollard), normally OUTSIDE the
+# repo; ignored here too in case someone points POLLARD_HOME inside a checkout, so a venv/weights never commit.
+envs/
+pollard/
+phome/
+pyvenv.cfg
+POLLARD_HOME/

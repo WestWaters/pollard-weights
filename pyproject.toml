@@ -71,8 +71,9 @@ pollard-palette = "pollard_palette:main"
 pollard-serve-eval = "pollard_serve_eval:main"
 pollard-card = "pollard_card:main"
 pollard-onboard = "pollard_onboard:main"
+pollard-envmatch = "pollard_envmatch:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
 py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_probes", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
-    "pollard_serve_eval", "pollard_card", "pollard_onboard", "imatrix_fix_gate"]
+    "pollard_serve_eval", "pollard_card", "pollard_onboard", "pollard_envmatch", "imatrix_fix_gate"]
