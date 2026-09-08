@@ -7,12 +7,15 @@ will crash under transformers 5.x — the internal APIs its code calls (e.g. `cr
 between majors. Spark-X2.5-4B is the canonical case: `create_causal_mask() got an unexpected keyword
 argument 'input_embeds'` under transformers 5.15.
 
-This reads that version and provisions a CACHED venv at `$POLLARD_HOME/envs/tv-<ver>/` with the matched
-transformers + the lane's deps + Pollard (editable), so the export lanes build there instead of crashing.
-Stock archs (no auto_map) are left alone — they're forward-compatible and use the current env.
+This reads that version and provisions a CACHED PYTHONPATH overlay at `$POLLARD_HOME/tvover/tv-<ver>/`
+holding just `transformers==<ver>` (+ its light deps). Prepended to PYTHONPATH, it shadows the base
+env's transformers while torch/gptqmodel/exllamav3 keep coming from the base env — so a custom-arch
+model builds under the transformers it expects, on the SAME (CUDA) interpreter. No separate venv (a
+child venv can't inherit a parent venv's site-packages via --system-site-packages). Stock archs
+(no auto_map) are left alone — they're forward-compatible and use the current env.
 
 Used by the `pollard` one-shot automatically (--match-transformers auto|on|off); also runnable:
-  pollard-envmatch --model XHToken/Spark-X2.5-4B --lane gptq   # print/ensure the matched env
+  pollard-envmatch --model XHToken/Spark-X2.5-4B --lane gptq --ensure   # provision the overlay
 """
 import argparse
 import json
@@ -72,41 +75,37 @@ def needs_matched_env(model):
     return None
 
 
-def _env_python(envdir):
-    win = os.path.join(envdir, "Scripts", "python.exe")
-    nix = os.path.join(envdir, "bin", "python")
-    return win if os.path.exists(win) else nix
+def ensure_overlay(version, lane=None):
+    """Provision a PYTHONPATH OVERLAY that pins transformers to `version`, and return its directory.
 
+    Why an overlay, not a venv: the base env is itself a venv (e.g. the CUDA venv with the right
+    cu-tagged torch + gptqmodel). A child venv with --system-site-packages inherits the SYSTEM python's
+    packages, NOT the parent venv's — so it comes up empty and has to reinstall torch (CPU-only). Instead
+    we `pip install --target <dir> transformers==version` (transformers + its light deps only — NOT torch)
+    and prepend <dir> to PYTHONPATH: transformers==version shadows the base's, while torch/gptqmodel/
+    exllamav3 keep coming from the base env. Lighter (no venv, no 2.5GB torch) and correct.
 
-def ensure_env(version, lane, pollard_repo=None):
-    """Create (or reuse) a cached venv pinned to transformers==version with the lane's deps + Pollard.
-    Returns the path to that env's python. Cached at $POLLARD_HOME/envs/tv-<version>/ and reused."""
+    Cached at $POLLARD_HOME/tvover/tv-<version>/ and reused. Returns the dir, or None on failure."""
     home = os.path.abspath(os.environ.get("POLLARD_HOME", os.path.expanduser("~/pollard")))
-    envdir = os.path.join(home, "envs", f"tv-{version}")
-    py = _env_python(envdir)
-    marker = os.path.join(envdir, f".ready-{lane}")
-    if os.path.exists(py) and os.path.exists(marker):
-        return py
-    if not os.path.exists(py):
-        print(f"   [envmatch] creating matched env (transformers=={version}) at {envdir}")
-        # --system-site-packages so the matched env INHERITS the base env's heavy CUDA stack (the right
-        # cu-tagged torch, gptqmodel, exllamav3) and we only overlay the pinned transformers. A plain venv
-        # would pull CPU-only torch from PyPI and the GPU lanes would fail.
-        subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", envdir], check=True)
-        py = _env_python(envdir)
-    repo = pollard_repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # transformers is pinned (shadows the inherited one); the rest are installed only if the base env
-    # doesn't already satisfy them (pip skips inherited torch/gptqmodel/etc. via --system-site-packages).
-    deps = ["transformers==" + version] + LANE_DEPS.get(lane, ["torch", "safetensors"])
-    print(f"   [envmatch] pinning transformers=={version} (inheriting torch/CUDA from the base env); "
-          "installing {lane} deps + pollard as needed (cached after first run)".replace("{lane}", lane))
-    subprocess.run([py, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=False)
-    r = subprocess.run([py, "-m", "pip", "install", "-q", *deps, "-e", repo])
+    tdir = os.path.join(home, "tvover", f"tv-{version}")
+    marker = os.path.join(tdir, ".ready")
+    if os.path.exists(marker):
+        return tdir
+    os.makedirs(tdir, exist_ok=True)
+    print(f"   [envmatch] provisioning transformers=={version} overlay at {tdir} "
+          "(torch/gptqmodel stay inherited from the base env; cached after first run)")
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--target", tdir,
+                        "transformers==" + version])
     if r.returncode != 0:
-        print("   [envmatch] pip install failed — the lane will run in the current env (may crash on the arch)")
+        print("   [envmatch] overlay install failed — the lane will run in the current env (may crash on the arch)")
         return None
     open(marker, "w").write(version)
-    return py
+    return tdir
+
+
+# backward-compatible alias (older callers used ensure_env)
+def ensure_env(version, lane=None, pollard_repo=None):
+    return ensure_overlay(version, lane)
 
 
 def main():
@@ -126,10 +125,14 @@ def main():
     if not target:
         print("   verdict: current env is fine (stock arch or matching major) — no matched env needed.")
         return
-    print(f"   verdict: MATCHED ENV needed — build the {a.lane} lane under transformers=={target}")
+    print(f"   verdict: MATCHED OVERLAY needed — build the {a.lane} lane under transformers=={target}")
     if a.ensure:
-        py = ensure_env(target, a.lane)
-        print(f"   env python: {py}" if py else "   env setup failed.")
+        tdir = ensure_overlay(target, a.lane)
+        if tdir:
+            print(f"   overlay dir: {tdir}")
+            print(f"   use:  PYTHONPATH={tdir}{os.pathsep}$PYTHONPATH  <build command>")
+        else:
+            print("   overlay setup failed.")
     else:
         print(f"   (run with --ensure to provision it, or `pollard --hf {a.model} --format {a.lane} --run` "
               "does it automatically)")
