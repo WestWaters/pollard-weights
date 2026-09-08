@@ -1,0 +1,105 @@
+diff --git a/exllamav3/exllamav3_ext/aarch64_stubs.cpp b/exllamav3/exllamav3_ext/aarch64_stubs.cpp
+new file mode 100644
+index 0000000..4773306
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/aarch64_stubs.cpp
+@@ -0,0 +1,41 @@
++// aarch64_stubs.cpp — non-x86 build: the AVX CPU MoE-inference and CPU all-reduce paths are compiled out (setup.py);
++// these stubs satisfy the pybind registrations and all_reduce_cpu.cu. Conversion (convert.py) never calls them.
++#include <stdexcept>
++#include <cstdint>
++#include <vector>
++#include <ATen/Tensor.h>
++#include "avx2_target.h"
++#include "avx512_target.h"
++#include "cpu/moe_mul1.h"
++#include "parallel/all_reduce_cpu_avx2.h"
++#include "parallel/all_reduce_cpu_avx512.h"
++static void _na(const char* f) { throw std::runtime_error(std::string(f) + ": x86 CPU path not available on this architecture (aarch64 build)"); }
++bool is_avx2_supported() { return false; }
++bool is_f16c_supported() { return false; }
++bool is_avx512_supported() { return false; }
++bool exl3_moe_cpu_has_avx2() { return false; }
++bool exl3_moe_cpu_has_avx512_vnni() { return false; }
++bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
++void exl3_moe_cpu_set_prof(bool) {}
++int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { return 0; }
++int64_t exl3_moe_cpu_make_layer(const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
++    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
++    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
++    const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
++    int64_t, double, int64_t) { _na("exl3_moe_cpu_make_layer"); return -1; }
++void exl3_moe_cpu_free_layer(int64_t) {}
++void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { _na("exl3_moe_cpu_forward"); }
++void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { _na("exl3_moe_cpu_forward_raw"); }
++void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int) { _na("exl3_moe_cpu_stage_experts"); }
++void enable_fast_fp() {}
++void enable_fast_fp_avx2() {}
++void enable_fast_fp_avx512() {}
++void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint32_t, uint8_t*, size_t) { _na("perform_cpu_reduce"); }
++void perform_cpu_reduce_avx2(PGContext*, size_t, uint32_t, uint32_t, uint8_t*, size_t) { _na("perform_cpu_reduce_avx2"); }
++void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint32_t, uint8_t*, size_t) { _na("perform_cpu_reduce_avx512"); }
++void cpu_reduce_parallel(void (*)(uint16_t*, const uint16_t*, const uint16_t*, size_t), void (*)(uint16_t*, const uint16_t*, size_t),
++    uint16_t*, const uint16_t*, const uint16_t*, size_t, int) { _na("cpu_reduce_parallel"); }
++void bf16_add_inplace_avx512(uint16_t*, const uint16_t*, size_t) { _na("bf16_add_inplace_avx512"); }
++void bf16_add_twosrc_avx512(uint16_t*, const uint16_t*, const uint16_t*, size_t) { _na("bf16_add_twosrc_avx512"); }
++void fp16_add_inplace_avx512(uint16_t*, const uint16_t*, size_t) { _na("fp16_add_inplace_avx512"); }
++void fp16_add_twosrc_avx512(uint16_t*, const uint16_t*, const uint16_t*, size_t) { _na("fp16_add_twosrc_avx512"); }
+diff --git a/exllamav3/exllamav3_ext/cpu/moe_handoff.cu b/exllamav3/exllamav3_ext/cpu/moe_handoff.cu
+index 2550b1d..3ff8106 100644
+--- a/exllamav3/exllamav3_ext/cpu/moe_handoff.cu
++++ b/exllamav3/exllamav3_ext/cpu/moe_handoff.cu
+@@ -150,7 +150,13 @@ namespace {
+ inline void cpu_pause_()
+ {
+ #ifdef __linux__
++    
++#if defined(__x86_64__) || defined(__i386__)
+     __builtin_ia32_pause();
++#else
++    asm volatile("yield" ::: "memory");   /* aarch64 */
++#endif
++
+ #else
+     _mm_pause();
+ #endif
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
+index 5b3688f..5d7e3db 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
+@@ -110,7 +110,13 @@ void run_cpu_reduce_jobs
+             if (++spins < 65536)
+             {
+                 #ifdef __linux__
+-                    __builtin_ia32_pause();
++                    
++#if defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#else
++    asm volatile("yield" ::: "memory");   /* aarch64 */
++#endif
++
+                 #else
+                     _mm_pause();
+                 #endif
+diff --git a/setup.py b/setup.py
+index 670f291..32da25c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -56,11 +56,16 @@ extra_compile_args = {
+ 
+ library_dir = "exllamav3"
+ sources_dir = os.path.join(library_dir, extension_name)
++import platform as _plat
++_X86_ONLY = {"avx2_target.cpp", "avx512_target.cpp", "moe_mul1.cpp", "all_reduce_cpu_avx2.cpp", "all_reduce_cpu_avx512.cpp"}
++_is_x86 = _plat.machine() in ("x86_64", "AMD64", "i386", "i686")
+ sources = [
+     os.path.relpath(os.path.join(root, file), start=os.path.dirname(__file__))
+     for root, _, files in os.walk(sources_dir)
+     for file in files
+     if file.endswith(('.c', '.cpp', '.cu'))
++    and (_is_x86 or (file not in _X86_ONLY))          # aarch64: AVX CPU paths compiled out, stubs provide the symbols
++    and (not _is_x86 or file != "aarch64_stubs.cpp")
+ ]
+ 
+ setup_kwargs = (
