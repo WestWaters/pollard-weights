@@ -18,8 +18,18 @@ Tools call `resolve_out(model, lane, tag, explicit)` — if the user passed --ou
 the build lands in the workspace automatically. After a build, call `record_build(...)` to log it to the
 model's MANIFEST so `pollard-ls` can show what exists and whether it verified.
 """
-import json, os, time
+import json, os, sys, time
 from datetime import datetime, timezone
+
+# Windows consoles default to cp1252 and CRASH (UnicodeEncodeError) on the progress bars / emoji that
+# Pollard and its deps (gptqmodel, llm-compressor, tqdm) print. Every Pollard tool imports this module,
+# so forcing UTF-8 here — at import, before those deps load — makes the whole toolchain safe on Windows
+# with no PYTHONUTF8 env needed. errors="replace" so an odd byte degrades a glyph instead of crashing.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 def pollard_home() -> str:

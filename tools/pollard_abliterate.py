@@ -114,6 +114,8 @@ def main():
     ap.add_argument("--out", help="output dir for the abliterated FP16 model")
     ap.add_argument("--layer", default="auto", help="direction layer index, or 'auto'")
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
+                    help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map")
     ap.add_argument("--selftest", action="store_true",
                     help="mechanism canary on the benign smoke sets — writes nothing")
     a = ap.parse_args()
@@ -129,13 +131,16 @@ def main():
             sys.exit("ERROR: pass --out for the abliterated model.")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    import pollard_workspace as ws
+    trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     print(f"== pollard-abliterate :: {a.model}  dev={dev}", flush=True)
-    tok = AutoTokenizer.from_pretrained(a.model)
+    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=trc)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(dev).eval()
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16,
+                                                trust_remote_code=trc).to(dev).eval()
 
     A = _load_lines(a.harmful) if a.harmful else _SMOKE_A
     B = _load_lines(a.harmless) if a.harmless else _SMOKE_B
