@@ -65,6 +65,25 @@ else
   echo "add to PATH:  export PATH=\"$LLAMA_DIR/build/bin:\$PATH\""
 fi
 
+# 3. ik_llama.cpp — the TRELLIS engine (IQ*_KT / QTIP types) that Pollard's 1-bit-class
+#    FLAGSHIP build needs. Stock llama.cpp (above) covers the K-quant ladder and runs
+#    everywhere; the flagship's IQ1_KT/IQ2_KT quants only build + run with ik_llama.cpp.
+#    Skip with POLLARD_NO_IK=1 (K-quant-only install).
+IK_DIR="${IK_DIR:-$HERE/runtime/ik_llama.cpp}"
+if [ -n "$POLLARD_NO_IK" ]; then
+  echo "ik_llama.cpp: skipped (POLLARD_NO_IK set) — flagship IQ*_KT builds unavailable, K-quants OK"
+elif [ -x "$IK_DIR/build/bin/llama-quantize" ]; then
+  echo "ik_llama.cpp: found at $IK_DIR/build/bin (trellis engine ready)"
+else
+  echo "building ik_llama.cpp (trellis engine for the flagship)…"
+  [ -d "$IK_DIR" ] || git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp "$IK_DIR"
+  cmake -S "$IK_DIR" -B "$IK_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON $GPU_FLAGS
+  cmake --build "$IK_DIR/build" -j \
+    --target llama-quantize llama-cli llama-imatrix llama-perplexity
+  echo "ik_llama.cpp built at $IK_DIR/build/bin ${GPU_FLAGS:+($GPU_FLAGS)}"
+  echo "for the trellis FLAGSHIP, prefer its binaries:  export PATH=\"$IK_DIR/build/bin:\$PATH\""
+fi
+
 echo
 echo "quickstart:"
 echo "  pollard-calc --model <hf-id> --ram 16          # what CAN this machine do"
