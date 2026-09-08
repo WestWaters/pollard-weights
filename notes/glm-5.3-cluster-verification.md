@@ -57,4 +57,6 @@ than the quantization). Two things the contract should say explicitly, both meas
 - Task-benchmark gates next to PPL/top-1/KL: pruning 40 % of experts cost +9 % PPL and −12…−16 HumanEval+ points here.
 - A cluster hardware-profile schema (nodes × RAM × fabric bandwidth × per-node bandwidth) so `pollard-calc` can take a pool
   as first-class input rather than a summed `--ram`.
-- Kimi-K3 routing profile: needs exactly this kind of cluster; on the list after the current cook.
+- Kimi-K3 routing profile: out of reach even for this cluster (5.5T parameters; a 2-bit build exceeds the pool's 1.2 TB, so
+  only NVMe-streamed capture at a fraction of a token/s). The next same-class dataset we can produce is Hy4-preview (770B/49B
+  active, 256 experts, DSA + MLA, hyperconnections) — a second 750B-class family for the routing/outlier tables.
