@@ -67,10 +67,57 @@ def detect_loop(text, min_chars=80):
     return False, round(comp, 3), "coherent"
 
 
-def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80):
+# A distinct sentinel for "the model produced nothing". It must never be confused with a short but
+# valid generation: empty text reads as "too short to judge", which the gate treats as not-a-loop,
+# which would PASS a build that never spoke. A silent false pass is worse than a visible hang.
+class _NoOutput(str):
+    __slots__ = ()
+
+
+_NO_OUTPUT = _NoOutput()
+_NO_CNV = {}          # cli_bin -> does this build accept -no-cnv? (probed once)
+
+
+def _supports_no_cnv(cli_bin):
+    """Recent llama-cli defaults to CONVERSATION mode: it generates, then waits on stdin forever.
+    -no-cnv turns that off, but not every build has the flag (ik_llama does not), so probe once."""
+    if cli_bin not in _NO_CNV:
+        try:
+            h = subprocess.run([cli_bin, "--help"], capture_output=True, text=True,
+                               errors="replace", timeout=60)
+            _NO_CNV[cli_bin] = "-no-cnv" in ((h.stdout or "") + (h.stderr or ""))
+        except Exception:
+            _NO_CNV[cli_bin] = False
+    return _NO_CNV[cli_bin]
+
+
+def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80, timeout=900):
     cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-c", "2048", "-n", str(n_predict), "-p", prompt]
+           + (["-no-cnv"] if _supports_no_cnv(cli_bin) else [])
            + sampling)
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    # On Windows, put the child in its own process group so console control events (Ctrl+C /
+    # Ctrl+Break, and the close event a SYSTEM scheduled task generates when it has no interactive
+    # desktop) are not delivered to it. Without this, adding `timeout=` below is enough to break a
+    # gate that used to work: a plain communicate() blocks uninterruptibly, but
+    # communicate(timeout=...) waits on a lock Windows CAN interrupt, so a stray console event
+    # surfaces as KeyboardInterrupt and takes the whole run down.
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        # stdin=DEVNULL is the load-bearing part: it ends conversation mode even on builds with no
+        # -no-cnv flag, instead of blocking forever on an inherited terminal. The timeout is the
+        # backstop -- a gate that hangs is worse than a gate that fails, because it looks like work.
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL, timeout=timeout, **kw)
+    except KeyboardInterrupt:
+        # Not somebody pressing anything: a console event reaching an interruptible wait. Report it
+        # like any other failure to produce output rather than killing the gate.
+        print("   ! interrupted by a console event during generation (not a real Ctrl+C)")
+        return _NO_OUTPUT
+    except subprocess.TimeoutExpired:
+        print(f"   ! generation exceeded {timeout}s (CPU-only runs on a big model are slow)")
+        return _NO_OUTPUT
     out = r.stdout or ""
     # llama-cli echoes the prompt then the continuation; keep only the continuation
     return out.split(prompt, 1)[-1] if prompt in out else out
@@ -87,6 +134,11 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
         rows, looped = [], False
         for p in prompts:
             gen = _generate(cli_bin, model, p, sampling, ngl)
+            if isinstance(gen, _NoOutput) or not gen.strip():
+                rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
+                             "reason": "NO OUTPUT (timeout or the run produced nothing)",
+                             "sample": ""})
+                return {"verdict": "NO_OUTPUT", "config": cfg_name, "rows": rows}
             is_loop, metric, reason = detect_loop(gen)
             rows.append({"prompt": p.splitlines()[0][:48], "loop": is_loop, "reason": reason,
                          "sample": gen.strip().replace("\n", " ")[:120]})
@@ -100,9 +152,15 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
 def print_gate(res):
     print("\n=== coherence gate ===")
     for r in res["rows"]:
-        print(f"  [{'LOOP' if r['loop'] else 'ok  '}] {r['prompt']:<50} {r['reason']}")
+        mark = "----" if r["loop"] is None else ("LOOP" if r["loop"] else "ok  ")
+        print(f"  [{mark}] {r['prompt']:<50} {r['reason']}")
         if r["loop"]:
             print(f"         -> {r['sample']}")
+    if res["verdict"] == "NO_OUTPUT":
+        print("\nVERDICT: NO OUTPUT -- the model produced nothing before the timeout, so this build\n"
+              "  is UNGATED, not passed. Usually the run is simply slow (a big model with no GPU\n"
+              "  offload): re-run with more time, or with -ngl set, before reading anything into it.")
+        return False
     if res["verdict"] == "PASS":
         s = " ".join(res["sampling"])
         print(f"\nVERDICT: PASS — coherent. Ship these sampling defaults on the card:\n  {s}")
