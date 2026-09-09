@@ -61,6 +61,7 @@ pollard-kl = "pollard_kl:main"
 pollard-lowbit = "pollard_lowbit:main"
 pollard-verify = "pollard_verify:main"
 pollard-doctor = "pollard_doctor:main"
+pollard-errsrc = "pollard_errsrc:main"
 pollard-archfp = "pollard_archfp:main"
 pollard-errtype = "pollard_errtype:main"
 pollard-ls = "pollard_ls:main"
@@ -79,4 +80,4 @@ pollard-envmatch = "pollard_envmatch:main"
 package-dir = { "" = "tools" }
 py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit", "pollard_experts", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_probes", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
     "pollard_serve_eval", "pollard_card", "pollard_onboard", "pollard_envmatch", "imatrix_fix_gate", "exl3_fix_mtp_ehproj",
-    "pollard_archfp", "pollard_errtype"]
+    "pollard_archfp", "pollard_errtype", "pollard_errsrc"]
