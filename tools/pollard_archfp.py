@@ -129,22 +129,39 @@ def twin(fp, hparams=None):
                          "bias_delta": sorted(bias_delta), "expert_delta": sorted(exp_delta),
                          "unknown": sorted(fp["unknown"])}
 
-    blockers = []
-    if best is None:                       # no family of the right kind at all
-        blockers.append("no known family of this kind (dense/MoE) to compare against")
+    # A gap is NOT "unsupported forever" -- it is the specific work that would support it. Refusing a
+    # silent mis-build is the point; refusing to say what it would take is just unhelpful.
+    gaps = []
+    if best is None:
+        gaps.append({"what": "no known family of this kind (dense/MoE) to compare against",
+                     "to_support": "add a family entry describing this block's roles, then reuse or "
+                                   "write the matching builder"})
     seen = set()
-    for key, label in (("value_expert_count", "value experts (MoVA)"), ("expert_count", "experts")):
+    for key, label, how in (
+        ("value_expert_count", "value experts (MoVA)",
+         "attention-side expert routing: per-layer attn_v_gate + attn_v_exps, selected by "
+         "n_value_expert/n_value_expert_used. No current family models it -- extend the dense "
+         "builder with a gated value path, then add it here as its own family"),
+        ("expert_count", "experts",
+         "route the FFN through the expert tensors and the router (an MoE family already covers "
+         "the common shapes)"),
+    ):
         for k, v in hparams.items():
             if k in seen or not k.endswith(key) or not isinstance(v, (int, float)) or not v:
                 continue
             seen.add(k)                    # a key matches the most specific rule only
-            blockers.append(f"{label}: {k}={v} -- the dense path would silently mis-build this")
+            gaps.append({"what": f"{label}: {k}={v} -- a plain twin would silently mis-build this",
+                         "to_support": how})
     if fp["unknown"]:
-        blockers.append("unrecognised per-block tensors: " + ", ".join(sorted(fp["unknown"])[:6]))
+        names = ", ".join(sorted(fp["unknown"])[:6])
+        gaps.append({"what": "per-block tensors no family accounts for: " + names,
+                     "to_support": "decide each tensor's role, add it to _ROLE_PATTERNS, and extend "
+                                   "the nearest family (or add one) so the layout scores exactly"})
+    blockers = [g["what"] for g in gaps]        # back-compat for existing callers
 
     exact = best_score == 0 and not blockers
     return {"twin": best, "exact": exact, "score": best_score, "diff": best_diff,
-            "blockers": blockers, "n_blocks": fp["n_blocks"]}
+            "gaps": gaps, "blockers": blockers, "n_blocks": fp["n_blocks"]}
 
 
 # ---- sources ---------------------------------------------------------------------------------------
@@ -194,8 +211,9 @@ def report(res, arch_name=None):
     out.append(f"layers: {res['n_blocks']}")
     if res["twin"] is None:
         out.append("layout: no known family of this kind to compare against")
-        for b in res["blockers"]:
-            out.append(f"   BLOCKER: {b}")
+        for g in res.get("gaps", []):
+            out.append(f"   GAP: {g['what']}")
+            out.append(f"        to support: {g['to_support']}")
         return "\n".join(out)
     if res["exact"]:
         out.append(f"layout: EXACT twin of `{res['twin']}` -- a runtime port is boilerplate "
@@ -208,8 +226,9 @@ def report(res, arch_name=None):
                          ("unknown", "unrecognised")):
             if d.get(k):
                 out.append(f"   {label}: {', '.join(d[k])}")
-    for b in res["blockers"]:
-        out.append(f"   BLOCKER: {b}")
+    for g in res.get("gaps", []):
+        out.append(f"   GAP: {g['what']}")
+        out.append(f"        to support: {g['to_support']}")
     return "\n".join(out)
 
 
