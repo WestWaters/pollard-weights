@@ -87,10 +87,20 @@ def main():
     ap.add_argument("--params", help="param count, e.g. 2.5B (else estimated from config)")
     ap.add_argument("--license", dest="license_", help="license (else from base config)")
     ap.add_argument("--lane", help="only this lane's builds")
-    ap.add_argument("--results", help="JSON: {file_or_tag: {ppl, kld, note}} + optional {_eval, _f16_ppl}")
+    ap.add_argument("--results", help="JSON: {file_or_tag: {ppl, kld, tps, note}} + optional "
+                    "{_eval, _f16_ppl, _hw}. `tps` adds a tok/s column; `_hw` names the machine.")
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
+    ap.add_argument("--no-default-errata", action="store_true",
+                    help="omit the generic errata bullets (measured-allocation blurb, "
+                    "'single machine') — use when --errata already states them, or when a "
+                    "default is not true of this build (e.g. it was reproduced on a second machine)")
+    ap.add_argument("--errata", action="append", default=[],
+                    help="extra errata bullet (repeatable) — e.g. a required llama.cpp fork or a "
+                         "platform caveat. Text is used verbatim, minus any leading '- '.")
+    ap.add_argument("--requires", help="what the files need in order to run, stated instead of the "
+                    "default 'runs in stock llama.cpp' line (custom architectures usually need a fork)")
     a = ap.parse_args()
 
     cfg = base_config(a.base_model or a.model)
@@ -99,6 +109,8 @@ def main():
     mtype = cfg.get("model_type", "")
     builds = load_builds(a.builds_from or a.model, a.lane)
     lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or (["gguf"])
+    if not any("_KT" in str(b.get("tag", "")).upper() for b in builds):
+        LANE_TAGS["gguf"] = [t for t in LANE_TAGS["gguf"] if t not in ("trellis", "ik_llama.cpp")]
     name = a.title or os.path.basename(str(base_model).rstrip("/"))
     repo = a.repo or f"PollardWeights/{name}-Pollard"
     results = {}
@@ -134,27 +146,50 @@ def main():
     out += [f"Pollard builds of [{base_model}](https://huggingface.co/{base_model}) made with "
             "[Pollard Weights](https://github.com/WestWaters/pollard-weights) — a ladder of "
             "**measured-allocation** quants (bits placed by per-layer sensitivity, not a uniform crush).", ""]
+    has_trellis = any("_KT" in str(b.get("tag", "")).upper() for b in builds)
     if "gguf" in lanes:
-        out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio.** "
-                "Trellis (`IQ*_KT`) files need [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp); "
-                "the K-quants run anywhere.", ""]
+        if a.requires:
+            out += [f"**Standard GGUF.** {a.requires}", ""]
+        else:
+            out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio.**", ""]
+        if has_trellis:
+            out[-2] += (" Trellis (`IQ*_KT`) files need "
+                        "[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp); "
+                        "the K-quants run anywhere.")
 
     # ---- available files
     out += [f"## Available files{(' (' + eval_str + ')') if eval_str else ''}", ""]
     if f16_ppl:
         out.append(f"_f16 reference PPL {f16_ppl}._\n")
-    out += ["| file | PPL | size | Mean KLD | notes |", "|---|---:|---:|---:|---|"]
+    # tok/s is a column people actually shop on, and the table had no way to carry it -- so every
+    # generated card was silently speed-less no matter what had been measured. Shown only when at
+    # least one rung reports it, so cards without speed data do not grow an empty column.
+    has_tps = any((results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("tps")
+                  for b in builds)
+    tps_h = " tok/s |" if has_tps else ""
+    tps_s = "---:|" if has_tps else ""
+    out += [f"| file | PPL | size |{tps_h} Mean KLD | notes |", f"|---|---:|---:|{tps_s}---:|---|"]
     for b in sorted(builds, key=lambda x: (x.get("bytes") or 0)):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
-        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} | "
+        tps_c = f" {r.get('tps','—')} |" if has_tps else ""
+        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{r.get('kld','—')} | {r.get('note', b.get('tag',''))} |")
+    if has_tps:
+        hw = results.get("_hw")
+        out.append("")
+        out.append(f"_tok/s measured on {hw}._" if hw else
+                   "_tok/s is hardware-specific; the machine it was measured on is stated in the errata._")
     if not results:
         out.append("")
         out.append("_PPL / Mean-KLD benchmarking pending — sizes and allocation are final._")
     out.append("")
 
     # ---- usage
-    ex = min(builds, key=lambda b: (b.get("bytes") or 1e18), default={})
+    def _recommended(b):
+        r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
+        return "recommended" in str(r.get("note", "")).lower()
+    ex = next((b for b in builds if _recommended(b)),
+              min(builds, key=lambda b: (b.get("bytes") or 1e18), default={}))
     out += ["## Usage", ""]
     if "gguf" in lanes:
         out += ["```bash", f"llama-cli -m {ex.get('name','model.gguf')} -p \"Explain why the sky is blue.\" --temp 0.7",
@@ -166,10 +201,14 @@ def main():
 
     # ---- errata + footer
     out += ["## Errata", ""]
-    if "gguf" in lanes:
+    for line in a.errata:
+        out.append("- " + line.lstrip("- ").strip())
+    if "gguf" in lanes and has_trellis:
         out.append("- Trellis (`IQ*_KT`) quants need ik_llama.cpp to build/run; K-quants run in any recent llama.cpp.")
-    out += ["- Measured allocation places bits by per-layer sensitivity under a size budget.",
-            "- Single machine; replication invited.", "",
+    if not a.no_default_errata:
+        out += ["- Measured allocation places bits by per-layer sensitivity under a size budget.",
+                "- Single machine; replication invited."]
+    out += ["",
             "*Built with [Pollard Weights](https://github.com/WestWaters/pollard-weights) — "
             "frontier models, small hardware, no compromise.*"]
 
