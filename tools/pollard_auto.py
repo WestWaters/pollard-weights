@@ -147,11 +147,11 @@ def _resolve_hf(a):
     if os.path.isdir(a.hf):
         a._hf_dir = _precondition_hf(a, a.hf)
         return a._hf_dir
-    local = os.path.join(os.path.abspath(a.output or "."), a.hf.split("/")[-1])
-    print(f"   fetch HF repo: huggingface-cli download {a.hf} --local-dir {local}")
+    import pollard_workspace as ws
+    local = ws.source_dir(a.hf)                         # $POLLARD_HOME/downloads/<slug> — one findable place
+    print(f"   fetch HF repo -> {local}  (workspace downloads/)")
     if a.run:
-        from huggingface_hub import snapshot_download
-        local = snapshot_download(a.hf, local_dir=local)
+        local = ws.fetch_source(a.hf)                   # single copy, no ~/.cache dup
     a._hf_dir = _precondition_hf(a, local)
     return a._hf_dir
 

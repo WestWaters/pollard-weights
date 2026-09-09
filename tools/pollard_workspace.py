@@ -6,13 +6,16 @@ they ran the command.
 Layout (default ~/pollard, override with $POLLARD_HOME):
 
   ~/pollard/
-    models/
+    downloads/                                pulled SOURCE models (the input side), one findable copy
+      <Org>__<Model>/                         e.g. Qwen__Qwen2.5-3B (mirrors the models/ naming)
+      .hf-cache/                              hub cache pinned here so a pull can't dup into ~/.cache
+    models/                                   BUILT Pollard outputs (the output side)
       <Org>__<Model>/                         e.g. Qwen__Qwen2.5-3B
         <Model>-Pollard-<LANE>-<tag>/         runtime-ready build, HF-card-style name
         calibration/                          imatrix, cal data, sensitivity.json
         reports/                              pollard-verify / scorecard / ppl outputs
         MANIFEST.json                         every build here: lane, bpw, ppl, verified, size, date
-    cache/                                    downloads + _work dirs (safe to delete)
+    cache/                                    _work dirs (safe to delete)
 
 Tools call `resolve_out(model, lane, tag, explicit)` — if the user passed --out it's respected; otherwise
 the build lands in the workspace automatically. After a build, call `record_build(...)` to log it to the
@@ -72,6 +75,56 @@ def cache_dir(create: bool = False) -> str:
     d = os.path.join(pollard_home(), "cache")
     if create: os.makedirs(d, exist_ok=True)
     return d
+
+
+def downloads_dir(create: bool = False) -> str:
+    """Staging home for pulled SOURCE models — the input side, distinct from models/ (built outputs) and
+    cache/ (scratch). $POLLARD_HOME/downloads/<Org>__<Model>/ keeps every fetched model in one findable,
+    human-named place instead of scattered under wherever the command was run."""
+    d = os.path.join(pollard_home(), "downloads")
+    if create: os.makedirs(d, exist_ok=True)
+    return d
+
+
+def source_dir(model: str, create: bool = False) -> str:
+    """Per-source-model folder under downloads/, named like the models/ tree so the pair lines up."""
+    d = os.path.join(downloads_dir(), model_slug(model))
+    if create: os.makedirs(d, exist_ok=True)
+    return d
+
+
+def fetch_source(repo_id: str, filename: str | None = None, revision: str | None = None,
+                 allow_patterns=None, token: str | None = None) -> str:
+    """Pull an HF source model (or one file) into $POLLARD_HOME/downloads/<slug> — ONE findable copy.
+
+    Returns the local file path (when `filename` is given) or the model dir. A path that already exists
+    locally is returned as-is (point Pollard at a repo id OR a dir). The Xet backend is disabled (its
+    write token can expire mid-transfer, which stalls big pulls) and the hub cache is pinned INSIDE
+    downloads/ (`.hf-cache`) so a download can't silently duplicate the model into ~/.cache and fill the
+    disk — everything the pull touches lives under one folder you can see and clean. Idempotent: a
+    complete prior download is reused, not re-fetched."""
+    if os.path.exists(repo_id):                       # already a local dir/file — use it directly
+        return repo_id
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    dest = source_dir(repo_id, create=True)
+    hf_cache = os.path.join(downloads_dir(), ".hf-cache")
+    if filename:
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(repo_id, filename, revision=revision, local_dir=dest,
+                               cache_dir=hf_cache, token=token)
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo_id, revision=revision, local_dir=dest, cache_dir=hf_cache,
+                             allow_patterns=allow_patterns, token=token)
+
+
+def clean_downloads() -> int:
+    """Delete the downloads/ staging tree (source models are re-pullable). Returns bytes freed."""
+    import shutil
+    d = downloads_dir()
+    n = _dir_size(d)
+    if os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+    return n
 
 
 def charts_dir(model: str | None = None, create: bool = False) -> str:
