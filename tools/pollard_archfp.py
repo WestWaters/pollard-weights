@@ -42,7 +42,10 @@ _ROLE_PATTERNS = [
     (r"(?:mlp|feed_forward)[._]gate_proj\b|ffn_gate\b",            "ffn_gate"),
     (r"(?:mlp|feed_forward)[._]up_proj\b|ffn_up\b",                "ffn_up"),
     (r"(?:mlp|feed_forward)[._]down_proj\b|ffn_down\b",            "ffn_down"),
-    (r"gate_up_proj|ffn_gate_up\b",                                "ffn_gate_up"),
+    (r"gate_up_proj|ffn_gate_up(?:_exps|_shexp)?\b",               "ffn_gate_up"),
+    (r"ffn_gate(?:_exps|_shexp)\b",                                "ffn_gate"),
+    (r"ffn_up(?:_exps|_shexp)\b",                                  "ffn_up"),
+    (r"ffn_down(?:_exps|_shexp)\b",                                "ffn_down"),
     (r"(?:mlp\.)?(?:gate|router)\b(?!_proj)|ffn_gate_inp\b",       "router"),
 ]
 _EXPERT_RE = re.compile(r"experts?[._]|_exps\b|\.experts\.")
@@ -92,10 +95,17 @@ def fingerprint(names):
 # is the only question this tool answers. `biases` is the set of roles that carry a bias tensor.
 DENSE_CORE = {"attn_q", "attn_k", "attn_v", "attn_out", "attn_norm",
               "ffn_gate", "ffn_up", "ffn_down", "ffn_norm"}
+MOE_CORE = {"attn_q", "attn_k", "attn_v", "attn_out", "attn_norm", "ffn_norm", "router"}
 FAMILIES = {
-    "llama":  {"roles": DENSE_CORE, "biases": set()},
-    "qwen2":  {"roles": DENSE_CORE, "biases": {"attn_q", "attn_k", "attn_v"}},
-    "qwen3":  {"roles": DENSE_CORE | {"attn_q_norm", "attn_k_norm"}, "biases": set()},
+    "llama":     {"roles": DENSE_CORE, "biases": set(), "moe": False},
+    "qwen2":     {"roles": DENSE_CORE, "biases": {"attn_q", "attn_k", "attn_v"}, "moe": False},
+    "qwen3":     {"roles": DENSE_CORE | {"attn_q_norm", "attn_k_norm"}, "biases": set(), "moe": False},
+    "qwen2moe":  {"roles": MOE_CORE, "biases": {"attn_q", "attn_k", "attn_v"},
+                  "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
+    "qwen3moe":  {"roles": MOE_CORE | {"attn_q_norm", "attn_k_norm"}, "biases": set(),
+                  "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
+    "llama-moe": {"roles": MOE_CORE, "biases": set(),
+                  "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
 }
 
 
@@ -103,27 +113,32 @@ def twin(fp, hparams=None):
     """Nearest known family + the exact deltas + anything that makes 'twin' unsafe to act on."""
     hparams = hparams or {}
     best, best_score, best_diff = None, None, None
+    is_moe = bool(fp["expert_roles"])
     for fam, spec in FAMILIES.items():
+        if spec.get("moe", False) != is_moe:
+            continue                       # never score a dense model against an MoE family, or vice versa
         missing = spec["roles"] - fp["roles"]
         extra = fp["roles"] - spec["roles"]
         bias_delta = spec["biases"] ^ (fp["biases"] & (spec["biases"] | fp["biases"]))
-        score = len(missing) * 2 + len(extra) * 2 + len(bias_delta) + len(fp["unknown"])
+        exp_delta = (spec.get("experts", set()) ^ fp["expert_roles"]) if spec.get("moe") else set()
+        score = (len(missing) * 2 + len(extra) * 2 + len(bias_delta)
+                 + len(exp_delta) * 2 + len(fp["unknown"]))
         if best_score is None or score < best_score:
             best, best_score = fam, score
             best_diff = {"missing": sorted(missing), "extra": sorted(extra),
-                         "bias_delta": sorted(bias_delta), "unknown": sorted(fp["unknown"])}
+                         "bias_delta": sorted(bias_delta), "expert_delta": sorted(exp_delta),
+                         "unknown": sorted(fp["unknown"])}
 
     blockers = []
-    if fp["expert_roles"]:
-        blockers.append(f"MoE expert tensors present ({', '.join(sorted(fp['expert_roles']))}) — "
-                        "a dense twin does NOT cover this model")
+    if best is None:                       # no family of the right kind at all
+        blockers.append("no known family of this kind (dense/MoE) to compare against")
     seen = set()
     for key, label in (("value_expert_count", "value experts (MoVA)"), ("expert_count", "experts")):
         for k, v in hparams.items():
             if k in seen or not k.endswith(key) or not isinstance(v, (int, float)) or not v:
                 continue
             seen.add(k)                    # a key matches the most specific rule only
-            blockers.append(f"{label}: {k}={v} — the dense path would silently mis-build this")
+            blockers.append(f"{label}: {k}={v} -- the dense path would silently mis-build this")
     if fp["unknown"]:
         blockers.append("unrecognised per-block tensors: " + ", ".join(sorted(fp["unknown"])[:6]))
 
@@ -177,6 +192,11 @@ def report(res, arch_name=None):
     if arch_name:
         out.append(f"arch: {arch_name}")
     out.append(f"layers: {res['n_blocks']}")
+    if res["twin"] is None:
+        out.append("layout: no known family of this kind to compare against")
+        for b in res["blockers"]:
+            out.append(f"   BLOCKER: {b}")
+        return "\n".join(out)
     if res["exact"]:
         out.append(f"layout: EXACT twin of `{res['twin']}` -- a runtime port is boilerplate "
                    f"(arch enum + name + tensor map, reuse the existing builder)")
@@ -184,7 +204,8 @@ def report(res, arch_name=None):
         out.append(f"layout: nearest `{res['twin']}` (distance {res['score']}) -- NOT a drop-in")
         d = res["diff"]
         for k, label in (("missing", "missing vs that family"), ("extra", "extra vs that family"),
-                         ("bias_delta", "bias mismatch"), ("unknown", "unrecognised")):
+                         ("bias_delta", "bias mismatch"), ("expert_delta", "expert tensor mismatch"),
+                         ("unknown", "unrecognised")):
             if d.get(k):
                 out.append(f"   {label}: {', '.join(d[k])}")
     for b in res["blockers"]:
