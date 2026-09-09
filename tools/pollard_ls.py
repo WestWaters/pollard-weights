@@ -2,9 +2,10 @@
 """pollard-ls — list what's in the Pollard workspace so you never hunt for a build. Reads each model's
 MANIFEST.json and prints every build: lane, quant, size, PPL, and whether it passed pollard-verify.
 
-  pollard-ls                 # everything in $POLLARD_HOME (default ~/pollard)
-  pollard-ls Qwen2.5-3B      # just builds whose model matches this substring
+  pollard-ls                 # everything in $POLLARD_HOME (default ~/pollard): builds + pulled sources
+  pollard-ls Qwen2.5-3B      # just entries whose model matches this substring
   pollard-ls --paths         # print full paths (for scripting)
+  pollard-ls --clean-downloads   # delete downloads/ (source models are re-fetchable) to reclaim disk
 """
 import argparse, os
 import pollard_workspace as ws
@@ -15,7 +16,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("filter", nargs="?", default="", help="only models matching this substring")
     ap.add_argument("--paths", action="store_true", help="print full build paths")
+    ap.add_argument("--clean-downloads", action="store_true",
+                    help="delete the downloads/ staging tree (pulled source models are re-fetchable)")
     a = ap.parse_args()
+
+    if a.clean_downloads:
+        freed = ws.clean_downloads()
+        print(f"cleared downloads/ — freed {ws.human(freed)}")
+        return
 
     home = ws.pollard_home()
     print(f"Pollard workspace: {home}")
@@ -42,6 +50,23 @@ def main():
             if a.paths:
                 print(f"       {b.get('path','')}")
     print(f"\ntotal: {ws.human(total)} across {len(models)} model(s)")
+
+    # pulled SOURCE models (the input side) — show them so they're findable and easy to reclaim
+    dl = ws.downloads_dir()
+    if os.path.isdir(dl):
+        srcs = sorted(d for d in os.listdir(dl) if os.path.isdir(os.path.join(dl, d)) and not d.startswith("."))
+        if srcs:
+            dtotal = 0
+            print(f"\ndownloads/ (pulled sources):")
+            for s in srcs:
+                if a.filter.lower() not in s.lower():
+                    continue
+                sz = ws._dir_size(os.path.join(dl, s)); dtotal += sz
+                print(f"   {s:<44} {ws.human(sz)}")
+                if a.paths:
+                    print(f"       {os.path.join(dl, s)}")
+            if dtotal:
+                print(f"   (source total: {ws.human(dtotal)} — reclaim with `pollard-ls --clean-downloads`)")
 
 
 if __name__ == "__main__":
