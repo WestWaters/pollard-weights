@@ -375,6 +375,15 @@ def analyse(cfg):
     # kv_heads*head_dim — the difference between "needs 256 GB" and "fits a Spark".
     kv_lora_rank = first(cfg, "kv_lora_rank", default=0) or 0
     qk_rope_head_dim = first(cfg, "qk_rope_head_dim", default=0) or 0
+    # DeepSeek Sparse Attention (DeepSeek-V3.2, GLM-5.3 `glm_moe_dsa`, Tencent Hy4 `hy_v4`): a "lightning indexer" keeps
+    # its own per-token key cache (index_head_dim per layer) NEXT to the MLA latent. Measured on GLM-5.3 (78 layers,
+    # index_head_dim 128): 41 KB/token with an NVFP4 latent vs the 22 KB the latent alone predicts — the indexer cache is
+    # about half the KV bytes on these models, and it is not compressed by the latent's quant. Layers with
+    # indexer_types == "shared" (Hy4: 57 of 78) reuse a previous layer's top-k and keep no cache of their own.
+    index_head_dim = first(cfg, "index_head_dim", default=0) or 0
+    idx_types = cfg.get("indexer_types")
+    n_indexer = (sum(1 for t in idx_types if str(t) != "shared") if isinstance(idx_types, list)
+                 else (layers if index_head_dim else 0))
 
     n_experts = first(cfg, "num_experts", "n_routed_experts",
                       "num_local_experts", "moe_num_experts")
@@ -452,6 +461,7 @@ def analyse(cfg):
         "kv_heads": kv_heads, "head_dim": head_dim,
         "mla": kv_lora_rank > 0, "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "index_head_dim": index_head_dim, "n_indexer": n_indexer,   # DSA indexer key cache (0 when absent)
     }
 
 
@@ -460,9 +470,15 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
     compressed latent per token/layer (tiny); hybrid models only grow KV on their
     full-attention layers. kv_bytes: 2 = f16 cache (default), 1 = q8_0, ~0.56 = q4."""
     n_attn = a.get("n_full") or a["layers"]                 # linear layers barely grow KV
+    # DSA indexer key cache: index_head_dim per token on every layer that runs its own indexer. Not compressed by the
+    # NVFP4 latent path (bf16 keys), fp8/f16 otherwise — GLM-5.3 measured: 41 KB/tok nvfp4, 57 KB fp8 (latent-only
+    # model: 22 / 45 KB). Anything below 1 byte/elem for the latent still costs ~2 bytes/elem here.
+    idx = 0.0
+    if a.get("index_head_dim") and a.get("n_indexer"):
+        idx = a["n_indexer"] * ctx * a["index_head_dim"] * (kv_bytes if kv_bytes >= 1.0 else 2.0)
     if a.get("mla") and a.get("kv_lora_rank"):
         per_tok_layer = a["kv_lora_rank"] + (a.get("qk_rope_head_dim") or 0)
-        return n_attn * ctx * per_tok_layer * kv_bytes      # MLA: single latent, no K/V split
+        return n_attn * ctx * per_tok_layer * kv_bytes + idx   # MLA: single latent, no K/V split (+ indexer cache)
     kvh, hd = a.get("kv_heads") or 0, a.get("head_dim") or 0
     return 2 * n_attn * ctx * kvh * hd * kv_bytes           # GQA/MHA: K and V
 
@@ -576,11 +592,17 @@ def gb(nbytes):
 #   * GPTQ: Qwen2.5-0.5B = ~9 min on a 5090 (fast box) -> a Spark-class ~0.5 h/B
 #   * GGUF ladder + EXL3: a same-bit GGUF 2-6bit ladder of glm-flash ~1-2 h on ONE Spark, while
 #     EXL3 of ONE 2-bit output takes ~34 h on ONE Spark (community datapoint) -> EXL3 ~20-30x GGUF.
+#   * MEASURED 2026-09 on GLM-5.3 (744B MoE, 78 layers, 384 x 2048 calibration rows), GB10 nodes:
+#       GPTQ (Pollard-method Hessian, int4 experts / int8 attention): ~20 node-hours  -> 0.027 h/B (total params)
+#       EXL3 (exllamav3 budgeted allocator, -b 3.2 -hq, one bpw): ~66 GPU-hours (~50 min per MoE layer, ~4 min dense)
+#                                                                    -> 0.09 h/B — consistent with the 320B 2-bit datapoint
+#                                                                       above (34 h / 320B = 0.11), so the old 3.0 was ~30x high.
+#     Both scale with TOTAL params (every expert is solved), band-parallel across nodes divides wall-clock by node count.
 _BUILD_RATE = {   # format: (basis, hours_per_billion_params_on_a_GB10_class_box)
     "gguf": ("active", 0.12),   # imatrix pass + the 2-6bit K-quant ladder (imatrix is active-bound)
-    "gptq": ("total",  0.5),    # per-layer Hessian + error-feedback solve over the whole model
+    "gptq": ("total",  0.03),   # per-layer Hessian + error-feedback solve over the whole model (measured 744B: 20 node-h)
     "mlx":  ("total",  0.05),   # group quant, no calib forward — the cheap lane
-    "exl3": ("total",  3.0),    # trellis optimization per tensor, ONE target bpw — the heavy lane
+    "exl3": ("total",  0.09),   # trellis optimization per tensor, ONE target bpw (measured 744B: 66 GPU-h; 320B: 34 h)
 }
 
 
