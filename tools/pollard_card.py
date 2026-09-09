@@ -91,6 +91,15 @@ def main():
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
+    ap.add_argument("--no-default-errata", action="store_true",
+                    help="omit the generic errata bullets (measured-allocation blurb, "
+                    "'single machine') — use when --errata already states them, or when a "
+                    "default is not true of this build (e.g. it was reproduced on a second machine)")
+    ap.add_argument("--errata", action="append", default=[],
+                    help="extra errata bullet (repeatable) — e.g. a required llama.cpp fork or a "
+                         "platform caveat. Text is used verbatim, minus any leading '- '.")
+    ap.add_argument("--requires", help="what the files need in order to run, stated instead of the "
+                    "default 'runs in stock llama.cpp' line (custom architectures usually need a fork)")
     a = ap.parse_args()
 
     cfg = base_config(a.base_model or a.model)
@@ -99,6 +108,8 @@ def main():
     mtype = cfg.get("model_type", "")
     builds = load_builds(a.builds_from or a.model, a.lane)
     lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or (["gguf"])
+    if not any("_KT" in str(b.get("tag", "")).upper() for b in builds):
+        LANE_TAGS["gguf"] = [t for t in LANE_TAGS["gguf"] if t not in ("trellis", "ik_llama.cpp")]
     name = a.title or os.path.basename(str(base_model).rstrip("/"))
     repo = a.repo or f"PollardWeights/{name}-Pollard"
     results = {}
@@ -134,10 +145,16 @@ def main():
     out += [f"Pollard builds of [{base_model}](https://huggingface.co/{base_model}) made with "
             "[Pollard Weights](https://github.com/WestWaters/pollard-weights) — a ladder of "
             "**measured-allocation** quants (bits placed by per-layer sensitivity, not a uniform crush).", ""]
+    has_trellis = any("_KT" in str(b.get("tag", "")).upper() for b in builds)
     if "gguf" in lanes:
-        out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio.** "
-                "Trellis (`IQ*_KT`) files need [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp); "
-                "the K-quants run anywhere.", ""]
+        if a.requires:
+            out += [f"**Standard GGUF.** {a.requires}", ""]
+        else:
+            out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio.**", ""]
+        if has_trellis:
+            out[-2] += (" Trellis (`IQ*_KT`) files need "
+                        "[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp); "
+                        "the K-quants run anywhere.")
 
     # ---- available files
     out += [f"## Available files{(' (' + eval_str + ')') if eval_str else ''}", ""]
@@ -154,7 +171,11 @@ def main():
     out.append("")
 
     # ---- usage
-    ex = min(builds, key=lambda b: (b.get("bytes") or 1e18), default={})
+    def _recommended(b):
+        r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
+        return "recommended" in str(r.get("note", "")).lower()
+    ex = next((b for b in builds if _recommended(b)),
+              min(builds, key=lambda b: (b.get("bytes") or 1e18), default={}))
     out += ["## Usage", ""]
     if "gguf" in lanes:
         out += ["```bash", f"llama-cli -m {ex.get('name','model.gguf')} -p \"Explain why the sky is blue.\" --temp 0.7",
@@ -166,10 +187,14 @@ def main():
 
     # ---- errata + footer
     out += ["## Errata", ""]
-    if "gguf" in lanes:
+    for line in a.errata:
+        out.append("- " + line.lstrip("- ").strip())
+    if "gguf" in lanes and has_trellis:
         out.append("- Trellis (`IQ*_KT`) quants need ik_llama.cpp to build/run; K-quants run in any recent llama.cpp.")
-    out += ["- Measured allocation places bits by per-layer sensitivity under a size budget.",
-            "- Single machine; replication invited.", "",
+    if not a.no_default_errata:
+        out += ["- Measured allocation places bits by per-layer sensitivity under a size budget.",
+                "- Single machine; replication invited."]
+    out += ["",
             "*Built with [Pollard Weights](https://github.com/WestWaters/pollard-weights) — "
             "frontier models, small hardware, no compromise.*"]
 
