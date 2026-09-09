@@ -136,11 +136,25 @@ def lane_report(gguf_path, ik_bin_dir=None):
     elif known:
         print("   trellis flagship: available (ik_llama.cpp knows this arch)")
     else:
-        print(f"   trellis flagship: UNAVAILABLE — ik_llama.cpp does not know '{arch}'.")
-        print( "     The K-quant ladder still runs and is honest, but the hand-coded winner needs the")
-        print(f"     arch ported into ik_llama.cpp. For a DENSE model whose tensors are the standard")
-        print( "     attn_q/k/v/output + ffn_gate/up/down set, that port is mostly boilerplate:")
-        print( "     arch enum + name + tensor map + tokenizer pre-type, reusing an existing builder.")
+        print(f"   trellis flagship: UNAVAILABLE - ik_llama.cpp does not know '{arch}'.")
+        print( "     The K-quant ladder still runs and is honest; the flagship needs the arch ported.")
+        # Don't leave the user guessing how hard that port is -- fingerprint the layout and say so.
+        try:
+            from pollard_archfp import fingerprint, twin, report as fp_report
+            meta = read_gguf_meta(gguf_path)
+            names = meta.get("_tensor_names") or []
+            if names:
+                hp = {k: v for k, v in meta.items() if not k.startswith("_")}
+                res = twin(fingerprint(names), hp)
+                for line in fp_report(res).splitlines():
+                    print("     " + line)
+                if res["exact"]:
+                    print(f"     -> port it by giving ik_llama an arch enum + the name '{arch}' + the "
+                          f"{res['twin']} tensor map, and reusing its existing builder.")
+                else:
+                    print("     -> NOT a drop-in: the deltas above are real work, not a rename.")
+        except Exception as e:
+            print(f"     (layout fingerprint unavailable: {e})")
         print( "     See notes/custom-arch-onboarding.md.")
     return known
 

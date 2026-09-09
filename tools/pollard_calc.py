@@ -191,9 +191,10 @@ def _read_one_gguf(path):
         # for ANY architecture (LLM, DiT, VAE...) with no key conventions.
         total_params = 0
         dcounts = {}
+        tnames = []
         try:
             for _ in range(n_tensors):
-                rd_str()  # tensor name
+                tnames.append(rd_str())  # tensor name — the model's real layout, free while we're here
                 nd, = struct.unpack("<I", f.read(4))
                 dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
                 dt, = struct.unpack("<I", f.read(4)); f.read(8)  # ggml dtype + offset
@@ -204,6 +205,7 @@ def _read_one_gguf(path):
                 total_params += n
         except Exception:
             total_params = None  # malformed tail: key-based analysis only
+    meta["_tensor_names"] = tnames
     return meta, total_params, dcounts
 
 
