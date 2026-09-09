@@ -40,6 +40,13 @@ _ROLE_PATTERNS = [
     (r"(?:self_attn|attn)[._]kv_a_layernorm\b|attn_kv_a_norm\b",  "attn_kv_a_norm"),
     (r"(?:self_attn|attn)[._]indexer[._]|attn_indexer",            "attn_indexer"),
     (r"(?:self_attn|attn)[._]linear_gate\b",                       "attn_gate"),
+    # --- gated linear attention (Mamba2 / GatedDeltaNet / Kimi-Delta): the SSM state path ---------
+    # Qwen3.5 and friends interleave these blocks with ordinary attention, so a model can carry BOTH.
+    (r"linear_attn[._]in_proj[a-z_]*|ssm_in\b",                    "lin_in"),
+    (r"linear_attn[._]conv1d|ssm_conv1d\b",                        "lin_conv"),
+    (r"linear_attn[._](?:A_log|dt_bias)|ssm_(?:a|dt)\b",           "lin_decay"),
+    (r"linear_attn[._]norm|ssm_norm\b",                            "lin_norm"),
+    (r"linear_attn[._]out_proj|ssm_out\b",                         "lin_out"),
     # --- standard attention ----------------------------------------------------------------------
     (r"(?:self_attn|attn)[._](?:q_proj|q)\b",                     "attn_q"),
     (r"(?:self_attn|attn)[._](?:k_proj|k)\b",                     "attn_k"),
@@ -50,9 +57,9 @@ _ROLE_PATTERNS = [
     (r"(?:self_attn|attn)[._][a-z_]*g_proj\b|attn_gate\b",         "attn_gate"),
     (r"input_layernorm|attn_norm\b",                               "attn_norm"),
     (r"post_attention_layernorm|ffn_norm\b",                       "ffn_norm"),
-    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts)?(?:\.\d+)?[._]gate_proj\b|ffn_gate\b",            "ffn_gate"),
-    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts)?(?:\.\d+)?[._]up_proj\b|ffn_up\b",                "ffn_up"),
-    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts)?(?:\.\d+)?[._]down_proj\b|ffn_down\b",            "ffn_down"),
+    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts?)?(?:\.\d+)?[._]gate_proj\b|ffn_gate\b",            "ffn_gate"),
+    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts?)?(?:\.\d+)?[._]up_proj\b|ffn_up\b",                "ffn_up"),
+    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts?)?(?:\.\d+)?[._]down_proj\b|ffn_down\b",            "ffn_down"),
     (r"gate_up_proj|ffn_gate_up(?:_exps|_shexp)?\b",               "ffn_gate_up"),
     (r"ffn_gate(?:_exps|_shexp)\b",                                "ffn_gate"),
     (r"ffn_up(?:_exps|_shexp)\b",                                  "ffn_up"),
@@ -94,7 +101,9 @@ def fingerprint(names):
             # an expert rather than filing it under "unrecognised" and losing the MoE signal.
             (expert_roles if is_expert else unknown).add(clean)
             continue
-        (expert_roles if is_expert else roles).add(r)
+        # A router/gate is selection machinery, not an expert projection -- Qwen MoE writes
+        # `mlp.shared_expert_gate`, which reads as "expert" by name but belongs with the roles.
+        (expert_roles if (is_expert and r != "router") else roles).add(r)
         if tail.endswith(".bias"):
             has_bias.add(r)
     return {"roles": roles, "expert_roles": expert_roles, "unknown": unknown,
@@ -126,6 +135,14 @@ FAMILIES = {
     # MLA + MoE: DeepSeek-V2/V3 and friends
     "deepseek-mla-moe": {"roles": MLA_ATTN | {"router"}, "biases": set(),
                          "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
+    # Hybrid: gated-linear-attention blocks interleaved with ordinary attention, MoE FFN.
+    # Qwen3.5 (qwen3_5_moe, e.g. Nex-N2.5-mini). ik_llama already implements the delta-net / KDA
+    # state path, so this is a family to match against, not an exotic to refuse.
+    "qwen3.5-hybrid-moe": {"roles": MOE_CORE | {"attn_q_norm", "attn_k_norm",
+                                                "lin_in", "lin_conv", "lin_decay", "lin_norm",
+                                                "lin_out"},
+                           "biases": set(), "moe": True,
+                           "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
     # + the DeepSeek-V3.2 lightning indexer (GLM-5.3 glm_moe_dsa, Tencent hy_v4)
     "dsa-mla-moe": {"roles": MLA_ATTN | {"router", "attn_indexer"}, "biases": set(),
                     "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
@@ -143,7 +160,12 @@ def twin(fp, hparams=None):
         missing = spec["roles"] - fp["roles"]
         extra = fp["roles"] - spec["roles"]
         bias_delta = spec["biases"] ^ (fp["biases"] & (spec["biases"] | fp["biases"]))
-        exp_delta = (spec.get("experts", set()) ^ fp["expert_roles"]) if spec.get("moe") else set()
+        # a fused ffn_gate_up expert is the same computation as separate gate+up -- treat it as both
+        got_exp = set(fp["expert_roles"])
+        if "ffn_gate_up" in got_exp:
+            got_exp |= {"ffn_gate", "ffn_up"}
+            got_exp.discard("ffn_gate_up")
+        exp_delta = (spec.get("experts", set()) ^ got_exp) if spec.get("moe") else set()
         score = (len(missing) * 2 + len(extra) * 2 + len(bias_delta)
                  + len(exp_delta) * 2 + len(fp["unknown"]))
         if best_score is None or score < best_score:
