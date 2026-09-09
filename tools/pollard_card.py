@@ -87,7 +87,8 @@ def main():
     ap.add_argument("--params", help="param count, e.g. 2.5B (else estimated from config)")
     ap.add_argument("--license", dest="license_", help="license (else from base config)")
     ap.add_argument("--lane", help="only this lane's builds")
-    ap.add_argument("--results", help="JSON: {file_or_tag: {ppl, kld, note}} + optional {_eval, _f16_ppl}")
+    ap.add_argument("--results", help="JSON: {file_or_tag: {ppl, kld, tps, note}} + optional "
+                    "{_eval, _f16_ppl, _hw}. `tps` adds a tok/s column; `_hw` names the machine.")
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
@@ -160,11 +161,24 @@ def main():
     out += [f"## Available files{(' (' + eval_str + ')') if eval_str else ''}", ""]
     if f16_ppl:
         out.append(f"_f16 reference PPL {f16_ppl}._\n")
-    out += ["| file | PPL | size | Mean KLD | notes |", "|---|---:|---:|---:|---|"]
+    # tok/s is a column people actually shop on, and the table had no way to carry it -- so every
+    # generated card was silently speed-less no matter what had been measured. Shown only when at
+    # least one rung reports it, so cards without speed data do not grow an empty column.
+    has_tps = any((results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("tps")
+                  for b in builds)
+    tps_h = " tok/s |" if has_tps else ""
+    tps_s = "---:|" if has_tps else ""
+    out += [f"| file | PPL | size |{tps_h} Mean KLD | notes |", f"|---|---:|---:|{tps_s}---:|---|"]
     for b in sorted(builds, key=lambda x: (x.get("bytes") or 0)):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
-        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} | "
+        tps_c = f" {r.get('tps','—')} |" if has_tps else ""
+        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{r.get('kld','—')} | {r.get('note', b.get('tag',''))} |")
+    if has_tps:
+        hw = results.get("_hw")
+        out.append("")
+        out.append(f"_tok/s measured on {hw}._" if hw else
+                   "_tok/s is hardware-specific; the machine it was measured on is stated in the errata._")
     if not results:
         out.append("")
         out.append("_PPL / Mean-KLD benchmarking pending — sizes and allocation are final._")
