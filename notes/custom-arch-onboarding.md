@@ -57,6 +57,19 @@ The arch-agnostic work pays off here — these needed **no** Spark-specific hack
 | **MLX** | ⚠️ code-ready, but MLX conversion needs the arch supported inside `mlx_lm` — a truly custom block may not convert until mlx_lm (or a community port) adds it. Try it; if `convert` errors on the arch, that's an mlx_lm gap, not ours. |
 | **EXL3** | ❌ exllamav3 doesn't know `spark2_5` yet — skip until upstream adds it (don't force a recipe). |
 
+## Platform gotcha: a custom pre-tokenizer can break one OS only
+
+A new architecture usually ships a new pre-tokenizer regex, and llama.cpp only hand-codes a splitter for
+regexes it recognizes — anything else falls through to `std::regex`, whose Unicode-property support is
+**platform-dependent**. K2-Horizon hit exactly this: its `\p{L}`/`\p{M}` regex loads fine on macOS
+(libc++) and fails with `regex_error(error_escape)` on Windows (MSVC), so the same GGUF built on one
+machine could not be quantized *or* evaluated on the other. Full write-up and a ready patch:
+[`k2-horizon-msvc-regex.md`](k2-horizon-msvc-regex.md) · [`k2-horizon-msvc-regex.patch`](k2-horizon-msvc-regex.patch).
+
+When onboarding an arch, load a tiny GGUF of it on **every** OS you build on before trusting the toolchain
+— and keep a known-good model of a *different* arch as the control, so you can tell "this tokenizer is
+unsupported here" apart from "this build is broken."
+
 ## Verify, always
 Custom code + custom attention means the reconstruction check matters more, not less: gate every build
 with `pollard-verify` (decode-vs-source + end-to-end forward) and, on the served side, `pollard-serve-eval`.
