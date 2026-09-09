@@ -30,6 +30,17 @@ import sys
 # One vocabulary both naming conventions collapse into. Anything unmatched is kept verbatim so a
 # genuinely novel tensor shows up as a difference instead of being silently dropped.
 _ROLE_PATTERNS = [
+    # --- MLA (DeepSeek-V2/V3 latent attention, and the GLM/Hy DSA descendants) -------------------
+    # Tried first: `q_a_proj` must not be captured by the plain `q_proj` matcher below.
+    (r"(?:self_attn|attn)[._]q_a_proj\b|attn_q_a\b",              "attn_q_a"),
+    (r"(?:self_attn|attn)[._]q_b_proj\b|attn_q_b\b",              "attn_q_b"),
+    (r"(?:self_attn|attn)[._]q_a_layernorm\b|attn_q_a_norm\b",    "attn_q_a_norm"),
+    (r"(?:self_attn|attn)[._]kv_a_proj_with_mqa\b|attn_kv_a_mqa\b", "attn_kv_a"),
+    (r"(?:self_attn|attn)[._]kv_b_proj\b|attn_kv_b\b",            "attn_kv_b"),
+    (r"(?:self_attn|attn)[._]kv_a_layernorm\b|attn_kv_a_norm\b",  "attn_kv_a_norm"),
+    (r"(?:self_attn|attn)[._]indexer[._]|attn_indexer",            "attn_indexer"),
+    (r"(?:self_attn|attn)[._]linear_gate\b",                       "attn_gate"),
+    # --- standard attention ----------------------------------------------------------------------
     (r"(?:self_attn|attn)[._](?:q_proj|q)\b",                     "attn_q"),
     (r"(?:self_attn|attn)[._](?:k_proj|k)\b",                     "attn_k"),
     (r"(?:self_attn|attn)[._](?:v_proj|v)\b",                     "attn_v"),
@@ -39,9 +50,9 @@ _ROLE_PATTERNS = [
     (r"(?:self_attn|attn)[._][a-z_]*g_proj\b|attn_gate\b",         "attn_gate"),
     (r"input_layernorm|attn_norm\b",                               "attn_norm"),
     (r"post_attention_layernorm|ffn_norm\b",                       "ffn_norm"),
-    (r"(?:mlp|feed_forward)[._]gate_proj\b|ffn_gate\b",            "ffn_gate"),
-    (r"(?:mlp|feed_forward)[._]up_proj\b|ffn_up\b",                "ffn_up"),
-    (r"(?:mlp|feed_forward)[._]down_proj\b|ffn_down\b",            "ffn_down"),
+    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts)?(?:\.\d+)?[._]gate_proj\b|ffn_gate\b",            "ffn_gate"),
+    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts)?(?:\.\d+)?[._]up_proj\b|ffn_up\b",                "ffn_up"),
+    (r"(?:mlp|feed_forward|block_sparse_moe)(?:\.experts|\.shared_experts)?(?:\.\d+)?[._]down_proj\b|ffn_down\b",            "ffn_down"),
     (r"gate_up_proj|ffn_gate_up(?:_exps|_shexp)?\b",               "ffn_gate_up"),
     (r"ffn_gate(?:_exps|_shexp)\b",                                "ffn_gate"),
     (r"ffn_up(?:_exps|_shexp)\b",                                  "ffn_up"),
@@ -96,6 +107,9 @@ def fingerprint(names):
 DENSE_CORE = {"attn_q", "attn_k", "attn_v", "attn_out", "attn_norm",
               "ffn_gate", "ffn_up", "ffn_down", "ffn_norm"}
 MOE_CORE = {"attn_q", "attn_k", "attn_v", "attn_out", "attn_norm", "ffn_norm", "router"}
+# MLA: latent q/kv projections replace q/k/v entirely (deepseek_v2/v3, glm4_moe, glm_moe_dsa, hy_v4)
+MLA_ATTN = {"attn_q_a", "attn_q_b", "attn_q_a_norm", "attn_kv_a", "attn_kv_b",
+            "attn_kv_a_norm", "attn_out", "attn_norm", "ffn_norm"}
 FAMILIES = {
     "llama":     {"roles": DENSE_CORE, "biases": set(), "moe": False},
     "qwen2":     {"roles": DENSE_CORE, "biases": {"attn_q", "attn_k", "attn_v"}, "moe": False},
@@ -106,6 +120,15 @@ FAMILIES = {
                   "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
     "llama-moe": {"roles": MOE_CORE, "biases": set(),
                   "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
+    # MLA, dense FFN (rare but real)
+    "mla-dense": {"roles": MLA_ATTN | {"ffn_gate", "ffn_up", "ffn_down"}, "biases": set(),
+                  "moe": False},
+    # MLA + MoE: DeepSeek-V2/V3 and friends
+    "deepseek-mla-moe": {"roles": MLA_ATTN | {"router"}, "biases": set(),
+                         "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
+    # + the DeepSeek-V3.2 lightning indexer (GLM-5.3 glm_moe_dsa, Tencent hy_v4)
+    "dsa-mla-moe": {"roles": MLA_ATTN | {"router", "attn_indexer"}, "biases": set(),
+                    "moe": True, "experts": {"ffn_gate", "ffn_up", "ffn_down"}},
 }
 
 
