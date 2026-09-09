@@ -60,3 +60,37 @@ than the quantization). Two things the contract should say explicitly, both meas
 - Kimi-K3 routing profile: out of reach even for this cluster (5.5T parameters; a 2-bit build exceeds the pool's 1.2 TB, so
   only NVMe-streamed capture at a fraction of a token/s). The next same-class dataset we can produce is Hy4-preview (770B/49B
   active, 256 experts, DSA + MLA, hyperconnections) — a second 750B-class family for the routing/outlier tables.
+
+## 6. The EXL3 lane, measured end to end on GLM-5.3 (2026-09-08)
+
+The 3.2 bpw EXL3 body from the band-parallel run (`-b 3.2 -hb 6 -mb 8 -hq`, exllamav3's budgeted allocator, SmoothQuant folded,
+our 384 × 2048 in-domain rows) served on **four** GB10 nodes at TP4, against the same model's Pollard-method GPTQ int4/int8 build
+on **eight** nodes. Same probes, same day, same fleet. (The serving side needed the runtime fixes described in the companion
+serving-gotchas note before any of this could be read.)
+
+| | EXL3 3.2 bpw, 4 nodes | GPTQ int4 experts / int8 attention, 8 nodes |
+|---|---|---|
+| artifact | 292 GB, 3.21 bpw | 396 GB, experts 4.25 bpw |
+| live perplexity, 6 fixed held-out texts (4,079 tokens) | **4.831** | 4.82 – 4.84 |
+| HumanEval / HumanEval+ pass@1 (greedy, EvalPlus) | 0.957 / 0.927 | 0.963 / 0.945 |
+| MBPP / MBPP+ pass@1 | **0.979 / 0.841** | 0.971 / 0.828 |
+| correctness probe (5 checks incl. 4- and 8-way concurrent) | all passed | all passed |
+| speculative draft | in-checkpoint MTP layer, EXL3 8-bit, k=3: **2.23 accepted/step**, 74 % draft accept | separate GPTQ int8 layer-78 draft, k=5: 1.58 – 1.84 |
+| single-stream decode, mixed workload | 24.0 tok/s | 40.0 tok/s |
+| 4-stream aggregate | 58.2 tok/s (14.6 per node) | 85.2 tok/s (10.7 per node) |
+| KV | fp8, 396K tokens at gmu 0.84 (nvfp4 unsupported by the EXL3 sparse-MLA runtime) | nvfp4, 900K at gmu 0.81 |
+
+Readings for the lane:
+- **Quality parity at 25 % fewer bits per expert weight and half the nodes.** Perplexity equal to the second decimal; HumanEval+
+  −1.8 points; MBPP+ +1.3 points. This is the allocator's own allocation with no hand-tiered recipe, i.e. the configuration your
+  measurement said wins; on this model it holds at 744B.
+- **The allocator's depth heuristic is still wrong here, and it did not matter for these gates.** §F3 of the data note showed the
+  measured per-layer error peaking mid-stack (28 dB at layers 32–49 vs 35–38 dB elsewhere at 3 bits) while the allocator spends its
+  extra bit at the ends. The budget-neutral second pass (`exl3_depth_recipe.py plan`: 19 moves, 0 bytes, predicted −25 % output
+  noise) is therefore optional for quality on GLM-5.3. It remains the cleanest experiment on measured-vs-heuristic allocation at
+  fixed size; we will run it if a fleet window opens, and report either way.
+- **The in-checkpoint MTP layer at 8 bits is the best draft we have measured on any body** (2.23 accepted/step at k=3). Quantizing the
+  draft with the body, by the same method, beats a separately quantized draft — consistent with §5.
+- **Per-node efficiency favours the 3-bit lane** (+37 % aggregate tokens per node); absolute single-stream speed favours more nodes.
+- Practical: exllamav3 pads `out_features` to multiples of 128 and stores the MTP side model with an index that can point at the
+  wrong shard; both cost us boots and are written up, with the fixes, in the serving-gotchas note and `tools/exl3_fix_mtp_ehproj.py`.
