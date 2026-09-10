@@ -37,6 +37,68 @@ from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
 from pollard_fit import LADDER, PRESET, IMATRIX_REQUIRED_PRESETS, BPW
 
 
+def imatrix_datasets(path):
+    """The corpus paths recorded inside an imatrix, or [] if it does not say.
+
+    llama-imatrix stores `imatrix.datasets` in the GGUF-format matrix, so the matrix itself knows
+    what it was calibrated on. That is what makes the overlap check below exact rather than a guess.
+    """
+    try:
+        import gguf
+        f = gguf.GGUFReader(path).fields.get("imatrix.datasets")
+        if not f:
+            return []
+        out = []
+        for i in range(len(f.data)):
+            try:
+                out.append(bytes(f.parts[f.data[i]]).decode("utf-8", "replace"))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+
+def warn_if_eval_overlaps_calib(imatrix_path, eval_path):
+    """Refuse to let the corpus that BUILT the quant also MEASURE it.
+
+    If the same text drives the imatrix and the eval, the measurement agrees with the error: a bad
+    allocation scores well because it was tuned on the very lines it is graded on. The docstring has
+    always said "held-out"; this checks it. Returns True when an overlap was found.
+    """
+    ds = imatrix_datasets(imatrix_path)
+    ev = os.path.abspath(eval_path)
+    hit = None
+    for d in ds:
+        if os.path.abspath(d) == ev or os.path.basename(d) == os.path.basename(ev):
+            hit = d
+            break
+    if hit is None and ds:                     # different names: compare content, cheaply
+        try:
+            with open(ev, "r", encoding="utf-8", errors="ignore") as fh:
+                ev_lines = {ln.strip() for ln in fh if len(ln.strip()) > 40}
+            for d in ds:
+                if not os.path.exists(d):
+                    continue
+                with open(d, "r", encoding="utf-8", errors="ignore") as fh:
+                    cal = {ln.strip() for ln in fh if len(ln.strip()) > 40}
+                if ev_lines and len(ev_lines & cal) / len(ev_lines) > 0.10:
+                    hit = f"{d} (content overlap)"
+                    break
+        except Exception:
+            pass
+    if hit:
+        print("=" * 78)
+        print("WARNING: the eval corpus overlaps the imatrix calibration.")
+        print(f"  imatrix was calibrated on : {hit}")
+        print(f"  --eval                    : {eval_path}")
+        print("  Sensitivity measured this way is optimistic: the allocation is being graded on the")
+        print("  text it was tuned on, so a bad allocation can still score well. Use a held-out")
+        print("  corpus -- `pollard-calib --held-out calib.heldout.txt` writes a disjoint one.")
+        print("=" * 78)
+    return bool(hit)
+
+
 def _kl(ppl, model, eval_f, base, rpc=None, ngl=99):
     """Mean KL-divergence of `model` vs the base logits, or None on failure.
     `rpc` (host:port[,host:port…]) pools RPC nodes so a model too big for one box
@@ -121,6 +183,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--gguf", required=True, help="source GGUF (f16/bf16)")
     ap.add_argument("--imatrix", required=True, help="importance matrix (llama-imatrix)")
+    ap.add_argument("--allow-eval-overlap", action="store_true",
+                    help="measure even when the eval corpus overlaps the imatrix calibration. The "
+                         "result is optimistic -- the allocation is graded on the text it was tuned "
+                         "on -- so this is for deliberate experiments only.")
+    ap.add_argument("--yes", action="store_true", help="warn about an overlapping eval but continue")
     ap.add_argument("--eval", required=True, help="held-out eval text (disjoint from imatrix)")
     ap.add_argument("--out", help="profile path (default: <gguf>.sensitivity.json)")
     ap.add_argument("--groups", default="ffn,attn",
@@ -149,6 +216,12 @@ def main():
                     help="force the sweep on a DENSE model (it's the MoE tool; dense doesn't "
                          "benefit and this is a multi-hour sweep). Research only.")
     a = ap.parse_args()
+
+    # The measurement must not be graded on the text it was tuned on. Checked, not just documented.
+    if not a.allow_eval_overlap:
+        if warn_if_eval_overlaps_calib(a.imatrix, a.eval) and not a.yes:
+            sys.exit("refusing to measure sensitivity on the calibration corpus. Pass a held-out "
+                     "--eval, or --allow-eval-overlap if you really mean it.")
 
     a.llama_quantize = find_llama_bin(a.llama_quantize)
     a.llama_perplexity = find_llama_bin(a.llama_perplexity)

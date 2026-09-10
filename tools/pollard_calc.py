@@ -191,9 +191,10 @@ def _read_one_gguf(path):
         # for ANY architecture (LLM, DiT, VAE...) with no key conventions.
         total_params = 0
         dcounts = {}
+        tnames = []
         try:
             for _ in range(n_tensors):
-                rd_str()  # tensor name
+                tnames.append(rd_str())  # tensor name — the model's real layout, free while we're here
                 nd, = struct.unpack("<I", f.read(4))
                 dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
                 dt, = struct.unpack("<I", f.read(4)); f.read(8)  # ggml dtype + offset
@@ -204,6 +205,7 @@ def _read_one_gguf(path):
                 total_params += n
         except Exception:
             total_params = None  # malformed tail: key-based analysis only
+    meta["_tensor_names"] = tnames
     return meta, total_params, dcounts
 
 
@@ -375,6 +377,15 @@ def analyse(cfg):
     # kv_heads*head_dim — the difference between "needs 256 GB" and "fits a Spark".
     kv_lora_rank = first(cfg, "kv_lora_rank", default=0) or 0
     qk_rope_head_dim = first(cfg, "qk_rope_head_dim", default=0) or 0
+    # DeepSeek Sparse Attention (DeepSeek-V3.2, GLM-5.3 `glm_moe_dsa`, Tencent Hy4 `hy_v4`): a "lightning indexer" keeps
+    # its own per-token key cache (index_head_dim per layer) NEXT to the MLA latent. Measured on GLM-5.3 (78 layers,
+    # index_head_dim 128): 41 KB/token with an NVFP4 latent vs the 22 KB the latent alone predicts — the indexer cache is
+    # about half the KV bytes on these models, and it is not compressed by the latent's quant. Layers with
+    # indexer_types == "shared" (Hy4: 57 of 78) reuse a previous layer's top-k and keep no cache of their own.
+    index_head_dim = first(cfg, "index_head_dim", default=0) or 0
+    idx_types = cfg.get("indexer_types")
+    n_indexer = (sum(1 for t in idx_types if str(t) != "shared") if isinstance(idx_types, list)
+                 else (layers if index_head_dim else 0))
 
     n_experts = first(cfg, "num_experts", "n_routed_experts",
                       "num_local_experts", "moe_num_experts")
@@ -452,6 +463,7 @@ def analyse(cfg):
         "kv_heads": kv_heads, "head_dim": head_dim,
         "mla": kv_lora_rank > 0, "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "index_head_dim": index_head_dim, "n_indexer": n_indexer,   # DSA indexer key cache (0 when absent)
     }
 
 
@@ -460,9 +472,15 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
     compressed latent per token/layer (tiny); hybrid models only grow KV on their
     full-attention layers. kv_bytes: 2 = f16 cache (default), 1 = q8_0, ~0.56 = q4."""
     n_attn = a.get("n_full") or a["layers"]                 # linear layers barely grow KV
+    # DSA indexer key cache: index_head_dim per token on every layer that runs its own indexer. Not compressed by the
+    # NVFP4 latent path (bf16 keys), fp8/f16 otherwise — GLM-5.3 measured: 41 KB/tok nvfp4, 57 KB fp8 (latent-only
+    # model: 22 / 45 KB). Anything below 1 byte/elem for the latent still costs ~2 bytes/elem here.
+    idx = 0.0
+    if a.get("index_head_dim") and a.get("n_indexer"):
+        idx = a["n_indexer"] * ctx * a["index_head_dim"] * (kv_bytes if kv_bytes >= 1.0 else 2.0)
     if a.get("mla") and a.get("kv_lora_rank"):
         per_tok_layer = a["kv_lora_rank"] + (a.get("qk_rope_head_dim") or 0)
-        return n_attn * ctx * per_tok_layer * kv_bytes      # MLA: single latent, no K/V split
+        return n_attn * ctx * per_tok_layer * kv_bytes + idx   # MLA: single latent, no K/V split (+ indexer cache)
     kvh, hd = a.get("kv_heads") or 0, a.get("head_dim") or 0
     return 2 * n_attn * ctx * kvh * hd * kv_bytes           # GQA/MHA: K and V
 
@@ -470,11 +488,28 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
 # per-card VRAM (GB) for the --gpu convenience; anything not listed, pass GB directly
 _GPU_VRAM = {"3050": 8, "3060": 12, "3060ti": 8, "3070": 8, "3080": 10, "3090": 24,
              "4050": 6, "4060": 8, "4060ti": 16, "4070": 12, "4080": 16, "4090": 24,
-             "5060": 8, "5070": 12, "5080": 16, "5090": 32, "a4000": 16, "a5000": 24,
+             "5060": 8, "5070": 12, "5070ti": 16, "5080": 16, "5090": 32,
+             "a4000": 16, "a5000": 24,
              "a6000": 48, "rtx6000": 48, "rtx6000pro": 96,
              "6000pro": 96, "a40": 48, "l40": 48, "l40s": 48, "v100": 32, "a100": 80,
              "h100": 80, "h200": 141, "b100": 192, "b200": 192, "mi300x": 192,
              "spark": 128, "gb10": 128, "m4max": 128, "m3ultra": 512}
+
+
+def detect_gpu_gb():
+    """Total VRAM across the local NVIDIA cards, from nvidia-smi. None if it cannot be read.
+
+    A name table can only ever cover the cards someone thought to list. Detection covers the card
+    the user actually owns -- including the ones we got wrong ourselves (this box is a 5070 Ti with
+    16 GB, and was budgeted as a 32 GB 5090 for a whole week)."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        total = sum(int(x) for x in out.replace(",", " ").split() if x.strip().isdigit())
+        return total / 1024 if total else None
+    except Exception:
+        return None
 
 
 def parse_gpu(spec):
@@ -482,6 +517,8 @@ def parse_gpu(spec):
     name or GB, right = count). Plain number or a bare card name = that much. None if
     unparseable — so any stack of any card works, not a fixed menu."""
     s = spec.lower().replace(" ", "")
+    if s == "auto":                             # read the card that is actually installed
+        return detect_gpu_gb()
     if s in _GPU_VRAM:                          # bare card name (may contain 'x': rtx…)
         return _GPU_VRAM[s]
     try:
@@ -576,11 +613,17 @@ def gb(nbytes):
 #   * GPTQ: Qwen2.5-0.5B = ~9 min on a 5090 (fast box) -> a Spark-class ~0.5 h/B
 #   * GGUF ladder + EXL3: a same-bit GGUF 2-6bit ladder of glm-flash ~1-2 h on ONE Spark, while
 #     EXL3 of ONE 2-bit output takes ~34 h on ONE Spark (community datapoint) -> EXL3 ~20-30x GGUF.
+#   * MEASURED 2026-09 on GLM-5.3 (744B MoE, 78 layers, 384 x 2048 calibration rows), GB10 nodes:
+#       GPTQ (Pollard-method Hessian, int4 experts / int8 attention): ~20 node-hours  -> 0.027 h/B (total params)
+#       EXL3 (exllamav3 budgeted allocator, -b 3.2 -hq, one bpw): ~66 GPU-hours (~50 min per MoE layer, ~4 min dense)
+#                                                                    -> 0.09 h/B — consistent with the 320B 2-bit datapoint
+#                                                                       above (34 h / 320B = 0.11), so the old 3.0 was ~30x high.
+#     Both scale with TOTAL params (every expert is solved), band-parallel across nodes divides wall-clock by node count.
 _BUILD_RATE = {   # format: (basis, hours_per_billion_params_on_a_GB10_class_box)
     "gguf": ("active", 0.12),   # imatrix pass + the 2-6bit K-quant ladder (imatrix is active-bound)
-    "gptq": ("total",  0.5),    # per-layer Hessian + error-feedback solve over the whole model
+    "gptq": ("total",  0.03),   # per-layer Hessian + error-feedback solve over the whole model (measured 744B: 20 node-h)
     "mlx":  ("total",  0.05),   # group quant, no calib forward — the cheap lane
-    "exl3": ("total",  3.0),    # trellis optimization per tensor, ONE target bpw — the heavy lane
+    "exl3": ("total",  0.09),   # trellis optimization per tensor, ONE target bpw (measured 744B: 66 GPU-h; 320B: 34 h)
 }
 
 
@@ -732,9 +775,10 @@ def main():
                         "size + total RAM-to-run + device fit (e.g. --ctx 262144 for 256k)")
     p.add_argument("--kv-quant", default="f16", choices=["f16", "q8", "q4", "nvfp4"],
                    help="KV cache precision for the --ctx estimate (default f16; nvfp4 = Blackwell 4-bit KV)")
-    p.add_argument("--gpu", help="your rig for the fit verdict: total VRAM GB, a card "
-                                 "name, or CARDxCOUNT — e.g. '96', '5090x4', '3090x8', "
-                                 "'rtx6000prox2'. Any stack of any card.")
+    p.add_argument("--gpu", help="your rig for the fit verdict: 'auto' to read the installed "
+                                 "card from nvidia-smi, total VRAM GB, a card name, or "
+                                 "CARDxCOUNT — e.g. 'auto', '96', '16x2', '5090x4', "
+                                 "'rtx6000prox2'. Any card, listed or not: pass GB.")
     p.add_argument("--device", default="gpu", choices=["gpu", "unified", "mac", "phone"],
                    help="what --gpu's number is: dedicated 'gpu' VRAM (~94%% usable, "
                         "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% — the OS "
@@ -792,7 +836,18 @@ def main():
         if a.gpu:
             rig_gb = parse_gpu(a.gpu)
             if rig_gb is None:
-                print(f"(could not parse --gpu '{a.gpu}'; skipping the rig verdict)")
+                # The name table only knows the cards someone listed. Never leave a user with an
+                # unlisted card (AMD, Intel, a new SKU) staring at a dropped verdict -- tell them
+                # the two ways in that always work.
+                det = detect_gpu_gb()
+                if det:
+                    rig_gb = det
+                    print(f"(--gpu '{a.gpu}' not in the card table; detected {det:.0f} GB "
+                          f"of local VRAM instead)")
+                else:
+                    print(f"(could not parse --gpu '{a.gpu}' -- it is not in the card table. "
+                          f"Pass VRAM in GB instead, e.g. --gpu 16 or --gpu 16x2, or --gpu auto "
+                          f"to read it from nvidia-smi. Skipping the rig verdict.)")
         if rig_gb is None and a.ram:                      # no discrete card given -> the user's own --ram
             rig_gb = float(a.ram)                          # is the rig (unified memory: Spark/Mac/pooled)
         fit_report(arch, arch["total"] * qbits / 8 / 1e9, a.ctx, kv_bytes, a.kv_quant,

@@ -22,7 +22,15 @@ import sys
 
 # Pollard's arch-agnostic matchers (kept in sync with pollard_export).
 ATTN_PROJ = r"self_attn\.[a-z_]*proj[a-z0-9_]*"
-FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.\d+)?\.(?:gate|up|down)_proj"
+FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.(?:\d+|N))?\.(?:gate|up|down)_proj"   # N = collapsed layer/expert index (tensor_patterns)
+# DeepSeek-V3.2-family additions (GLM-5.3 `glm_moe_dsa`, Tencent Hy4 `hy_v4`), measured on 744B/750B checkpoints 2026-09:
+FUSED_EXPERTS = r"\.experts\.(?:gate_up_proj|down_proj|gate_proj|up_proj)$"   # stacked [E, ...] tensors, no per-expert index
+SHARED_EXPERTS = r"\.shared_experts\.(?:gate|up|down)_proj"
+ROUTER = r"\.mlp\.gate$"                                   # router weight (`mlp.gate.weight`) — protect, do not quantize
+DSA_INDEXER = r"self_attn\.indexer\.(?:wq_b|wk|weights_proj|k_norm)"   # lightning-indexer projections (small; keep high)
+ATTN_GATE = r"self_attn\.(?:linear_gate|gate_proj)$"      # attention output gate (gated MLA) — treat like a router
+MTP_PREFIX = r"^model\.mtp_layers\.N\."                   # MTP side model stored outside model.layers
+MTP_GLUE = r"\.(?:eh_proj|enorm|hnorm|shared_head\.norm|final_layernorm)$"   # MTP projection + norms: keep bf16 (vLLM builds eh_proj unquantized)
 KNOWN_TYPES = {"llama", "qwen2", "qwen3", "mistral", "mixtral", "gemma", "gemma2", "gemma3",
                "phi3", "deepseek_v2", "deepseek_v3", "glm4", "glm4_moe", "cohere", "starcoder2"}
 
@@ -67,15 +75,30 @@ def audit(model_id):
                 "custom_code": custom, "known_type": known, "n_tensor_patterns": len(pats)}
 
     covered, unmatched, flags = [], [], []
+    fused = bool([p for p in pats if re.search(FUSED_EXPERTS, p)])   # fused expert tensors carry no ".weight" suffix
     for p in weight_pats:
         body = p[:-len(".weight")]
-        if re.search(ATTN_PROJ, body) or re.search(FFN_PROJ, body) or \
+        if re.search(ATTN_PROJ, body) or re.search(FFN_PROJ, body) or re.search(SHARED_EXPERTS, body) or \
+           re.search(DSA_INDEXER, body) or re.search(ATTN_GATE, body) or re.search(ROUTER, body) or re.search(MTP_GLUE, body) or \
            re.search(r"(input_layernorm|post_attention_layernorm|\bnorm\b|layernorm)", body):
             covered.append(p)
         elif "embed" in body or body.endswith("lm_head"):
             covered.append(p)                                   # vocab carriers (handled generically)
         else:
             unmatched.append(p)
+    if fused:
+        flags.append("FUSED EXPERTS: routed experts stored as stacked tensors (`experts.gate_up_proj` [E, 2I, H], "
+                     "`experts.down_proj` [E, H, I]) — per-expert lanes must slice dim 0; FFN_PROJ never matches them")
+    if any(re.search(DSA_INDEXER, p) for p in weight_pats):
+        flags.append("DSA sparse-attention indexer (wq_b/wk/weights_proj/k_norm) — small, keep at high precision; "
+                     "its per-layer key cache adds to KV bytes (pollard-calc accounts for it via index_head_dim)")
+    if any(re.search(ATTN_GATE, p) for p in weight_pats):
+        flags.append("gated attention output (linear_gate/gate_proj under self_attn) — protect like a router")
+    if any(re.search(MTP_PREFIX, p) for p in pats):
+        flags.append("MTP side model under `model.mtp_layers.N.*` (not `model.layers.<last+1>`) — separate prefix for export/skip rules")
+    if any(".hc_" in p or "hc_head" in p for p in pats):
+        flags.append("hyperconnections (hc_*): the residual is hc_mult streams — activation memory and band hand-off scale by hc_mult; "
+                     "hc tensors are tiny, keep fp32/bf16")
     # heuristic flags for the onboarder
     if any("self_attn" in p and re.search(r"\bg_proj\b|gate", p) for p in weight_pats):
         flags.append("attention output GATE present (protect it high — like a router)")

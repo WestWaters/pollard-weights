@@ -69,6 +69,96 @@ def _run(cmd, do_run, cwd=None):
     return not do_run
 
 
+def _arch_name(gguf_path):
+    """The GGUF's `general.architecture` string, or None."""
+    try:
+        meta = read_gguf_meta(gguf_path)
+        for k in ("general.architecture", "architecture", "arch"):
+            v = meta.get(k) if isinstance(meta, dict) else None
+            if v:
+                return str(v)
+    except Exception:
+        pass
+    return None
+
+
+def _scan_for(path, needle):
+    """Substring search over a file, chunked, without loading it whole."""
+    try:
+        overlap = len(needle) - 1
+        prev = b""
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    return False
+                if needle in prev + chunk:          # `prev` carries the chunk boundary
+                    return True
+                prev = chunk[-overlap:] if overlap else b""
+    except Exception:
+        return False
+
+
+def _build_knows_arch(bin_dir, arch):
+    """Does this llama.cpp build know `arch`? Arch names are string literals in the arch table, which
+    lives in the SHARED LIBRARY (llama.dll / libllama.so), not the CLI executable — scanning only the
+    exe reports false negatives for architectures the build genuinely supports. So scan the whole bin
+    directory. Returns True/False, or None when the directory is missing/unreadable."""
+    if not arch or not bin_dir or not os.path.isdir(bin_dir):
+        return None
+    needle = arch.encode()
+    try:
+        files = [os.path.join(bin_dir, n) for n in os.listdir(bin_dir)]
+    except OSError:
+        return None
+    files = [p for p in files if os.path.isfile(p)]
+    if not files:
+        return None
+    return any(_scan_for(p, needle) for p in files)
+
+
+def lane_report(gguf_path, ik_bin_dir=None):
+    """Autoaware lane availability: the trellis FLAGSHIP needs ik_llama.cpp, and ik_llama only
+    builds architectures it knows. Say so BEFORE planning a flagship that cannot build, and say
+    exactly what is missing so it can be ported instead of silently downgraded."""
+    arch = _arch_name(gguf_path)
+    if not arch:
+        return None
+    known = None
+    for cand in ([ik_bin_dir] if ik_bin_dir else []) + [os.environ.get("IK_LLAMA_BIN")]:
+        known = _build_knows_arch(cand, arch)
+        if known is not None:
+            break
+    print(f"   arch: {arch}")
+    if known is None:
+        print("   trellis flagship: ik_llama.cpp build not found — set IK_LLAMA_BIN to enable the "
+              "IQ*_KT flagship (the K-quant ladder still runs).")
+    elif known:
+        print("   trellis flagship: available (ik_llama.cpp knows this arch)")
+    else:
+        print(f"   trellis flagship: UNAVAILABLE - ik_llama.cpp does not know '{arch}'.")
+        print( "     The K-quant ladder still runs and is honest; the flagship needs the arch ported.")
+        # Don't leave the user guessing how hard that port is -- fingerprint the layout and say so.
+        try:
+            from pollard_archfp import fingerprint, twin, report as fp_report
+            meta = read_gguf_meta(gguf_path)
+            names = meta.get("_tensor_names") or []
+            if names:
+                hp = {k: v for k, v in meta.items() if not k.startswith("_")}
+                res = twin(fingerprint(names), hp)
+                for line in fp_report(res).splitlines():
+                    print("     " + line)
+                if res["exact"]:
+                    print(f"     -> port it by giving ik_llama an arch enum + the name '{arch}' + the "
+                          f"{res['twin']} tensor map, and reusing its existing builder.")
+                else:
+                    print("     -> NOT a drop-in: the deltas above are real work, not a rename.")
+        except Exception as e:
+            print(f"     (layout fingerprint unavailable: {e})")
+        print( "     See notes/custom-arch-onboarding.md.")
+    return known
+
+
 def _automap_mix(a, is_moe):
     """Emit + (with --run) build the automap mix — the hand-coded mixed-precision flagship.
     MoE: expert-allocation (crush cold experts, protect router/down/shared/attn). DENSE: the
@@ -362,6 +452,7 @@ def main():
                         argv = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + \
                                ["--match-transformers", "off"]
                         env = dict(os.environ)
+                        env["POLLARD_AUTO"] = "1"   # silence pollard-fit's step-1 notice: we run the rest
                         env["PYTHONPATH"] = tdir + os.pathsep + env.get("PYTHONPATH", "")
                         sys.exit(subprocess.run(argv, env=env).returncode)
                     print("   [match-transformers] env setup failed — falling back to the current env")
@@ -391,6 +482,9 @@ def main():
     # show the size ladder so the user sees the shrink + can compare to NVFP4/Q4/etc.
     # (actual built size is reported by the build step; this is where Pollard will land)
     size_ladder((arch.get("total") or 0) / 1e9)
+
+    # Autoaware: which lanes are actually open for THIS architecture (never plan an impossible build)
+    lane_report(a.gguf, ik_bin_dir=getattr(a, "bin", None))
 
     # WINNING PATH — SAME shape for dense AND MoE (no losing fallback):
     #   (1) the imatrix K-quant ladder (pollard-fit) — the honest, fit-your-RAM baseline, and

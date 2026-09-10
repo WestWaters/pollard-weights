@@ -470,6 +470,20 @@ def main():
     print(f"\ndone: {out}")
     print("run it with stock llama.cpp / Ollama / LM Studio — it is a normal GGUF.")
 
+    # This build is STEP 1 of the gold recipe, not the whole thing. Say so, every time, unless the
+    # caller is pollard-auto (which runs the remaining steps itself). A ladder rung shipped as if it
+    # were the finished method is the single easiest mistake to make with this tool.
+    if not os.environ.get("POLLARD_AUTO"):
+        print("\n" + "=" * 72)
+        print("NOTE: this is the fit-your-RAM BASELINE — step 1 of the gold Pollard recipe.")
+        print("The full method is:  Calib 3.0 imatrix -> measured automap FLAGSHIP mix -> coherence gate")
+        print("Still to run for a gold build:")
+        print("  2. pollard-automap ...     the mixed-precision flagship (the winner; needs ik_llama.cpp")
+        print("                             for trellis IQ*_KT atoms)")
+        print("  3. pollard-bench --gguf <build> --coherence     is it actually usable?")
+        print("Or do all of it in one shot:  pollard --gguf <f16> --run")
+        print("=" * 72)
+
 
 if __name__ == "__main__":
     main()

@@ -61,7 +61,7 @@ than the quantization). Two things the contract should say explicitly, both meas
   only NVMe-streamed capture at a fraction of a token/s). The next same-class dataset we can produce is Hy4-preview (770B/49B
   active, 256 experts, DSA + MLA, hyperconnections) — a second 750B-class family for the routing/outlier tables.
 
-## 6. Serving the Pollard body on vLLM 0.29.0 + b12x, TP8 × 8 GB10 — deploy numbers (2026-09-09)
+## 7. Serving the Pollard body on vLLM 0.29.0 + b12x, TP8 × 8 GB10 — deploy numbers (2026-09-09)
 
 The Int4/Int8-mix GPTQ body from this method (experts int4 g128, attention/shared int8, 369 GB text-only repack) plus the
 int8-quantized MTP layer as a separate drafter, served on our vLLM 0.29.0 + b12x merge (fork `local-inference-lab/vllm` glue,
