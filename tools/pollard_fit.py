@@ -160,7 +160,7 @@ def _fill_noise(measured):
     return {t: est(t) for t in LADDER}
 
 
-def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False):
+def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False, tiers=None):
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
@@ -168,7 +168,14 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     is no imatrix-magnitude proxy: magnitude misranks (see e13), so without a
     measured profile we allocate uniformly rather than worse-than-uniform.
     Embeddings/output/norms are one 'other' group, kept high AND counted for size
-    (so the projection matches the real build). `overrides` is [(regex, type)]."""
+    (so the projection matches the real build). `overrides` is [(regex, type)].
+
+    `tiers` PINS a whole component class to one type -- {"attn": "q8_0"} keeps every attention
+    tensor at 8 bits regardless of what measurement says, reserves its bytes, and lets the rest of
+    the model compete for what is left. That is the axis a per-tensor allocator cannot express, and
+    it is how the vendor recipes are written (NVIDIA's Qwen3.8-27B-NVFP4: MLP at NVFP4, every
+    attention path at FP8, vision untouched). Pinning is a CONSTRAINT, not a measurement -- it says
+    "I want this guarantee, spend the remainder wisely" -- so the steering it frees is the point."""
     budget = ram_gb * 0.85 - reserve_gb
     if budget <= 0:
         sys.exit(f"ERROR: RAM budget {ram_gb}GB minus {reserve_gb}GB activation "
@@ -244,12 +251,34 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     # Embeddings/output kept at EMB_FLOOR (measured: keeping them high wins; they
     # carry the whole vocab). Reserve their size, allocate FFN+attn over the rest;
     # step emb down a rung only if the budget genuinely can't hold it.
-    emb_type = EMB_FLOOR
+    # A pinned class is removed from the contest and its bytes reserved up front, so the remaining
+    # budget is spent only where allocation still has a choice.
+    tiers = tiers or {}
+    pinned, pinned_gb = [], 0.0
+    if tiers:
+        keep_items, keep_meta = [], []
+        for (kind, pats), (params, imp) in zip(meta, items):
+            t = tiers.get(kind)
+            if t:
+                pinned += [(p, t) for p in pats]
+                pinned_gb += params * BPW[t] / 8 / 1e9
+            else:
+                keep_items.append((params, imp))
+                keep_meta.append((kind, pats))
+        items, meta = keep_items, keep_meta
+
+    emb_type = tiers.get("emb", EMB_FLOOR)
     while True:
         emb_gb = other * BPW[emb_type] / 8 / 1e9
-        res = _alloc_klaware(items, budget - emb_gb, noise, ladder)
+        if not items:                       # everything pinned: nothing left to allocate
+            res = ([], 0.0)
+            break
+        res = _alloc_klaware(items, budget - emb_gb - pinned_gb, noise, ladder)
         if res is not None:
             break
+        if tiers.get("emb"):
+            sys.exit(f"ERROR: --tier emb={emb_type} does not fit in {budget:.1f}GB. Drop the tier "
+                     f"or raise --ram.")
         ei = LADDER.index(emb_type)
         if ei + 1 < len(LADDER):
             emb_type = LADDER[ei + 1]                    # embeddings never go 1-bit
@@ -259,10 +288,10 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
             sys.exit(f"ERROR: cannot fit {total/1e9:.1f}B into {budget:.1f}GB even at "
                      f"the floor. pollard-calc will tell you the streaming tier.{hint}")
     types, alloc_gb = res
-    gb = alloc_gb + emb_gb
+    gb = alloc_gb + emb_gb + pinned_gb
 
     from collections import Counter
-    overrides, bulk_types = [], []
+    overrides, bulk_types = list(pinned), []
     for (kind, pats), t in zip(meta, types):
         overrides += [(p, t) for p in pats]
         if kind == "bulk":
@@ -270,6 +299,10 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     base_t = Counter(bulk_types).most_common(1)[0][0] if bulk_types else LADDER[0]
     c = Counter(bulk_types)
     summary = ", ".join(f"{n}L@{t}" for t, n in sorted(c.items(), key=lambda x: -BPW[x[0]]))
+    if tiers:
+        summary += "  [pinned: " + ", ".join(f"{k}={v}" for k, v in sorted(tiers.items())) + "]"
+    if not bulk_types:
+        base_t = tiers.get("bulk") or LADDER[0]
     return overrides, emb_type, gb, PRESET[base_t], (summary, src)
 
 
@@ -296,11 +329,30 @@ def main():
     ap.add_argument("--allow-grow", action="store_true",
                     help="permit a build LARGER than an already-quantized source "
                          "(normally refused — requantizing up only loses)")
+    ap.add_argument("--tier", action="append", default=[], metavar="CLASS=TYPE",
+                    help="pin a whole component class to one type instead of letting measurement "
+                         "decide it: attn / bulk / emb. e.g. --tier attn=q8_0 keeps every attention "
+                         "tensor at 8 bits, reserves its bytes, and spends the rest of the budget "
+                         "where allocation still has a choice. This is how the vendor recipes are "
+                         "written (NVIDIA NVFP4: MLP 4-bit, all attention FP8, vision untouched); "
+                         "it is a guarantee you are asking for, not a measurement. Repeatable.")
     ap.add_argument("--allow-1bit", action="store_true",
                     help="extend the floor to 1-bit (iq1_m/iq1_s) for models that won't "
                          "fit at iq2_xxs — heavy quality loss, but giant MoEs absorb it. "
                          "Only used where the budget forces it.")
     a = ap.parse_args()
+
+    tiers = {}
+    for spec in a.tier:
+        if "=" not in spec:
+            sys.exit(f"--tier wants CLASS=TYPE, got '{spec}' (classes: attn, bulk, emb)")
+        k, v = spec.split("=", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k not in ("attn", "bulk", "emb"):
+            sys.exit(f"--tier class must be attn, bulk or emb; got '{k}'")
+        if v not in BPW:
+            sys.exit(f"--tier type '{v}' is not a known quant type (see the ladder)")
+        tiers[k] = v
 
     if str(a.ram).lower() == "auto":
         avail = detect_available_ram_gb()
@@ -319,7 +371,7 @@ def main():
     arch = analyse(cfg)
     sensitivity = json.load(open(a.sensitivity)) if a.sensitivity else None
     overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
-        arch, a.ram, a.reserve, sensitivity, a.allow_1bit)
+        arch, a.ram, a.reserve, sensitivity, a.allow_1bit, tiers)
     if a.out:
         out = a.out
     else:
