@@ -61,36 +61,23 @@ than the quantization). Two things the contract should say explicitly, both meas
   only NVMe-streamed capture at a fraction of a token/s). The next same-class dataset we can produce is Hy4-preview (770B/49B
   active, 256 experts, DSA + MLA, hyperconnections) — a second 750B-class family for the routing/outlier tables.
 
-## 6. The EXL3 lane, measured end to end on GLM-5.3 (2026-09-08)
+## 7. Serving the Pollard body on vLLM 0.29.0 + b12x, TP8 × 8 GB10 — deploy numbers (2026-09-09)
 
-The 3.2 bpw EXL3 body from the band-parallel run (`-b 3.2 -hb 6 -mb 8 -hq`, exllamav3's budgeted allocator, SmoothQuant folded,
-our 384 × 2048 in-domain rows) served on **four** GB10 nodes at TP4, against the same model's Pollard-method GPTQ int4/int8 build
-on **eight** nodes. Same probes, same day, same fleet. (The serving side needed the runtime fixes described in the companion
-serving-gotchas note before any of this could be read.)
+The Int4/Int8-mix GPTQ body from this method (experts int4 g128, attention/shared int8, 369 GB text-only repack) plus the
+int8-quantized MTP layer as a separate drafter, served on our vLLM 0.29.0 + b12x merge (fork `local-inference-lab/vllm` glue,
+RoCE one-shot all-reduce, sparse-MLA/indexer kernels). Same mixed-workload bench as our production gate (300 s at concurrency 1
+and 4); correctness probes passed on every leg.
 
-| | EXL3 3.2 bpw, 4 nodes | GPTQ int4 experts / int8 attention, 8 nodes |
-|---|---|---|
-| artifact | 292 GB, 3.21 bpw | 396 GB, experts 4.25 bpw |
-| live perplexity, 6 fixed held-out texts (4,079 tokens) | **4.831** | 4.82 – 4.84 |
-| HumanEval / HumanEval+ pass@1 (greedy, EvalPlus) | 0.957 / 0.927 | 0.963 / 0.945 |
-| MBPP / MBPP+ pass@1 | **0.979 / 0.841** | 0.971 / 0.828 |
-| correctness probe (5 checks incl. 4- and 8-way concurrent) | all passed | all passed |
-| speculative draft | in-checkpoint MTP layer, EXL3 8-bit, k=3: **2.23 accepted/step**, 74 % draft accept | separate GPTQ int8 layer-78 draft, k=5: 1.58 – 1.84 |
-| single-stream decode, mixed workload | 24.0 tok/s | 40.0 tok/s |
-| 4-stream aggregate | 58.2 tok/s (14.6 per node) | 85.2 tok/s (10.7 per node) |
-| KV | fp8, 396K tokens at gmu 0.84 (nvfp4 unsupported by the EXL3 sparse-MLA runtime) | nvfp4, 900K at gmu 0.81 |
+| config | C1 tok/s | C4 tok/s | MTP accepted/step | notes |
+|---|---|---|---|---|
+| spec off, fp8 KV 600K | 24.1 | 58.4 | — | engine baseline |
+| + RoCE all-reduce | 32.4 | 67.5 | — | +34 % / +16 % |
+| + MTP k3 (int8 layer-78 drafter) | 49.8 | 85.3 | 1.82 (60.6 %) | the int8 drafter works natively |
+| + NVFP4 KV 900K + k5 schedule | 51.0 | 85.1 | 1.73 (63.6 %) | production shape; pool 1.04M tokens |
+| fp8 KV 600K variant | 43.8 prose | 86.1 | 1.74 | **prefill +11 %** (1007/942/902 tok/s at 42K/92K/132K vs 906/861/830 on NVFP4 KV) |
 
-Readings for the lane:
-- **Quality parity at 25 % fewer bits per expert weight and half the nodes.** Perplexity equal to the second decimal; HumanEval+
-  −1.8 points; MBPP+ +1.3 points. This is the allocator's own allocation with no hand-tiered recipe, i.e. the configuration your
-  measurement said wins; on this model it holds at 744B.
-- **The allocator's depth heuristic is still wrong here, and it did not matter for these gates.** §F3 of the data note showed the
-  measured per-layer error peaking mid-stack (28 dB at layers 32–49 vs 35–38 dB elsewhere at 3 bits) while the allocator spends its
-  extra bit at the ends. The budget-neutral second pass (`exl3_depth_recipe.py plan`: 19 moves, 0 bytes, predicted −25 % output
-  noise) is therefore optional for quality on GLM-5.3. It remains the cleanest experiment on measured-vs-heuristic allocation at
-  fixed size; we will run it if a fleet window opens, and report either way.
-- **The in-checkpoint MTP layer at 8 bits is the best draft we have measured on any body** (2.23 accepted/step at k=3). Quantizing the
-  draft with the body, by the same method, beats a separately quantized draft — consistent with §5.
-- **Per-node efficiency favours the 3-bit lane** (+37 % aggregate tokens per node); absolute single-stream speed favours more nodes.
-- Practical: exllamav3 pads `out_features` to multiples of 128 and stores the MTP side model with an index that can point at the
-  wrong shard; both cost us boots and are written up, with the fixes, in the serving-gotchas note and `tools/exl3_fix_mtp_ehproj.py`.
+Prose single-stream (10 prompts, 250 out, wall incl. TTFT): 42.8–43.8 tok/s; concurrency-8 aggregate 121–129 tok/s. Prefill is
+the remaining gap to the best community number on this hardware (~1.3–1.4K tok/s); it is kernel-bound (sparse-MLA/indexer prefill),
+not scheduler-bound — Marlin beats the Triton WNA16 MoE kernel on GB10 for both prefill and decode, and NCCL channel count,
+indexer budget, AOT compile and chunk size were all inert. Relevant to the method: the deploy math holds — the 3.2–3.4 bpw-class
+body with an int8 drafter gives a 51 tok/s single-stream assistant at 900K context on eight 128 GB nodes.

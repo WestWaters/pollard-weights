@@ -159,3 +159,43 @@ first bit is spent.
 *Disclosure per CONTRIBUTING: measurements were produced with the help of an AI assistant operating the cluster; the numbers
 above were read back from the raw capture files by the contributor and the harness code is ours, not Pollard's `e2` shim (the
 model does not run under llama.cpp on this cluster).*
+
+## 7. Live-serving routing capture (TP4, 388K real tokens) — addendum
+
+Section 1 measured routing on the calibration set. This is the same model routing **live traffic**: a sitecustomize hook on the
+router (per rank, TP4 EXL3 3.2 bpw serving of GLM-5.3 on 4 × GB10, spec decode off, `--enforce-eager`) recorded per-layer expert
+counts over 388,257 served tokens (agentic/tool, code, prose, long-context mix from our assistant's real sessions).
+Raw per-rank JSON + the analysis table are in `experiments/data/glm53_live_routing/`.
+
+Effective expert count `n_eff = 1/Σp²` and the share of routed mass held by the top-64 / top-128 experts, per router:
+
+```
+layer | decode tokens n_eff top64 top128 | prefill tokens n_eff top64 top128 | n_eff ratio decode/prefill
+                     router0 |         — |   388257   20.9  99.9% 100.0% | nan
+                     router1 |         — |   388257   36.3  99.7% 100.0% | nan
+                     router2 |         — |   388257   37.2  99.5% 100.0% | nan
+                     router3 |         — |   388257   38.2  96.4%  99.6% | nan
+                     router4 |         — |   388257   67.3  86.5%  97.7% | nan
+                     router5 |         — |   388257   52.5  87.1%  96.1% | nan
+                     router6 |         — |   388257   66.2  82.7%  94.7% | nan
+                     router7 |         — |   388257   60.6  87.0%  95.9% | nan
+                     router8 |         — |   388257   85.9  79.3%  92.6% | nan
+                     router9 |         — |   388257   49.4  87.7%  96.1% | nan
+                    router10 |         — |   388257   87.8  74.7%  87.8% | nan
+                    router11 |         — |   388257   81.0  78.4%  90.6% | nan
+                    router12 |         — |   388257   69.2  83.3%  94.3% | nan
+                    router13 |         — |   388257   72.9  82.0%  94.0% | nan
+                    router14 |         — |   388257   76.0  82.6%  93.6% | nan
+                    router15 |         — |   388257   81.8  82.0%  94.1% | nan
+                    router16 |         — |   388257   51.4  90.4%  97.2% | nan
+                    router17 |         — |   388257   46.0  90.4%  97.6% | nan
+                    router18 |         — |   388257   70.4  84.0%  94.9% | nan
+                    router19 |         — |   388257  101.6  75.2%  90.8% | nan
+                    router20 |         — |   388257  101.0  70.9%  86.7% | nan
+```
+
+Reading: early routers are extremely concentrated on live traffic (router0 n_eff ≈ 21 of 256, top-64 = 99.9 %), loosening to
+n_eff ≈ 70–90 by routers 8–15 (top-64 ≈ 75–83 %). The calibration-set picture in §1 under-states the early-layer concentration
+seen in production. **Caveat:** the decode/prefill split column is empty — on the sparse-MLA backend the attention metadata lacks
+`max_query_len`, so the hook could not classify steps; the hook has been fixed to use `num_decode_tokens` and the split will be
+re-captured at the next TP4 window.
