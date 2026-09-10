@@ -52,7 +52,11 @@ def _shard_files(path):
 
 
 def _run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+    # stdin=DEVNULL as a belt beside the -no-cnv brace: the flag only helps on builds that HAVE it
+    # (ik_llama.cpp does not), and a build that opens an interactive chat after generating will
+    # otherwise sit at its prompt forever with the work already done. Closing stdin ends that
+    # regardless of the flag, and costs nothing on builds where the flag already worked.
+    return subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
 
 def _score(ppl, quant, corpus, base, rpc):
@@ -69,10 +73,41 @@ def _score(ppl, quant, corpus, base, rpc):
             float(kld.group(1)) if kld else None)
 
 
+_ONE_SHOT = {}
+
+
+def _one_shot_flag(cli):
+    """The flag that makes THIS build generate once and exit, or None if it needs no flag.
+
+    There is no single answer across builds, and passing an unknown flag is a hard error:
+      * older llama.cpp   -no-cnv          (conversation on by default)
+      * current llama.cpp -st/--single-turn ("run conversation for a single turn only, then exit")
+      * ik_llama.cpp      none needed      (conversation is opt-in via -cnv)
+    So read --help once and use whatever that binary actually offers. stdin=DEVNULL in _run is the
+    belt underneath this; the flag is the brace."""
+    if cli not in _ONE_SHOT:
+        flag = None
+        try:
+            h = subprocess.run([cli, "--help"], capture_output=True, text=True,
+                               errors="replace", timeout=60, stdin=subprocess.DEVNULL)
+            help_text = (h.stdout or "") + (h.stderr or "")
+            for cand in ("-no-cnv", "--single-turn"):
+                if cand in help_text:
+                    flag = cand
+                    break
+        except Exception:
+            pass
+        _ONE_SHOT[cli] = flag
+    return _ONE_SHOT[cli]
+
+
 def _greedy(cli, ref, prompt, n, rpc):
     """N greedy tokens continued from `prompt` by the reference model (temp 0)."""
     cmd = [cli, "-m", ref, "-p", prompt, "-n", str(n), "--temp", "0",
-           "-ngl", "99", "--no-display-prompt", "-no-cnv", "--simple-io"]
+           "-ngl", "99", "--no-display-prompt", "--simple-io"]
+    flag = _one_shot_flag(cli)         # None on builds where conversation is opt-in anyway
+    if flag:
+        cmd.insert(-1, flag)
     if rpc:
         cmd += ["--rpc", rpc]
     out = _run(cmd)
