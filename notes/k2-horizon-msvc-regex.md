@@ -52,7 +52,7 @@ cmake --build build --config Release -j 8 \
 file programmatically rather than retyping it — a single wrong backslash silently reverts you to the
 broken fallback.
 
-**Verification** (RTX 5090, MSVC 2022, CUDA 12.8 — full wikitext-2, ctx 512):
+**Verification** (RTX 5070 Ti 16 GB, MSVC 2022, CUDA 12.8 — full wikitext-2, ctx 512):
 
 | check | before | after |
 |---|---|---|

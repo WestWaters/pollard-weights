@@ -488,11 +488,28 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
 # per-card VRAM (GB) for the --gpu convenience; anything not listed, pass GB directly
 _GPU_VRAM = {"3050": 8, "3060": 12, "3060ti": 8, "3070": 8, "3080": 10, "3090": 24,
              "4050": 6, "4060": 8, "4060ti": 16, "4070": 12, "4080": 16, "4090": 24,
-             "5060": 8, "5070": 12, "5080": 16, "5090": 32, "a4000": 16, "a5000": 24,
+             "5060": 8, "5070": 12, "5070ti": 16, "5080": 16, "5090": 32,
+             "a4000": 16, "a5000": 24,
              "a6000": 48, "rtx6000": 48, "rtx6000pro": 96,
              "6000pro": 96, "a40": 48, "l40": 48, "l40s": 48, "v100": 32, "a100": 80,
              "h100": 80, "h200": 141, "b100": 192, "b200": 192, "mi300x": 192,
              "spark": 128, "gb10": 128, "m4max": 128, "m3ultra": 512}
+
+
+def detect_gpu_gb():
+    """Total VRAM across the local NVIDIA cards, from nvidia-smi. None if it cannot be read.
+
+    A name table can only ever cover the cards someone thought to list. Detection covers the card
+    the user actually owns -- including the ones we got wrong ourselves (this box is a 5070 Ti with
+    16 GB, and was budgeted as a 32 GB 5090 for a whole week)."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        total = sum(int(x) for x in out.replace(",", " ").split() if x.strip().isdigit())
+        return total / 1024 if total else None
+    except Exception:
+        return None
 
 
 def parse_gpu(spec):
@@ -500,6 +517,8 @@ def parse_gpu(spec):
     name or GB, right = count). Plain number or a bare card name = that much. None if
     unparseable — so any stack of any card works, not a fixed menu."""
     s = spec.lower().replace(" ", "")
+    if s == "auto":                             # read the card that is actually installed
+        return detect_gpu_gb()
     if s in _GPU_VRAM:                          # bare card name (may contain 'x': rtx…)
         return _GPU_VRAM[s]
     try:
@@ -756,9 +775,10 @@ def main():
                         "size + total RAM-to-run + device fit (e.g. --ctx 262144 for 256k)")
     p.add_argument("--kv-quant", default="f16", choices=["f16", "q8", "q4", "nvfp4"],
                    help="KV cache precision for the --ctx estimate (default f16; nvfp4 = Blackwell 4-bit KV)")
-    p.add_argument("--gpu", help="your rig for the fit verdict: total VRAM GB, a card "
-                                 "name, or CARDxCOUNT — e.g. '96', '5090x4', '3090x8', "
-                                 "'rtx6000prox2'. Any stack of any card.")
+    p.add_argument("--gpu", help="your rig for the fit verdict: 'auto' to read the installed "
+                                 "card from nvidia-smi, total VRAM GB, a card name, or "
+                                 "CARDxCOUNT — e.g. 'auto', '96', '16x2', '5090x4', "
+                                 "'rtx6000prox2'. Any card, listed or not: pass GB.")
     p.add_argument("--device", default="gpu", choices=["gpu", "unified", "mac", "phone"],
                    help="what --gpu's number is: dedicated 'gpu' VRAM (~94%% usable, "
                         "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% — the OS "
@@ -816,7 +836,18 @@ def main():
         if a.gpu:
             rig_gb = parse_gpu(a.gpu)
             if rig_gb is None:
-                print(f"(could not parse --gpu '{a.gpu}'; skipping the rig verdict)")
+                # The name table only knows the cards someone listed. Never leave a user with an
+                # unlisted card (AMD, Intel, a new SKU) staring at a dropped verdict -- tell them
+                # the two ways in that always work.
+                det = detect_gpu_gb()
+                if det:
+                    rig_gb = det
+                    print(f"(--gpu '{a.gpu}' not in the card table; detected {det:.0f} GB "
+                          f"of local VRAM instead)")
+                else:
+                    print(f"(could not parse --gpu '{a.gpu}' -- it is not in the card table. "
+                          f"Pass VRAM in GB instead, e.g. --gpu 16 or --gpu 16x2, or --gpu auto "
+                          f"to read it from nvidia-smi. Skipping the rig verdict.)")
         if rig_gb is None and a.ram:                      # no discrete card given -> the user's own --ram
             rig_gb = float(a.ram)                          # is the rig (unified memory: Spark/Mac/pooled)
         fit_report(arch, arch["total"] * qbits / 8 / 1e9, a.ctx, kv_bytes, a.kv_quant,
