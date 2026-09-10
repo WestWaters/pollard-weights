@@ -91,7 +91,7 @@ def _supports_no_cnv(cli_bin):
     return _NO_CNV[cli_bin]
 
 
-def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80, timeout=900):
+def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80):
     cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-c", "2048", "-n", str(n_predict), "-p", prompt]
            + (["-no-cnv"] if _supports_no_cnv(cli_bin) else [])
            + sampling)
@@ -104,20 +104,14 @@ def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80, timeout=900):
     kw = {}
     if os.name == "nt":
         kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    try:
-        # stdin=DEVNULL is the load-bearing part: it ends conversation mode even on builds with no
-        # -no-cnv flag, instead of blocking forever on an inherited terminal. The timeout is the
-        # backstop -- a gate that hangs is worse than a gate that fails, because it looks like work.
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           stdin=subprocess.DEVNULL, timeout=timeout, **kw)
-    except KeyboardInterrupt:
-        # Not somebody pressing anything: a console event reaching an interruptible wait. Report it
-        # like any other failure to produce output rather than killing the gate.
-        print("   ! interrupted by a console event during generation (not a real Ctrl+C)")
-        return _NO_OUTPUT
-    except subprocess.TimeoutExpired:
-        print(f"   ! generation exceeded {timeout}s (CPU-only runs on a big model are slow)")
-        return _NO_OUTPUT
+    # stdin=DEVNULL is the whole fix, and it is one line: some llama-cli builds (the MBZUAI-IFM
+    # fork, b1-35999d1) open an interactive chat after generating and never exit on their own, so
+    # subprocess.run waits on a process that is finished working but still sitting at a prompt.
+    # Closing stdin ends that. NO timeout: adding one made communicate() wait on a lock Windows can
+    # interrupt, which turned stray console events into fatal KeyboardInterrupts and -- worse -- gave
+    # an empty result that the loop detector scored as PASS.
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       stdin=subprocess.DEVNULL, **kw)
     out = r.stdout or ""
     # llama-cli echoes the prompt then the continuation; keep only the continuation
     return out.split(prompt, 1)[-1] if prompt in out else out
