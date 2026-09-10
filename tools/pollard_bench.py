@@ -78,22 +78,36 @@ _NO_OUTPUT = _NoOutput()
 _NO_CNV = {}          # cli_bin -> does this build accept -no-cnv? (probed once)
 
 
-def _supports_no_cnv(cli_bin):
-    """Recent llama-cli defaults to CONVERSATION mode: it generates, then waits on stdin forever.
-    -no-cnv turns that off, but not every build has the flag (ik_llama does not), so probe once."""
+def _one_shot_flag(cli_bin):
+    """The flag that makes THIS build generate once and exit, or None if it needs none.
+
+    Builds disagree and the name changed upstream:
+      * older llama.cpp   -no-cnv           (conversation on by default)
+      * current llama.cpp -st/--single-turn ("run conversation for a single turn only, then exit")
+      * ik_llama.cpp      none needed       (conversation is opt-in via -cnv)
+
+    Closing stdin is NOT always sufficient: a current build was observed loaded, 15 GB resident, at
+    0% GPU, waiting at its prompt with stdin already at EOF. So probe --help and pass what the binary
+    says it takes. Passing an unknown flag is a hard error, which is why this cannot be unconditional."""
     if cli_bin not in _NO_CNV:
+        flag = None
         try:
             h = subprocess.run([cli_bin, "--help"], capture_output=True, text=True,
-                               errors="replace", timeout=60)
-            _NO_CNV[cli_bin] = "-no-cnv" in ((h.stdout or "") + (h.stderr or ""))
+                               errors="replace", timeout=60, stdin=subprocess.DEVNULL)
+            help_text = (h.stdout or "") + (h.stderr or "")
+            for cand in ("-no-cnv", "--single-turn"):
+                if cand in help_text:
+                    flag = cand
+                    break
         except Exception:
-            _NO_CNV[cli_bin] = False
+            pass
+        _NO_CNV[cli_bin] = flag
     return _NO_CNV[cli_bin]
 
 
 def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80):
     cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-c", "2048", "-n", str(n_predict), "-p", prompt]
-           + (["-no-cnv"] if _supports_no_cnv(cli_bin) else [])
+           + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else [])
            + sampling)
     # On Windows, put the child in its own process group so console control events (Ctrl+C /
     # Ctrl+Break, and the close event a SYSTEM scheduled task generates when it has no interactive
@@ -195,6 +209,37 @@ def _fmt(v, nd=4):
     return f"{v:.{nd}f}" if isinstance(v, float) else "—"
 
 
+_SPEED = re.compile(r"Generation:\s*([\d.]+)\s*t/s")
+_PROMPT_SPEED = re.compile(r"Prompt:\s*([\d.]+)\s*t/s")
+
+
+def measure_speed(cli_bin, model, ngl, n_predict=128,
+                  prompt="Explain why the sky is blue."):
+    """Decode speed for one build: (generation_tps, prompt_tps), either may be None.
+
+    This lives here rather than in a shell loop because the invocation needs the same hardening
+    _generate has -- own process group so console events cannot kill it mid-load, stdin closed so a
+    conversation-mode build exits. A raw llama-cli in a .bat on Windows gets killed part way through
+    loading ("Loading model... ^C") and silently produces nothing.
+
+    Speed is hardware-specific, so whatever consumes this has to name the machine beside it."""
+    cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-n", str(n_predict),
+            "--no-warmup", "-p", prompt]
+           + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else []))
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           stdin=subprocess.DEVNULL, **kw)
+    except KeyboardInterrupt:
+        print("   ! interrupted by a console event during the speed run (not a real Ctrl+C)")
+        return None, None
+    out = (r.stdout or "") + (r.stderr or "")
+    g, p = _SPEED.search(out), _PROMPT_SPEED.search(out)
+    return (float(g.group(1)) if g else None), (float(p.group(1)) if p else None)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", required=True, help="the model to score (a Pollard build, or any GGUF)")
@@ -210,6 +255,10 @@ def main():
                     help="run the COHERENCE GATE: generate over fixed prompts, detect loops, sweep "
                          "sampling, and report PASS (+the sampling to ship) or BELOW-FLOOR (bump a tier). "
                          "Runs alone (no --ref/--eval needed); add --ref for the full board too.")
+    ap.add_argument("--speed", action="store_true",
+                    help="also measure decode tok/s for --gguf (and --vs), on the same flags so the "
+                         "two are comparable. Needs --llama-cli. tok/s is hardware-specific: state "
+                         "the machine wherever you publish it.")
     ap.add_argument("--quick", action="store_true",
                     help="with --coherence: fast one-prompt / default-sampling sanity instead of the full sweep.")
     a = ap.parse_args()
@@ -225,6 +274,25 @@ def main():
         passed = print_gate(res)
         if not a.ref:                      # gate-only invocation -> done (exit code reflects verdict)
             sys.exit(0 if passed else 2)
+
+    if a.speed:
+        cli_bin = find_llama_bin(a.llama_cli)
+        if not cli_bin:
+            sys.exit("--speed needs llama-cli — build it or pass --llama-cli.")
+        print("\n=== decode speed ===")
+        for label, m in (("this build", a.gguf), ("rival", a.rival)):
+            if not m:
+                continue
+            gen, pro = measure_speed(cli_bin, m, a.ngl)
+            name = os.path.basename(m)
+            if gen is None:
+                print(f"  {name}: no speed line (the run produced none)")
+            else:
+                print(f"  {name}: {gen:.1f} tok/s generation"
+                      + (f"  ({pro:.0f} prompt)" if pro else ""))
+        print("  tok/s is hardware-specific -- name the machine wherever you publish it.")
+        if not a.ref and not os.path.exists(a.eval):
+            sys.exit(0)                    # speed-only invocation: nothing to score, and that is fine
 
     ppl_bin = find_llama_bin(a.llama_perplexity)
     if not ppl_bin:
