@@ -60,3 +60,24 @@ than the quantization). Two things the contract should say explicitly, both meas
 - Kimi-K3 routing profile: out of reach even for this cluster (5.5T parameters; a 2-bit build exceeds the pool's 1.2 TB, so
   only NVMe-streamed capture at a fraction of a token/s). The next same-class dataset we can produce is Hy4-preview (770B/49B
   active, 256 experts, DSA + MLA, hyperconnections) — a second 750B-class family for the routing/outlier tables.
+
+## 6. Serving the Pollard body on vLLM 0.29.0 + b12x, TP8 × 8 GB10 — deploy numbers (2026-09-09)
+
+The Int4/Int8-mix GPTQ body from this method (experts int4 g128, attention/shared int8, 369 GB text-only repack) plus the
+int8-quantized MTP layer as a separate drafter, served on our vLLM 0.29.0 + b12x merge (fork `local-inference-lab/vllm` glue,
+RoCE one-shot all-reduce, sparse-MLA/indexer kernels). Same mixed-workload bench as our production gate (300 s at concurrency 1
+and 4); correctness probes passed on every leg.
+
+| config | C1 tok/s | C4 tok/s | MTP accepted/step | notes |
+|---|---|---|---|---|
+| spec off, fp8 KV 600K | 24.1 | 58.4 | — | engine baseline |
+| + RoCE all-reduce | 32.4 | 67.5 | — | +34 % / +16 % |
+| + MTP k3 (int8 layer-78 drafter) | 49.8 | 85.3 | 1.82 (60.6 %) | the int8 drafter works natively |
+| + NVFP4 KV 900K + k5 schedule | 51.0 | 85.1 | 1.73 (63.6 %) | production shape; pool 1.04M tokens |
+| fp8 KV 600K variant | 43.8 prose | 86.1 | 1.74 | **prefill +11 %** (1007/942/902 tok/s at 42K/92K/132K vs 906/861/830 on NVFP4 KV) |
+
+Prose single-stream (10 prompts, 250 out, wall incl. TTFT): 42.8–43.8 tok/s; concurrency-8 aggregate 121–129 tok/s. Prefill is
+the remaining gap to the best community number on this hardware (~1.3–1.4K tok/s); it is kernel-bound (sparse-MLA/indexer prefill),
+not scheduler-bound — Marlin beats the Triton WNA16 MoE kernel on GB10 for both prefill and decode, and NCCL channel count,
+indexer budget, AOT compile and chunk size were all inert. Relevant to the method: the deploy math holds — the 3.2–3.4 bpw-class
+body with an int8 drafter gives a 51 tok/s single-stream assistant at 900K context on eight 128 GB nodes.
