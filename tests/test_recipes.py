@@ -713,6 +713,33 @@ def test_runtime_patch_verification_survives_line_ending_drift():
     assert R._added_lines("+++ b/x\n+\n+real\n") == {"real"}
 
 
+def test_install_state_catches_a_declared_but_uninstalled_command():
+    """A synced repo can still be missing the command for a tool it declares.
+
+    An editable install keeps module code current -- `import pollard_card` resolves straight into the
+    checkout -- but pip only writes command launchers when it runs. Add a tool, sync, and the code is
+    there while the command is not, which nobody notices until they type the name. Every tool added in
+    one session sat in exactly that state on both machines.
+    """
+    import pollard_runtime as R
+
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "pyproject.toml"), "w", encoding="utf-8") as fh:
+        fh.write('[project]\nname = "x"\n\n[project.scripts]\n'
+                 'pollard-alpha = "a:main"\npollard-beta = "b:main"\n')
+    got = R.declared_scripts(d)
+    assert got == {"pollard-alpha": "a:main", "pollard-beta": "b:main"}, got
+
+    st = R.install_state(d)
+    assert st is not None
+    assert set(st["declared"]) == {"pollard-alpha", "pollard-beta"}
+    # this interpreter has neither, so both must be reported missing rather than assumed fine
+    assert set(st["missing"]) == {"pollard-alpha", "pollard-beta"}, st["missing"]
+
+    # no pyproject at all is "cannot tell", not "all good"
+    assert R.install_state(tempfile.mkdtemp()) is None
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
