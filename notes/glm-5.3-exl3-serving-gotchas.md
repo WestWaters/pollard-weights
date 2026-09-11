@@ -1,6 +1,6 @@
 # Serving an EXL3 cook that quantizes attention — four artifact/runtime gaps, measured on GLM-5.3 744B
 
-Companion to `glm-5.3-cluster-verification.md`. The EXL3 3.2 bpw GLM-5.3 body from the band-parallel run (`experiments/exl3_band.py`)
+Companion to `glm-5.3-cluster-verification.md`. The EXL3 3.2 bpw GLM-5.3 body from the band-parallel run (`pollard-exl3-band`)
 went to a TP4 serving gate on vLLM 0.28 with the `cuda-exl3` plugin (its sparse-MLA attention backend is the only one that runs a
 DSA model on GB10). It loaded, every counter was healthy, throughput was fine — and the output was gibberish. Five boots and one
 afternoon later, four distinct gaps. None is a quantization-quality problem; all four bite anyone who follows the Pollard EXL3
