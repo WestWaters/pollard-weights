@@ -53,8 +53,9 @@ UPSTREAM = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/src/llam
 # Only runtimes Pollard itself builds against. Nothing here reaches into unrelated projects that
 # happen to vendor a llama.cpp -- use --scan for anything outside this list.
 DEFAULT_SCAN = [
-    "runtime/llama.cpp", "~/llama.cpp", "~/pollard-builds/ifm-llama", "~/pollard-stq/llama.cpp",
-    "C:/pollard/ifm-llama", "C:/pollard/ik_llama.cpp", "C:/pollard/llama-stq", "C:/pollard/pw/runtime/llama.cpp",
+    "runtime/llama.cpp", "~/llama.cpp", "~/llama-current", "~/pollard-builds/ifm-llama",
+    "~/pollard-stq/llama.cpp", "C:/pollard/llama-current", "C:/pollard/ifm-llama",
+    "C:/pollard/ik_llama.cpp", "C:/pollard/llama-stq", "C:/pollard/pw/runtime/llama.cpp",
 ]
 
 
