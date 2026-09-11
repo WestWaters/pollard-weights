@@ -109,19 +109,34 @@ def harvest(card, files):
             real = next((f for f in files if f.endswith(fn) or fn.endswith(f)), None)
             results[real or (fn[:-5].rstrip("-").split("-")[-1] or fn)] = rec
 
+    seen_sections = set()
     for mt in re.finditer(r"^(## .+?)$(.*?)(?=^## |\Z)", card, re.S | re.M):
         title = mt.group(1)[3:].strip().lower()
         if title in TEMPLATE_SECTIONS or title.split(" (")[0] in TEMPLATE_SECTIONS:
             continue
-        keep.append(mt.group(0).rstrip())
+        body = mt.group(0).rstrip()
+        if body in seen_sections:            # a card can carry the same section twice; keep one
+            continue
+        seen_sections.add(body)
+        keep.append(body)
 
-    rescued = []
+    # Prose with measured numbers that lives outside any section we kept would otherwise be lost, so
+    # it is gathered into one section. It must skip anything the pass above already preserved
+    # verbatim -- otherwise recarding a card that has been recarded before harvests its own
+    # "Measured notes" twice, once as a section and once as loose prose, and the section doubles
+    # every run. Recarding has to be idempotent: the same card in, the same card out.
+    kept_text = "\n\n".join(keep)
+    rescued, seen_paras = [], set()
     for para in re.split(r"\n\s*\n", card):
         p = para.strip()
         if not p or p.startswith(("|", "#", "---", "```", "- ", "> ")):
             continue
-        if MEASURED.search(p) and re.search(r"\d+\.\d", p):
-            rescued.append(p)
+        if not (MEASURED.search(p) and re.search(r"\d+\.\d", p)):
+            continue
+        if p in kept_text or p in seen_paras:
+            continue
+        seen_paras.add(p)
+        rescued.append(p)
     if rescued:
         keep.append("## Measured notes\n\n" + "\n\n".join(rescued))
 
@@ -135,6 +150,10 @@ def main():
     g.add_argument("--repo", help="one repo id, e.g. you/Model-GGUF")
     g.add_argument("--author", help="every model repo under this HF account")
     ap.add_argument("--out", default="recard", help="directory for the regenerated cards")
+    ap.add_argument("--no-runtime-check", action="store_true",
+                    help="skip reading each rung's runtime need from the published file "
+                         "(a few MB of range requests per file); the card then says nothing "
+                         "specific about stock-llama.cpp compatibility")
     ap.add_argument("--upload", action="store_true", help="publish them (default: write locally only)")
     a = ap.parse_args()
 
@@ -192,6 +211,12 @@ def main():
         cmd = [sys.executable, os.path.join(HERE, "pollard_card.py"), "--model", src,
                "--title", name.replace("-Pollard", ""), "--builds-from", key,
                "--repo", rid, "--out", out_md, "--results", rp]
+        # recard always works from a published repo, so which runtime each rung needs can be read
+        # off the files themselves. Without this the card falls back to describing the ladder from
+        # filenames -- which is how two repos ended up telling people a rung ran in stock llama.cpp
+        # when its protected tensors carry ik_llama-only atoms.
+        if not a.no_runtime_check:
+            cmd += ["--runtime-from-repo"]
         if params:
             cmd += ["--params", params]
         if ep:

@@ -393,6 +393,49 @@ def test_ggufcheck_reads_runtime_from_types_not_names():
         pass
 
 
+def test_recard_harvest_is_idempotent():
+    """Recarding a card that has already been recarded must not double its sections.
+
+    Two of the harvest passes can see the same prose: one keeps every non-template section verbatim,
+    the other gathers loose paragraphs carrying measured numbers into a "Measured notes" section.
+    A card that already has that section feeds it to both, so the section grew a fresh copy on every
+    run -- caught with two identical "## Measured notes" blocks on Qwen2.5-7B and -14B before they
+    were uploaded. Same card in, same card out.
+    """
+    import re as _re
+
+    import pollard_recard as R
+
+    card = (
+        "---\nlicense: apache-2.0\nbase_model: Qwen/Qwen2.5-7B-Instruct\n---\n\n"
+        "# M\n\n"
+        "## Available files\n\n"
+        "| file | PPL | size |\n|---|---:|---:|\n| `m-Q6_K.gguf` | 6.55 | 6.25 GB |\n\n"
+        "## Measured notes\n\n"
+        "The flagship reaches PPL 10.23 at 0.537 Mean KLD, a real step over the baseline.\n\n"
+        "## Errata\n\n- something\n"
+    )
+    files = ["m-Q6_K.gguf"]
+
+    def heads(t):
+        return _re.findall(r"^##\s+(.+)$", t or "", _re.M)
+
+    _, e1 = R.harvest(card, files)
+    h1 = heads(e1)
+    assert h1.count("Measured notes") == 1, f"harvested it {h1.count('Measured notes')} times: {h1}"
+
+    # feed the harvest back in, the way recarding an already-recarded repo does
+    _, e2 = R.harvest(card + "\n\n" + (e1 or ""), files)
+    h2 = heads(e2)
+    assert h2 == h1, f"not a fixed point: {h1} then {h2}"
+    assert len(h2) == len(set(h2)), f"duplicate sections after a second pass: {h2}"
+
+    # a section appearing twice in the source card is also collapsed to one
+    _, e3 = R.harvest(card + "\n## Measured notes\n\nThe flagship reaches PPL 10.23 at 0.537 Mean "
+                              "KLD, a real step over the baseline.\n", files)
+    assert heads(e3).count("Measured notes") == 1, heads(e3)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

@@ -97,7 +97,7 @@ def base_license(model_id, cfg):
     return _hub_license(model_id)
 
 
-def build_runtimes(builds):
+def build_runtimes(builds, repo=None):
     """{build path: 'stock'|'ik_llama'} for the GGUF builds we can actually open.
 
     A file's name does not decide which runtime loads it; its tensor types do. Stock llama.cpp
@@ -106,7 +106,10 @@ def build_runtimes(builds):
     to reach for a better atom on a sensitive tensor, so this is normal -- it just has to be said on
     the card instead of assumed from the name.
 
-    Builds whose file is not present are simply absent from the result; the caller states nothing
+    With `repo` set, a build whose local file is gone is read from the published copy instead, over
+    range requests -- a rung already on the Hub can be described without pulling it back down.
+
+    Builds that can be read neither way are simply absent from the result; the caller states nothing
     about a rung it could not read rather than guessing.
     """
     out = {}
@@ -116,13 +119,19 @@ def build_runtimes(builds):
         return out
     for b in builds:
         path = b.get("path") or ""
-        if b.get("lane", "gguf") != "gguf" or not path or not os.path.isfile(path):
+        if b.get("lane", "gguf") != "gguf" or not path:
             continue
+        src, where = path, "local file"
+        if not os.path.isfile(path):
+            if not repo:
+                continue
+            src = f"https://huggingface.co/{repo}/resolve/main/{b.get('name') or os.path.basename(path)}"
+            where = "the published copy"
         try:
-            out[path] = gc.runtime_of(path)[0]
+            out[path] = gc.runtime_of(src)[0]
         except Exception as e:                                            # noqa: BLE001
-            print(f"WARNING: could not read tensor types from {os.path.basename(path)} ({e}); "
-                  f"the card will not state a runtime for it.", file=sys.stderr)
+            print(f"WARNING: could not read tensor types from {os.path.basename(path)} via {where} "
+                  f"({e}); the card will not state a runtime for it.", file=sys.stderr)
     return out
 
 
@@ -184,6 +193,10 @@ def main():
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
+    ap.add_argument("--runtime-from-repo", action="store_true",
+                    help="for rungs whose local build file is gone, read which runtime they need "
+                         "from the copy already published in --repo, over range requests (a few MB "
+                         "per file, not the whole download)")
     ap.add_argument("--prompt-format", help="chat template name or a fenced example (Model details + "
                     "Prompt format). Omit and the section is skipped.")
     ap.add_argument("--arch", help="architecture line for Model details (else the base config's model_type)")
@@ -223,10 +236,11 @@ def main():
     eval_str = results.get("_eval", "")
     f16_ppl = results.get("_f16_ppl")
 
+    runtimes = build_runtimes(builds, repo if a.runtime_from_repo else None)
+    ik_builds = [b for b in builds if runtimes.get(b.get("path")) == "ik_llama"]
+
     pb = parse_params_b(a.params, cfg)
     f16_gb = pb * 2.0
-    runtimes = build_runtimes(builds)
-    ik_builds = [b for b in builds if runtimes.get(b.get("path")) == "ik_llama"]
     builds_sorted = sorted(builds, key=lambda b: -(b.get("bytes") or 0))
     smallest = builds_sorted[-1] if builds_sorted else {}
     small_gb = (smallest.get("bytes") or 0) / 1e9
@@ -299,6 +313,10 @@ def main():
             if is_rec and note:
                 note = f"**{note}**"
             head = f"- **~{gb + 2:.0f} GB RAM / VRAM** → **`{b.get('tag','')}`** ({gb:.2f} GB)."
+            # This list is where people actually pick a file, so a rung that stock llama.cpp cannot
+            # open has to say so here too -- not only in the table further down.
+            if runtimes.get(b.get("path")) == "ik_llama":
+                head += " *(ik_llama.cpp)*"
             out.append(f"{head} {note[:110]}{rec}" if note else f"{head}{rec}")
         out.append("")
 
