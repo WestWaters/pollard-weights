@@ -1,0 +1,49 @@
+{
+ "engram_layers": [
+  1,
+  14
+ ],
+ "table_rows_per_layer": 384016648,
+ "calibration_tokens": 786432,
+ "hash_columns": 24,
+ "in_sample": {
+  "accesses_per_layer": 18900000.0,
+  "unique_rows": 7040000.0,
+  "rows_seen_once_frac": 0.699,
+  "coverage_top_rows": {
+   "10000": 0.158,
+   "100000": 0.345,
+   "1000000": 0.616,
+   "5000000": 0.892
+  }
+ },
+ "held_out_split": {
+  "train_nodes": 5,
+  "test_nodes": 5,
+  "train_unique_rows": 4000000.0,
+  "coverage_top_rows": {
+   "1000000": 0.41,
+   "2000000": 0.432,
+   "5000000": 0.489,
+   "7000000": 0.489
+  },
+  "note": "capped by rows seen in the training half; corpus-bound not distribution-bound"
+ },
+ "fp4_rows_nll": {
+  "mxfp4_per32_ue8m0": {
+   "delta_nll": -0.0031,
+   "sem": 0.0032,
+   "rows": 39,
+   "elements_changed_frac": 0.804,
+   "rel_rms": 0.109
+  },
+  "nvfp4_per16_e4m3": {
+   "delta_nll": -0.0025,
+   "sem": 0.0031,
+   "rows": 39,
+   "elements_changed_frac": 1.0,
+   "rel_rms": 0.094
+  }
+ },
+ "layers_share_ids": true
+}
