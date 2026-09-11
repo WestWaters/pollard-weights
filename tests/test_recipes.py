@@ -436,6 +436,44 @@ def test_recard_harvest_is_idempotent():
     assert heads(e3).count("Measured notes") == 1, heads(e3)
 
 
+def test_reclaim_never_mistakes_a_build_for_a_source():
+    """The one mistake pollard-reclaim must not make: offering a published ladder as a "source".
+
+    The workspace stores a ladder INSIDE a directory named after the f16 body it was built from
+    (`models/FrogMini-14B-f16.gguf/FrogMini-14B-f16.gguf-Pollard-GGUF-Q6_K.gguf`), so any test that
+    looks at the path -- or even at the basename alone -- sees "-f16" and calls the rung a source.
+    Under --delete --sources that deletes the whole published ladder. Caught on the real box before
+    anything was removed.
+    """
+    import pollard_reclaim as R
+
+    ladder = os.path.join("models", "FrogMini-14B-f16.gguf",
+                          "FrogMini-14B-f16.gguf-Pollard-GGUF-Q6_K.gguf")
+    assert not R.is_source_name(ladder), "a build carrying -Pollard is never a source"
+    assert not R.is_source_name("Qwen2.5-7B-Instruct-Pollard-IQ4_XS.gguf")
+
+    # a real unquantized body still is one
+    assert R.is_source_name("Qwen2.5-7B-Instruct-f16.gguf")
+    assert R.is_source_name(os.path.join("downloads", "FrogMini-14B-bf16.gguf"))
+    # and an ordinary quant with no marker is neither
+    assert not R.is_source_name("some-model-Q6_K.gguf")
+
+
+def test_reclaim_repo_guesses_strip_source_decoration():
+    """A manifest key is often the source GGUF's path, not an HF id.
+
+    `FrogMini-14B-f16.gguf` was published as `PollardWeights/FrogMini-14B-Pollard`, so the extension
+    and the f16/bf16 marker have to come off before the repo is guessed, or nothing matches and
+    nothing is ever reclaimable.
+    """
+    import pollard_reclaim as R
+
+    g = R.repo_guesses("C:/pollard/phome/models/FrogMini-14B-f16.gguf", "PollardWeights")
+    assert "PollardWeights/FrogMini-14B-Pollard" in g, g
+    g2 = R.repo_guesses("Qwen/Qwen2.5-7B-Instruct", "PollardWeights")
+    assert "PollardWeights/Qwen2.5-7B-Instruct-Pollard" in g2, g2
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
