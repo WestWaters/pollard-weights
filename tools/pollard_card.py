@@ -97,6 +97,35 @@ def base_license(model_id, cfg):
     return _hub_license(model_id)
 
 
+def build_runtimes(builds):
+    """{build path: 'stock'|'ik_llama'} for the GGUF builds we can actually open.
+
+    A file's name does not decide which runtime loads it; its tensor types do. Stock llama.cpp
+    rejects any ggml type above 42, so one protected tensor carrying an ik_llama-only atom makes the
+    whole file ik_llama-only even when the filename says `IQ4_XS`. The measured allocation is meant
+    to reach for a better atom on a sensitive tensor, so this is normal -- it just has to be said on
+    the card instead of assumed from the name.
+
+    Builds whose file is not present are simply absent from the result; the caller states nothing
+    about a rung it could not read rather than guessing.
+    """
+    out = {}
+    try:
+        import pollard_ggufcompat as gc
+    except ImportError:
+        return out
+    for b in builds:
+        path = b.get("path") or ""
+        if b.get("lane", "gguf") != "gguf" or not path or not os.path.isfile(path):
+            continue
+        try:
+            out[path] = gc.runtime_of(path)[0]
+        except Exception as e:                                            # noqa: BLE001
+            print(f"WARNING: could not read tensor types from {os.path.basename(path)} ({e}); "
+                  f"the card will not state a runtime for it.", file=sys.stderr)
+    return out
+
+
 def load_builds(key, lane=None):
     try:
         import pollard_workspace as ws
@@ -196,6 +225,8 @@ def main():
 
     pb = parse_params_b(a.params, cfg)
     f16_gb = pb * 2.0
+    runtimes = build_runtimes(builds)
+    ik_builds = [b for b in builds if runtimes.get(b.get("path")) == "ik_llama"]
     builds_sorted = sorted(builds, key=lambda b: -(b.get("bytes") or 0))
     smallest = builds_sorted[-1] if builds_sorted else {}
     small_gb = (smallest.get("bytes") or 0) / 1e9
@@ -222,9 +253,27 @@ def main():
             "[Pollard Weights](https://github.com/WestWaters/pollard-weights) — a ladder of "
             "**measured-allocation** quants (bits placed by per-layer sensitivity, not a uniform crush).", ""]
     if "gguf" in lanes:
-        out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio.** "
-                "Trellis (`IQ*_KT`) files need [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp); "
-                "the K-quants run anywhere.", ""]
+        # Stated from the files' own tensor types, not from their names: a rung can carry a
+        # fork-only atom on one protected tensor and still be called IQ4_XS, and saying "the
+        # K-quants run anywhere" would then be wrong for a file people are told to download.
+        IK_URL = "https://github.com/ikawrakow/ik_llama.cpp"
+        if not runtimes:
+            out += ["**GGUF for llama.cpp / ik_llama.cpp, Ollama, LM Studio.** Rungs built on "
+                    f"[ik_llama.cpp]({IK_URL})-only atoms (the trellis `IQ*_KT` family among them) "
+                    "need that build; the rest run in any recent llama.cpp.", ""]
+        elif not ik_builds:
+            out += ["**Standard GGUF — every file here runs in stock llama.cpp / ik_llama.cpp, "
+                    "Ollama, LM Studio.**", ""]
+        elif len(ik_builds) == len(runtimes):
+            out += [f"**These files need [ik_llama.cpp]({IK_URL}).** The measured allocation places "
+                    "ik_llama-only atoms on this model's sensitive tensors, so stock llama.cpp "
+                    "(and therefore Ollama and LM Studio) will not load them.", ""]
+        else:
+            need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
+                             sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
+            out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, "
+                    f"except where noted.** {need} need [ik_llama.cpp]({IK_URL}): their allocation "
+                    "puts ik_llama-only atoms on the tensors it protects. The rest run anywhere.", ""]
 
     # ---- Model details: the at-a-glance table every good Pollard card opens with
     arch = a.arch or mtype or "—"
@@ -264,12 +313,20 @@ def main():
                   for b in builds)
     tps_h = " tok/s |" if has_tps else ""
     tps_s = "---:|" if has_tps else ""
-    out += [f"| file | PPL | size |{tps_h} Mean KLD | notes |", f"|---|---:|---:|{tps_s}---:|---|"]
+    # "runs in" appears only when the ladder is actually mixed -- a uniform ladder says it once
+    # in the line above the table instead of repeating itself on every row.
+    mixed = bool(ik_builds) and len(ik_builds) != len(runtimes)
+    rt_h = " runs in |" if mixed else ""
+    rt_s = "---|" if mixed else ""
+    out += [f"| file | PPL | size |{tps_h} Mean KLD |{rt_h} notes |",
+            f"|---|---:|---:|{tps_s}---:|{rt_s}---|"]
     for b in sorted(builds, key=lambda x: (x.get("bytes") or 0)):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','—')} |" if has_tps else ""
+        rt = runtimes.get(b.get("path"))
+        rt_c = (" " + ("ik_llama" if rt == "ik_llama" else "any llama.cpp" if rt else "—") + " |") if mixed else ""
         out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{r.get('kld','—')} | {r.get('note', b.get('tag',''))} |")
+                   f"{r.get('kld','—')} |{rt_c} {r.get('note', b.get('tag',''))} |")
     if has_tps:
         hw = results.get("_hw")
         out.append("")
@@ -331,14 +388,35 @@ def main():
     # ---- How to run
     out += ["## How to run", ""]
     if "gguf" in lanes:
-        out += ["These are standard GGUF and run with **llama.cpp**:", "", "```bash",
-                f"llama-server -hf {repo}:{extag}" if extag else f"llama-server -hf {repo}", "```", "",
-                "or from a local file:", "", "```bash",
-                f'llama-cli    -m {exn} -ngl 99 -p "Explain why the sky is blue."',
-                f"llama-server -m {exn} -ngl 99      # OpenAI-compatible API + web UI at :8080",
-                "```", "",
-                "They also work in anything built on llama.cpp — **LM Studio, koboldcpp, Jan, ramalama, "
-                f"Ollama** (`ollama run hf.co/{repo}`).", ""]
+        # The featured command has to name a file that command can actually open. If the
+        # recommended rung is ik_llama-only, showing it behind a stock `llama-server -hf` sends
+        # people to a load error -- so the stock example moves to a rung that loads, and the
+        # recommended one is shown with the build it needs.
+        ex_ik = runtimes.get(ex.get("path")) == "ik_llama"
+        stock = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
+        stock_pick = max(stock, key=lambda b: (b.get("bytes") or 0), default=None)
+        if not ex_ik:
+            out += ["These are standard GGUF and run with **llama.cpp**:", "", "```bash",
+                    f"llama-server -hf {repo}:{extag}" if extag else f"llama-server -hf {repo}",
+                    "```", "", "or from a local file:", "", "```bash",
+                    f'llama-cli    -m {exn} -ngl 99 -p "Explain why the sky is blue."',
+                    f"llama-server -m {exn} -ngl 99      # OpenAI-compatible API + web UI at :8080",
+                    "```", ""]
+            out += ["They also work in anything built on llama.cpp — **LM Studio, koboldcpp, Jan, "
+                    f"ramalama, Ollama** (`ollama run hf.co/{repo}`).", ""]
+        else:
+            out += [f"`{extag or exn}` is built on ik_llama-only atoms, so it runs with "
+                    "**[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)**:", "", "```bash",
+                    f'llama-cli    -m {exn} -ngl 99 -p "Explain why the sky is blue."',
+                    f"llama-server -m {exn} -ngl 99", "```", ""]
+            if stock_pick:
+                sn, st = stock_pick.get("name", "model.gguf"), stock_pick.get("tag", "")
+                out += [f"For stock llama.cpp, Ollama or LM Studio, use `{st or sn}` instead:", "",
+                        "```bash", f"llama-server -hf {repo}:{st}" if st else f"llama-server -hf {repo}",
+                        f'llama-cli    -m {sn} -ngl 99 -p "Explain why the sky is blue."', "```", ""]
+            else:
+                out += ["No rung in this repo loads in stock llama.cpp, so Ollama and LM Studio "
+                        "cannot run these files.", ""]
     if "mlx" in lanes:
         out += ["```bash", f'mlx_lm.generate --model {repo} --prompt "Hello"', "```", ""]
     if "gptq" in lanes or "mx" in lanes:
@@ -364,7 +442,18 @@ def main():
     # ---- errata + footer
     out += ["## Errata", ""]
     if "gguf" in lanes:
-        out.append("- Trellis (`IQ*_KT`) quants need ik_llama.cpp to build/run; K-quants run in any recent llama.cpp.")
+        if ik_builds:
+            names = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
+                              sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
+            out.append(f"- {names} carry ik_llama-only atoms and need ik_llama.cpp to run; "
+                       "stock llama.cpp rejects any ggml type above 42 outright. Checked with "
+                       "`pollard-ggufcheck`, from the files' tensor types rather than their names.")
+        elif runtimes:
+            out.append("- Every file here loads in stock llama.cpp — verified from the tensor types "
+                       "with `pollard-ggufcheck`, not assumed from the filenames.")
+        else:
+            out.append("- Trellis (`IQ*_KT`) quants need ik_llama.cpp to build/run; K-quants run in "
+                       "any recent llama.cpp.")
     out += ["- Measured allocation places bits by per-layer sensitivity under a size budget.",
             "- Single machine; replication invited."]
     # ---- Credits & license: every card names the base model, the tooling, and the method

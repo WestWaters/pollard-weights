@@ -330,6 +330,69 @@ def test_card_license_is_never_invented():
     assert "apache-2.0" not in src, "pollard_card must not hardcode any license"
 
 
+def _mini_gguf(types, path=None):
+    """Write a minimal GGUF with one tensor per entry in `types` (ggml type ids)."""
+    import struct
+    path = path or tempfile.NamedTemporaryFile(suffix=".gguf", delete=False).name
+    with open(path, "wb") as fh:
+        fh.write(b"GGUF")
+        fh.write(struct.pack("<I", 3))                 # version
+        fh.write(struct.pack("<Q", len(types)))        # tensor count
+        fh.write(struct.pack("<Q", 1))                 # one kv pair
+        # kv: "general.architecture" (type 8 = string) -> "test"
+        k = b"general.architecture"
+        fh.write(struct.pack("<Q", len(k))); fh.write(k)
+        fh.write(struct.pack("<I", 8))
+        fh.write(struct.pack("<Q", 4)); fh.write(b"test")
+        for i, t in enumerate(types):
+            n = f"blk.{i}.weight".encode()
+            fh.write(struct.pack("<Q", len(n))); fh.write(n)
+            fh.write(struct.pack("<I", 1))             # 1 dimension
+            fh.write(struct.pack("<Q", 32))            # dim 0
+            fh.write(struct.pack("<I", t))             # ggml type
+            fh.write(struct.pack("<Q", 0))             # offset
+    return path
+
+
+def test_ggufcheck_reads_runtime_from_types_not_names():
+    """Which runtime loads a GGUF is decided by its tensor types, never by its filename.
+
+    Stock llama.cpp rejects any ggml type above 42 outright, so a single protected tensor carrying an
+    ik_llama-only atom makes the whole file ik_llama-only -- which is exactly how a rung named
+    `IQ4_XS` shipped with IQ5_K on every attn_v and a card saying it ran anywhere. The allocator is
+    supposed to reach for that atom; the card just has to say so.
+    """
+    import pollard_ggufcompat as gc
+
+    # stock-only ladder: F32 + IQ4_XS(23) + Q6_K(14)
+    p = _mini_gguf([0, 23, 23, 14])
+    assert gc.runtime_of(p) == ("stock", {}), "an all-stock file must not be called ik_llama"
+
+    # the real shape of the bug: IQ4_XS body, IQ5_K (140) on the protected tensors
+    p2 = _mini_gguf([0, 23, 23, 140, 140])
+    rt, fo = gc.runtime_of(p2)
+    assert rt == "ik_llama", "a fork-only atom anywhere makes the file ik_llama-only"
+    assert fo == {"IQ5_K": 2}, f"must name the atom and count it, got {fo}"
+
+    # the trellis family must be named too, not reported as a bare number
+    rt3, fo3 = gc.runtime_of(_mini_gguf([0, 158, 153]))
+    assert rt3 == "ik_llama" and set(fo3) == {"IQ1_KT", "IQ2_KT"}, fo3
+
+    # 42 is the last stock id; 43 is not
+    assert gc.runtime_of(_mini_gguf([0, 42]))[0] == "stock"
+    assert gc.runtime_of(_mini_gguf([0, 43]))[0] == "ik_llama"
+
+    # a file with no GGUF magic must raise, not quietly read as stock -- a zeroed header means the
+    # file will not load in ANY runtime, which is worth surfacing rather than defaulting.
+    blank = tempfile.NamedTemporaryFile(suffix=".gguf", delete=False)
+    blank.write(b"\0" * 4096); blank.close()
+    try:
+        gc.runtime_of(blank.name)
+        raise AssertionError("a header-less file must raise, not report a runtime")
+    except ValueError:
+        pass
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
