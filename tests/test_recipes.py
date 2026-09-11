@@ -301,6 +301,35 @@ def test_alloc_granular_protects_down():
     assert F.BPW[dg] > F.BPW[gg], f"granular must protect down above gate/up, got gate={gg} down={dg}"
 
 
+def test_card_license_is_never_invented():
+    """A card's license line is a legal claim about someone else's weights, so the template must
+    read it, not default it. The old code asked `config.json` -- which almost never carries a
+    license -- and fell through to a hardcoded "apache-2.0", which published Ling-3.0-tiny (MIT)
+    under the wrong license. An unresolvable base must come back None so the tool warns.
+    """
+    import pollard_card as C
+
+    # config wins when it actually carries one
+    assert C.base_license("whoever/whatever", {"license": "mit"}) == "mit"
+
+    # a local checkout resolves from the card frontmatter, not from a default
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write("---\nlicense: mit\npipeline_tag: text-generation\n---\n# hi\n")
+    assert C.base_license(d, {}) == "mit", "must read the frontmatter of a local base model"
+
+    # frontmatter with no license must not invent one
+    d2 = tempfile.mkdtemp()
+    with open(os.path.join(d2, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write("---\npipeline_tag: text-generation\n---\n# hi\n")
+    assert C.base_license(d2, {}) is None, "no license present must resolve to None, not a guess"
+
+    # and the module must not carry a fallback license string anywhere
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_card.py"),
+               encoding="utf-8").read()
+    assert "apache-2.0" not in src, "pollard_card must not hardcode any license"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

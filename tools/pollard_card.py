@@ -28,6 +28,7 @@ manifest key (e.g. the f16 GGUF path). Sizes/bpw come from the manifest."""
 import argparse
 import json
 import os
+import re
 import sys
 
 LANE_TAGS = {"gguf": ["gguf", "llama.cpp", "ik_llama.cpp", "trellis", "imatrix"],
@@ -46,6 +47,54 @@ def base_config(model_id):
         return json.load(open(hf_hub_download(model_id, "config.json")))
     except Exception:
         return {}
+
+
+def _frontmatter_license(path):
+    """Read `license:` out of a model card's YAML frontmatter."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.readline().strip() != "---":
+                return None
+            for line in fh:
+                if line.strip() == "---":
+                    return None
+                m = re.match(r"license:\s*(\S+)", line)
+                if m:
+                    return m.group(1).strip("\"'")
+    except OSError:
+        pass
+    return None
+
+
+def _hub_license(model_id):
+    """Ask the Hub for a model's declared license, over stdlib.
+
+    Deliberately not via `huggingface_hub`: reading one public metadata field should not require the
+    `[hf]` extra, and when that import is missing the alternative is guessing.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"https://huggingface.co/api/models/{model_id}",
+                                     headers={"User-Agent": "pollard-card"})
+        with urllib.request.urlopen(req, timeout=30) as fh:
+            return ((json.load(fh).get("cardData") or {}).get("license"))
+    except Exception:
+        return None
+
+
+def base_license(model_id, cfg):
+    """Resolve the base model's license.
+
+    `config.json` almost never carries a license -- the Hub keeps it in the card frontmatter -- so
+    reading config alone falls through to whatever default sits behind it and labels every card the
+    same regardless of the base. Ask the card first, and return None rather than guessing: the
+    license line is a legal claim about someone else's weights.
+    """
+    if cfg.get("license"):
+        return cfg["license"]
+    if os.path.isdir(model_id):
+        return _frontmatter_license(os.path.join(model_id, "README.md"))
+    return _hub_license(model_id)
 
 
 def load_builds(key, lane=None):
@@ -99,7 +148,7 @@ def main():
     ap.add_argument("--base-model", help="base_model for the frontmatter (default: --model)")
     ap.add_argument("--title", help="card title (default: basename of base model)")
     ap.add_argument("--params", help="param count, e.g. 2.5B (else estimated from config)")
-    ap.add_argument("--license", dest="license_", help="license (else from base config)")
+    ap.add_argument("--license", dest="license_", help="license (else read off the base model's card)")
     ap.add_argument("--lane", help="only this lane's builds")
     ap.add_argument("--results", help="JSON: {file_or_tag: {ppl, kld, tps, note}} + optional "
                     "{_eval, _f16_ppl, _hw}. `tps` adds a tok/s column; `_hw` names the machine.")
@@ -128,7 +177,12 @@ def main():
 
     cfg = base_config(a.base_model or a.model)
     base_model = a.base_model or a.model
-    lic = a.license_ or cfg.get("license") or "apache-2.0"
+    lic = a.license_ or base_license(base_model, cfg)
+    if not lic:
+        lic = "other"
+        print(f"WARNING: could not resolve the license of {base_model}. Wrote `other`; pass "
+              f"--license to set it. A card must not guess -- it is a legal claim about "
+              f"someone else's weights.", file=sys.stderr)
     mtype = cfg.get("model_type", "")
     builds = load_builds(a.builds_from or a.model, a.lane)
     lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or (["gguf"])
