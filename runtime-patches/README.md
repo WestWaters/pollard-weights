@@ -38,3 +38,23 @@ A patch is confirmed applied by checking its added lines against the tree's own 
 the patch is tried first but cannot be trusted alone: these trees are CRLF on the Windows box and the
 patches are read on a Mac, and one patch would not reverse-apply even with `--ignore-whitespace` while
 every line of it was plainly still in the file.
+
+## Updating a runtime safely
+
+`git pull` in a tree carrying uncommitted support is how `spark2_5` was lost. The order that does not
+lose work:
+
+```bash
+pollard-runtime --dirty                                    # what is uncaptured right now
+pollard-runtime --scan <tree> --capture pre-update         # make it an artifact first
+cd <tree> && git pull && cmake --build build -j
+pollard-runtime --scan <tree> --apply pre-update           # put it back
+pollard-runtime --verify                                   # prove it is back
+```
+
+`pollard-fit` prints exactly this sequence when it hits a build too old for a model's architecture. It
+used to print a bare `git pull`, which was advice that could destroy a published model's runtime.
+
+**A patched tree is not updated in place.** The trees carrying local support (`ifm-llama`,
+`ik_llama.cpp`, `llama-stq`) are pinned to the bases their patches were written against. A current
+upstream runtime is a SEPARATE clone, so nothing a pull does can reach the patched trees.
