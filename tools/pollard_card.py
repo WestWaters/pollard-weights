@@ -138,6 +138,7 @@ def build_runtimes(builds, repo=None):
             arch = reasons.get("architecture") if isinstance(reasons, dict) else None
             if arch:
                 out.setdefault("_fork_arch", arch)
+                out.setdefault("_arch_verdict", verdict)
         except Exception as e:                                            # noqa: BLE001
             print(f"WARNING: could not read the header of {os.path.basename(path)} via {where} "
                   f"({e}); the card will not state a runtime for it.", file=sys.stderr)
@@ -250,10 +251,20 @@ def main():
     # the card has to name which. `k2-horizon` is not among upstream's 146 architectures, so all three
     # K2 repos shipped ordinary K-quants that still open nowhere but the IFM fork.
     fork_arch = runtimes.get("_fork_arch")
+    # 'newer' and 'fork' are different promises to a reader: one is "update llama.cpp", the other is
+    # "you need someone else's build". Conflating them once told people Spark-X2.5 needed a fork when
+    # upstream had merged the architecture days earlier.
+    arch_verdict = runtimes.get("_arch_verdict")
     fork_where = runtimes.get("_supported_by")
     fork_plain = runtimes.get("_supported_plain") or "a vendor fork"
+    if arch_verdict == "newer":
+        fork_where = "a current llama.cpp"
+        fork_plain = "a current llama.cpp"
     runtimes = {k: v for k, v in runtimes.items() if not k.startswith("_")}
-    ik_builds = [b for b in builds if runtimes.get(b.get("path")) in ("ik_llama", "fork")]
+    # Anything that is not plainly 'stock' has to be said on the card. 'newer' and 'unknown' belong
+    # here too: a reader whose llama.cpp cannot open the file does not care why it cannot.
+    NONSTOCK = ("ik_llama", "fork", "newer", "unknown")
+    ik_builds = [b for b in builds if runtimes.get(b.get("path")) in NONSTOCK]
 
     pb = parse_params_b(a.params, cfg)
     f16_gb = pb * 2.0
@@ -295,7 +306,13 @@ def main():
             out += ["**Standard GGUF — every file here runs in stock llama.cpp / ik_llama.cpp, "
                     "Ollama, LM Studio.**", ""]
         elif len(ik_builds) == len(runtimes):
-            if fork_arch:
+            if fork_arch and arch_verdict == "newer":
+                out += [f"**Standard GGUF, but you need a recent llama.cpp.** This model's "
+                        f"architecture (`{fork_arch}`) is implemented upstream, so any build new "
+                        "enough to carry it runs these files -- llama.cpp itself, and Ollama or "
+                        "LM Studio once they ship a runtime with it. An older build will refuse them "
+                        "with `unknown model architecture`. The quants are ordinary K-quants.", ""]
+            elif fork_arch:
                 where = fork_where or "the vendor's llama.cpp fork"
                 out += [f"**These files need {where}.** This model's architecture "
                         f"(`{fork_arch}`) is not one upstream llama.cpp knows, so stock llama.cpp -- "
@@ -341,7 +358,7 @@ def main():
             rtb = runtimes.get(b.get("path"))
             if rtb == "ik_llama":
                 head += " *(ik_llama.cpp)*"
-            elif rtb == "fork":
+            elif rtb in ("fork", "newer", "unknown"):
                 head += f" *(needs {fork_plain})*"
             out.append(f"{head} {note[:110]}{rec}" if note else f"{head}{rec}")
         out.append("")
@@ -368,8 +385,8 @@ def main():
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','—')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
-        rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain,
-                  "stock": "any llama.cpp"}.get(rt, "—")
+        rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain,
+                  "unknown": "unverified", "stock": "any llama.cpp"}.get(rt, "—")
         rt_c = (" " + rt_lbl + " |") if mixed else ""
         out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{r.get('kld','—')} |{rt_c} {r.get('note', b.get('tag',''))} |")
@@ -438,7 +455,7 @@ def main():
         # recommended rung is ik_llama-only, showing it behind a stock `llama-server -hf` sends
         # people to a load error -- so the stock example moves to a rung that loads, and the
         # recommended one is shown with the build it needs.
-        ex_ik = runtimes.get(ex.get("path")) in ("ik_llama", "fork")
+        ex_ik = runtimes.get(ex.get("path")) in NONSTOCK
         stock = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
         stock_pick = max(stock, key=lambda b: (b.get("bytes") or 0), default=None)
         if not ex_ik:
@@ -451,7 +468,10 @@ def main():
             out += ["They also work in anything built on llama.cpp — **LM Studio, koboldcpp, Jan, "
                     f"ramalama, Ollama** (`ollama run hf.co/{repo}`).", ""]
         else:
-            lead = (f"This model's architecture (`{fork_arch}`) needs "
+            lead = (f"This model's architecture (`{fork_arch}`) needs a llama.cpp new enough to "
+                    "carry it, so build or update from upstream first"
+                    if fork_arch and arch_verdict == "newer" else
+                    f"This model's architecture (`{fork_arch}`) needs "
                     f"{fork_where or 'the vendor llama.cpp fork'}, so every file here runs there"
                     if fork_arch else
                     f"`{extag or exn}` is built on ik_llama-only atoms, so it runs with "
@@ -464,6 +484,9 @@ def main():
                 out += [f"For stock llama.cpp, Ollama or LM Studio, use `{st or sn}` instead:", "",
                         "```bash", f"llama-server -hf {repo}:{st}" if st else f"llama-server -hf {repo}",
                         f'llama-cli    -m {sn} -ngl 99 -p "Explain why the sky is blue."', "```", ""]
+            elif arch_verdict == "newer":
+                out += ["Ollama and LM Studio will run these once their bundled llama.cpp carries "
+                        f"`{fork_arch}`.", ""]
             else:
                 out += ["No rung in this repo loads in stock llama.cpp, so Ollama and LM Studio "
                         "cannot run these files.", ""]
@@ -492,7 +515,13 @@ def main():
     # ---- errata + footer
     out += ["## Errata", ""]
     if "gguf" in lanes:
-        if ik_builds and fork_arch:
+        if ik_builds and fork_arch and arch_verdict == "newer":
+            out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp added "
+                       "recently. A build older than that support refuses these files with `unknown "
+                       "model architecture` — update llama.cpp rather than looking for a different "
+                       "quant. Checked with `pollard-ggufcheck`, which reads the architecture and the "
+                       "tensor types out of the header and asks upstream what it implements.")
+        elif ik_builds and fork_arch:
             out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp does not "
                        f"implement, so these files load only in "
                        f"{fork_where or 'the vendor fork that adds it'} — the quant types are "

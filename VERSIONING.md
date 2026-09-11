@@ -28,9 +28,10 @@ Tools added since `v1.3.0` — **45 CLI tools** now:
 - `pollard-errsrc` — attribute measured KL cost to a tensor *and* the trigger behind it, so budget goes
   where it buys something.
 - `pollard-ggufcheck` — report which runtime a GGUF needs from its header rather than its name: both
-  the tensor types (stock llama.cpp rejects any ggml type above 42) and `general.architecture` (checked
-  against upstream's 146). Either alone can make a file fork-only. Exits non-zero, so it works as a
-  pre-publish gate.
+  the tensor types (stock llama.cpp rejects any ggml type above 42) and `general.architecture`. Either
+  alone can stop a file loading. It separates "your llama.cpp is older than this architecture" from
+  "no upstream support exists", asking ggml-org master rather than trusting a snapshot, and says
+  nothing at all when it cannot check. Exits non-zero, so it works as a pre-publish gate.
 - `pollard-reclaim` — free the disk a finished model still holds, but only once the published copy is
   proven identical (matched by exact length, then confirmed head/middle/tail against the Hub). Reports
   by default; deleting is opt-in, and sources are a separate opt-in again.
