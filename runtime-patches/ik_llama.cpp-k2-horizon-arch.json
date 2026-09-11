@@ -21,11 +21,10 @@
  "adds_strings": [
   "deepseek-llm",
   "k2-horizon",
-  "llama-vocab.h",
   "output",
   "output_norm",
   "rope_freqs",
   "token_embd"
  ],
- "diff_bytes": 30634
+ "diff_bytes": 14427
 }

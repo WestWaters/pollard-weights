@@ -250,6 +250,25 @@ def _slug(tree):
     return os.path.basename(os.path.abspath(tree).rstrip("/\\")) or "runtime"
 
 
+def encoding_noise(diff):
+    """Describe encoding damage in a diff, or '' if it is clean.
+
+    Two signatures: a byte-order mark on an added line, and the leading bytes of UTF-8 text that was
+    decoded as Latin-1 and re-encoded. Both replace a line with a broken copy of itself.
+    """
+    bom = "\ufeff"
+    markers = ("\u00c3\u00a2", "\u00c3\u0083", "\u00ef\u00bd", "\u00c3\u00af")
+    adds = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    n_bom = sum(1 for l in adds if bom in l)
+    n_moji = sum(1 for l in adds if any(m in l for m in markers))
+    bits = []
+    if n_bom:
+        bits.append(f"{n_bom} added line(s) carry a byte-order mark")
+    if n_moji:
+        bits.append(f"{n_moji} added line(s) look like UTF-8 re-encoded as Latin-1")
+    return "; ".join(bits)
+
+
 def capture(tree, name, out_dir=PATCH_DIR):
     """Export a runtime tree's uncommitted changes as a tracked patch plus a manifest.
 
@@ -270,6 +289,17 @@ def capture(tree, name, out_dir=PATCH_DIR):
 
     added_archs = sorted({m for m in re.findall(r'^\+.*?"\s*([a-z][a-z0-9._\-]{2,31})\s*"',
                                                 diff, re.M)})
+    # Refuse to store encoding damage as if it were work. A byte-order mark, or text that was valid
+    # UTF-8 until an editor read it as Latin-1 and wrote it back, shows up as hunks that replace a
+    # line with a corrupted copy of itself. That is never an intended change, and once captured it
+    # becomes the thing you re-apply after a clone -- baking the damage in permanently.
+    # Found for real: 27 of 39 hunks in a k2-horizon capture were a BOM or mojibake, including inside
+    # a DeepSeek pre-tokenizer regex, which would mis-tokenize that model in any build made from it.
+    noise = encoding_noise(diff)
+    if noise:
+        return None, ("refusing to capture: this diff carries encoding damage, not just changes -- "
+                      + noise + ". Restore the affected files and re-apply only the hunks you meant, "
+                      "then capture again.")
     gi = git_info(tree)
     os.makedirs(out_dir, exist_ok=True)
     slug = _slug(tree)
