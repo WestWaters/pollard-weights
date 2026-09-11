@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""exl3_band.py — band-parallel conversion for exllamav3 (EXL3) on models that do not fit one node.
+"""pollard-exl3-band — band-parallel EXL3 conversion for models that do not fit one node.
+
+The companion to `pollard-exl3`: same lane, same gold recipe, but for a body too large to cook
+sequentially on one machine.
 
 exllamav3's converter is sequential: module i+1 is calibrated on the quantized output of module i, and a 744B model would
 take ~3 days on one 121 GB node. Its work dir, however, is plain: `args.json`, `ckpt/job.json` (`next_module_idx`,
@@ -23,15 +26,15 @@ Layer i is module i+1 (module 0 = embeddings, num_layers+1 = final norm, +2 = he
 tensor `[rows, cols, hidden]` (any float dtype; key --state-key, default "h").
 
     # on node k (band first..last), CONVERT = path to exllamav3/convert.py, extra flags after "--" go to the fresh run:
-    python3 exl3_band.py band --convert $CONVERT --in-dir $HF --work $W --first 32 --last 39 \
+    pollard-exl3-band band --convert $CONVERT --in-dir $HF --work $W --first 32 --last 39 \
         --state boundary_32.safetensors --calib calib.safetensors --rows 384 --cols 2048 -- -b 3.2 -hb 6 -mb 8 -hq
     # merge node:
-    python3 exl3_band.py merge --convert $CONVERT --work $W --out $OUT --num-layers 78 --state boundary_78.safetensors \
+    pollard-exl3-band merge --convert $CONVERT --work $W --out $OUT --num-layers 78 --state boundary_78.safetensors \
         --calib calib.safetensors --rows 384 --qtensors /gather/band*/qtensors
     # lower level: fabricate/replace a checkpoint by hand
-    python3 exl3_band.py inject --work $W --state boundary_32.safetensors --calib calib.safetensors --next 33
+    pollard-exl3-band inject --work $W --state boundary_32.safetensors --calib calib.safetensors --next 33
 
-Second pass (re-cook only some bands with a corrected --recipe, see exl3_depth_recipe.py): run `band` again for those bands
+Second pass (re-cook only some bands with a corrected --recipe, see experiments/exl3_depth_recipe.py): run `band` again for those bands
 with `-- --recipe recipe.yaml ...` into a new work dir, then `merge` with `--qtensors` listing the new bands' dirs FIRST and
 `--overwrite` (later dirs never overwrite earlier ones).
 """
@@ -125,7 +128,7 @@ def cmd_merge(a):
     print("merge:", "DONE" if ok else f"FAILED rc={rc}", a.out); sys.exit(0 if ok else 1)
 
 
-if __name__ == "__main__":
+def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     sp = ap.add_subparsers(dest="cmd", required=True)
     common = argparse.ArgumentParser(add_help=False)
@@ -140,5 +143,11 @@ if __name__ == "__main__":
     p.add_argument("--state", required=True, help="residual stream after the last layer"); p.add_argument("--qtensors", nargs="+", required=True, help="dirs (globs ok) holding model.layers.*.safetensors; earlier wins unless --overwrite")
     p.add_argument("--overwrite", action="store_true"); p.add_argument("--hardlink", action="store_true"); p.add_argument("--devices", default="0"); p.add_argument("--checkpoint-interval", type=int, default=900)
     a = ap.parse_args()
-    if a.cmd == "band" and a.rows is None: sys.exit("--rows is required for band (calibration rows)")
+    if a.cmd == "band" and a.rows is None:
+        sys.exit("--rows is required for band (calibration rows)")
     {"inject": cmd_inject, "band": cmd_band, "merge": cmd_merge}[a.cmd](a)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

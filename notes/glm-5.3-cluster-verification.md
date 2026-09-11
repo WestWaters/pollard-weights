@@ -39,7 +39,7 @@ than the quantization). Two things the contract should say explicitly, both meas
 
 ## 3. Gaps filled in this PR
 
-- `experiments/exl3_band.py` — the executing side of the contract for the **EXL3 lane**: `inject` a band-start residual
+- `pollard-exl3-band` — the executing side of the contract for the **EXL3 lane**: `inject` a band-start residual
   stream into exllamav3's checkpoint format, `band` (template → inject → resume), `merge` (gather → final norm/head/MTP →
   compile). The GLM-5.3 run used these exact steps as per-node shell scripts (78 layers, 10 nodes, ~7 h + 1 h merge; a
   fabricated 16-row checkpoint resumed through layer 0 before the full run); this file is the consolidated, node-agnostic
