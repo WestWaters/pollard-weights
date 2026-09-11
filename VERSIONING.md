@@ -17,7 +17,7 @@ is green and ready.
 
 ## Unreleased (on `main`, not yet tagged)
 
-Tools added since `v1.3.0` — **41 CLI tools** now:
+Tools added since `v1.3.0` — **42 CLI tools** now:
 
 - `pollard-archfp` — fingerprint an architecture's layout and name the known family it is a twin of
   (dense / MoE / MLA / DSA / hybrid linear-attention), from a GGUF or HF weights.
@@ -27,12 +27,15 @@ Tools added since `v1.3.0` — **41 CLI tools** now:
   before building any candidate.
 - `pollard-errsrc` — attribute measured KL cost to a tensor *and* the trigger behind it, so budget goes
   where it buys something.
+- `pollard-ggufcheck` — report which runtime a GGUF needs from its tensor types rather than its name,
+  locally or against a published repo; exits non-zero so it works as a pre-publish gate.
 - `pollard-card` / `pollard-onboard` / `pollard-envmatch` / `pollard-serve-eval` — card generation,
   custom-arch onboarding, environment matching, served-side evaluation.
 
 Also on `main`: `pollard-fit --tier` (pin a whole component class and spend the remaining budget),
 `pollard-calc --gpu auto` (read the installed card instead of a name table), and the one master card
-template every repo is generated from.
+template every repo is generated from — which now reads each rung's license and runtime need from the
+base model's card and the built files, instead of defaulting either.
 
 ## History
 
