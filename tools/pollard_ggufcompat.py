@@ -157,6 +157,61 @@ IK_NAMES = {133: "Q6_0", 134: "IQ1_BN", 135: "IQ2_BN", 136: "Q8_K64", 137: "IQ2_
             157: "IQ2_KL", 158: "IQ1_KT"}
 
 
+# What a non-CUDA/Metal BACKEND will accept, and what it silently does to the rest.
+#
+# "Which runtime opens this file" is only half the question. A backend can open a file and then change
+# it: OpenVINO's NPU path requantizes Q6_K to Q4_0_128, which discards a measured allocation while
+# reporting success. That is the same failure shape as a fork-only atom -- the file works, and is not
+# what the card promised.
+#
+# Source: llama.cpp docs/backend/OPENVINO.md. `accepts` is the documented scheme list; `rewrites` maps
+# an accepted type to what the backend turns it into on that device.
+BACKENDS = {
+    "openvino-cpu": {
+        "label": "OpenVINO (Intel CPU)",
+        "accepts": {"F16", "BF16", "Q8_0", "Q4_0", "Q4_1", "Q4_K", "Q5_K", "Q6_K"},
+        "rewrites": {"Q5_K": "Q8_0_C", "Q6_K": "Q8_0_C"},
+        "note": "BF16 is Xeon-only",
+    },
+    "openvino-gpu": {
+        "label": "OpenVINO (Intel GPU)",
+        "accepts": {"F16", "Q8_0", "Q4_0", "Q4_1", "Q4_K", "Q5_K", "Q6_K"},
+        "rewrites": {"Q5_K": "Q8_0_C", "Q6_K": "Q8_0_C"},
+        "note": "",
+    },
+    "openvino-npu": {
+        "label": "OpenVINO (Intel NPU)",
+        "accepts": {"F16", "Q8_0", "Q4_0", "Q4_1", "Q4_K", "Q5_K", "Q6_K"},
+        "rewrites": {"Q6_K": "Q4_0_128", "Q5_K": "Q4_0_128"},
+        "note": "Q4_0 is the primary scheme; embedding Q6_K goes to Q8_0_C and the token embedding "
+                "is dequantized to fp16",
+    },
+}
+
+
+def backend_report(counts):
+    """{backend key: (verdict, detail)} for a tensor-type histogram.
+
+    verdict is 'ok' (every type accepted and kept as-is), 'rewritten' (accepted but the backend
+    changes some tensors) or 'unsupported' (a type the backend does not take at all).
+    """
+    out = {}
+    present = {type_name(t) for t in counts}
+    for key, spec in BACKENDS.items():
+        # F32 is always fine: it is the accumulate/norm type, not a quantization scheme
+        quant = {n for n in present if n != "F32"}
+        missing = sorted(n for n in quant if n not in spec["accepts"])
+        if missing:
+            out[key] = ("unsupported", f"does not accept {', '.join(missing)}")
+            continue
+        changed = sorted(f"{n} -> {spec['rewrites'][n]}" for n in quant if n in spec["rewrites"])
+        if changed:
+            out[key] = ("rewritten", "; ".join(changed))
+        else:
+            out[key] = ("ok", "")
+    return out
+
+
 def type_name(t):
     return STOCK_NAMES.get(t) or IK_NAMES.get(t) or f"type{t}"
 
@@ -323,6 +378,10 @@ def main():
     ap.add_argument("files", nargs="*", help="GGUF paths (or URLs)")
     ap.add_argument("--repo", help="check every .gguf in a published HF repo instead")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--backends", action="store_true",
+                    help="also report what non-CUDA/Metal backends do with this file. A backend can "
+                         "ACCEPT a file and still change it -- OpenVINO's NPU path requantizes Q6_K "
+                         "to Q4_0_128, which discards a measured allocation while reporting success")
     ap.add_argument("--offline", action="store_true",
                     help="do not ask upstream what it implements. An architecture missing from the "
                          "local list then reports as unverified instead of being called fork-only -- "
@@ -352,7 +411,13 @@ def main():
             if not a.json:
                 print(f"  UNREADABLE  {name}\n              {e}")
             continue
-        rows.append({"file": name, "runtime": rt, "reasons": fo})
+        row = {"file": name, "runtime": rt, "reasons": fo}
+        if a.backends:
+            try:
+                row["backends"] = backend_report(read_header(t)[1])
+            except Exception:                                              # noqa: BLE001
+                row["backends"] = {}
+        rows.append(row)
         if rt != "stock":
             rc = 1                     # 'newer' counts: the runtime here still cannot open it
         if not a.json:
@@ -375,6 +440,11 @@ def main():
             else:
                 label, why = "stock llama.cpp", ""
             print(f"  {label:<16}  {name}{why}")
+            for key, (verdict, detail) in (row.get("backends") or {}).items():
+                mark = {"ok": "loads as built", "rewritten": "REWRITTEN",
+                        "unsupported": "UNSUPPORTED"}[verdict]
+                line = f"      {BACKENDS[key]['label']:<24} {mark}"
+                print(line + (f"  ({detail})" if detail else ""))
 
     if a.json:
         print(json.dumps(rows, indent=1))

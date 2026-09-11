@@ -800,6 +800,41 @@ def test_bench_coherence_does_not_swallow_speed():
         "the speed exit must distinguish 'no gate ran' from 'gate failed'"
 
 
+def test_backend_report_flags_rewrites_not_just_rejections():
+    """A backend that ACCEPTS a file can still change it, and that must be reported too.
+
+    OpenVINO's NPU path requantizes Q6_K to Q4_0_128. The load succeeds, the model runs, and the
+    measured allocation is gone -- the same failure shape as a fork-only atom or an unknown
+    architecture, which is the third time this pattern has cost us. And no IQ type is on OpenVINO's
+    accepted list at all, so most of what Pollard publishes cannot load there in any form.
+    """
+    import pollard_ggufcompat as gc
+
+    # an IQ ladder rung: unsupported everywhere on OpenVINO
+    iq = {0: 100, 23: 200, 21: 50}            # F32, IQ4_XS, IQ3_S
+    rep = gc.backend_report(iq)
+    for key in ("openvino-cpu", "openvino-gpu", "openvino-npu"):
+        verdict, detail = rep[key]
+        assert verdict == "unsupported", (key, verdict, detail)
+        assert "IQ4_XS" in detail, detail
+
+    # Q6_K: accepted everywhere, but rewritten -- and to something WORSE on NPU
+    q6 = {0: 100, 14: 200}                    # F32, Q6_K
+    rep2 = gc.backend_report(q6)
+    assert rep2["openvino-cpu"][0] == "rewritten", rep2["openvino-cpu"]
+    assert "Q8_0_C" in rep2["openvino-cpu"][1]
+    assert rep2["openvino-npu"][0] == "rewritten", rep2["openvino-npu"]
+    assert "Q4_0_128" in rep2["openvino-npu"][1], rep2["openvino-npu"][1]
+
+    # Q4_0 is the one scheme that survives untouched on every OpenVINO device
+    q4 = {0: 100, 2: 200}                     # F32, Q4_0
+    rep3 = gc.backend_report(q4)
+    assert all(v == "ok" for v, _ in rep3.values()), rep3
+
+    # F32 alone must never be called a quantization problem
+    assert all(v == "ok" for v, _ in gc.backend_report({0: 10}).values())
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
