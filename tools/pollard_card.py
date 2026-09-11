@@ -128,9 +128,18 @@ def build_runtimes(builds, repo=None):
             src = f"https://huggingface.co/{repo}/resolve/main/{b.get('name') or os.path.basename(path)}"
             where = "the published copy"
         try:
-            out[path] = gc.runtime_of(src)[0]
+            verdict, reasons = gc.runtime_of(src)
+            out[path] = verdict
+            if isinstance(reasons, dict) and reasons.get("supported_by"):
+                url = reasons.get("supported_url")
+                out.setdefault("_supported_by",
+                               f"[{reasons['supported_by']}]({url})" if url else reasons["supported_by"])
+                out.setdefault("_supported_plain", reasons["supported_by"])
+            arch = reasons.get("architecture") if isinstance(reasons, dict) else None
+            if arch:
+                out.setdefault("_fork_arch", arch)
         except Exception as e:                                            # noqa: BLE001
-            print(f"WARNING: could not read tensor types from {os.path.basename(path)} via {where} "
+            print(f"WARNING: could not read the header of {os.path.basename(path)} via {where} "
                   f"({e}); the card will not state a runtime for it.", file=sys.stderr)
     return out
 
@@ -237,7 +246,14 @@ def main():
     f16_ppl = results.get("_f16_ppl")
 
     runtimes = build_runtimes(builds, repo if a.runtime_from_repo else None)
-    ik_builds = [b for b in builds if runtimes.get(b.get("path")) == "ik_llama"]
+    # A rung can fail stock llama.cpp two ways -- a fork-only atom, or a fork-only architecture -- and
+    # the card has to name which. `k2-horizon` is not among upstream's 146 architectures, so all three
+    # K2 repos shipped ordinary K-quants that still open nowhere but the IFM fork.
+    fork_arch = runtimes.get("_fork_arch")
+    fork_where = runtimes.get("_supported_by")
+    fork_plain = runtimes.get("_supported_plain") or "a vendor fork"
+    runtimes = {k: v for k, v in runtimes.items() if not k.startswith("_")}
+    ik_builds = [b for b in builds if runtimes.get(b.get("path")) in ("ik_llama", "fork")]
 
     pb = parse_params_b(a.params, cfg)
     f16_gb = pb * 2.0
@@ -279,9 +295,16 @@ def main():
             out += ["**Standard GGUF — every file here runs in stock llama.cpp / ik_llama.cpp, "
                     "Ollama, LM Studio.**", ""]
         elif len(ik_builds) == len(runtimes):
-            out += [f"**These files need [ik_llama.cpp]({IK_URL}).** The measured allocation places "
-                    "ik_llama-only atoms on this model's sensitive tensors, so stock llama.cpp "
-                    "(and therefore Ollama and LM Studio) will not load them.", ""]
+            if fork_arch:
+                where = fork_where or "the vendor's llama.cpp fork"
+                out += [f"**These files need {where}.** This model's architecture "
+                        f"(`{fork_arch}`) is not one upstream llama.cpp knows, so stock llama.cpp -- "
+                        "and therefore Ollama and LM Studio -- cannot load them whatever the quant "
+                        "types are. The quants themselves are ordinary K-quants.", ""]
+            else:
+                out += [f"**These files need [ik_llama.cpp]({IK_URL}).** The measured allocation "
+                        "places ik_llama-only atoms on this model's sensitive tensors, so stock "
+                        "llama.cpp (and therefore Ollama and LM Studio) will not load them.", ""]
         else:
             need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                              sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
@@ -315,8 +338,11 @@ def main():
             head = f"- **~{gb + 2:.0f} GB RAM / VRAM** → **`{b.get('tag','')}`** ({gb:.2f} GB)."
             # This list is where people actually pick a file, so a rung that stock llama.cpp cannot
             # open has to say so here too -- not only in the table further down.
-            if runtimes.get(b.get("path")) == "ik_llama":
+            rtb = runtimes.get(b.get("path"))
+            if rtb == "ik_llama":
                 head += " *(ik_llama.cpp)*"
+            elif rtb == "fork":
+                head += f" *(needs {fork_plain})*"
             out.append(f"{head} {note[:110]}{rec}" if note else f"{head}{rec}")
         out.append("")
 
@@ -342,7 +368,9 @@ def main():
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','—')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
-        rt_c = (" " + ("ik_llama" if rt == "ik_llama" else "any llama.cpp" if rt else "—") + " |") if mixed else ""
+        rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain,
+                  "stock": "any llama.cpp"}.get(rt, "—")
+        rt_c = (" " + rt_lbl + " |") if mixed else ""
         out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{r.get('kld','—')} |{rt_c} {r.get('note', b.get('tag',''))} |")
     if has_tps:
@@ -410,7 +438,7 @@ def main():
         # recommended rung is ik_llama-only, showing it behind a stock `llama-server -hf` sends
         # people to a load error -- so the stock example moves to a rung that loads, and the
         # recommended one is shown with the build it needs.
-        ex_ik = runtimes.get(ex.get("path")) == "ik_llama"
+        ex_ik = runtimes.get(ex.get("path")) in ("ik_llama", "fork")
         stock = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
         stock_pick = max(stock, key=lambda b: (b.get("bytes") or 0), default=None)
         if not ex_ik:
@@ -423,8 +451,12 @@ def main():
             out += ["They also work in anything built on llama.cpp — **LM Studio, koboldcpp, Jan, "
                     f"ramalama, Ollama** (`ollama run hf.co/{repo}`).", ""]
         else:
-            out += [f"`{extag or exn}` is built on ik_llama-only atoms, so it runs with "
-                    "**[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)**:", "", "```bash",
+            lead = (f"This model's architecture (`{fork_arch}`) needs "
+                    f"{fork_where or 'the vendor llama.cpp fork'}, so every file here runs there"
+                    if fork_arch else
+                    f"`{extag or exn}` is built on ik_llama-only atoms, so it runs with "
+                    "**[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)**")
+            out += [lead + ":", "", "```bash",
                     f'llama-cli    -m {exn} -ngl 99 -p "Explain why the sky is blue."',
                     f"llama-server -m {exn} -ngl 99", "```", ""]
             if stock_pick:
@@ -460,7 +492,13 @@ def main():
     # ---- errata + footer
     out += ["## Errata", ""]
     if "gguf" in lanes:
-        if ik_builds:
+        if ik_builds and fork_arch:
+            out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp does not "
+                       f"implement, so these files load only in "
+                       f"{fork_where or 'the vendor fork that adds it'} — the quant types are "
+                       "ordinary and irrelevant to that. Checked with `pollard-ggufcheck`, which "
+                       "reads the architecture and the tensor types out of the header.")
+        elif ik_builds:
             names = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                               sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
             out.append(f"- {names} carry ik_llama-only atoms and need ik_llama.cpp to run; "
