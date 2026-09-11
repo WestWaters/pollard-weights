@@ -835,6 +835,52 @@ def test_backend_report_flags_rewrites_not_just_rejections():
     assert all(v == "ok" for v, _ in gc.backend_report({0: 10}).values())
 
 
+def test_kv_counts_only_the_layers_that_produce_it():
+    """KV must be counted on the layers that PRODUCE it, and the indexer cache on every arch.
+
+    DeepSeek-V4.1-Flash runs CSA2: most layers read a previous layer's KV and keep none of their own.
+    Its config says which produce it -- kv_source_layer_ids = [2, 8, 14, 20], four of forty layers.
+    Counting all forty overstates the cache by 10x, and at a 1M context that is the number deciding
+    whether the model fits a box at all.
+
+    The second bug was worse because it was silent: the indexer cache was added only on the MLA
+    branch. This model has no kv_lora_rank, so its 8 indexer layers vanished and the estimate halved.
+
+    Validated against a served measurement: 12 GiB pinned holding 2.56 M tokens with fp4 KV
+    = 4.92 KB/token. The model lands at 4.00, 19 % under -- the right order, where it had been 2.5x
+    out before.
+    """
+    import pollard_calc as pc
+
+    cfg = {
+        "num_hidden_layers": 40,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "index_head_dim": 128,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "hidden_size": 5120,
+        "num_attention_heads": 64,
+    }
+    a = pc.analyse(cfg)
+    assert a["layers"] == 40
+    assert a["n_kv_layers"] == 4, a.get("n_kv_layers")
+    assert a["n_indexer"] == 8, a.get("n_indexer")
+
+    kb = pc.kv_cache_bytes(a, 1_000_000, 0.5) / 1_000_000 / 1024
+    assert 3.5 < kb < 6.0, f"{kb} KB/token is not near the measured 4.92"
+
+    # counting all 40 layers -- the old behaviour -- must be far away from measured
+    naive = dict(a); naive["n_kv_layers"] = 0; naive["n_full"] = 0
+    kb_naive = pc.kv_cache_bytes(naive, 1_000_000, 0.5) / 1_000_000 / 1024
+    assert kb_naive > 2 * kb, f"all-layer count {kb_naive} should dwarf {kb}"
+
+    # and the indexer must be counted even with no MLA latent present
+    no_idx = dict(a); no_idx["index_head_dim"] = 0
+    assert pc.kv_cache_bytes(no_idx, 1_000_000, 0.5) < pc.kv_cache_bytes(a, 1_000_000, 0.5), \
+        "the indexer cache must add bytes on a non-MLA architecture"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
