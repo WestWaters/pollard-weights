@@ -330,8 +330,13 @@ def test_card_license_is_never_invented():
     assert "apache-2.0" not in src, "pollard_card must not hardcode any license"
 
 
-def _mini_gguf(types, path=None):
-    """Write a minimal GGUF with one tensor per entry in `types` (ggml type ids)."""
+def _mini_gguf(types, path=None, arch=b"llama"):
+    """Write a minimal GGUF with one tensor per entry in `types` (ggml type ids).
+
+    The architecture is a real upstream one by default: pollard-ggufcheck rejects an unknown
+    `general.architecture` on its own, so a placeholder here would make every atom assertion fail for
+    the wrong reason.
+    """
     import struct
     path = path or tempfile.NamedTemporaryFile(suffix=".gguf", delete=False).name
     with open(path, "wb") as fh:
@@ -339,11 +344,12 @@ def _mini_gguf(types, path=None):
         fh.write(struct.pack("<I", 3))                 # version
         fh.write(struct.pack("<Q", len(types)))        # tensor count
         fh.write(struct.pack("<Q", 1))                 # one kv pair
-        # kv: "general.architecture" (type 8 = string) -> "test"
+        # kv: general.architecture -> a REAL upstream architecture, so this fixture exercises the
+        # atom check without tripping the separate architecture check
         k = b"general.architecture"
         fh.write(struct.pack("<Q", len(k))); fh.write(k)
         fh.write(struct.pack("<I", 8))
-        fh.write(struct.pack("<Q", 4)); fh.write(b"test")
+        fh.write(struct.pack("<Q", len(arch))); fh.write(arch)
         for i, t in enumerate(types):
             n = f"blk.{i}.weight".encode()
             fh.write(struct.pack("<Q", len(n))); fh.write(n)
@@ -552,6 +558,31 @@ def test_refcheck_flags_a_broken_forward():
     # hy_v4 is on record with the expected value the gate compares against
     assert "hy_v4" in RC.KNOWN_DEFECTS
     assert RC.KNOWN_DEFECTS["hy_v4"]["expect_nll"] < RC.NLL_SUSPECT
+
+
+def test_ggufcheck_catches_a_fork_only_architecture():
+    """Stock-only atoms are not enough: the architecture string has to be one stock llama.cpp knows.
+
+    `general.architecture` is checked by name against upstream's LLM_ARCH_NAMES. A brand-new model
+    whose support lives in a vendor fork produces a file of perfectly ordinary K-quants that opens
+    nowhere else -- which is what all three K2-Horizon repos shipped. Every tensor is stock, the
+    tensor-type check passed them clean, and all three cards said the K-quants run anywhere.
+    """
+    import pollard_ggufcompat as gc
+
+    known = gc.stock_archs()
+    assert len(known) > 100, f"the architecture list looks wrong ({len(known)} entries)"
+    for ordinary in ("llama", "qwen2", "qwen3", "qwen3moe", "bailingmoe3", "deepseek2"):
+        assert ordinary in known, f"{ordinary} must be recognised as stock-loadable"
+
+    # the ones we actually ship that upstream does not implement
+    assert "k2-horizon" not in known, "k2-horizon is not an upstream architecture"
+    assert "k2-horizon" in gc.FORK_ARCHS, "a fork-only architecture must record where it IS supported"
+    name, url = gc.FORK_ARCHS["k2-horizon"]
+    assert "MBZUAI" in name and url.startswith("https://"), (name, url)
+
+    # `clip` is a quantize-only dummy and must not be offered as a loadable architecture
+    assert "clip" not in known
 
 
 def main():
