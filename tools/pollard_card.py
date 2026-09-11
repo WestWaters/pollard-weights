@@ -313,6 +313,10 @@ def main():
             if is_rec and note:
                 note = f"**{note}**"
             head = f"- **~{gb + 2:.0f} GB RAM / VRAM** → **`{b.get('tag','')}`** ({gb:.2f} GB)."
+            # This list is where people actually pick a file, so a rung that stock llama.cpp cannot
+            # open has to say so here too -- not only in the table further down.
+            if runtimes.get(b.get("path")) == "ik_llama":
+                head += " *(ik_llama.cpp)*"
             out.append(f"{head} {note[:110]}{rec}" if note else f"{head}{rec}")
         out.append("")
 
