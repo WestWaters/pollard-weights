@@ -1,0 +1,18 @@
+{
+ "all_k3_3p01bpw": {
+  "rows": 39,
+  "bf16_nll": 1.3209,
+  "exl3_nll": 1.3152,
+  "delta_nll": -0.0057,
+  "sem": 0.0031,
+  "rows_worse": 16,
+  "ppl_bf16": 3.747,
+  "ppl_exl3": 3.726,
+  "weight_rel_err": {
+   "w1": 0.1673,
+   "w3": 0.1673,
+   "w2": 0.1653
+  }
+ },
+ "method": "reference forward with every routed expert replaced by its EXL3 reconstruction; paired per row vs the bf16 forward on the same calibration rows"
+}
