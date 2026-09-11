@@ -31,7 +31,10 @@ Tools added since `v1.3.0` — **46 CLI tools** now:
   the tensor types (stock llama.cpp rejects any ggml type above 42) and `general.architecture`. Either
   alone can stop a file loading. It separates "your llama.cpp is older than this architecture" from
   "no upstream support exists", asking ggml-org master rather than trusting a snapshot, and says
-  nothing at all when it cannot check. Exits non-zero, so it works as a pre-publish gate.
+  nothing at all when it cannot check. `--backends` adds what a non-CUDA/Metal backend does with the
+  file: OpenVINO accepts no IQ type at all, and its NPU path requantizes Q6_K to Q4_0_128, discarding
+  a measured allocation while the load reports success. Exits non-zero, so it works as a pre-publish
+  gate.
 - `pollard-reclaim` — free the disk a finished model still holds, but only once the published copy is
   proven identical (matched by exact length, then confirmed head/middle/tail against the Hub). Reports
   by default; deleting is opt-in, and sources are a separate opt-in again.
