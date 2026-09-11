@@ -58,3 +58,17 @@ used to print a bare `git pull`, which was advice that could destroy a published
 **A patched tree is not updated in place.** The trees carrying local support (`ifm-llama`,
 `ik_llama.cpp`, `llama-stq`) are pinned to the bases their patches were written against. A current
 upstream runtime is a SEPARATE clone, so nothing a pull does can reach the patched trees.
+
+## After a sync that adds a tool
+
+Syncing the repo updates the code but not the commands. An editable install resolves modules straight
+into the checkout, so `import pollard_card` is always current, but pip only writes command launchers
+when it runs — so a newly added tool exists and its command does not.
+
+```bash
+pollard-runtime --install        # does the install run what the repo declares?
+```
+
+Non-zero means a declared command has no launcher, and it prints the exact `pip install -e` to fix it.
+Run that wherever Pollard is installed. Every tool added in one session was in that state on both
+machines, and nothing surfaced it until someone typed a name that did not exist.

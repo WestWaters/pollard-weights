@@ -201,6 +201,48 @@ def published_archs(owner="PollardWeights"):
     return out
 
 
+def declared_scripts(repo_root="."):
+    """Console scripts pyproject declares, as {command: module}."""
+    try:
+        import tomllib
+    except ImportError:                                                    # py<3.11
+        return {}
+    try:
+        with open(os.path.join(repo_root, "pyproject.toml"), "rb") as fh:
+            d = tomllib.load(fh)
+        return dict(d.get("project", {}).get("scripts", {}))
+    except Exception:                                                      # noqa: BLE001
+        return {}
+
+
+def installed_scripts():
+    """Command launchers actually present next to the running interpreter."""
+    bindir = os.path.dirname(sys.executable)
+    out = set()
+    for f in os.listdir(bindir) if os.path.isdir(bindir) else []:
+        name = f[:-4] if f.lower().endswith(".exe") else f
+        if name.startswith("pollard"):
+            out.add(name)
+    return out
+
+
+def install_state(repo_root="."):
+    """Is the install able to RUN what the repo declares?
+
+    An editable install keeps module code current automatically -- `import pollard_card` resolves
+    straight into the checkout -- but it only writes command launchers when pip runs. So adding a tool
+    and syncing leaves the code present and the command missing, which is invisible until someone types
+    the name. Every tool added in one session was in exactly that state on both machines.
+    """
+    declared = declared_scripts(repo_root)
+    if not declared:
+        return None
+    present = installed_scripts()
+    missing = sorted(c for c in declared if c not in present)
+    return {"declared": sorted(declared), "present": sorted(present), "missing": missing,
+            "bindir": os.path.dirname(sys.executable)}
+
+
 PATCH_DIR = "runtime-patches"
 
 
@@ -367,6 +409,11 @@ def main():
                          "binaries); non-zero if any has been lost")
     ap.add_argument("--apply", metavar="NAME", help="re-apply a captured patch after a clone or reset")
     ap.add_argument("--patch-dir", default=PATCH_DIR, help=f"where patches live (default {PATCH_DIR})")
+    ap.add_argument("--install", action="store_true",
+                    help="check the install can RUN what the repo declares -- an editable install "
+                         "keeps module code current but only writes command launchers when pip runs, "
+                         "so a synced repo can still have missing commands. Non-zero if any is")
+    ap.add_argument("--repo-root", default=".", help="repo to read pyproject.toml from")
     ap.add_argument("--dirty", action="store_true",
                     help="just list trees with uncommitted changes -- runtime work that is not yet "
                          "an artifact and would be lost by a checkout")
@@ -377,6 +424,25 @@ def main():
     if not trees:
         print("no llama.cpp trees found. Pass --scan <dir>.")
         return 0
+
+    if a.install:
+        st = install_state(a.repo_root)
+        if st is None:
+            print(f"could not read {os.path.join(a.repo_root, 'pyproject.toml')} — pass --repo-root")
+            return 0
+        print(f"interpreter : {sys.executable}")
+        print(f"launchers in: {st['bindir']}")
+        print(f"declared    : {len(st['declared'])}")
+        print(f"present     : {len(st['present'])}")
+        if not st["missing"]:
+            print("\nevery declared command is installed.")
+            return 0
+        print(f"\nMISSING {len(st['missing'])} command(s) — the code is there, the launcher is not:")
+        for c in st["missing"]:
+            print(f"   {c}")
+        print(f"\nfix: {sys.executable} -m pip install -e {os.path.abspath(a.repo_root)} --no-deps")
+        print("Run that wherever Pollard is installed after a sync that adds a tool.")
+        return 1
 
     if a.dirty:
         rc = 0
