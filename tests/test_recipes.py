@@ -767,6 +767,39 @@ def test_capture_refuses_encoding_damage():
     assert R.encoding_noise(legit) == "", R.encoding_noise(legit)
 
 
+def test_bench_coherence_does_not_swallow_speed():
+    """Asking pollard-bench for two measurements must not silently return one.
+
+    The coherence gate exited as soon as it had a verdict, which fired BEFORE the --speed branch. So
+    `--coherence --speed` printed a gate, exited 0, and produced no tok/s at all, with nothing saying
+    a requested measurement had been dropped. That is very likely why published cards have been
+    missing tok/s: the obvious command looks like it did everything.
+
+    Checked against the source rather than by running llama-cli, since the bug is purely one of
+    control flow -- the early exit must be conditional on nothing else having been asked for.
+    """
+    import re as _re
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_bench.py"),
+               encoding="utf-8").read()
+
+    # the gate's early exit must not fire when --speed was also requested
+    m = _re.search(r"gate_passed = print_gate\(res\)\s*\n\s*if ([^\n:]+):", src)
+    assert m, "the gate no longer stores its verdict before deciding to exit"
+    cond = m.group(1)
+    assert "a.speed" in cond, f"the gate still exits without considering --speed: {cond!r}"
+
+    # and the speed branch must come AFTER the gate, so both can run in one invocation
+    i_gate = src.index("gate_passed = print_gate(res)")
+    i_speed = src.index("=== decode speed ===")
+    assert i_gate < i_speed, "speed must run after the gate for both to be reachable"
+
+    # the speed-only exit must still report a gate verdict when a gate ran
+    tail = src[i_speed:i_speed + 2000]
+    assert "gate_passed is None" in tail, \
+        "the speed exit must distinguish 'no gate ran' from 'gate failed'"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
