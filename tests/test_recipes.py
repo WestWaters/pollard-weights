@@ -585,6 +585,53 @@ def test_ggufcheck_catches_a_fork_only_architecture():
     assert "clip" not in known
 
 
+def test_arch_support_never_calls_a_new_architecture_a_fork():
+    """A stale architecture list must not become a claim about someone else's runtime.
+
+    The first version of this check compared against one snapshot and reported anything missing as
+    fork-only. The snapshot came from the vendored runtime, which was three entries behind master, so
+    Spark-X2.5-4B was published as needing a fork when upstream had merged `spark2_5` four days
+    earlier (llama.cpp #27868, 2026-09-06). "Update llama.cpp" and "go get someone else's build" are
+    different instructions and only one of them was true.
+
+    So a miss against the local list is the trigger to ask upstream, and there are four answers, not
+    two. Unreachable upstream must produce "unknown" -- never "fork".
+    """
+    import pollard_ggufcompat as gc
+
+    local = {"llama", "qwen2", "k2-horizon-not-this"}
+
+    # in the local list -> stock, and upstream is never consulted
+    assert gc.arch_support("llama", local=local, offline=True)[0] == "stock"
+
+    # missing locally and upstream cannot be reached -> claim nothing
+    v, why = gc.arch_support("spark2_5", local=local, offline=True)
+    assert v == "unknown", (v, why)
+    assert "no claim" in why.lower(), why
+
+    # missing locally but upstream has it -> a version requirement, not a fork
+    saved = gc._upstream_cache
+    try:
+        gc._upstream_cache = {"llama", "qwen2", "spark2_5"}
+        v2, why2 = gc.arch_support("spark2_5", local=local)
+        assert v2 == "newer", (v2, why2)
+        # and one upstream does NOT have is a fork, named
+        v3, why3 = gc.arch_support("k2-horizon", local=local)
+        assert v3 == "fork", (v3, why3)
+        assert "MBZUAI" in why3, why3
+    finally:
+        gc._upstream_cache = saved
+
+    # the shipped snapshot must be at least as new as the architectures we publish against
+    assert "spark2_5" in gc.STOCK_ARCHS, "the snapshot is stale again"
+    assert "k2-horizon" not in gc.STOCK_ARCHS, "k2-horizon is not upstream"
+
+    # the atom tables must survive any future edit to the architecture block -- they were once
+    # deleted by a rewrite of it, which silently made every atom verdict raise
+    assert gc.type_name(140) == "IQ5_K" and gc.type_name(23) == "IQ4_XS"
+    assert gc.fork_only({0: 1, 23: 10, 140: 28}) == {"IQ5_K": 28}
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

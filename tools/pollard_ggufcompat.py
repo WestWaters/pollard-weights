@@ -19,6 +19,7 @@ Either way the fix is the same -- say so on the card.
   pollard-ggufcheck model.gguf [more.gguf ...]      # local files
   pollard-ggufcheck --repo PollardWeights/<Model>   # a published repo, over range requests
   pollard-ggufcheck --json *.gguf                   # machine-readable
+  pollard-ggufcheck --offline model.gguf            # never consult upstream (claims less)
 
 Exit code is 1 if any file needs ik_llama, so this works as a pre-publish gate."""
 import argparse
@@ -30,10 +31,14 @@ import sys
 # Highest ggml type id stock llama.cpp knows. Anything above is a fork-only atom.
 STOCK_MAX = 42
 
-# Architectures upstream llama.cpp can load, snapshotted from LLM_ARCH_NAMES in
-# runtime/llama.cpp/src/llama-arch.cpp (146 entries; `clip` dropped -- it is a quantize-only dummy).
-# A vendored checkout is read in preference to this list when one is present, so a newer runtime is
-# believed over the snapshot.
+# Architectures upstream llama.cpp can load, snapshotted from LLM_ARCH_NAMES on ggml-org master,
+# 2026-09-10 (149 entries; `clip` dropped -- it is a quantize-only dummy).
+#
+# A SNAPSHOT GOES STALE, and stale in the dangerous direction: a new architecture that upstream has
+# merged looks fork-only, which is a claim about someone else's runtime. That already happened here --
+# a list taken from the vendored runtime was three entries behind master and reported Spark-X2.5-4B as
+# fork-only when upstream had merged `spark2_5` days earlier. So a miss against this list is not the
+# answer; it is the trigger to go and ask, which `arch_support()` does.
 STOCK_ARCHS = {
     "afmoe", "apertus", "arcee", "arctic", "arwkv7", "baichuan", "bailingmoe", "bailingmoe2",
     "bailingmoe3", "bert", "bitnet", "bloom", "chameleon", "chatglm", "codeshell", "cogvlm",
@@ -43,18 +48,18 @@ STOCK_ARCHS = {
     "falcon", "falcon-h1", "gemma", "gemma-embedding", "gemma2", "gemma3", "gemma3n", "gemma4",
     "gemma4-assistant", "glm-dsa", "glm4", "glm4moe", "gpt-oss", "gpt2", "gptj", "gptneox",
     "granite", "granite_swa", "granitehybrid", "granitemoe", "graniteswitch", "grok", "grovemoe",
-    "hunyuan-dense", "hunyuan-moe", "hunyuan_vl", "hy_v3", "internlm2", "jais", "jais2", "jamba",
-    "jina-bert-v2", "jina-bert-v3", "kimi-k3", "kimi-linear", "laguna", "lfm2", "lfm2moe",
-    "llada", "llada-moe", "llama", "llama-embed", "llama4", "maincoder", "mamba", "mamba2",
-    "mellum", "mimo2", "minicpm", "minicpm3", "minimax-01", "minimax-m2", "minimax-m3",
+    "hunyuan-dense", "hunyuan-moe", "hunyuan_vl", "hy_v3", "hy_v4", "internlm2", "jais", "jais2",
+    "jamba", "jina-bert-v2", "jina-bert-v3", "kimi-k3", "kimi-linear", "laguna", "lfm2",
+    "lfm2moe", "llada", "llada-moe", "llama", "llama-embed", "llama4", "maincoder", "mamba",
+    "mamba2", "mellum", "mimo2", "minicpm", "minicpm3", "minimax-01", "minimax-m2", "minimax-m3",
     "mistral3", "mistral4", "modern-bert", "mpt", "muse-glimmer", "nanbeige", "nemotron",
     "nemotron_h", "nemotron_h_moe", "neo-bert", "nomic-bert", "nomic-bert-moe", "olmo", "olmo2",
     "olmoe", "openelm", "orion", "paddleocr", "pangu-embedded", "phi2", "phi3", "phimoe",
     "plamo", "plamo2", "plamo3", "plm", "pockettts", "qwen", "qwen2", "qwen2moe", "qwen2vl",
     "qwen3", "qwen35", "qwen35moe", "qwen3moe", "qwen3next", "qwen3tts", "qwen3vl", "qwen3vlmoe",
-    "refact", "rnd1", "rwkv6", "rwkv6qwen2", "rwkv7", "seed_oss", "smallthinker", "smollm3",
-    "stablelm", "starcoder", "starcoder2", "step35", "t5", "t5encoder", "talkie",
-    "wavtokenizer-dec", "xverse"
+    "qwen4exp", "refact", "rnd1", "rwkv6", "rwkv6qwen2", "rwkv7", "seed_oss", "smallthinker",
+    "smollm3", "spark2_5", "stablelm", "starcoder", "starcoder2", "step35", "t5", "t5encoder",
+    "talkie", "wavtokenizer-dec", "xverse"
 }
 
 # Architectures Pollard can build that stock cannot load, and where support actually lives.
@@ -65,10 +70,11 @@ FORK_ARCHS = {
 
 
 def stock_archs(vendored="runtime/llama.cpp/src/llama-arch.cpp"):
-    """The architecture names stock llama.cpp knows.
+    """The architecture names the llama.cpp BESIDE US knows.
 
-    Prefers a vendored checkout so a fresher runtime wins over the snapshot; falls back to the
-    snapshot when the source is not there (an installed tool usually has no runtime beside it).
+    Prefers a vendored checkout, because that is the runtime this machine would actually build and run
+    with. Falls back to the snapshot when there is no source to read (an installed tool usually has no
+    runtime next to it). This is a local fact, not a claim about upstream -- see arch_support().
     """
     try:
         import re as _re
@@ -81,6 +87,60 @@ def stock_archs(vendored="runtime/llama.cpp/src/llama-arch.cpp"):
     except OSError:
         pass
     return set(STOCK_ARCHS)
+
+
+_UPSTREAM_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/src/llama-arch.cpp"
+_upstream_cache = None
+
+
+def upstream_archs(offline=False):
+    """What ggml-org master implements right now, or None if it could not be read.
+
+    None matters: it means "unknown", and an unknown must never be reported as a fork-only
+    architecture. Cached per process -- one fetch however many files are checked.
+    """
+    global _upstream_cache
+    if offline:
+        return None
+    if _upstream_cache is not None:
+        return _upstream_cache or None
+    try:
+        import re as _re
+        import urllib.request
+        req = urllib.request.Request(_UPSTREAM_URL, headers={"User-Agent": "pollard-ggufcheck"})
+        with urllib.request.urlopen(req, timeout=45) as fh:
+            src = fh.read().decode("utf-8", "replace")
+        m = _re.search(r"LLM_ARCH_NAMES\s*=\s*\{(.*?)\n\};", src, _re.S)
+        got = set(_re.findall(r'"\s*([a-z0-9._\-]+)\s*"', m.group(1))) - {"clip"} if m else set()
+        _upstream_cache = got if len(got) > 50 else set()
+    except Exception:
+        _upstream_cache = set()
+    return _upstream_cache or None
+
+
+def arch_support(arch, local=None, offline=False):
+    """('stock'|'newer'|'fork'|'unknown', detail) for an architecture name.
+
+    Three different answers that a single list cannot tell apart, and conflating them makes a false
+    claim about someone else's runtime:
+
+      stock   the llama.cpp here already knows it
+      newer   upstream has merged it, the runtime here is behind -- the user needs a newer llama.cpp,
+              not a fork
+      fork    upstream does not implement it at all; support lives somewhere specific
+      unknown the local list misses it and upstream could not be consulted -- say so, claim nothing
+    """
+    known = stock_archs() if local is None else local
+    if not arch or arch in known:
+        return "stock", ""
+    up = upstream_archs(offline=offline)
+    if up is None:
+        return "unknown", ("not in the llama.cpp here, and upstream could not be checked "
+                           "(offline?) -- no claim made")
+    if arch in up:
+        return "newer", "upstream llama.cpp implements it; the build here is older"
+    where = FORK_ARCHS.get(arch)
+    return "fork", (where[0] if where else "no upstream support and no fork on record")
 
 
 STOCK_NAMES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
@@ -229,23 +289,30 @@ def fork_only(counts):
     return {type_name(t): n for t, n in sorted(counts.items()) if t > STOCK_MAX}
 
 
-def runtime_of(path_or_url, archs=None):
-    """('stock'|'ik_llama'|'fork', reasons) -- which runtime this file needs, and why.
+def runtime_of(path_or_url, archs=None, offline=False):
+    """('stock'|'ik_llama'|'newer'|'fork'|'unknown', reasons) -- what this file needs, and why.
 
-    `reasons` is a dict: fork-only atoms by name, plus an "architecture" key when
-    `general.architecture` is one stock llama.cpp does not know. Either is disqualifying on its own,
-    and the architecture is the one a tensor-type check alone cannot see.
+    Two independent disqualifiers live in a GGUF header and a tensor-type check sees only one:
+
+      * a fork-only atom (any ggml type above 42)      -> 'ik_llama'
+      * an architecture the local llama.cpp lacks       -> resolved by arch_support(), which
+        separates "upstream merged it, you are behind" from "no upstream support at all"
+
+    The architecture answer takes precedence when it is disqualifying, because no quant type can
+    rescue a file whose architecture will not load.
     """
     arch, counts = read_header(path_or_url)
     reasons = fork_only(counts)
-    known = archs if archs is not None else stock_archs()
-    if arch and arch not in known:
+    verdict, detail = arch_support(arch, local=archs, offline=offline)
+    if verdict != "stock":
         reasons = dict(reasons)
         reasons["architecture"] = arch
-        where = FORK_ARCHS.get(arch)
-        if where:
-            reasons["supported_by"], reasons["supported_url"] = where
-        return "fork", reasons
+        reasons["arch_detail"] = detail
+        if verdict == "fork":
+            where = FORK_ARCHS.get(arch)
+            if where:
+                reasons["supported_by"], reasons["supported_url"] = where
+        return verdict, reasons
     return ("ik_llama" if reasons else "stock"), reasons
 
 
@@ -256,6 +323,10 @@ def main():
     ap.add_argument("files", nargs="*", help="GGUF paths (or URLs)")
     ap.add_argument("--repo", help="check every .gguf in a published HF repo instead")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--offline", action="store_true",
+                    help="do not ask upstream what it implements. An architecture missing from the "
+                         "local list then reports as unverified instead of being called fork-only -- "
+                         "a stale list must not turn into a claim about someone else's runtime")
     a = ap.parse_args()
 
     targets = list(a.files)
@@ -274,7 +345,7 @@ def main():
     for t in targets:
         name = os.path.basename(str(t).split("?")[0])
         try:
-            rt, fo = runtime_of(t)
+            rt, fo = runtime_of(t, offline=a.offline)
         except Exception as e:                                            # noqa: BLE001
             rows.append({"file": name, "error": str(e)})
             rc = 1
@@ -283,14 +354,16 @@ def main():
             continue
         rows.append({"file": name, "runtime": rt, "reasons": fo})
         if rt != "stock":
-            rc = 1
+            rc = 1                     # 'newer' counts: the runtime here still cannot open it
         if not a.json:
             arch = fo.get("architecture")
             atoms = ", ".join(f"{k} x{v}" for k, v in fo.items()
-                              if k not in ("architecture", "supported_by", "supported_url"))
+                              if k not in ("architecture", "supported_by", "supported_url",
+                                           "arch_detail"))
             if arch:
-                label = "needs a fork"
-                bits = [f"architecture `{arch}` is not one stock llama.cpp knows"]
+                label = {"newer": "needs newer llama.cpp", "fork": "needs a fork",
+                         "unknown": "cannot verify"}.get(rt, "needs a fork")
+                bits = [f"architecture `{arch}`: {fo.get('arch_detail','')}".rstrip(": ")]
                 if fo.get("supported_by"):
                     bits.append(f"supported by {fo['supported_by']} ({fo.get('supported_url','')})"
                                 .replace(" ()", ""))
@@ -306,14 +379,18 @@ def main():
     if a.json:
         print(json.dumps(rows, indent=1))
     else:
-        ik = [r for r in rows if r.get("runtime") == "ik_llama"]
-        fk = [r for r in rows if r.get("runtime") == "fork"]
-        bad = [r for r in rows if r.get("error")]
-        print(f"\n{len(rows)} file(s): {len(rows)-len(ik)-len(fk)-len(bad)} stock, {len(ik)} ik_llama"
-              + (f", {len(fk)} fork-only architecture" if fk else "")
-              + (f", {len(bad)} unreadable" if bad else ""))
-        if ik or fk:
+        by = {}
+        for r in rows:
+            by.setdefault(r.get("runtime") or "error", []).append(r)
+        parts = [f"{len(v)} {k}" for k, v in sorted(by.items())]
+        print(f"\n{len(rows)} file(s): " + ", ".join(parts))
+        if by.get("newer"):
+            print("Say so on the card: these need a llama.cpp new enough to carry the architecture. "
+                  "That is a version requirement, NOT a fork.")
+        if by.get("ik_llama") or by.get("fork"):
             print("Say so on the card: these will not load in stock llama.cpp, Ollama or LM Studio.")
+        if by.get("unknown"):
+            print("Could not reach upstream to confirm an unrecognised architecture; nothing claimed.")
     return rc
 
 
