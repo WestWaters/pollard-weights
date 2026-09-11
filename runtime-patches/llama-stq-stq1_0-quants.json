@@ -1,0 +1,13 @@
+{
+ "name": "stq1_0-quants",
+ "tree_slug": "llama-stq",
+ "remote": "https://github.com/ggml-org/llama.cpp",
+ "base_commit": "1e411d8f5",
+ "base_describe": "b10335-3-g1e411d8f5",
+ "base_date": "2026-08-10",
+ "files": [
+  "ggml/src/ggml-quants.c"
+ ],
+ "adds_strings": [],
+ "diff_bytes": 4152
+}

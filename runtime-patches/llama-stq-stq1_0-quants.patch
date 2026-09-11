@@ -1,0 +1,82 @@
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 00ff91557..2e5dac351 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -2480,10 +2480,75 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+     return nrow * row_size;
+ }
+ 
++// POLLARD: calibration-aware STQ1_0 (Sherry-style). The reference quantizer ignores the imatrix
++// (blind: zero the smallest-|x| lane, amax scale). Here quant_weights (per-input-channel imatrix
++// importance) drives BOTH decisions: zero the least-IMPORTANT lane (min w*|x|), and set the scale
++// by the importance-weighted mean of the surviving lanes' magnitude (LS optimum d=sum(w|x|)/sum(w))
++// instead of a single outlier's amax. Same packed format — only the encoder is smarter.
++static void quantize_row_stq1_0_imatrix(const float * GGML_RESTRICT x, block_stq1_0 * GGML_RESTRICT y,
++                                        int64_t n_per_row, const float * GGML_RESTRICT qw) {
++    const int64_t nb = n_per_row / QK_K;
++    for (int64_t i = 0; i < nb; ++i) {
++        memset(y[i].qs,   0, sizeof(y[i].qs));
++        memset(y[i].sign, 0, sizeof(y[i].sign));
++        const float * xb = x  + i*QK_K;
++        const float * wb = qw ? qw + i*QK_K : NULL;
++
++        uint8_t zero_of[QK_K/4];
++        double num = 0.0, den = 0.0;            // LS scale over the surviving (non-zero) lanes
++        for (int g = 0; g < QK_K/4; ++g) {
++            const int base = (g/16)*64 + (g%16);
++            int zpos = 0; float zmetric = FLT_MAX;
++            for (int p = 0; p < 4; ++p) {
++                const int idx = base + p*16;
++                const float w = wb ? wb[idx] : 1.0f;
++                const float m = w * fabsf(xb[idx]);   // importance-weighted magnitude
++                if (m < zmetric) { zmetric = m; zpos = p; }
++            }
++            zero_of[g] = (uint8_t) zpos;
++            for (int p = 0; p < 4; ++p) {
++                if (p == zpos) continue;
++                const int idx = base + p*16;
++                const float w = wb ? wb[idx] : 1.0f;
++                num += (double) w * fabsf(xb[idx]);
++                den += (double) w;
++            }
++        }
++        float d = den > 0.0 ? (float)(num/den) : 0.0f;
++        if (!(d > 0.0f)) {                       // degenerate block -> amax fallback
++            float amax = 0.0f;
++            for (int j = 0; j < QK_K; ++j) { const float a = fabsf(xb[j]); if (a > amax) amax = a; }
++            d = amax;
++        }
++        y[i].d = GGML_FP32_TO_FP16(d);
++
++        for (int g = 0; g < QK_K/4; ++g) {
++            const int base = (g/16)*64 + (g%16);
++            const int zpos = zero_of[g];
++            uint8_t qpack = 0;
++            for (int p = 0; p < 4; ++p) {
++                const uint8_t lane = (p == zpos) ? 0x1 : ((xb[base + p*16] < 0.0f) ? 0x0 : 0x2);
++                qpack |= (uint8_t)(lane << (2*p));
++            }
++            const uint8_t code = stq1_0_qpack_to_slot[qpack];
++            const uint8_t sign = stq1_0_qpack_to_sign[qpack];
++            y[i].qs  [g/2] |= (uint8_t)((code & 0x0F) << (4 * (g & 1)));
++            y[i].sign[g/8] |= (uint8_t)(sign << (g % 8));
++        }
++    }
++}
++
+ size_t quantize_stq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+-    (void)quant_weights; // not used
++    // POLLARD: ALWAYS use the calibrated encoder — with quant_weights==NULL it applies uniform
++    // importance (per-group zero = argmin|x|, per-block scale = mean|x| over survivors), which is
++    // EXACTLY what the QAT fake-quant simulates. So a no-imatrix export deploys the trained weights
++    // faithfully (was: fall back to the amax ref, which the fake-quant doesn't match).
+     const size_t row_size = ggml_row_size(GGML_TYPE_STQ1_0, n_per_row);
+-    quantize_row_stq1_0_ref(src, dst, (int64_t)nrow*n_per_row);
++    char * qrow = (char *) dst;
++    for (int64_t r = 0; r < nrow; ++r) {
++        quantize_row_stq1_0_imatrix(src + r*n_per_row, (block_stq1_0 *) qrow, n_per_row, quant_weights);
++        qrow += row_size;
++    }
+     return nrow * row_size;
+ }
+ 

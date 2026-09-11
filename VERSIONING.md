@@ -17,7 +17,7 @@ is green and ready.
 
 ## Unreleased (on `main`, not yet tagged)
 
-Tools added since `v1.3.0` — **45 CLI tools** now:
+Tools added since `v1.3.0` — **46 CLI tools** now:
 
 - `pollard-archfp` — fingerprint an architecture's layout and name the known family it is a twin of
   (dense / MoE / MLA / DSA / hybrid linear-attention), from a GGUF or HF weights.
@@ -38,6 +38,9 @@ Tools added since `v1.3.0` — **45 CLI tools** now:
 - `pollard-exl3-band` — band-parallel EXL3 conversion for a body too large to cook sequentially on one
   machine (GLM-5.3, 78 layers: ~7 h across the cluster instead of ~3 days). Was proven in
   `experiments/`; a capability belongs in a tool, so it moved.
+- `pollard-runtime` — are the llama.cpp builds on this machine current, and can they still load what we
+  published? Reads architecture names from the built binaries as well as from source, compares every
+  tree to ggml-org master, and names any published repo with no runtime here. Non-zero in that state.
 - `pollard-refcheck` — prove the reference forward is sane before measuring on it: the model's own NLL
   on in-domain rows, plus the head/tail profile that exposes scrambled positions. Carries the known
   model-code fixes (`hy_v4` interleaved rotary, [#65](https://github.com/WestWaters/pollard-weights/issues/65))
