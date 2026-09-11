@@ -497,11 +497,21 @@ def main():
         # distinguish "no binary at all" from "binary present but too old for THIS arch"
         present = find_llama_bin(cmd[0])
         if present is not None and arch_name and arch_name != "unknown":
+            # Do NOT tell anyone to `git pull` a runtime tree unguarded. A tree can be carrying
+            # local support a published model depends on, only as uncommitted edits -- that is how
+            # `spark2_5` was lost, and how a model we shipped ended up with no runtime that could
+            # open it. Capture first, then update, then put the patches back.
             sys.exit(
                 f"ERROR: the llama.cpp build found ({present}) does not support the "
-                f"'{arch_name}' architecture — it predates support for this model. "
-                f"Update the bundled runtime:\n"
+                f"'{arch_name}' architecture — it predates support for this model.\n"
+                f"Check what upstream has and whether this tree is carrying local work:\n"
+                f"    pollard-runtime --arch {arch_name}\n"
+                f"    pollard-runtime --dirty\n"
+                f"Then update it safely (capture anything uncommitted BEFORE pulling):\n"
+                f"    pollard-runtime --scan runtime/llama.cpp --capture pre-update\n"
                 f"    cd runtime/llama.cpp && git pull && cmake --build build -j\n"
+                f"    pollard-runtime --scan runtime/llama.cpp --apply pre-update\n"
+                f"    pollard-runtime --verify\n"
                 f"or point at a capable binary with --llama-quantize /path/to/llama-quantize.")
         sys.exit(f"ERROR: {cmd[0]} not found. install.sh builds it into "
                  f"runtime/llama.cpp/build/bin — re-run install.sh, or pass "

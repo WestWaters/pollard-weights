@@ -1,0 +1,13 @@
+{
+ "name": "k2-msvc-regex",
+ "tree_slug": "ifm-llama",
+ "remote": "https://github.com/MBZUAI-IFM/llama.cpp",
+ "base_commit": "35999d1",
+ "base_describe": "35999d1",
+ "base_date": "2026-09-01",
+ "files": [
+  "src/unicode.cpp"
+ ],
+ "adds_strings": [],
+ "diff_bytes": 7393
+}

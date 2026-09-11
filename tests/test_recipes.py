@@ -632,6 +632,87 @@ def test_arch_support_never_calls_a_new_architecture_a_fork():
     assert gc.fork_only({0: 1, 23: 10, 140: 28}) == {"IQ5_K": 28}
 
 
+def test_runtime_reads_archs_from_source_and_binaries():
+    """A runtime's architecture list has to be read from the binary, not only the source tree.
+
+    A tree can be reset, re-pointed or rebuilt after a model was made, and then the source says one
+    thing while the binary that actually runs says another. Spark-X2.5-4B was quantized on 2026-09-08
+    against a llama.cpp carrying `spark2_5` (upstream #27868, merged 2026-09-06); the tree was later
+    rebuilt as the IFM fork, whose base predates that merge, and the published model stopped loading
+    anywhere on either machine. Source-only inspection cannot see that happen.
+    """
+    import pollard_runtime as R
+
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "src"), exist_ok=True)
+    with open(os.path.join(d, "src", "llama-arch.cpp"), "w", encoding="utf-8") as fh:
+        fh.write("static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {\n")
+        fh.write('    { LLM_ARCH_CLIP, "clip" },\n')
+        for i in range(30):
+            fh.write(f'    {{ LLM_ARCH_M{i}, "made-up-{i}" }},\n')
+        fh.write('    { LLM_ARCH_K2, "k2-horizon" },\n')
+        fh.write("};\n")
+    got = R._arch_list_from_source(d)
+    assert got and "k2-horizon" in got, got
+    assert "clip" not in got, "clip is a quantize-only dummy, not a loadable architecture"
+
+    # a binary is searched for the literal strings, independently of the source
+    os.makedirs(os.path.join(d, "build", "bin"), exist_ok=True)
+    binpath = os.path.join(d, "build", "bin", "llama-cli")
+    with open(binpath, "wb") as fh:
+        # literals in a real binary are NUL-delimited; `notspark2_5x` is deliberately adjacent text
+        # that must NOT count as a hit
+        fh.write(b"\x00notspark2_5x\x00" + b"spark2_5\x00" + b"\x00" * 32 + b"qwen3moe\x00")
+    found, nfiles = R.archs_in_binaries(d, ["spark2_5", "qwen3moe", "k2-horizon"])
+    assert nfiles >= 1, "the binary should have been scanned"
+    assert found == {"spark2_5", "qwen3moe"}, found
+    assert "k2-horizon" not in found, "must not report an architecture the binary does not carry"
+
+    # a name embedded in a longer identifier is not a hit on its own
+    only_embedded = os.path.join(d, "build", "bin", "llama-perplexity")
+    with open(only_embedded, "wb") as fh:
+        fh.write(b"\x00xxk2-horizonyy\x00")
+    got2, _ = R.archs_in_binaries(os.path.dirname(only_embedded), ["k2-horizon"])
+    assert got2 == set(), got2
+
+    # and the source list did NOT contain spark2_5 -- the two views genuinely differ, which is the point
+    assert "spark2_5" not in got
+
+
+def test_runtime_patch_verification_survives_line_ending_drift():
+    """A captured runtime patch must verify by CONTENT, not by whether git can reverse-apply it.
+
+    Our runtime trees are CRLF on the Windows box and the patches get read on a Mac. One captured patch
+    would not reverse-apply even with --ignore-whitespace while every added line was still in the file,
+    so a reverse-apply-only check reported LOST on three patches that were all applied. That is worse
+    than not checking, because the whole point is to notice when support really has gone -- which is
+    how spark2_5 was lost.
+    """
+    import pollard_runtime as R
+
+    patch = (
+        "diff --git a/src/unicode.cpp b/src/unicode.cpp\n"
+        "--- a/src/unicode.cpp\n"
+        "+++ b/src/unicode.cpp\n"
+        "@@ -1,3 +1,5 @@\n"
+        " context line\n"
+        "+static void k2_horizon_split() {\n"
+        "+    return;\n"
+        " more context\n"
+    )
+    want = R._added_lines(patch)
+    assert want == {"static void k2_horizon_split() {", "return;"}, want
+    assert not any(l.startswith("+++") for l in want), "the +++ header is not an added line"
+
+    # the same additions, arriving with CRLF endings and different indentation, must still match
+    crlf = patch.replace("+static void k2_horizon_split() {",
+                         "+  static void k2_horizon_split() {\r").replace("+    return;", "+\treturn;\r")
+    assert R._added_lines(crlf) == want, R._added_lines(crlf)
+
+    # a blank added line carries no content and must not count toward the total
+    assert R._added_lines("+++ b/x\n+\n+real\n") == {"real"}
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
