@@ -384,8 +384,23 @@ def analyse(cfg):
     # indexer_types == "shared" (Hy4: 57 of 78) reuse a previous layer's top-k and keep no cache of their own.
     index_head_dim = first(cfg, "index_head_dim", default=0) or 0
     idx_types = cfg.get("indexer_types")
-    n_indexer = (sum(1 for t in idx_types if str(t) != "shared") if isinstance(idx_types, list)
-                 else (layers if index_head_dim else 0))
+    # Newer sparse-attention stacks name the producing layers OUTRIGHT instead of tagging each layer.
+    # DeepSeek-V4.1-Flash: index_source_layer_ids = [2, 8, 14, 20, 24, 28, 32, 36], so 8 of 40 layers
+    # run an indexer and the rest reuse one.
+    idx_src = first(cfg, "index_source_layer_ids")
+    if isinstance(idx_src, list) and idx_src:
+        n_indexer = len(idx_src)
+    else:
+        n_indexer = (sum(1 for t in idx_types if str(t) != "shared") if isinstance(idx_types, list)
+                     else (layers if index_head_dim else 0))
+
+    # Layers that actually PRODUCE a KV cache. CSA2 (DeepSeek-V4.1-Flash) runs most layers in Reuse
+    # mode: they read a previous layer's KV and keep none of their own. The config says which produce
+    # it -- kv_source_layer_ids = [2, 8, 14, 20] means FOUR of forty layers hold KV, not forty.
+    # Counting every layer overstates the cache by 10x on that model, and KV is exactly the number
+    # that decides whether it fits a given box at its 1M context.
+    kv_src = first(cfg, "kv_source_layer_ids")
+    n_kv_layers = len(kv_src) if isinstance(kv_src, list) and kv_src else 0
 
     n_experts = first(cfg, "num_experts", "n_routed_experts",
                       "num_local_experts", "moe_num_experts")
@@ -459,7 +474,7 @@ def analyse(cfg):
         "attn_params": attn,                      # per-layer attention (q,k,v,o) — its own group
         "dense_layers": dense_layers,
         "multimodal": multimodal, "hybrid": hybrid,
-        "n_linear": n_linear, "n_full": n_full, "mtp": mtp,
+        "n_linear": n_linear, "n_full": n_full, "mtp": mtp, "n_kv_layers": n_kv_layers,
         "kv_heads": kv_heads, "head_dim": head_dim,
         "mla": kv_lora_rank > 0, "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
@@ -471,7 +486,9 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
     """KV-cache bytes at `ctx` tokens. Arch-aware: MLA (DeepSeek/GLM) stores one
     compressed latent per token/layer (tiny); hybrid models only grow KV on their
     full-attention layers. kv_bytes: 2 = f16 cache (default), 1 = q8_0, ~0.56 = q4."""
-    n_attn = a.get("n_full") or a["layers"]                 # linear layers barely grow KV
+    # KV-producing layers, most specific first: an explicit kv_source_layer_ids list (CSA2 Reuse),
+    # then a hybrid model's full-attention layers, then every layer.
+    n_attn = a.get("n_kv_layers") or a.get("n_full") or a["layers"]
     # DSA indexer key cache: index_head_dim per token on every layer that runs its own indexer. Not compressed by the
     # NVFP4 latent path (bf16 keys), fp8/f16 otherwise — GLM-5.3 measured: 41 KB/tok nvfp4, 57 KB fp8 (latent-only
     # model: 22 / 45 KB). Anything below 1 byte/elem for the latent still costs ~2 bytes/elem here.
@@ -482,7 +499,10 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
         per_tok_layer = a["kv_lora_rank"] + (a.get("qk_rope_head_dim") or 0)
         return n_attn * ctx * per_tok_layer * kv_bytes + idx   # MLA: single latent, no K/V split (+ indexer cache)
     kvh, hd = a.get("kv_heads") or 0, a.get("head_dim") or 0
-    return 2 * n_attn * ctx * kvh * hd * kv_bytes           # GQA/MHA: K and V
+    # `+ idx` is not optional here. The indexer cache used to be added only on the MLA branch, so a
+    # sparse-attention model that is NOT MLA lost it silently -- DeepSeek-V4.1-Flash has no
+    # kv_lora_rank but does run 8 indexer layers, and dropping them halved its KV estimate.
+    return 2 * n_attn * ctx * kvh * hd * kv_bytes + idx     # GQA/MHA: K and V (+ indexer cache)
 
 
 # per-card VRAM (GB) for the --gpu convenience; anything not listed, pass GB directly
