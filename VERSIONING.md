@@ -17,7 +17,7 @@ is green and ready.
 
 ## Unreleased (on `main`, not yet tagged)
 
-Tools added since `v1.3.0` — **42 CLI tools** now:
+Tools added since `v1.3.0` — **43 CLI tools** now:
 
 - `pollard-archfp` — fingerprint an architecture's layout and name the known family it is a twin of
   (dense / MoE / MLA / DSA / hybrid linear-attention), from a GGUF or HF weights.
@@ -29,6 +29,9 @@ Tools added since `v1.3.0` — **42 CLI tools** now:
   where it buys something.
 - `pollard-ggufcheck` — report which runtime a GGUF needs from its tensor types rather than its name,
   locally or against a published repo; exits non-zero so it works as a pre-publish gate.
+- `pollard-reclaim` — free the disk a finished model still holds, but only once the published copy is
+  proven identical (matched by exact length, then confirmed head/middle/tail against the Hub). Reports
+  by default; deleting is opt-in, and sources are a separate opt-in again.
 - `pollard-card` / `pollard-onboard` / `pollard-envmatch` / `pollard-serve-eval` — card generation,
   custom-arch onboarding, environment matching, served-side evaluation.
 
