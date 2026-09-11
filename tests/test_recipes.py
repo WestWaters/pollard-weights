@@ -472,6 +472,86 @@ def test_reclaim_repo_guesses_strip_source_decoration():
     assert "PollardWeights/FrogMini-14B-Pollard" in g, g
     g2 = R.repo_guesses("Qwen/Qwen2.5-7B-Instruct", "PollardWeights")
     assert "PollardWeights/Qwen2.5-7B-Instruct-Pollard" in g2, g2
+def test_rope_conventions_are_distinct_and_correct():
+    """The one-line difference that invalidates every activation-derived measurement.
+
+    Rotate-half (NeoX) pairs element i with i+d/2; interleaved (Megatron/PTM) pairs 2i with 2i+1.
+    Applying the wrong one to a checkpoint scrambles relative positions in every layer, and nothing
+    about the shapes or the key names looks wrong -- the model loads and generates, it is just
+    measuring the wrong thing. It cost Hy4-preview a bf16 NLL of 5.02 instead of 1.855 with routing
+    mass off by 24 points (issue #65), and K2-Horizon nearly shipped with NORM where the reference
+    fork says NEOX.
+
+    Both conventions are checked against an explicit pairwise rotation, so the test states which is
+    which rather than just pinning whatever the code happens to do.
+    """
+    import numpy as np
+
+    import pollard_refcheck as RC
+
+    T, D = 6, 8
+    pos = np.arange(T)[:, None]
+    inv = 1.0 / (10000 ** (np.arange(0, D, 2) / D))          # d/2 distinct angles
+    ang = pos * inv[None, :]
+    # transformers builds cos/sin in the half-width layout: the d/2 angles, concatenated
+    cos = np.concatenate([np.cos(ang), np.cos(ang)], axis=-1)
+    sin = np.concatenate([np.sin(ang), np.sin(ang)], axis=-1)
+    x = np.random.default_rng(0).standard_normal((T, D))
+
+    half = RC.rope_rotate_half(x, cos, sin, np)
+    inter = RC.rope_interleaved(x, cos, sin, np)
+    assert not np.allclose(half, inter), "the two conventions must not be the same function"
+
+    # interleaved: rotate each adjacent (2i, 2i+1) pair by its own angle
+    gt = np.empty_like(x)
+    for t in range(T):
+        for i in range(D // 2):
+            c, s2 = np.cos(ang[t, i]), np.sin(ang[t, i])
+            a0, a1 = x[t, 2 * i], x[t, 2 * i + 1]
+            gt[t, 2 * i] = a0 * c - a1 * s2
+            gt[t, 2 * i + 1] = a1 * c + a0 * s2
+    assert np.allclose(inter, gt, atol=1e-12), "interleaved must rotate ADJACENT pairs"
+
+    # rotate-half: pair i with i + d/2
+    d = D // 2
+    gt2 = np.empty_like(x)
+    for t in range(T):
+        for i in range(d):
+            c, s2 = np.cos(ang[t, i]), np.sin(ang[t, i])
+            a0, a1 = x[t, i], x[t, i + d]
+            gt2[t, i] = a0 * c - a1 * s2
+            gt2[t, i + d] = a1 * c + a0 * s2
+    assert np.allclose(half, gt2, atol=1e-12), "rotate-half must pair i with i+d/2"
+
+    # a rotation changes direction, never length
+    for got in (half, inter):
+        assert np.allclose(np.linalg.norm(got, axis=-1), np.linalg.norm(x, axis=-1)), \
+            "rotary must preserve the norm"
+
+
+def test_refcheck_flags_a_broken_forward():
+    """The gate has to fire on the measured signature, not just on a threshold.
+
+    Hy4's broken forward scored 5.02 nats AND got worse along the sequence (5.1 at positions 0-64 ->
+    5.8 at 1024-2047). A single mean can be argued away as hard rows; loss that RISES with distance is
+    positional damage, so both signals are checked.
+    """
+    import pollard_refcheck as RC
+
+    broken = {"nll": 5.02, "ppl": 151.0, "head_nll": 5.1, "tail_nll": 5.8,
+              "tail_ratio": 5.8 / 5.1, "tokens": 16384}
+    ok, why = RC.verdict(broken, expect=1.86)
+    assert not ok and len(why) >= 2, why
+    assert any("RISES" in w for w in why), "the rising-loss signature must be named"
+
+    fixed = {"nll": 1.855, "ppl": 6.39, "head_nll": 1.9, "tail_nll": 1.82,
+             "tail_ratio": 1.82 / 1.9, "tokens": 16384}
+    ok2, why2 = RC.verdict(fixed, expect=1.86)
+    assert ok2, why2
+
+    # hy_v4 is on record with the expected value the gate compares against
+    assert "hy_v4" in RC.KNOWN_DEFECTS
+    assert RC.KNOWN_DEFECTS["hy_v4"]["expect_nll"] < RC.NLL_SUSPECT
 
 
 def main():

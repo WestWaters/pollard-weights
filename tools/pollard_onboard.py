@@ -112,6 +112,28 @@ def audit(model_id):
         flags.append("MoE — use the MoE dynamic map / automap MoE path")
     if custom:
         flags.append("custom modeling code — run lanes with --trust-remote-code (auto-detected)")
+    # A shape-and-name audit cannot see a wrong RoPE pairing: the model loads, generates, and measures
+    # the wrong thing. Hy4-preview scored 5.02 nats instead of 1.855 that way, with routing mass off by
+    # 24 points, and K2-Horizon nearly shipped NORM where the reference says NEOX. So every onboarding
+    # is told to gate the reference forward before capturing anything from it.
+    mt = (cfg.get("model_type") or "").lower()
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from pollard_refcheck import KNOWN_DEFECTS
+    except Exception:                                                      # noqa: BLE001
+        KNOWN_DEFECTS = {}
+    if mt in KNOWN_DEFECTS:
+        d = KNOWN_DEFECTS[mt]
+        flags.append(f"KNOWN MODEL-CODE DEFECT for `{mt}` — {d['symptom']} Run "
+                     f"`pollard-refcheck --model <this> --calib rows.txt --fix` BEFORE any capture; "
+                     f"measurements taken without it are invalid ({d['credit']})")
+    else:
+        flags.append("BEFORE measuring anything: `pollard-refcheck --model <this> --calib rows.txt`. "
+                     "A wrong RoPE pairing (rotate-half vs interleaved) or a wrong rope_type passes "
+                     "every shape and name check, loads, generates — and silently invalidates every "
+                     "Hessian, sensitivity ranking and routing statistic. ~1.5-2.5 nats on in-domain "
+                     "rows is healthy; ~5, or loss RISING along the sequence, means positions are "
+                     "scrambled")
     findings.update(covered=len(covered), unmatched=unmatched, flags=flags, patterns=pats)
     return findings
 
