@@ -45,5 +45,28 @@
    "rel_rms": 0.094
   }
  },
- "layers_share_ids": true
+ "layers_share_ids": false,
+ "corpus_scale_ledger": {
+  "corpus_tokens": 1120000000.0,
+  "accesses_per_layer": 26840000000.0,
+  "unique_rows_per_layer": 106180000.0,
+  "held_out_coverage_top_rows": {
+   "1000000": 0.4346,
+   "5000000": 0.5917,
+   "10000000": 0.6688,
+   "20000000": 0.7418,
+   "50000000": 0.8358,
+   "100000000": 0.9271
+  },
+  "in_sample_coverage_top_rows": {
+   "1000000": 0.5215,
+   "5000000": 0.6902,
+   "10000000": 0.7707,
+   "20000000": 0.8535,
+   "50000000": 0.9537,
+   "100000000": 0.9994
+  },
+  "layers_share_ids": false,
+  "note": "the earlier layers_share_ids=True (from identical per-layer statistics) was wrong: identical distributions, different id sets"
+ }
 }
