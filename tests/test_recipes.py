@@ -740,6 +740,33 @@ def test_install_state_catches_a_declared_but_uninstalled_command():
     assert R.install_state(tempfile.mkdtemp()) is None
 
 
+def test_capture_refuses_encoding_damage():
+    """A captured runtime patch must not smuggle encoding damage in as if it were work.
+
+    An editor that reads a UTF-8 source as Latin-1 and writes it back replaces lines with broken
+    copies of themselves. Captured, that becomes the thing you re-apply after a clone, so the damage
+    is permanent. Real case: 27 of 39 hunks in a k2-horizon capture were a byte-order mark or
+    mojibake, and the mojibake sat inside a DeepSeek pre-tokenizer regex -- any build made from that
+    patch would mis-tokenize DeepSeek models.
+    """
+    import pollard_runtime as R
+
+    good = ("diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c\n@@ -1,1 +1,2 @@\n"
+            " int main(void) {\n+    return 0;\n")
+    assert R.encoding_noise(good) == "", R.encoding_noise(good)
+
+    bom = "+\ufeff#include <stdio.h>\n-#include <stdio.h>\n"
+    assert "byte-order mark" in R.encoding_noise(bom)
+
+    # 'A-tilde circumflex' is how an em dash looks after a UTF-8 -> Latin-1 -> UTF-8 round trip
+    moji = "+// clear the graph \u00c3\u00a2\u00c2\u0080\u00c2\u0094 before reuse\n-// clear the graph before reuse\n"
+    assert "Latin-1" in R.encoding_noise(moji), R.encoding_noise(moji)
+
+    # a legitimate non-ASCII addition is NOT damage: real unicode in a tokenizer regex must pass
+    legit = '+        "\\s?[!-/:-~\uff01-\uff0f\u2018-\u201f\u3000-\u3002]+",\n'
+    assert R.encoding_noise(legit) == "", R.encoding_noise(legit)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
