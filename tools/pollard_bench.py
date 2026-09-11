@@ -264,6 +264,11 @@ def main():
     a = ap.parse_args()
 
     # --- coherence gate (can run standalone: no perplexity bin / eval corpus required) ---
+    # The gate used to exit here as soon as it had a verdict, which silently swallowed --speed: ask
+    # for both and you got the gate, exit 0, and no tok/s anywhere. A measuring tool must not drop a
+    # measurement you asked for without saying so, so the verdict is held and the exit happens after
+    # every requested measurement has run.
+    gate_passed = None
     if a.coherence or a.quick:
         if not os.path.exists(a.gguf):
             sys.exit(f"file not found: {a.gguf}")
@@ -271,9 +276,9 @@ def main():
         if not cli_bin:
             sys.exit("llama-cli not found — build llama.cpp/ik_llama.cpp or pass --llama-cli.")
         res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick)
-        passed = print_gate(res)
-        if not a.ref:                      # gate-only invocation -> done (exit code reflects verdict)
-            sys.exit(0 if passed else 2)
+        gate_passed = print_gate(res)
+        if not a.ref and not a.speed:      # nothing else was asked for -> exit on the verdict
+            sys.exit(0 if gate_passed else 2)
 
     if a.speed:
         cli_bin = find_llama_bin(a.llama_cli)
@@ -292,7 +297,8 @@ def main():
                       + (f"  ({pro:.0f} prompt)" if pro else ""))
         print("  tok/s is hardware-specific -- name the machine wherever you publish it.")
         if not a.ref and not os.path.exists(a.eval):
-            sys.exit(0)                    # speed-only invocation: nothing to score, and that is fine
+            # nothing left to score. If a gate also ran, its verdict is what the exit code means.
+            sys.exit(0 if gate_passed is None else (0 if gate_passed else 2))
 
     ppl_bin = find_llama_bin(a.llama_perplexity)
     if not ppl_bin:
