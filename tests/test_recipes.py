@@ -1027,6 +1027,39 @@ def test_card_attribution_follows_the_publisher_not_the_tool():
     assert 'default="PollardWeights"' not in rsrc, "reclaim still defaults --owner to our account"
 
 
+def test_card_detects_the_pipeline_tag():
+    """`pipeline_tag` must reflect what the model is, not always text-generation.
+
+    It was hardcoded, so every multimodal build we publish was advertised as text-only -- Carnice-V3
+    and Qwen3.8-27B both ship an mmproj next to their rungs and both said text-generation, which
+    contradicts their own file list and keeps them out of any Hub search for vision models.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_card.py"),
+               encoding="utf-8").read()
+    assert '"pipeline_tag: text-generation"' not in src, "frontmatter still hardcodes the tag"
+
+    # an explicit flag wins outright
+    assert C.detect_pipeline_tag("x/y", {}, explicit="any-to-any") == "any-to-any"
+
+    # modality signals in the base config, without any network call
+    assert C.detect_pipeline_tag("local/dir", {"vision_config": {}}) == "image-text-to-text"
+    assert C.detect_pipeline_tag("local/dir", {"video_config": {}}) == "video-text-to-text"
+    assert C.detect_pipeline_tag("local/dir", {"audio_config": {}}) == "audio-text-to-text"
+
+    # what this repo actually ships
+    assert C.detect_pipeline_tag("local/dir", {}, mmproj="mmproj.gguf") == "image-text-to-text"
+    assert C.detect_pipeline_tag("local/dir", {}, input_support="text+image+video") == "video-text-to-text"
+
+    # a plain text model stays text
+    assert C.detect_pipeline_tag("local/dir", {}) == "text-generation"
+
+    # and quantizing a VLM WITHOUT its projector must not promise vision
+    assert C.detect_pipeline_tag("local/dir", {"vision_config": {}}, input_support="text") == "text-generation"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

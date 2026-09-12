@@ -66,20 +66,83 @@ def _frontmatter_license(path):
     return None
 
 
-def _hub_license(model_id):
-    """Ask the Hub for a model's declared license, over stdlib.
+_HUB_META = {}
 
-    Deliberately not via `huggingface_hub`: reading one public metadata field should not require the
-    `[hf]` extra, and when that import is missing the alternative is guessing.
+
+def _hub_meta(model_id):
+    """Ask the Hub for a model's public metadata, over stdlib, once per model.
+
+    Deliberately not via `huggingface_hub`: reading public metadata should not require the `[hf]`
+    extra, and when that import is missing the alternative is guessing.
     """
+    if model_id in _HUB_META:
+        return _HUB_META[model_id]
     import urllib.request
     try:
         req = urllib.request.Request(f"https://huggingface.co/api/models/{model_id}",
                                      headers={"User-Agent": "pollard-card"})
         with urllib.request.urlopen(req, timeout=30) as fh:
-            return ((json.load(fh).get("cardData") or {}).get("license"))
+            meta = json.load(fh) or {}
     except Exception:
-        return None
+        meta = {}
+    _HUB_META[model_id] = meta
+    return meta
+
+
+def _hub_license(model_id):
+    """The base model's declared license, from the Hub's card metadata."""
+    return ((_hub_meta(model_id).get("cardData") or {}).get("license"))
+
+
+# Signals in config.json that a model takes more than text. Keyed by the pipeline tag they imply.
+_MODALITY_KEYS = [
+    ("video-text-to-text", ("video_config", "video_tower")),
+    ("image-text-to-text", ("vision_config", "vision_tower", "image_token_index", "mm_vision_tower")),
+    ("audio-text-to-text", ("audio_config", "audio_tower")),
+]
+
+
+def detect_pipeline_tag(model_id, cfg, explicit=None, mmproj=None, input_support=None):
+    """What kind of model this is, for the frontmatter `pipeline_tag`.
+
+    This was hardcoded to `text-generation` on every card, which quietly mislabels every multimodal
+    build we ship -- Carnice-V3 carries an mmproj and a video preprocessor and was still advertised as
+    text-only, so it never surfaced in a Hub search for vision models and the tag contradicted the
+    repo's own file list.
+
+    Resolution order, first hit wins:
+      1. an explicit --pipeline-tag
+      2. what the BASE model declares on the Hub -- its authors' own answer, and authoritative
+      3. modality signals in the base config.json (vision/video/audio towers)
+      4. what this repo actually ships: an mmproj, or --input-support naming image/video
+      5. text-generation
+    """
+    if explicit:
+        return explicit
+
+    # A caller stating the artifact is text-only outranks the base being multimodal: quantizing a VLM
+    # without shipping its projector produces a repo that cannot see, and tagging it image-text-to-text
+    # would promise vision the files cannot deliver.
+    if (input_support or "").strip().lower() == "text" and not mmproj:
+        return "text-generation"
+
+    hub = _hub_meta(model_id).get("pipeline_tag") if not os.path.isdir(model_id) else None
+    if hub:
+        return hub
+
+    for tag, keys in _MODALITY_KEYS:
+        if any(k in cfg for k in keys):
+            return tag
+    archs = " ".join(cfg.get("architectures") or []).lower()
+    if "vision" in archs or "vl" in archs.split():
+        return "image-text-to-text"
+
+    sup = (input_support or "").lower()
+    if "video" in sup:
+        return "video-text-to-text"
+    if mmproj or "image" in sup:
+        return "image-text-to-text"
+    return "text-generation"
 
 
 def base_license(model_id, cfg):
@@ -209,7 +272,8 @@ def parse_params_b(params, cfg):
     return round((12 * L * h * h + 2 * v * h) / 1e9, 2) if h and L else 0.0
 
 
-def frontmatter(base_model, lic, lanes, model_type, quantized_by=None):
+def frontmatter(base_model, lic, lanes, model_type, quantized_by=None,
+                pipeline_tag="text-generation"):
     tags = ["pollard-weights", "pollard"]
     for ln in lanes:
         tags += LANE_TAGS.get(ln, [ln])
@@ -225,7 +289,7 @@ def frontmatter(base_model, lic, lanes, model_type, quantized_by=None):
     # a misattributed one is false.
     if quantized_by:
         lines.append(f"quantized_by: {quantized_by}")
-    lines += ["pipeline_tag: text-generation", "language:", "- en", "tags:"]
+    lines += [f"pipeline_tag: {pipeline_tag}", "language:", "- en", "tags:"]
     lines += [f"- {t}" for t in uniq]
     lines.append("---")
     return "\n".join(lines)
@@ -237,6 +301,9 @@ def main():
     ap.add_argument("--model", required=True, help="base model id or dir (title/frontmatter/config)")
     ap.add_argument("--builds-from", help="workspace manifest key for builds (default: --model)")
     ap.add_argument("--base-model", help="base_model for the frontmatter (default: --model)")
+    ap.add_argument("--pipeline-tag", dest="pipeline_tag",
+                    help="HF pipeline tag (default: detected from the base model's Hub metadata, "
+                         "its config's modality signals, then what this repo ships)")
     ap.add_argument("--quantized-by", dest="quantized_by",
                     help="HF account to credit (default: the owner of --repo/--upload, else your "
                          "Hugging Face login)")
@@ -327,7 +394,9 @@ def main():
     lane_word = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
                  "mx": " for Blackwell/vLLM", "exl3": " for exllamav3"}.get(primary, "")
     # ---- frontmatter + hero
-    out = [frontmatter(base_model, lic, lanes, mtype, account), "", f"# {name} — Pollard", ""]
+    ptag = detect_pipeline_tag(base_model, cfg, a.pipeline_tag, a.mmproj, a.input_support)
+    out = [frontmatter(base_model, lic, lanes, mtype, account, ptag), "",
+           f"# {name} — Pollard", ""]
     if f16_gb and small_gb:
         out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) → {small_gb:.2f} GB** — "
                 f"**{pct:.0f}% smaller, {x:.1f}× down**.",
