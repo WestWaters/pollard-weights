@@ -187,6 +187,10 @@ def twin(fp, hparams=None):
          "attention-side expert routing: per-layer attn_v_gate + attn_v_exps, selected by "
          "n_value_expert/n_value_expert_used. No current family models it -- extend the dense "
          "builder with a gated value path, then add it here as its own family"),
+        ("hc_mult", "hyper-connections: the residual is several parallel streams",
+         "activation memory and any band/layer hand-off scale by this factor, and each block's "
+         "output reaches the residual through a learned gain -- an allocator that weights tensors by "
+         "their own error alone will send bits to layers whose output barely arrives"),
         ("expert_count", "experts",
          "route the FFN through the expert tensors and the router (an MoE family already covers "
          "the common shapes)"),
@@ -197,6 +201,33 @@ def twin(fp, hparams=None):
             seen.add(k)                    # a key matches the most specific rule only
             gaps.append({"what": f"{label}: {k}={v} -- a plain twin would silently mis-build this",
                          "to_support": how})
+    # LIST-valued hparams name a per-layer structure the numeric loop above cannot see, and they are
+    # where the newest architectures keep the facts that change an allocation. DeepSeek-V4.1-Flash is
+    # the case that forced this: its tensor layout scores as an ordinary MoE twin, while
+    # kv_source_layer_ids says only 4 of its 40 layers hold KV at all. A twin that ignores that
+    # overstates the cache tenfold on a model whose 1M context makes KV the deciding number.
+    for key, label, how in (
+        ("kv_source_layer_ids", "only some layers PRODUCE KV (CSA2 Reuse and friends)",
+         "read the list and size the KV cache on its length, not the layer count -- pollard-calc "
+         "does this; any allocator reasoning about cache bytes must too"),
+        ("index_source_layer_ids", "only some layers run a sparse-attention indexer",
+         "count the indexer key cache on these layers alone; the rest reuse a previous layer's top-k"),
+        ("engram_layer_ids", "n-gram lookup tables sit at specific layers",
+         "these are lookup rows, not weights: they are not quantized by a bits-per-weight budget and "
+         "belong in a residency/frequency ledger instead"),
+        ("compress_ratios", "per-layer attention compression ratio",
+         "attention cost and cache differ per layer; a single per-model attention shape is wrong here"),
+    ):
+        for k, v in hparams.items():
+            if k in seen or not k.endswith(key) or not isinstance(v, (list, tuple)) or not v:
+                continue
+            seen.add(k)
+            n_layers = hparams.get("num_hidden_layers") or fp.get("n_blocks") or 0
+            detail = f"{k}={list(v)[:8]}{'...' if len(v) > 8 else ''}"
+            if key.endswith("layer_ids") and n_layers:
+                detail += f" -- {len(v)} of {n_layers} layers"
+            gaps.append({"what": f"{label}: {detail}", "to_support": how})
+
     if fp["unknown"]:
         names = ", ".join(sorted(fp["unknown"])[:6])
         gaps.append({"what": "per-block tensors no family accounts for: " + names,
