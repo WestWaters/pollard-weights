@@ -925,6 +925,37 @@ def test_archfp_surfaces_per_layer_structure_a_twin_would_miss():
     assert "kv_source_layer_ids" not in " ".join(g["what"] for g in plain["gaps"])
 
 
+def test_speed_parser_reads_the_classic_timing_block():
+    """Decode speed must parse on ik_llama too, not only on builds that print "Generation: t/s".
+
+    pollard-bench matched one format. ik_llama and older llama.cpp print the classic timing block
+    instead, so every trellis build came back "no speed line" -- which is why no IQ*_KT rung has ever
+    carried a tok/s figure on a card. Measuring the wrong thing is bad; silently measuring nothing and
+    reporting success is worse.
+    """
+    import pollard_bench as pb
+
+    classic = (
+        "main: prompt eval time =     217.23 ms /     1 tokens (  217.23 ms per token,"
+        "     4.60 tokens per second)\n"
+        "main:        eval time =     156.00 ms /    32 tokens (    4.88 ms per token,"
+        "   205.12 tokens per second)\n"
+        "main:       total time =     400.00 ms\n"
+    )
+    gen, pro = pb._classic_speeds(classic)
+    assert gen == 205.12, gen          # generation is the plain "eval time" line
+    assert pro == 4.60, pro            # prompt is the "prompt eval time" line
+
+    # the two lines must not be confused: prompt is far slower here, so a mix-up is obvious
+    assert gen > pro
+
+    # a build that prints neither format yields nothing rather than a wrong number
+    assert pb._classic_speeds("main: total time = 400.00 ms\n") == (None, None)
+
+    # lines mentioning tokens per second that are NOT timing lines are ignored
+    assert pb._classic_speeds("note: we measured 999.0 tokens per second once\n") == (None, None)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
