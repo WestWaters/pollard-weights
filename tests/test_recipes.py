@@ -881,6 +881,50 @@ def test_kv_counts_only_the_layers_that_produce_it():
         "the indexer cache must add bytes on a non-MLA architecture"
 
 
+def test_archfp_surfaces_per_layer_structure_a_twin_would_miss():
+    """A layout can score as a known twin while the config says it behaves nothing like one.
+
+    DeepSeek-V4.1-Flash's tensor names fingerprint as an ordinary MLA MoE. What makes it different
+    lives in LIST-valued hparams the numeric gap check could not see: kv_source_layer_ids says only
+    4 of its 40 layers produce KV at all. A twin that ignores that overstates the cache tenfold, on a
+    model whose 1M context makes KV the number that decides whether it fits anything.
+    """
+    import pollard_archfp as A
+
+    names = ["token_embd.weight", "output.weight", "output_norm.weight"]
+    for i in range(4):
+        for t in ("attn_q_a", "attn_q_b", "attn_kv_a", "attn_kv_b", "attn_out", "attn_norm",
+                  "ffn_norm", "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"):
+            names.append(f"blk.{i}.{t}.weight")
+    fp = A.fingerprint(names)
+
+    hp = {
+        "num_hidden_layers": 40,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "engram_layer_ids": [1, 14],
+        "compress_ratios": [0, 0] + [2] * 38,
+        "hc_mult": 4,
+    }
+    res = A.twin(fp, hp)
+    what = " | ".join(g["what"] for g in res["gaps"])
+
+    assert not res["exact"], "a model with per-layer KV sourcing must never read as an exact twin"
+    assert "kv_source_layer_ids" in what, what
+    assert "4 of 40 layers" in what, what          # the count, not just the key name
+    assert "index_source_layer_ids" in what, what
+    assert "engram_layer_ids" in what, what
+    assert "hc_mult" in what, what
+
+    # every gap must say what supporting it would take, not merely refuse
+    for g in res["gaps"]:
+        assert g.get("to_support"), g
+
+    # an ordinary model must not collect these gaps
+    plain = A.twin(fp, {"num_hidden_layers": 40})
+    assert "kv_source_layer_ids" not in " ".join(g["what"] for g in plain["gaps"])
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
