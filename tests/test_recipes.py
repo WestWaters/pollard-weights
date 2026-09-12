@@ -993,6 +993,40 @@ def test_card_calib_note_is_not_double_punctuated():
     assert 'not in ".!?"' in src, "no guard against double punctuation in the calibration note"
 
 
+def test_card_attribution_follows_the_publisher_not_the_tool():
+    """A cloned Pollard must not credit PollardWeights for someone else's build.
+
+    `quantized_by: PollardWeights` was hardcoded into the frontmatter and the repo id defaulted to a
+    PollardWeights repo, so anyone else running pollard-card produced a card that credited us and
+    pointed every download line at our repos. No credential ever leaked -- huggingface_hub resolves
+    the token from the caller's own login -- but the attribution followed the tool, not the publisher.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    here = os.path.dirname(__file__)
+    src = open(os.path.join(here, "..", "tools", "pollard_card.py"), encoding="utf-8").read()
+    assert '"quantized_by: PollardWeights"' not in src, "frontmatter still hardcodes our account"
+    assert 'a.repo or f"PollardWeights/' not in src, "repo id still defaults to our account"
+
+    # resolution order: explicit flag, then the repo being written/uploaded to
+    assert C.publishing_account("acme") == "acme"
+    assert C.publishing_account(None, "someone/Model-Pollard") == "someone"
+    assert C.publishing_account(None, None, "other/Model-Pollard") == "other"
+    # an explicit flag outranks the repo owner
+    assert C.publishing_account("acme", "someone/Model-Pollard") == "acme"
+
+    # with nobody identified the line is omitted rather than filled with a wrong or fake name
+    anon = C.frontmatter("Qwen/Qwen2.5-7B-Instruct", "apache-2.0", ["gguf"], "qwen2", None)
+    assert "quantized_by" not in anon, "unattributed card invented an owner"
+    named = C.frontmatter("Qwen/Qwen2.5-7B-Instruct", "apache-2.0", ["gguf"], "qwen2", "acme")
+    assert "quantized_by: acme" in named
+
+    # and reclaim no longer checks everyone's local builds against our repos
+    rsrc = open(os.path.join(here, "..", "tools", "pollard_reclaim.py"), encoding="utf-8").read()
+    assert 'default="PollardWeights"' not in rsrc, "reclaim still defaults --owner to our account"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
