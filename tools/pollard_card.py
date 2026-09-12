@@ -509,10 +509,15 @@ def main():
 
     # ---- imatrix / calibration: what the allocation was measured on
     if a.imatrix_file:
+        # A note detailed enough to be worth reading ends in its own punctuation; appending a period
+        # unconditionally gave the Qwen cards "...the allocation was tuned on.." on the one line whose
+        # job is to make the measurement credible.
+        note = (a.calib_note or
+                "a mixed-domain corpus so the matrix sees every register the model serves").rstrip()
+        if note[-1:] not in ".!?":
+            note += "."
         out += ["## imatrix (calibration)", "",
-                f"The importance matrix (`{a.imatrix_file}`, included) was computed on "
-                + (a.calib_note or "a mixed-domain corpus so the matrix sees every register the model serves")
-                + ".", ""]
+                f"The importance matrix (`{a.imatrix_file}`, included) was computed on {note}", ""]
         if a.calib_file:
             out += [f"The exact corpus is included as `{a.calib_file}`, so the allocation can be "
                     "reproduced rather than taken on trust.", ""]

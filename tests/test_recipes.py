@@ -978,6 +978,21 @@ def test_card_rung_list_agrees_in_number():
         assert frag in src, f"rung list still not agreement-aware: {frag}"
 
 
+def test_card_calib_note_is_not_double_punctuated():
+    """A calibration note that ends in a period must not get a second one appended.
+
+    The Qwen cards' calib note ends with a sentence about test-set disjointness -- exactly the claim a
+    reader checks hardest -- and it rendered as "tuned on..".
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_card.py"),
+               encoding="utf-8").read()
+    assert '+ "."' not in src, "calibration note still appends a period unconditionally"
+    assert 'not in ".!?"' in src, "no guard against double punctuation in the calibration note"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
