@@ -956,6 +956,28 @@ def test_speed_parser_reads_the_classic_timing_block():
     assert pb._classic_speeds("note: we measured 999.0 tokens per second once\n") == (None, None)
 
 
+def test_card_rung_list_agrees_in_number():
+    """One fork-only rung must not be described in the plural.
+
+    The stock rebuild of both Qwen repos left exactly one trellis rung, and the card then read
+    "`IQ1_KT` need ik_llama.cpp: their allocation puts ..." -- grammatically wrong in the one
+    sentence a reader uses to decide whether the file will open on their machine.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    assert C.rung_agreement(1) == ("needs", "carries", "its")
+    assert C.rung_agreement(2) == ("need", "carry", "their")
+    assert C.rung_agreement(4) == ("need", "carry", "their")
+
+    # and the template must actually use it -- checked on the rendered sentence rather than by
+    # grepping the source, which trips over the helper's own docstring.
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_card.py"),
+               encoding="utf-8").read()
+    for frag in ("{need} {v_need} [ik_llama.cpp]", "{names} {v_carry} ik_llama-only atoms"):
+        assert frag in src, f"rung list still not agreement-aware: {frag}"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

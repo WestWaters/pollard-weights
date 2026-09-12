@@ -154,6 +154,16 @@ def load_builds(key, lane=None):
     return [b for b in builds if (not lane or b.get("lane") == lane)]
 
 
+def rung_agreement(n):
+    """Verb and pronoun agreement for a list of rungs, so a single fork-only rung is not plural.
+
+    With one rung needing ik_llama the card read "`IQ1_KT` need ik_llama.cpp: their allocation puts
+    ...", which is the one sentence on a measured-results card that announces nobody read it. Both
+    Qwen repos hit it the moment the stock rebuild left exactly one trellis rung.
+    """
+    return ("needs", "carries", "its") if n == 1 else ("need", "carry", "their")
+
+
 def human_gb(nbytes):
     return f"{nbytes/1e9:.2f} GB" if nbytes else "—"
 
@@ -325,9 +335,11 @@ def main():
         else:
             need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                              sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
+            v_need, _, pron = rung_agreement(len(ik_builds))
             out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, "
-                    f"except where noted.** {need} need [ik_llama.cpp]({IK_URL}): their allocation "
-                    "puts ik_llama-only atoms on the tensors it protects. The rest run anywhere.", ""]
+                    f"except where noted.** {need} {v_need} [ik_llama.cpp]({IK_URL}): {pron} "
+                    "allocation puts ik_llama-only atoms on the tensors it protects. The rest run "
+                    "anywhere.", ""]
 
     # ---- Model details: the at-a-glance table every good Pollard card opens with
     arch = a.arch or mtype or "—"
@@ -530,7 +542,8 @@ def main():
         elif ik_builds:
             names = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                               sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
-            out.append(f"- {names} carry ik_llama-only atoms and need ik_llama.cpp to run; "
+            v_need, v_carry, _ = rung_agreement(len(ik_builds))
+            out.append(f"- {names} {v_carry} ik_llama-only atoms and {v_need} ik_llama.cpp to run; "
                        "stock llama.cpp rejects any ggml type above 42 outright. Checked with "
                        "`pollard-ggufcheck`, from the files' tensor types rather than their names.")
         elif runtimes:
