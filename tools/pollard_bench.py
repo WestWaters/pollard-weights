@@ -211,6 +211,28 @@ def _fmt(v, nd=4):
 
 _SPEED = re.compile(r"Generation:\s*([\d.]+)\s*t/s")
 _PROMPT_SPEED = re.compile(r"Prompt:\s*([\d.]+)\s*t/s")
+# ik_llama and older llama.cpp print the classic timing block instead:
+#   main: prompt eval time = 217.23 ms / 1 tokens ( 217.23 ms per token, 4.60 tokens per second)
+#   main:        eval time = 156.00 ms / 32 tokens (   4.88 ms per token, 205.12 tokens per second)
+# Matching only "Generation: t/s" meant every trellis build reported "no speed line", which is why
+# IQ*_KT rungs have never carried a tok/s figure on a card.
+_CLASSIC = re.compile(r"([\d.]+)\s*tokens per second")
+
+
+def _classic_speeds(text):
+    """(generation, prompt) from the classic timing block, either may be None."""
+    gen = pro = None
+    for line in text.splitlines():
+        if "tokens per second" not in line or "eval time" not in line:
+            continue
+        m = _CLASSIC.search(line)
+        if not m:
+            continue
+        if "prompt eval time" in line:
+            pro = float(m.group(1))
+        else:
+            gen = float(m.group(1))
+    return gen, pro
 
 
 def measure_speed(cli_bin, model, ngl, n_predict=128,
@@ -237,7 +259,12 @@ def measure_speed(cli_bin, model, ngl, n_predict=128,
         return None, None
     out = (r.stdout or "") + (r.stderr or "")
     g, p = _SPEED.search(out), _PROMPT_SPEED.search(out)
-    return (float(g.group(1)) if g else None), (float(p.group(1)) if p else None)
+    gen = float(g.group(1)) if g else None
+    pro = float(p.group(1)) if p else None
+    if gen is None:                        # older/ik_llama builds print the classic timing block
+        gen, pro2 = _classic_speeds(out)
+        pro = pro if pro is not None else pro2
+    return gen, pro
 
 
 def main():
