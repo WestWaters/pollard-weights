@@ -956,6 +956,77 @@ def test_speed_parser_reads_the_classic_timing_block():
     assert pb._classic_speeds("note: we measured 999.0 tokens per second once\n") == (None, None)
 
 
+def test_card_rung_list_agrees_in_number():
+    """One fork-only rung must not be described in the plural.
+
+    The stock rebuild of both Qwen repos left exactly one trellis rung, and the card then read
+    "`IQ1_KT` need ik_llama.cpp: their allocation puts ..." -- grammatically wrong in the one
+    sentence a reader uses to decide whether the file will open on their machine.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    assert C.rung_agreement(1) == ("needs", "carries", "its")
+    assert C.rung_agreement(2) == ("need", "carry", "their")
+    assert C.rung_agreement(4) == ("need", "carry", "their")
+
+    # and the template must actually use it -- checked on the rendered sentence rather than by
+    # grepping the source, which trips over the helper's own docstring.
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_card.py"),
+               encoding="utf-8").read()
+    for frag in ("{need} {v_need} [ik_llama.cpp]", "{names} {v_carry} ik_llama-only atoms"):
+        assert frag in src, f"rung list still not agreement-aware: {frag}"
+
+
+def test_card_calib_note_is_not_double_punctuated():
+    """A calibration note that ends in a period must not get a second one appended.
+
+    The Qwen cards' calib note ends with a sentence about test-set disjointness -- exactly the claim a
+    reader checks hardest -- and it rendered as "tuned on..".
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "tools", "pollard_card.py"),
+               encoding="utf-8").read()
+    assert '+ "."' not in src, "calibration note still appends a period unconditionally"
+    assert 'not in ".!?"' in src, "no guard against double punctuation in the calibration note"
+
+
+def test_card_attribution_follows_the_publisher_not_the_tool():
+    """A cloned Pollard must not credit PollardWeights for someone else's build.
+
+    `quantized_by: PollardWeights` was hardcoded into the frontmatter and the repo id defaulted to a
+    PollardWeights repo, so anyone else running pollard-card produced a card that credited us and
+    pointed every download line at our repos. No credential ever leaked -- huggingface_hub resolves
+    the token from the caller's own login -- but the attribution followed the tool, not the publisher.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_card as C
+
+    here = os.path.dirname(__file__)
+    src = open(os.path.join(here, "..", "tools", "pollard_card.py"), encoding="utf-8").read()
+    assert '"quantized_by: PollardWeights"' not in src, "frontmatter still hardcodes our account"
+    assert 'a.repo or f"PollardWeights/' not in src, "repo id still defaults to our account"
+
+    # resolution order: explicit flag, then the repo being written/uploaded to
+    assert C.publishing_account("acme") == "acme"
+    assert C.publishing_account(None, "someone/Model-Pollard") == "someone"
+    assert C.publishing_account(None, None, "other/Model-Pollard") == "other"
+    # an explicit flag outranks the repo owner
+    assert C.publishing_account("acme", "someone/Model-Pollard") == "acme"
+
+    # with nobody identified the line is omitted rather than filled with a wrong or fake name
+    anon = C.frontmatter("Qwen/Qwen2.5-7B-Instruct", "apache-2.0", ["gguf"], "qwen2", None)
+    assert "quantized_by" not in anon, "unattributed card invented an owner"
+    named = C.frontmatter("Qwen/Qwen2.5-7B-Instruct", "apache-2.0", ["gguf"], "qwen2", "acme")
+    assert "quantized_by: acme" in named
+
+    # and reclaim no longer checks everyone's local builds against our repos
+    rsrc = open(os.path.join(here, "..", "tools", "pollard_reclaim.py"), encoding="utf-8").read()
+    assert 'default="PollardWeights"' not in rsrc, "reclaim still defaults --owner to our account"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

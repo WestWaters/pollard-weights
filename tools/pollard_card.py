@@ -154,6 +154,45 @@ def load_builds(key, lane=None):
     return [b for b in builds if (not lane or b.get("lane") == lane)]
 
 
+PLACEHOLDER_OWNER = "YOUR_HF_ACCOUNT"
+
+
+def publishing_account(explicit=None, repo=None, upload=None):
+    """Whose name goes on this card.
+
+    The template used to hardcode `quantized_by: PollardWeights` and default every download and usage
+    line to a PollardWeights repo id. That is fine while we are the only ones running it and wrong the
+    moment anyone else clones Pollard: their card credits us for their work and points readers at our
+    repos instead of theirs. No credential leaks either way -- huggingface_hub resolves the token from
+    the caller's own login -- but the attribution followed the tool instead of the publisher.
+
+    Resolution order, first hit wins: an explicit --quantized-by, the owner segment of the repo id
+    being written to or uploaded to, then whoever is logged in locally. None of those is a guess.
+    """
+    if explicit:
+        return explicit
+    for rid in (repo, upload):
+        if rid and "/" in rid:
+            owner = rid.split("/", 1)[0].strip()
+            if owner:
+                return owner
+    try:
+        from huggingface_hub import HfApi
+        return (HfApi().whoami() or {}).get("name") or None
+    except Exception:
+        return None
+
+
+def rung_agreement(n):
+    """Verb and pronoun agreement for a list of rungs, so a single fork-only rung is not plural.
+
+    With one rung needing ik_llama the card used to read "`IQ1_KT` need ik_llama.cpp: their
+    allocation puts ...", which is the one sentence on a measured-results card that announces nobody
+    read it. Both Qwen repos hit it the moment the stock rebuild left exactly one trellis rung.
+    """
+    return ("needs", "carries", "its") if n == 1 else ("need", "carry", "their")
+
+
 def human_gb(nbytes):
     return f"{nbytes/1e9:.2f} GB" if nbytes else "—"
 
@@ -170,7 +209,7 @@ def parse_params_b(params, cfg):
     return round((12 * L * h * h + 2 * v * h) / 1e9, 2) if h and L else 0.0
 
 
-def frontmatter(base_model, lic, lanes, model_type):
+def frontmatter(base_model, lic, lanes, model_type, quantized_by=None):
     tags = ["pollard-weights", "pollard"]
     for ln in lanes:
         tags += LANE_TAGS.get(ln, [ln])
@@ -181,8 +220,12 @@ def frontmatter(base_model, lic, lanes, model_type):
     for t in tags:
         if t not in seen:
             seen.add(t); uniq.append(t)
-    lines = ["---", f"license: {lic}", f"base_model: {base_model}", "base_model_relation: quantized",
-             "quantized_by: PollardWeights", "pipeline_tag: text-generation", "language:", "- en", "tags:"]
+    lines = ["---", f"license: {lic}", f"base_model: {base_model}", "base_model_relation: quantized"]
+    # Better to say nothing than to credit the wrong account: an unattributed card is incomplete,
+    # a misattributed one is false.
+    if quantized_by:
+        lines.append(f"quantized_by: {quantized_by}")
+    lines += ["pipeline_tag: text-generation", "language:", "- en", "tags:"]
     lines += [f"- {t}" for t in uniq]
     lines.append("---")
     return "\n".join(lines)
@@ -194,6 +237,9 @@ def main():
     ap.add_argument("--model", required=True, help="base model id or dir (title/frontmatter/config)")
     ap.add_argument("--builds-from", help="workspace manifest key for builds (default: --model)")
     ap.add_argument("--base-model", help="base_model for the frontmatter (default: --model)")
+    ap.add_argument("--quantized-by", dest="quantized_by",
+                    help="HF account to credit (default: the owner of --repo/--upload, else your "
+                         "Hugging Face login)")
     ap.add_argument("--title", help="card title (default: basename of base model)")
     ap.add_argument("--params", help="param count, e.g. 2.5B (else estimated from config)")
     ap.add_argument("--license", dest="license_", help="license (else read off the base model's card)")
@@ -239,7 +285,10 @@ def main():
     builds = load_builds(a.builds_from or a.model, a.lane)
     lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or (["gguf"])
     name = a.title or os.path.basename(str(base_model).rstrip("/"))
-    repo = a.repo or f"PollardWeights/{name}-Pollard"
+    account = publishing_account(a.quantized_by, a.repo, a.upload)
+    # A placeholder reads as "fill this in"; a real-but-wrong repo id reads as an instruction, and
+    # sends people to download someone else's weights.
+    repo = a.repo or f"{account or PLACEHOLDER_OWNER}/{name}-Pollard"
     results = {}
     if a.results and os.path.exists(a.results):
         results = json.load(open(a.results))
@@ -278,7 +327,7 @@ def main():
     lane_word = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
                  "mx": " for Blackwell/vLLM", "exl3": " for exllamav3"}.get(primary, "")
     # ---- frontmatter + hero
-    out = [frontmatter(base_model, lic, lanes, mtype), "", f"# {name} — Pollard", ""]
+    out = [frontmatter(base_model, lic, lanes, mtype, account), "", f"# {name} — Pollard", ""]
     if f16_gb and small_gb:
         out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) → {small_gb:.2f} GB** — "
                 f"**{pct:.0f}% smaller, {x:.1f}× down**.",
@@ -325,9 +374,11 @@ def main():
         else:
             need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                              sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
+            v_need, _, pron = rung_agreement(len(ik_builds))
             out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, "
-                    f"except where noted.** {need} need [ik_llama.cpp]({IK_URL}): their allocation "
-                    "puts ik_llama-only atoms on the tensors it protects. The rest run anywhere.", ""]
+                    f"except where noted.** {need} {v_need} [ik_llama.cpp]({IK_URL}): {pron} "
+                    "allocation puts ik_llama-only atoms on the tensors it protects. The rest run "
+                    "anywhere.", ""]
 
     # ---- Model details: the at-a-glance table every good Pollard card opens with
     arch = a.arch or mtype or "—"
@@ -497,10 +548,15 @@ def main():
 
     # ---- imatrix / calibration: what the allocation was measured on
     if a.imatrix_file:
+        # A note detailed enough to be worth reading ends in its own punctuation; appending a period
+        # unconditionally gave the Qwen cards "...the allocation was tuned on.." on the one line whose
+        # job is to make the measurement credible.
+        note = (a.calib_note or
+                "a mixed-domain corpus so the matrix sees every register the model serves").rstrip()
+        if note[-1:] not in ".!?":
+            note += "."
         out += ["## imatrix (calibration)", "",
-                f"The importance matrix (`{a.imatrix_file}`, included) was computed on "
-                + (a.calib_note or "a mixed-domain corpus so the matrix sees every register the model serves")
-                + ".", ""]
+                f"The importance matrix (`{a.imatrix_file}`, included) was computed on {note}", ""]
         if a.calib_file:
             out += [f"The exact corpus is included as `{a.calib_file}`, so the allocation can be "
                     "reproduced rather than taken on trust.", ""]
@@ -530,7 +586,8 @@ def main():
         elif ik_builds:
             names = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                               sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
-            out.append(f"- {names} carry ik_llama-only atoms and need ik_llama.cpp to run; "
+            v_need, v_carry, _ = rung_agreement(len(ik_builds))
+            out.append(f"- {names} {v_carry} ik_llama-only atoms and {v_need} ik_llama.cpp to run; "
                        "stock llama.cpp rejects any ggml type above 42 outright. Checked with "
                        "`pollard-ggufcheck`, from the files' tensor types rather than their names.")
         elif runtimes:

@@ -154,8 +154,9 @@ def main():
                     help="workspace to read manifests from (default $POLLARD_HOME)")
     ap.add_argument("--scan", action="append", default=[],
                     help="extra directory to scan for model files no manifest claims (repeatable)")
-    ap.add_argument("--owner", default="PollardWeights",
-                    help="HF account the builds were published under")
+    ap.add_argument("--owner", default=None,
+                    help="HF account the builds were published under (default: your Hugging Face "
+                         "login)")
     ap.add_argument("--repo", action="append", default=[],
                     help="also check against these repo ids (repeatable). Needed when a build was "
                          "published under a name the manifest key does not imply.")
@@ -174,9 +175,18 @@ def main():
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     a = ap.parse_args()
 
+    # Defaulting this to PollardWeights meant anyone else running reclaim checked their local builds
+    # against OUR repos, so nothing ever matched and nothing was ever reclaimed. Their own account is
+    # the only sensible default; deletion is gated on a positive match, so an unknown owner simply
+    # finds nothing rather than removing anything.
+    from pollard_card import publishing_account
+    owner = a.owner or publishing_account()
+    if not owner:
+        sys.exit("no HF account known: pass --owner, or log in with `hf auth login`.")
+
     cands, seen, repos = [], set(), set(a.repo)
     for _, man in iter_manifests(a.home):
-        guesses = repo_guesses(man.get("model") or "", a.owner)
+        guesses = repo_guesses(man.get("model") or "", owner)
         repos.update(guesses)
         for b in man.get("builds", []):
             p = b.get("path")
