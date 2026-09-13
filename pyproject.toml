@@ -33,6 +33,8 @@ mx = ["torch", "transformers", "llmcompressor", "datasets"]
 hf = ["huggingface-hub", "hf-transfer"]                            # publishing to the Hub
 all = ["torch", "transformers", "safetensors", "exllamav3", "datasets", "gptqmodel",
        "mlx-lm", "llmcompressor", "huggingface-hub", "hf-transfer", "matplotlib"]
+# the connectome memory lane: attaches a fly brain to a frozen model (pollard-flybrain)
+flybrain = ["torch", "transformers", "pandas", "scipy"]
 
 [project.scripts]
 pollard = "pollard_auto:main"
@@ -74,6 +76,7 @@ pollard-palette = "pollard_palette:main"
 pollard-serve-eval = "pollard_serve_eval:main"
 pollard-card = "pollard_card:main"
 pollard-ggufcheck = "pollard_ggufcompat:main"
+pollard-flybrain = "pollard_flybrain:main"
 pollard-reclaim = "pollard_reclaim:main"
 pollard-exl3-band = "pollard_exl3_band:main"
 pollard-refcheck = "pollard_refcheck:main"
