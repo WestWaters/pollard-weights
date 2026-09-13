@@ -187,11 +187,163 @@ class FlyBrain:
         return cfg.hidden_size
 
 
+# ---------------------------------------------------------------------------- training
+def train_brain(model, tokenizer, corpus, connectome, signs, *, out, canonical=512, probe_len=160,
+                win=128, ctx=1024, steps=400, lr=5e-5, radius=0.95, gain=0.1, seed=0,
+                device="cpu", log=print):
+    """Fit a brain to a backbone. The backbone is frozen; only the adapters and gate learn.
+
+    A brain does not transfer between backbone families, so this is how you make one for yours. The
+    task is the claim itself: attention sees `win` tokens, the connectome sees everything, and the
+    loss is scored on the final chunk -- whose useful context is entirely outside attention's reach.
+
+    `connectome` is (src, dst, weight) arrays; `signs` is +1/-1 per neuron.
+    """
+    import numpy as np
+
+    torch.manual_seed(seed); np.random.seed(seed)
+    src, dst, w_raw = connectome
+    src = np.asarray(src); dst = np.asarray(dst)
+    nodes, inv = np.unique(np.concatenate([src, dst]), return_inverse=True)
+    E, N = len(src), len(nodes)
+    src_i, dst_i = inv[:E], inv[E:]
+    sign = np.asarray(signs, dtype=np.float32)
+
+    for q in model.parameters():
+        q.requires_grad_(False)
+    stack = FlyBrain._find_stack(model)
+    D = FlyBrain._hidden_size(model, stack)
+    dev = torch.device(device)
+
+    w = np.log1p(np.asarray(w_raw, dtype=np.float32))
+    rho = _spectral_radius(src_i, dst_i, w * sign[src_i], N, dev)
+    w = w * (radius / rho)
+    log(f"connectome {N:,} neurons {E:,} synapses, rho {rho:.1f} -> {radius}")
+
+    # the bridge: this model's own responses to a fixed probe set (see FlyBrain._build_bridge)
+    rows = []
+    with torch.no_grad():
+        for i in range(canonical):
+            ids = tokenizer(corpus[i*probe_len:(i+1)*probe_len],
+                            return_tensors="pt").input_ids[:, :48].to(dev)
+            if ids.shape[1] < 2:
+                continue
+            rows.append(model(input_ids=ids, output_hidden_states=True)
+                        .hidden_states[-1][0].float().mean(0))
+    A = torch.stack(rows); A = A / A.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    Ainv = torch.linalg.pinv(A)                      # NOT A.t(): the basis is not orthonormal
+    C = A.shape[0]
+    log(f"probe bridge: {C} probes x hidden {D}, pseudo-inverse return path")
+
+    SRC = torch.as_tensor(src_i, dtype=torch.long, device=dev)
+    DST = torch.as_tensor(dst_i, dtype=torch.long, device=dev)
+    SGN = torch.as_tensor(sign, dtype=torch.float32, device=dev)[SRC]
+    W = nn.Parameter(torch.as_tensor(w, dtype=torch.float32, device=dev))
+    TAU = nn.Parameter(torch.full((N,), 0.5, device=dev))
+    WRITE = nn.Linear(C, N, bias=False).to(dev)
+    READ = nn.Linear(N, C, bias=False).to(dev)
+    torch.nn.init.normal_(WRITE.weight, std=1.0 / math.sqrt(C))
+    with torch.no_grad():
+        READ.weight.copy_(WRITE.weight.t() * (gain * C / N))
+    # not zero: at exactly zero the gradient reaching the adapters is zero too, and nothing learns
+    GATE = nn.Parameter(torch.full((1,), 0.05, device=dev))
+
+    def step_state(st, drive_t):
+        msg = st[:, SRC] * (W * SGN)
+        agg = torch.zeros_like(st).index_add_(1, DST, msg)
+        t = torch.sigmoid(TAU)
+        return (1 - t) * st + t * torch.tanh(agg + drive_t)
+
+    ids_all = tokenizer(corpus, return_tensors="pt").input_ids.to(dev)
+    embed = stack.embed_tokens
+
+    def score(mode, ids, grad=False):
+        with (torch.enable_grad() if grad else torch.no_grad()):
+            if mode == "full":
+                lg = model(input_ids=ids).logits[0, -win-1:-1]
+                return nn.functional.cross_entropy(lg.float(), ids[0, -win:])
+            st = torch.zeros(1, N, device=dev); loss = None
+            for s0 in range(0, ids.shape[1], win):
+                ch = ids[:, s0:s0+win]
+                if ch.shape[1] < 2:
+                    continue
+                emb = embed(ch)
+                if mode == "brain":
+                    drive = (emb @ A.t()) @ WRITE.weight.t()
+                    outs = []
+                    for i in range(emb.shape[1]):
+                        st = step_state(st, drive[:, i]); outs.append(st)
+                    emb = emb + ((torch.stack(outs, 1) @ READ.weight.t())
+                                 * torch.tanh(GATE)) @ Ainv.t()
+                out = model(inputs_embeds=emb)
+                if s0 + win >= ids.shape[1]:
+                    loss = nn.functional.cross_entropy(out.logits[0, :-1].float(), ch[0, 1:])
+            return loss
+
+    ids = ids_all[:, :ctx]
+    floor = float(score("window", ids)); ceil = float(score("full", ids))
+    log(f"floor (windowed) {floor:.4f} | ceiling (full attention) {ceil:.4f} | gap {floor-ceil:.4f}")
+
+    params = [WRITE.weight, READ.weight, GATE]
+    opt = torch.optim.Adam(params, lr=lr)
+    best, best_state = -1e9, None
+    n_doc = max(1, ids_all.shape[1] // ctx)
+    for it in range(1, steps + 1):
+        j = np.random.randint(0, max(1, n_doc - 1))
+        loss = score("brain", ids_all[:, j*ctx:(j+1)*ctx], grad=True)
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        if it % max(1, steps // 20) == 0:
+            v = float(score("brain", ids))
+            pct = 100 * (floor - v) / max(1e-9, floor - ceil)
+            log(f"  step {it:>5}  held-out {v:.4f}   closes {pct:>5.1f}% of the gap")
+            if pct > best:
+                best = pct
+                best_state = {"write": WRITE.weight.detach().clone(),
+                              "read": READ.weight.detach().clone(),
+                              "gate": GATE.detach().clone(),
+                              "w": W.detach().clone(), "tau": TAU.detach().clone()}
+
+    torch.save({"src": src_i, "dst": dst_i, "sign": sign,
+                **{k: v.cpu() for k, v in best_state.items()},
+                "meta": {"name": os.path.basename(out).replace(".pt", ""),
+                         "backbone": getattr(model.config, "_name_or_path", "unknown"),
+                         "canonical": C, "probe_len": probe_len, "neurons": int(N),
+                         "synapses": int(E), "radius": radius, "gain": gain, "win": win,
+                         "ctx": ctx, "steps": steps, "lr": lr, "seed": seed,
+                         "trained_against_hidden": int(D), "floor": floor, "ceiling": ceil,
+                         "closes_pct": best, "bridge": "probe-stimulus basis (RSA)"}}, out)
+    log(f"saved {out} ({os.path.getsize(out)/1e6:.1f} MB) -- best {best:.1f}% of the gap")
+    return best
+
+
+def _spectral_radius(src, dst, vals, n, device, iters=50):
+    """Power iteration. ARPACK on a 26M-edge graph is needlessly heavy and memory-hungry."""
+    s = torch.as_tensor(src, dtype=torch.long, device=device)
+    d = torch.as_tensor(dst, dtype=torch.long, device=device)
+    v = torch.as_tensor(vals, dtype=torch.float32, device=device)
+    x = torch.randn(n, device=device); x /= x.norm()
+    lam = 1.0
+    for _ in range(iters):
+        y = torch.zeros(n, device=device).index_add_(0, d, x[s] * v)
+        nrm = y.norm()
+        if nrm < 1e-12:
+            return 1.0
+        lam = float(nrm); x = y / nrm
+    return lam
+
+
 def main():
     """CLI: attach a brain to a model and show what it costs and what it remembers."""
     import argparse
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--train", type=int, default=0,
+                    help="fit a NEW brain to --model for this many steps, then save to --brain.\n                         A brain does not transfer between backbones, so this is how you make\n                         one for yours. Needs --connectome.")
+    ap.add_argument("--connectome", default="",
+                    help="feather/parquet with body_pre, body_post, weight (+ --signs .npy)")
+    ap.add_argument("--signs", default="", help="per-neuron +1/-1 npy")
     ap.add_argument("--brain", required=True, help="a .pt brain, e.g. FlyBrain-Pollard-CNSv1.pt")
     ap.add_argument("--model", required=True, help="HF model id to attach it to")
     ap.add_argument("--probes", required=True,
@@ -207,6 +359,14 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float32).to(a.device).eval()
     corpus = open(a.probes, encoding="utf-8", errors="replace").read(400_000)
+
+    if a.train:
+        import numpy as np, pandas as pd
+        g = pd.read_feather(a.connectome)
+        train_brain(model, tok, corpus,
+                    (g["body_pre"].to_numpy(), g["body_post"].to_numpy(), g["weight"].to_numpy()),
+                    np.load(a.signs), out=a.brain, steps=a.train, device=a.device)
+        return
 
     brain = FlyBrain.load(a.brain, device=a.device).attach(model, tokenizer=tok, probe_text=corpus)
     if a.load_state:
