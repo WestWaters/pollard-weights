@@ -28,8 +28,15 @@ import math
 import os
 from typing import Optional
 
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+except ImportError as _e:      # the connectome lane is an optional extra, not a core dependency
+    raise SystemExit(
+        "pollard-flybrain needs PyTorch, which Pollard does not install by default.\n"
+        "  pip install 'pollard-weights[flybrain]'      (torch, transformers, pandas, scipy)\n"
+        f"({_e})"
+    ) from None
 
 __all__ = ["FlyBrain"]
 _STATE_MAGIC = b"FLYS"
