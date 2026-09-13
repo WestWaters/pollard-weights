@@ -288,6 +288,64 @@ pollard-lowbit  --model <hf> --bits 1 --keep 0.01 --levels 3 --eval-file held.tx
 pollard-palette --model <hf> --calib-file calib.txt --eval-file held.txt --target-bpw 1.58 1.3  # PROVEN measured mixed-alphabet allocation (beat uniform ternary -22%/-35%)
 ```
 
+## FlyBrain — give a Pollard build memory with no context window
+
+A quantized model still has the context problem: its KV cache grows with every token, and past the
+window the beginning is gone. `pollard-flybrain` attaches a measured fruit-fly connectome (MaleCNS
+v1.0) to a **frozen** model as a continuous recurrent state that never grows — so a Pollard build can
+be small AND remember.
+
+Measured on Qwen2.5-0.5B, 128-token attention window over a 1,024-token document:
+
+| | loss | ppl |
+|---|---:|---:|
+| windowed attention only | 1.7733 | 5.89 |
+| **+ fly brain** | **1.6271** | **5.09** |
+| full attention | 1.6232 | 5.07 |
+
+97.4% of the gap, **+3.1% decode**, **0.03 MB** of state at any sequence length, **35 KB** on disk.
+
+### The full package for a user
+
+1. Quantize as normal (`pollard --hf <model> --run`, or the dense/MoE path above).
+2. Train a brain **for that backbone** — they do not transfer between families:
+
+```bash
+pollard-flybrain --train 400 --model <hf-id-or-path> \
+                 --connectome graph.feather --signs signs.npy \
+                 --probes corpus.txt --brain MyModel-FlyBrain.pt
+```
+
+3. Attach it at run time, and persist the conversation:
+
+```python
+from pollard_flybrain import FlyBrain
+brain = FlyBrain.load("MyModel-FlyBrain.pt", device="cuda")
+brain.attach(model, tokenizer=tok, probe_text=open("corpus.txt").read())
+brain.save_state("session.flystate")    # 35 KB — survives the process
+brain.load_state("session.flystate")    # resume mid-thought
+```
+
+### What to tell the user honestly
+
+- **One brain per backbone family.** Loading a brain into an unrelated model runs but does not help
+  (measured **−14.6%** on an unseen backbone). Retraining is ~20 minutes, backbone frozen.
+- **The brain remembers; it does not reason.** Language, code and vision come from the backbone.
+  8,552 neurons are a memory, not a mind.
+- **It needs the extra:** `pip install 'pollard-weights[flybrain]'` (torch, transformers, pandas,
+  scipy). Core Pollard stays light.
+- The wiring is doing the work, not recurrence alone: a degree-preserving shuffle — same neurons,
+  synapses, degrees and weights, only the connectivity randomised — lost all four seeds (mean −9.2pts).
+
+### Gotchas that waste a run
+
+- The probe basis is **not orthonormal** → the return path must be a pseudo-inverse. Using the
+  transpose inflates the round trip several-fold and the brain never learns.
+- The gate must start **non-zero** (0.05). At exactly 0 the readout is scaled by `tanh(0)=0`, which
+  also zeroes the gradient into the adapters — held-out loss then sits exactly on the floor forever.
+- Train against the backbone the user will actually run. A brain fitted to a different hidden size
+  attaches (and warns) but contributes nothing.
+
 ## Guards & gotchas (why runs fail or waste time)
 
 - **Dense + sensitivity/automap = REFUSED** (multi-hour no-op / wrong tool). Use imatrix.
@@ -297,6 +355,7 @@ pollard-palette --model <hf> --calib-file calib.txt --eval-file held.txt --targe
 - **Start from f16/bf16**, never a re-quantized file (compounds loss).
 - **New/newer arch fails to quantize** = rebuild the runtime llama.cpp (`git pull && cmake --build`).
 - **Bench alone** — a parallel eval/build contaminates tok/s.
+- **FlyBrain does not transfer between backbones** — train one per model family (~20 min), or it contributes nothing.
 
 ## Full feature index (keep this list in sync with the tools)
 
@@ -325,6 +384,7 @@ pollard-palette --model <hf> --calib-file calib.txt --eval-file held.txt --targe
 | `pollard-scorecard` | the standardized publish scorecard | any |
 | `pollard-lowbit` | PROVEN low-bit levers: outlier-catch (SpQR) + residual carousel (AQLM) | any (torch, small model) |
 | `pollard-palette` | PROVEN measured mixed-alphabet allocator (prune/binary/ternary/2b) — beat uniform ternary −22%/−35% | any (torch, small model) |
+| `pollard-flybrain` | **connectome memory** — attach/train a fly brain so a build has no context window | any (torch) |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
 
 > **MAINTENANCE:** this skill must track the tools. When a feature is added/changed,
