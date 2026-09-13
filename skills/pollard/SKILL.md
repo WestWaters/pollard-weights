@@ -385,6 +385,28 @@ brain.load_state("session.flystate")    # resume mid-thought
 | `pollard-lowbit` | PROVEN low-bit levers: outlier-catch (SpQR) + residual carousel (AQLM) | any (torch, small model) |
 | `pollard-palette` | PROVEN measured mixed-alphabet allocator (prune/binary/ternary/2b) — beat uniform ternary −22%/−35% | any (torch, small model) |
 | `pollard-flybrain` | **connectome memory** — attach/train a fly brain so a build has no context window | any (torch) |
+| `pollard-ggufcheck` | which runtime can actually load a GGUF — reads ggml types + arch, not filenames | any |
+| `pollard-card` | the master HF model-card template (measured numbers, correct runtime column) | any |
+| `pollard-recard` | bring already-published repos onto that template without losing measured numbers | any |
+| `pollard-ls` | list the Pollard workspace so you never hunt for a build | any |
+| `pollard-reclaim` | free disk a finished model still holds, once it is verifiably published | any |
+| `pollard-runtime` | are the llama.cpp builds current, and do they carry our patches? | — |
+| `pollard-verify` | correctness/perf GATE for a converted model — catch bad weights before hours burn | any |
+| `pollard-refcheck` | prove the reference forward is sane BEFORE measuring anything against it | any |
+| `pollard-doctor` | diagnose/repair a model for low-bit: is this convert healthy, and why not? | any |
+| `pollard-errsrc` | attribute measured quant error to a tensor AND its trigger | any |
+| `pollard-errtype` | classify WHY a tensor quantizes badly, so the right lever is chosen | any |
+| `pollard-archfp` | what IS this architecture structurally — and which known one is it a twin of? | any |
+| `pollard-onboard` | audit a NEW architecture and emit a ready-to-submit contribution | any |
+| `pollard-envmatch` | build a custom-arch model in a Python env matched to its converter | any |
+| `pollard-calib` | build a multi-domain calibration corpus (Calib 3.0) | any |
+| `pollard-probes` | task-accuracy probes on a Pollard'd GGUF via llama.cpp's own runner | any |
+| `pollard-serve-eval` | A/B a served quantized model against its baseline, on the same traffic | any |
+| `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
+| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation | any |
+| `pollard-mx` | emit FP4/FP8 for Blackwell (NVFP4 default, MXFP4 export) | any |
+| `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
+| `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
 
 > **MAINTENANCE:** this skill must track the tools. When a feature is added/changed,
