@@ -1060,6 +1060,46 @@ def test_card_detects_the_pipeline_tag():
     assert C.detect_pipeline_tag("local/dir", {"vision_config": {}}, input_support="text") == "text-generation"
 
 
+def test_flybrain_state_is_fixed_size_and_refuses_a_mismatch():
+    """The memory must be a fixed-size file, and must not load into the wrong connectome.
+
+    The whole claim is that context costs a constant amount: a KV cache for a long conversation is
+    gigabytes and grows, while this is the same size forever. A state saved from one brain loaded
+    into another would silently produce confident nonsense, so it is refused.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    try:
+        import torch
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    from pollard_flybrain import FlyBrain
+
+    n = 64
+    blob = {"src": [0, 1], "dst": [1, 0], "sign": [1.0, -1.0],
+            "w": torch.ones(2), "tau": torch.zeros(n), "write": torch.zeros(n, 8),
+            "read": torch.zeros(8, n), "gate": torch.zeros(1),
+            "meta": {"name": "t", "neurons": n, "synapses": 2, "canonical": 8, "probe_len": 4}}
+    b = FlyBrain(blob)
+    b.reset(1)
+
+    with tempfile.TemporaryDirectory() as d:
+        p1 = os.path.join(d, "a.flystate")
+        size_short = b.save_state(p1)
+        for _ in range(50):                      # advance the state a lot
+            b.state = b.state + 1.0
+        size_long = b.save_state(p1)
+        assert size_short == size_long, "state size must not grow with use"
+
+        b2 = FlyBrain({**blob, "meta": {**blob["meta"], "neurons": n + 1}})
+        b2.n = n + 1
+        try:
+            b2.load_state(p1)
+            raise AssertionError("loaded a state from a different connectome")
+        except ValueError:
+            pass
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
