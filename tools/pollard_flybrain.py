@@ -42,9 +42,13 @@ class FlyBrain:
         self.meta = blob["meta"]
         self.device = device
         d = torch.device(device)
+        # Accept lists, numpy arrays or tensors. `sign` is per-neuron and has to be gathered onto
+        # the presynaptic side, which is numpy-style fancy indexing -- it raises on a plain list, and
+        # a checkpoint written from lists is a perfectly reasonable thing for someone to hand us.
         self.src = torch.as_tensor(blob["src"], dtype=torch.long, device=d)
         self.dst = torch.as_tensor(blob["dst"], dtype=torch.long, device=d)
-        self.sgn = torch.as_tensor(blob["sign"][blob["src"]], dtype=torch.float32, device=d)
+        sign = torch.as_tensor(blob["sign"], dtype=torch.float32, device=d)
+        self.sgn = sign[self.src]
         self.w = blob["w"].to(d).float()
         self.tau = torch.sigmoid(blob["tau"].to(d).float())
         self.write = blob["write"].to(d).float()
