@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""pollard-mlx — emit an MLX (Apple Silicon) mixed-bit model carrying Pollard's measured allocation.
+"""pollard-mlx -- emit an MLX (Apple Silicon) mixed-bit model carrying Pollard's measured allocation.
 
 The Apple deployment lane: llama.cpp/GGUF is the CPU/portable flagship, GPTQ (pollard-export) is the
 vLLM/SGLang server lane, and THIS is the on-device Apple lane (M-series, ANE/Metal via MLX). Same
-Pollard brain — detect arch, allocate bits by measured sensitivity under a size budget — a different
+Pollard brain -- detect arch, allocate bits by measured sensitivity under a size budget -- a different
 EMITTER. MLX group-quant supports mixed bits via a per-module `quant_predicate`, so the profile's hot
 modules stay high (8-bit) and the tolerant body is crushed (4-bit); router + shared experts pinned high.
 
@@ -83,7 +83,7 @@ def main():
     ap.add_argument("--layers", type=int, default=0)
     ap.add_argument("--hot-frac", type=float, default=0.35)
     ap.add_argument("--focus-layers", help="force these layers to HIGH (8-bit) regardless of the profile, "
-                    "e.g. '3,4,8' or '3-8,16' — steer the budget to layers you care about")
+                    "e.g. '3,4,8' or '3-8,16' -- steer the budget to layers you care about")
     ap.add_argument("--group-size", type=int, default=64, help="MLX quant group size (default 64)")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map. "
@@ -99,7 +99,7 @@ def main():
     auto_moe, det = detect_moe(a.model, n_layers)
     n_layers = n_layers or det
     if not n_layers:
-        sys.exit("ERROR: could not read layer count — pass --layers.")
+        sys.exit("ERROR: could not read layer count -- pass --layers.")
     is_moe = auto_moe if a.moe is None else a.moe
     import pollard_workspace as ws
     focus = ws.parse_layers(a.focus_layers)
@@ -108,8 +108,8 @@ def main():
     alloc = allocate(sens, n_layers, a.hot_frac, focus=focus)
     avg = sum(g["attn"] + g["ffn"] for g in alloc.values()) / (2 * len(alloc))
     kind = "MoE" if is_moe else "dense"
-    print(f"== pollard-mlx :: {a.model}  [{kind}]  {n_layers} layers · mix {LOW}/{HIGH}-bit "
-          f"avg {avg:.2f} · group_size {a.group_size}")
+    print(f"== pollard-mlx :: {a.model}  [{kind}]  {n_layers} layers  |  mix {LOW}/{HIGH}-bit "
+          f"avg {avg:.2f}  |  group_size {a.group_size}")
     if is_moe:
         print("   MoE: router + shared experts pinned 8-bit; cold experts 4-bit")
 

@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
-"""pollard-card — THE master template for every PollardWeights Hugging Face repo. One template, every
+"""pollard-card -- THE master template for every PollardWeights Hugging Face repo. One template, every
 model, so the repos read as one shelf instead of fourteen one-offs.
 
 Sections, in order. Ones that depend on the model only appear when they apply, so a card never
 advertises something the repo does not ship:
 
-  frontmatter · title + shrink hero + size table · what these are
+  frontmatter  |  title + shrink hero + size table  |  what these are
   Model details            params / arch / input support / imatrix / measured
   Which file should I choose?   the rung guide, sized off the real bytes
   Available files          PPL / size / tok-s / Mean KLD / notes
   Prompt format            --prompt-format
   Multimodal               --mmproj
   Fill-in-the-middle       --fim (coder models)
-  Download a specific file · How to run
+  Download a specific file  |  How to run
   imatrix (calibration)    --imatrix-file / --calib-file / --calib-note
-  ARM / AVX · Errata · Credits & license
+  ARM / AVX  |  Errata  |  Credits & license
 
-Data-driven from the workspace manifest + the base model's config — never hand-written, never drifts.
+Data-driven from the workspace manifest + the base model's config -- never hand-written, never drifts.
 
   pollard-card --model openbmb/MiniCPM5-2B --params 2.5B --out README.md
   pollard-card --model <base> --builds-from <manifest-key> --results results.json --out README.md
   pollard-card ... --repo PollardWeights/<Model>-Pollard --upload PollardWeights/<Model>-Pollard
 
 `--results` (optional) supplies per-file PPL / Mean-KLD / eval string so the files table carries real
-numbers; without it those columns show "—". `--builds-from` reads builds recorded under a different
+numbers; without it those columns show "--". `--builds-from` reads builds recorded under a different
 manifest key (e.g. the f16 GGUF path). Sizes/bpw come from the manifest."""
 import argparse
 import json
@@ -35,7 +35,7 @@ LANE_TAGS = {"gguf": ["gguf", "llama.cpp", "ik_llama.cpp", "trellis", "imatrix"]
              "gptq": ["gptq", "vllm", "compressed-tensors"],
              "mx": ["nvfp4", "compressed-tensors", "vllm", "blackwell"],
              "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"]}
-# format size multipliers vs f16 (bytes/param relative to 2.0) — for the shrink size table
+# format size multipliers vs f16 (bytes/param relative to 2.0) -- for the shrink size table
 FMT_BPP = {"Q8_0": 1.06, "Q6_K": 0.82, "Q5_K_M": 0.69, "Q4_K_M": 0.58, "NVFP4": 0.53, "IQ4_XS": 0.55}
 
 
@@ -257,7 +257,7 @@ def rung_agreement(n):
 
 
 def human_gb(nbytes):
-    return f"{nbytes/1e9:.2f} GB" if nbytes else "—"
+    return f"{nbytes/1e9:.2f} GB" if nbytes else "--"
 
 
 def parse_params_b(params, cfg):
@@ -396,10 +396,10 @@ def main():
     # ---- frontmatter + hero
     ptag = detect_pipeline_tag(base_model, cfg, a.pipeline_tag, a.mmproj, a.input_support)
     out = [frontmatter(base_model, lic, lanes, mtype, account, ptag), "",
-           f"# {name} — Pollard", ""]
+           f"# {name} -- Pollard", ""]
     if f16_gb and small_gb:
-        out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) → {small_gb:.2f} GB** — "
-                f"**{pct:.0f}% smaller, {x:.1f}× down**.",
+        out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) -> {small_gb:.2f} GB** -- "
+                f"**{pct:.0f}% smaller, {x:.1f}x down**.",
                 "> The smallest rung here; larger, higher-fidelity rungs are listed below."]
         if primary == "gguf":          # the format size table is GGUF-specific
             out += [">", "> | format | this model's size |", "> |---|---:|", f"> | f16 | {f16_gb:.2f} GB |"]
@@ -409,7 +409,7 @@ def main():
             out.append(f"> | **PollardMix (this repo's {smallest.get('tag','best')})** | **{small_gb:.2f} GB** |")
         out.append("")
     out += [f"Pollard builds of [{base_model}](https://huggingface.co/{base_model}) made with "
-            "[Pollard Weights](https://github.com/WestWaters/pollard-weights) — a ladder of "
+            "[Pollard Weights](https://github.com/WestWaters/pollard-weights) -- a ladder of "
             "**measured-allocation** quants (bits placed by per-layer sensitivity, not a uniform crush).", ""]
     if "gguf" in lanes:
         # Stated from the files' own tensor types, not from their names: a rung can carry a
@@ -421,7 +421,7 @@ def main():
                     f"[ik_llama.cpp]({IK_URL})-only atoms (the trellis `IQ*_KT` family among them) "
                     "need that build; the rest run in any recent llama.cpp.", ""]
         elif not ik_builds:
-            out += ["**Standard GGUF — every file here runs in stock llama.cpp / ik_llama.cpp, "
+            out += ["**Standard GGUF -- every file here runs in stock llama.cpp / ik_llama.cpp, "
                     "Ollama, LM Studio.**", ""]
         elif len(ik_builds) == len(runtimes):
             if fork_arch and arch_verdict == "newer":
@@ -444,19 +444,19 @@ def main():
             need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
                              sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
             v_need, _, pron = rung_agreement(len(ik_builds))
-            out += ["**Standard GGUF — runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, "
+            out += ["**Standard GGUF -- runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, "
                     f"except where noted.** {need} {v_need} [ik_llama.cpp]({IK_URL}): {pron} "
                     "allocation puts ik_llama-only atoms on the tensors it protects. The rest run "
                     "anywhere.", ""]
 
     # ---- Model details: the at-a-glance table every good Pollard card opens with
-    arch = a.arch or mtype or "—"
+    arch = a.arch or mtype or "--"
     out += ["## Model details", "", "| | |", "|---|---|"]
-    out.append(f"| Parameter count | ~{pb:.1f}B |" if pb else "| Parameter count | — |")
+    out.append(f"| Parameter count | ~{pb:.1f}B |" if pb else "| Parameter count | -- |")
     out.append(f"| Architecture | `{arch}` |")
     out.append(f"| Input support | {a.input_support} |")
-    out.append(f"| imatrix | {'**yes** — see [calibration](#imatrix-calibration)' if a.imatrix_file else 'no'} |")
-    out.append(f"| Perplexity measured | {'**yes** — table below' if f16_ppl or results else 'pending'} |")
+    out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if a.imatrix_file else 'no'} |")
+    out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
     out.append("")
 
     # ---- Which file should I choose? -- the rung guide, sized off the real bytes
@@ -472,7 +472,7 @@ def main():
             rec = "" if (is_rec and note) else (" **Recommended.**" if is_rec else "")
             if is_rec and note:
                 note = f"**{note}**"
-            head = f"- **~{gb + 2:.0f} GB RAM / VRAM** → **`{b.get('tag','')}`** ({gb:.2f} GB)."
+            head = f"- **~{gb + 2:.0f} GB RAM / VRAM** -> **`{b.get('tag','')}`** ({gb:.2f} GB)."
             # This list is where people actually pick a file, so a rung that stock llama.cpp cannot
             # open has to say so here too -- not only in the table further down.
             rtb = runtimes.get(b.get("path"))
@@ -503,13 +503,13 @@ def main():
             f"|---|---:|---:|{tps_s}---:|{rt_s}---|"]
     for b in sorted(builds, key=lambda x: (x.get("bytes") or 0)):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
-        tps_c = f" {r.get('tps','—')} |" if has_tps else ""
+        tps_c = f" {r.get('tps','--')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
         rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain,
-                  "unknown": "unverified", "stock": "any llama.cpp"}.get(rt, "—")
+                  "unknown": "unverified", "stock": "any llama.cpp"}.get(rt, "--")
         rt_c = (" " + rt_lbl + " |") if mixed else ""
-        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','—')} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{r.get('kld','—')} |{rt_c} {r.get('note', b.get('tag',''))} |")
+        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','--')} | {human_gb(b.get('bytes'))} |{tps_c} "
+                   f"{r.get('kld','--')} |{rt_c} {r.get('note', b.get('tag',''))} |")
     if has_tps:
         hw = results.get("_hw")
         out.append("")
@@ -517,7 +517,7 @@ def main():
                    "_tok/s is hardware-specific; the machine it was measured on is stated in the errata._")
     if not results:
         out.append("")
-        out.append("_PPL / Mean-KLD benchmarking pending — sizes and allocation are final._")
+        out.append("_PPL / Mean-KLD benchmarking pending -- sizes and allocation are final._")
     out.append("")
 
     # ---- usage
@@ -552,7 +552,7 @@ def main():
     # ---- Multimodal: only for a repo that actually ships the projector
     if a.mmproj:
         out += ["## Multimodal", "",
-                f"Vision needs the projector shipped alongside: **`{a.mmproj}`** — download it too and "
+                f"Vision needs the projector shipped alongside: **`{a.mmproj}`** -- download it too and "
                 "pass it with `--mmproj`. It is **not quantized**; it is small and the text ladder is "
                 "where the size lives.", "",
                 "```bash", f"llama-server -m {exn} --mmproj {a.mmproj} -ngl 99", "```", ""]
@@ -585,7 +585,7 @@ def main():
                     f'llama-cli    -m {exn} -ngl 99 -p "Explain why the sky is blue."',
                     f"llama-server -m {exn} -ngl 99      # OpenAI-compatible API + web UI at :8080",
                     "```", ""]
-            out += ["They also work in anything built on llama.cpp — **LM Studio, koboldcpp, Jan, "
+            out += ["They also work in anything built on llama.cpp -- **LM Studio, koboldcpp, Jan, "
                     f"ramalama, Ollama** (`ollama run hf.co/{repo}`).", ""]
         else:
             lead = (f"This model's architecture (`{fork_arch}`) needs a llama.cpp new enough to "
@@ -634,7 +634,7 @@ def main():
     if "gguf" in lanes:
         out += ["## ARM / AVX", "",
                 "llama.cpp repacks weights into an interleaved layout at load time for faster inference "
-                "on ARM and AVX machines — no special file needed, online repacking covers these quants. "
+                "on ARM and AVX machines -- no special file needed, online repacking covers these quants. "
                 "The old `Q4_0_4_4/4_8/8_8` variants are not required.", ""]
 
     # ---- errata + footer
@@ -643,13 +643,13 @@ def main():
         if ik_builds and fork_arch and arch_verdict == "newer":
             out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp added "
                        "recently. A build older than that support refuses these files with `unknown "
-                       "model architecture` — update llama.cpp rather than looking for a different "
+                       "model architecture` -- update llama.cpp rather than looking for a different "
                        "quant. Checked with `pollard-ggufcheck`, which reads the architecture and the "
                        "tensor types out of the header and asks upstream what it implements.")
         elif ik_builds and fork_arch:
             out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp does not "
                        f"implement, so these files load only in "
-                       f"{fork_where or 'the vendor fork that adds it'} — the quant types are "
+                       f"{fork_where or 'the vendor fork that adds it'} -- the quant types are "
                        "ordinary and irrelevant to that. Checked with `pollard-ggufcheck`, which "
                        "reads the architecture and the tensor types out of the header.")
         elif ik_builds:
@@ -660,7 +660,7 @@ def main():
                        "stock llama.cpp rejects any ggml type above 42 outright. Checked with "
                        "`pollard-ggufcheck`, from the files' tensor types rather than their names.")
         elif runtimes:
-            out.append("- Every file here loads in stock llama.cpp — verified from the tensor types "
+            out.append("- Every file here loads in stock llama.cpp -- verified from the tensor types "
                        "with `pollard-ggufcheck`, not assumed from the filenames.")
         else:
             out.append("- Trellis (`IQ*_KT`) quants need ik_llama.cpp to build/run; K-quants run in "
@@ -672,14 +672,14 @@ def main():
     out += ["", "## Credits & license", "",
             f"- Base model: [`{base_model}`](https://huggingface.co/{base_model}){owner}",
             "- Quantization tooling: [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org)",
-            "- Method + tooling: [Pollard Weights](https://github.com/WestWaters/pollard-weights) — "
+            "- Method + tooling: [Pollard Weights](https://github.com/WestWaters/pollard-weights) -- "
             "*measure first, no claim before a number.*"]
     out += [f"- License: `{lic}`, inherited from the base model."]
     for c in a.credits:
         out.append("- " + c.lstrip("- ").strip())
 
     out += ["",
-            "*Built with [Pollard Weights](https://github.com/WestWaters/pollard-weights) — "
+            "*Built with [Pollard Weights](https://github.com/WestWaters/pollard-weights) -- "
             "frontier models, small hardware, no compromise.*"]
 
     card = "\n".join(out) + "\n"

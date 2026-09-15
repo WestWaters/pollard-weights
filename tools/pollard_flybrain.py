@@ -1,4 +1,4 @@
-"""pollard-flybrain — a fruit-fly connectome as a language model's memory.
+"""pollard-flybrain -- a fruit-fly connectome as a language model's memory.
 
 A transformer's memory is its KV cache: it grows with every token, and when the context window fills,
 the oldest tokens are gone. A fly has no context window. This attaches a real connectome (MaleCNS

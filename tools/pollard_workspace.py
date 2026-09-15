@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard_workspace — the shared, organized output home for every Pollard build. Pure stdlib so any
+"""pollard_workspace -- the shared, organized output home for every Pollard build. Pure stdlib so any
 tool can import it. Users get a predictable, self-documenting tree instead of builds scattered wherever
 they ran the command.
 
@@ -17,7 +17,7 @@ Layout (default ~/pollard, override with $POLLARD_HOME):
         MANIFEST.json                         every build here: lane, bpw, ppl, verified, size, date
     cache/                                    _work dirs (safe to delete)
 
-Tools call `resolve_out(model, lane, tag, explicit)` — if the user passed --out it's respected; otherwise
+Tools call `resolve_out(model, lane, tag, explicit)` -- if the user passed --out it's respected; otherwise
 the build lands in the workspace automatically. After a build, call `record_build(...)` to log it to the
 model's MANIFEST so `pollard-ls` can show what exists and whether it verified.
 """
@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 
 # Windows consoles default to cp1252 and CRASH (UnicodeEncodeError) on the progress bars / emoji that
 # Pollard and its deps (gptqmodel, llm-compressor, tqdm) print. Every Pollard tool imports this module,
-# so forcing UTF-8 here — at import, before those deps load — makes the whole toolchain safe on Windows
+# so forcing UTF-8 here -- at import, before those deps load -- makes the whole toolchain safe on Windows
 # with no PYTHONUTF8 env needed. errors="replace" so an odd byte degrades a glyph instead of crashing.
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -78,7 +78,7 @@ def cache_dir(create: bool = False) -> str:
 
 
 def downloads_dir(create: bool = False) -> str:
-    """Staging home for pulled SOURCE models — the input side, distinct from models/ (built outputs) and
+    """Staging home for pulled SOURCE models -- the input side, distinct from models/ (built outputs) and
     cache/ (scratch). $POLLARD_HOME/downloads/<Org>__<Model>/ keeps every fetched model in one findable,
     human-named place instead of scattered under wherever the command was run."""
     d = os.path.join(pollard_home(), "downloads")
@@ -95,15 +95,15 @@ def source_dir(model: str, create: bool = False) -> str:
 
 def fetch_source(repo_id: str, filename: str | None = None, revision: str | None = None,
                  allow_patterns=None, token: str | None = None) -> str:
-    """Pull an HF source model (or one file) into $POLLARD_HOME/downloads/<slug> — ONE findable copy.
+    """Pull an HF source model (or one file) into $POLLARD_HOME/downloads/<slug> -- ONE findable copy.
 
     Returns the local file path (when `filename` is given) or the model dir. A path that already exists
     locally is returned as-is (point Pollard at a repo id OR a dir). The Xet backend is disabled (its
     write token can expire mid-transfer, which stalls big pulls) and the hub cache is pinned INSIDE
     downloads/ (`.hf-cache`) so a download can't silently duplicate the model into ~/.cache and fill the
-    disk — everything the pull touches lives under one folder you can see and clean. Idempotent: a
+    disk -- everything the pull touches lives under one folder you can see and clean. Idempotent: a
     complete prior download is reused, not re-fetched."""
-    if os.path.exists(repo_id):                       # already a local dir/file — use it directly
+    if os.path.exists(repo_id):                       # already a local dir/file -- use it directly
         return repo_id
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     dest = source_dir(repo_id, create=True)
@@ -248,7 +248,7 @@ def resolve_trust_remote_code(model_id, mode="auto") -> bool:
     """Custom architectures (Spark2_5, etc.) ship their own modeling code that transformers must be
     allowed to run to load them. 'auto' enables it ONLY when the model's config.json declares an
     `auto_map` (i.e. it actually has custom code) and says so; 'on'/'off' force it. Reads config.json
-    as plain JSON — no code is executed to make the decision. Shared by every export lane."""
+    as plain JSON -- no code is executed to make the decision. Shared by every export lane."""
     if mode == "on":
         return True
     if mode == "off":
@@ -261,7 +261,7 @@ def resolve_trust_remote_code(model_id, mode="auto") -> bool:
             from huggingface_hub import hf_hub_download
             cfg = json.load(open(hf_hub_download(model_id, "config.json")))
         if cfg.get("auto_map"):
-            print("   [trust-remote-code] custom architecture (auto_map) detected — enabling remote code")
+            print("   [trust-remote-code] custom architecture (auto_map) detected -- enabling remote code")
             return True
         return False
     except Exception:

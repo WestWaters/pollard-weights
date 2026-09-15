@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""pollard-rotate — incoherence preconditioning (QuIP#/QuaRot-style) before the quant.
+"""pollard-rotate -- incoherence preconditioning (QuIP#/QuaRot-style) before the quant.
 
 This is the RIGHT preconditioner for the IQ codebook quants (IQ2/IQ3/IQ4), where
-diagonal AWQ-style smoothing (see pollard-smooth) HURTS — because a lattice/codebook
+diagonal AWQ-style smoothing (see pollard-smooth) HURTS -- because a lattice/codebook
 quantizer assumes a fixed weight-distribution SHAPE, and per-channel scaling distorts
 it. Rotation does the opposite: an orthogonal transform on the residual stream spreads
 each coordinate's energy across all others (concentration of measure -> near-Gaussian,
@@ -14,11 +14,11 @@ The rotation is mathematically identity: r' = H r in the residual, with H folded
 the weights that WRITE the residual (embed, attn_output, ffn_down: W <- H W) and its
 inverse into the weights that READ it (q,k,v,gate,up,lm_head: W <- W diag(gamma) H^T,
 after absorbing the preceding RMSNorm gain gamma). q/k/v VALUES are unchanged, so RoPE,
-GQA and attention are untouched — no per-head handling, no runtime kernel. The output is
+GQA and attention are untouched -- no per-head handling, no runtime kernel. The output is
 a NORMAL GGUF that runs on CPU, CUDA, Metal, Vulkan unchanged.
 
 Every model gets an identity canary (rotated-f16 must match the original f16 to fp
-tolerance) — verify empirically, never assume. Then: build a FRESH imatrix on the
+tolerance) -- verify empirically, never assume. Then: build a FRESH imatrix on the
 rotated model and quantize as usual. Compare KL vs the f16 base at equal bits/weight.
 
 Usage:
@@ -61,7 +61,7 @@ def to_logical(t):
 
 
 def random_orthogonal(n, seed):
-    """A random orthogonal matrix via QR of a Gaussian — strong Gaussianization
+    """A random orthogonal matrix via QR of a Gaussian -- strong Gaussianization
     (each rotated coord is a random combination of all inputs -> CLT). Works for
     ANY dim (no power-of-2 requirement)."""
     g = np.random.default_rng(seed).standard_normal((n, n))
@@ -118,7 +118,7 @@ def main():
     ap.add_argument("--kind", default="orthogonal", choices=["orthogonal", "hadamard", "block"],
                     help="orthogonal = dense random Haar (any dim); hadamard = dense "
                     "randomized Hadamard (power-of-2 dims); block = block-diagonal "
-                    "(mix within --block channels only — keeps imatrix useful)")
+                    "(mix within --block channels only -- keeps imatrix useful)")
     ap.add_argument("--block", type=int, default=32,
                     help="block width for --kind block (match the quant block, 32)")
     ap.add_argument("--seed", type=int, default=1)
@@ -139,7 +139,7 @@ def main():
     # hidden size from the residual: attn_output OUTPUT rows == hidden
     probe = tensors.get("blk.0.attn_output.weight")
     if probe is None:
-        sys.exit("ERROR: no blk.0.attn_output.weight — unsupported arch for rotation.")
+        sys.exit("ERROR: no blk.0.attn_output.weight -- unsupported arch for rotation.")
     hidden = to_logical(probe).shape[0]
     print(f"== pollard-rotate :: {a.gguf}  [{arch}]  hidden={hidden}  layers={len(layers)}  kind={a.kind}")
 
@@ -154,7 +154,7 @@ def main():
     orth = float(np.max(np.abs(H @ Ht - np.eye(hidden))))
     print(f"   H orthogonality residual: {orth:.2e}  (must be ~0)")
     if orth > 1e-6:
-        sys.exit("ERROR: constructed H is not orthogonal — aborting.")
+        sys.exit("ERROR: constructed H is not orthogonal -- aborting.")
     if a.plan_only:
         nr = sum(1 for li in layers for s in READERS if f"blk.{li}.{s}.weight" in tensors)
         nw = sum(1 for li in layers for s in WRITERS if f"blk.{li}.{s}.weight" in tensors)
@@ -164,7 +164,7 @@ def main():
 
     # STREAMING design: hold only H (hidden x hidden) + the small 1-D norm gains in
     # RAM, and transform each tensor on the fly in the write loop. This is what lets
-    # rotate run on a 27B on a 16 GB box — never materialize the whole model.
+    # rotate run on a 27B on a 16 GB box -- never materialize the whole model.
     gains = {t.name: to_logical(tensors[t.name]).astype(np.float64)
              for t in reader.tensors if t.name.endswith("_norm.weight")}
     fn = next((n for n in ("output_norm.weight", "norm.weight") if n in tensors), None)
@@ -226,7 +226,7 @@ def main():
     if rel > a.canary_tol:
         sys.exit(f"ERROR: rotation identity canary FAILED ({rel:.2e} > {a.canary_tol}). "
                  f"Nothing written. (Likely a norm/axis mismatch for arch '{arch}'.)")
-    # writer path: o_orig into residual vs H^-1 (H o) — trivially exact, checked via H orth above
+    # writer path: o_orig into residual vs H^-1 (H o) -- trivially exact, checked via H orth above
 
     out = a.out or a.gguf.rsplit(".gguf", 1)[0] + "-rot.gguf"
     print(f"   writing {out} (streaming) ...")

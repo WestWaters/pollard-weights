@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-errtype — classify WHY a tensor will quantize badly, so the right lever is chosen
+"""pollard-errtype -- classify WHY a tensor will quantize badly, so the right lever is chosen
 without building every candidate first.
 
 pollard-precondition answers "which preconditioner wins" the honest way: build each candidate and
@@ -31,7 +31,7 @@ and read off the type:
   pollard-errtype --model Qwen/Qwen2.5-0.5B
   pollard-errtype --model ./local-dir --layers 0,15,23 --json
 
-⚠️ This PREDICTS which lever should win from weight statistics. It does not replace measuring.
+! This PREDICTS which lever should win from weight statistics. It does not replace measuring.
 Treat it as the cheap first pass that tells pollard-precondition which candidates are worth
 building, and check the prediction against the measured KL before trusting it on a new family.
 

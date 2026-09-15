@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""pollard — the autoaware entry point. Point it at ANY model; it detects dense vs MoE
+"""pollard -- the autoaware entry point. Point it at ANY model; it detects dense vs MoE
 and drives the WINNING method, so a user never runs a losing path or wastes hours.
 
-WINNING PATH — the SAME for dense AND MoE (no losing fallback):
-  (1) the imatrix K-quant ladder (pollard-fit) — the honest fit-your-RAM baseline, plus
-  (2) the mixed-precision FLAGSHIP mix (automap trellis) — the hand-coded winner (crush body,
-      protect attn/down/first-last; MoE = expert-allocation) — WHEN an imatrix is present.
+WINNING PATH -- the SAME for dense AND MoE (no losing fallback):
+  (1) the imatrix K-quant ladder (pollard-fit) -- the honest fit-your-RAM baseline, plus
+  (2) the mixed-precision FLAGSHIP mix (automap trellis) -- the hand-coded winner (crush body,
+      protect attn/down/first-last; MoE = expert-allocation) -- WHEN an imatrix is present.
   No --imatrix supplied -> AUTO-BUILD one (Calib 3.0 corpus -> llama-imatrix) so the DEFAULT is the
   flagship mix with ZERO manual steps. --no-auto-imatrix falls back to the stock K-quant ladder.
   (There is NO "imatrix-free mix": it loses to stock Q2_K, so it's deprecated, not a path here.)
 
-⛔ LOSING / TRAP paths — never the default, opt-in only:
+STOP LOSING / TRAP paths -- never the default, opt-in only:
   - sensitivity SWEEP on DENSE = loses (no expert redundancy) -> pollard-sensitivity refuses dense.
   - sensitivity SWEEP on a BIG MoE = ~2*layers full-model quantizes = many HOURS; opt-in R&D only.
   - the 3-bar comparison + KL/PPL = the BENCHMARK, opt-in via --benchmark (see benchmarks/).
@@ -22,7 +22,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --hf ./my-local-model --run             # ...or a model already on disk (any arch)
     pollard --hf Qwen/Qwen3-8B --format gptq --run  # GPTQ for vLLM/SGLang
     pollard --hf Qwen/Qwen3-8B --format mlx --run   # MLX for Apple Silicon
-    pollard --hf Qwen/Qwen3-8B --format exl3 --run  # EXL3 (exllamav3 — heavy trellis)
+    pollard --hf Qwen/Qwen3-8B --format exl3 --run  # EXL3 (exllamav3 -- heavy trellis)
     pollard --hf Qwen/Qwen3-8B --format mx --run    # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
@@ -43,7 +43,7 @@ _REF_BPW = [("f16", 16.0), ("Q8_0", 8.5), ("Q6_K", 6.6), ("Q5_K_M", 5.5),
 
 def size_ladder(params_b, pollard_gb=None, pollard_label="Pollard"):
     """Print the shrink story: f16 size, where Pollard's build lands, and the same model
-    at each reference format — so people SEE what Pollard did and can compare to NVFP4."""
+    at each reference format -- so people SEE what Pollard did and can compare to NVFP4."""
     if not params_b:
         return
     gb = lambda bpw: params_b * 1e9 * bpw / 8 / 1e9
@@ -101,7 +101,7 @@ def _scan_for(path, needle):
 
 def _build_knows_arch(bin_dir, arch):
     """Does this llama.cpp build know `arch`? Arch names are string literals in the arch table, which
-    lives in the SHARED LIBRARY (llama.dll / libllama.so), not the CLI executable — scanning only the
+    lives in the SHARED LIBRARY (llama.dll / libllama.so), not the CLI executable -- scanning only the
     exe reports false negatives for architectures the build genuinely supports. So scan the whole bin
     directory. Returns True/False, or None when the directory is missing/unreadable."""
     if not arch or not bin_dir or not os.path.isdir(bin_dir):
@@ -131,7 +131,7 @@ def lane_report(gguf_path, ik_bin_dir=None):
             break
     print(f"   arch: {arch}")
     if known is None:
-        print("   trellis flagship: ik_llama.cpp build not found — set IK_LLAMA_BIN to enable the "
+        print("   trellis flagship: ik_llama.cpp build not found -- set IK_LLAMA_BIN to enable the "
               "IQ*_KT flagship (the K-quant ladder still runs).")
     elif known:
         print("   trellis flagship: available (ik_llama.cpp knows this arch)")
@@ -160,7 +160,7 @@ def lane_report(gguf_path, ik_bin_dir=None):
 
 
 def _automap_mix(a, is_moe):
-    """Emit + (with --run) build the automap mix — the hand-coded mixed-precision flagship.
+    """Emit + (with --run) build the automap mix -- the hand-coded mixed-precision flagship.
     MoE: expert-allocation (crush cold experts, protect router/down/shared/attn). DENSE: the
     IQ1_KT crush-body / protect-attn+down+edges flagship (automap-on-dense, --allow-dense).
     Fast by default (--mix-only --no-eval); --benchmark emits the 3-bar + PPL board instead.
@@ -174,7 +174,7 @@ def _automap_mix(a, is_moe):
             subprocess.run([binq, "--dry-run", a.gguf, "x.gguf", "Q6_K"],
                            stdout=f, stderr=subprocess.STDOUT)
     out = os.path.join(here, "pollard_auto_build.bat" if is_moe else "pollard_auto_flagship.bat")
-    # the flagship is the TRELLIS mix (winner) — always imatrix-guided. No K-quant fallback.
+    # the flagship is the TRELLIS mix (winner) -- always imatrix-guided. No K-quant fallback.
     am = ["pollard-automap", "--tensors", tensors, "--model", a.gguf, "--out", out,
           "--imatrix", a.imatrix]
     if not is_moe:
@@ -238,7 +238,7 @@ def _resolve_hf(a):
         a._hf_dir = _precondition_hf(a, a.hf)
         return a._hf_dir
     import pollard_workspace as ws
-    local = ws.source_dir(a.hf)                         # $POLLARD_HOME/downloads/<slug> — one findable place
+    local = ws.source_dir(a.hf)                         # $POLLARD_HOME/downloads/<slug> -- one findable place
     print(f"   fetch HF repo -> {local}  (workspace downloads/)")
     if a.run:
         local = ws.fetch_source(a.hf)                   # single copy, no ~/.cache dup
@@ -283,20 +283,20 @@ def _ensure_sensitivity(a, hf_dir, calib, here):
     evalf = heldout if (heldout and (not a.run or os.path.exists(heldout))) else calib
     print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
     if a.run:
-        # tolerate a probe failure — fall back to uniform rather than killing the whole build
+        # tolerate a probe failure -- fall back to uniform rather than killing the whole build
         r = subprocess.run(["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof], cwd=here)
         if r.returncode != 0 or not os.path.exists(prof):
-            print("   (probe unavailable/failed — falling back to uniform allocation for this lane)")
+            print("   (probe unavailable/failed -- falling back to uniform allocation for this lane)")
             return None
     return prof
 
 
 def _emit_nongguf(a):
     """GPTQ (vLLM/SGLang), MLX (Apple), EXL3 (exllamav3), and MX (Blackwell/any-GPU compressed-tensors)
-    emit straight from HF weights — same Pollard method (smoothing default + measured allocation), a
+    emit straight from HF weights -- same Pollard method (smoothing default + measured allocation), a
     different emitter. Calib 3.0 and the sensitivity profile are auto-built so it's a true one-shot."""
     if not a.hf:
-        sys.exit(f"--format {a.format} exports from HF weights — pass --hf <repo-or-dir> "
+        sys.exit(f"--format {a.format} exports from HF weights -- pass --hf <repo-or-dir> "
                  f"(a GGUF can't be re-exported to {a.format}; use --format gguf for a GGUF input).")
     hf_dir = _resolve_hf(a)
     out = a.output or (os.path.basename(hf_dir.rstrip("/\\")) + f"-Pollard-{a.format.upper()}")
@@ -321,13 +321,13 @@ def _emit_nongguf(a):
         # GOLD EXL3 = smoothing (applied in _resolve_hf) + Calib 3.0 (-cd) + EXL3's native allocator.
         calib = _ensure_calib_text(a, here)
         cmd = ["pollard-exl3", "--model", hf_dir, "--out", out, "--calib-text", calib]
-    else:                                                   # mlx (Apple) — measured 4/8 mix; smoothing N/A
+    else:                                                   # mlx (Apple) -- measured 4/8 mix; smoothing N/A
         calib = _ensure_calib_text(a, here)                # only for the probe's held-out eval corpus
         sens = _ensure_sensitivity(a, hf_dir, calib, here)
         cmd = ["pollard-mlx", "--model", hf_dir, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
-    print(f"   {a.format.upper()} export (Pollard method — smoothing default + measured allocation):")
+    print(f"   {a.format.upper()} export (Pollard method -- smoothing default + measured allocation):")
     _run(cmd, a.run)
     _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate",
            "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)"}
@@ -343,7 +343,7 @@ def _ensure_imatrix(a):
     imat = os.path.join(here, os.path.splitext(os.path.basename(a.gguf))[0] + ".imatrix")
     binim = (os.path.join(a.bin, "llama-imatrix") if a.bin
              else find_llama_bin("llama-imatrix")) or "llama-imatrix"
-    print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) — no manual calibration step:")
+    print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) -- no manual calibration step:")
     if not a.calib:
         print(f"      pollard-calib --out {os.path.basename(calib)}")
     print(f"      {binim} -m {os.path.basename(a.gguf)} -f {os.path.basename(calib)} "
@@ -353,24 +353,24 @@ def _ensure_imatrix(a):
             _run(["pollard-calib", "--out", calib], True, cwd=here)
         subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", str(a.ngl)], cwd=here)
     print("      (big MoE won't fit f16 for the forward pass -> compute on a Q6_K host at a "
-          "partial --ngl; see SKILL.md. Undercovered experts hard-fail low-bit — Calib 3.0 covers them.)")
+          "partial --ngl; see SKILL.md. Undercovered experts hard-fail low-bit -- Calib 3.0 covers them.)")
     return imat
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
-    ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir — Pollard downloads/converts/"
+    ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir -- Pollard downloads/converts/"
                     "routes it (so a user can one-shot straight from a repo or a model already on disk)")
     ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3", "mx"],
-                    help="output lane: gguf (llama.cpp/Ollama, default) · gptq (vLLM/SGLang) · mlx (Apple) "
-                    "· exl3 (exllamav3 — the heavy trellis lane) · mx (Blackwell NVFP4 / any-GPU W4A16, "
+                    help="output lane: gguf (llama.cpp/Ollama, default)  |  gptq (vLLM/SGLang)  |  mlx (Apple) "
+                    " |  exl3 (exllamav3 -- the heavy trellis lane)  |  mx (Blackwell NVFP4 / any-GPU W4A16, "
                     "compressed-tensors)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx/mx allocation; else auto-measured)")
     ap.add_argument("--no-measure", dest="measure", action="store_false",
                     help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "
-                         "allocation). By default the one-shot measures allocation (pollard-probe) — the gold path.")
+                         "allocation). By default the one-shot measures allocation (pollard-probe) -- the gold path.")
     ap.set_defaults(measure=True)
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code for custom archs (Spark2_5 etc.); 'auto' enables "
@@ -393,25 +393,25 @@ def main():
     ap.add_argument("--bin", help="llama.cpp bin dir (for the MoE dry-run/build)")
     ap.add_argument("--smooth", dest="smooth", action="store_true", default=None,
                     help="SmoothQuant preconditioning (pollard-hf-smooth) on the FP16 model before the lane. "
-                         "DEFAULT-ON for the low-bit trellis/error-feedback lanes (EXL3/GPTQ/MX) — it's the "
+                         "DEFAULT-ON for the low-bit trellis/error-feedback lanes (EXL3/GPTQ/MX) -- it's the "
                          "locked gold recipe there (prevents the massive-activation broken build). Use --no-smooth to skip.")
     ap.add_argument("--no-smooth", dest="smooth", action="store_false",
                     help="skip the default preconditioning on the EXL3/GPTQ/MX lanes")
     ap.add_argument("--abliterate", action="store_true",
-                    help="OPT-IN: uncensor the FP16 model (pollard-abliterate) before the lane — composes "
+                    help="OPT-IN: uncensor the FP16 model (pollard-abliterate) before the lane -- composes "
                          "across ALL lanes. Behaviour-changing, your own model; measure quality with pollard-kl")
     ap.add_argument("--harmful", help="abliterate: prompts to stop refusing (one/line)")
     ap.add_argument("--harmless", help="abliterate: matched benign prompts (one/line)")
     ap.add_argument("--run", action="store_true", help="execute the path (default: plan/print it)")
     ap.add_argument("--benchmark", "--reproduce", dest="benchmark", action="store_true",
-                    help="ALSO run the gold-card benchmark (3-bar comparison + PPL) — the "
+                    help="ALSO run the gold-card benchmark (3-bar comparison + PPL) -- the "
                          "hour-long validation. OFF by default: a normal build makes ONE model "
                          "fast and skips the eval. Use this only to reproduce our published numbers.")
     ap.add_argument("--force-dense", action="store_true", help="override detection -> dense path")
     ap.add_argument("--force-moe", action="store_true", help="override detection -> MoE path")
     ap.add_argument("--no-gate", dest="gate", action="store_false",
                     help="skip the auto coherence gate (loop check + sampling sweep) the one-shot "
-                         "MoE build appends after the mix — by default it runs so you learn if the "
+                         "MoE build appends after the mix -- by default it runs so you learn if the "
                          "model is usable and which sampling to ship, without a manual step.")
     ap.set_defaults(gate=True)
     a = ap.parse_args()
@@ -419,14 +419,14 @@ def main():
         ap.error("pass --gguf <file> or --hf <repo-or-dir>")
 
     # LOCKED gold default: precondition (smooth) the low-bit trellis/error-feedback lanes unless opted out.
-    # These lanes silently break on massive-activation outliers without it (EXL3 3090→8.699); smoothing +
+    # These lanes silently break on massive-activation outliers without it (EXL3 3090->8.699); smoothing +
     # our Calib 3.0 is the measured EXL3 win (8.670 < exl3-default 8.699). GGUF has its own smoothing; MLX not needed.
     if a.smooth is None:
         a.smooth = a.format in ("exl3", "gptq", "mx")
         if a.smooth:
             print(f"   [{a.format}] LOCKED default: preconditioning ON (--no-smooth to skip)")
 
-    # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights — route and done.
+    # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights -- route and done.
     if a.format in ("gptq", "mlx", "exl3", "mx"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
         # Auto-version onboarding: a custom-arch model saved with an older transformers major will crash
@@ -455,19 +455,19 @@ def main():
                         env["POLLARD_AUTO"] = "1"   # silence pollard-fit's step-1 notice: we run the rest
                         env["PYTHONPATH"] = tdir + os.pathsep + env.get("PYTHONPATH", "")
                         sys.exit(subprocess.run(argv, env=env).returncode)
-                    print("   [match-transformers] env setup failed — falling back to the current env")
+                    print("   [match-transformers] env setup failed -- falling back to the current env")
             except Exception as e:
                 print(f"   [match-transformers] skipped ({e}); using the current env")
         _emit_nongguf(a)
         if not a.run:
-            print("\n   plan only — re-run with --run to execute.")
+            print("\n   plan only -- re-run with --run to execute.")
         return
 
     # GGUF lane: get an f16 GGUF (convert from HF if the user pointed at a repo/dir).
     if not a.gguf:
         a.gguf = _hf_to_gguf(a)
         if not a.run:                                      # plan mode: the GGUF doesn't exist yet
-            print("\n   plan only — re-run with --run to execute (convert + build).")
+            print("\n   plan only -- re-run with --run to execute (convert + build).")
             return
 
     arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
@@ -486,20 +486,20 @@ def main():
     # Autoaware: which lanes are actually open for THIS architecture (never plan an impossible build)
     lane_report(a.gguf, ik_bin_dir=getattr(a, "bin", None))
 
-    # WINNING PATH — SAME shape for dense AND MoE (no losing fallback):
-    #   (1) the imatrix K-quant ladder (pollard-fit) — the honest, fit-your-RAM baseline, and
-    #   (2) the mixed-precision FLAGSHIP mix (automap trellis) — the hand-coded winner —
+    # WINNING PATH -- SAME shape for dense AND MoE (no losing fallback):
+    #   (1) the imatrix K-quant ladder (pollard-fit) -- the honest, fit-your-RAM baseline, and
+    #   (2) the mixed-precision FLAGSHIP mix (automap trellis) -- the hand-coded winner --
     #       WHEN an imatrix is given. No imatrix -> just the ladder (stock K-quants), which
     #       is the correct imatrix-free build; there is NO "imatrix-free mix" (it loses to Q2_K).
     flagship = "PollardMix expert-allocation" if is_moe else "IQ1_KT"
     print(f"   path: {tag} -> K-quant ladder (pollard-fit) + the {flagship} mixed-precision "
           f"flagship (the hand-coded winner) when an imatrix is present")
     # TRUE one-shot: auto-build the imatrix (Calib 3.0) if none supplied, so the DEFAULT output
-    # is the flagship mix — no manual calib/fit/calc step. --no-auto-imatrix opts back to ladder-only.
+    # is the flagship mix -- no manual calib/fit/calc step. --no-auto-imatrix opts back to ladder-only.
     if not a.imatrix and a.auto_imatrix:
         a.imatrix = _ensure_imatrix(a)
     # MEASURED allocation for the ladder too (not just uniform K-quants): if we have the HF weights
-    # (came from --hf) and no profile was given, auto-probe one — same gold lever as the export lanes.
+    # (came from --hf) and no profile was given, auto-probe one -- same gold lever as the export lanes.
     hf_dir = getattr(a, "_hf_dir", None)
     if hf_dir and not a.sensitivity and a.measure:
         here = os.path.dirname(os.path.abspath(a.gguf)) or "."
@@ -517,9 +517,9 @@ def main():
         _automap_mix(a, is_moe=is_moe)
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
-              f"flag for the {flagship} flagship — the winning build, auto-calibrated.)")
+              f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
     if not a.run:
-        print("\n   plan only — re-run with --run to execute.")
+        print("\n   plan only -- re-run with --run to execute.")
 
 
 if __name__ == "__main__":

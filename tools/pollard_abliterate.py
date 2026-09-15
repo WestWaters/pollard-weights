@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-abliterate — OPTIONAL refusal-direction ablation, applied on the FP16
+"""pollard-abliterate -- OPTIONAL refusal-direction ablation, applied on the FP16
 weights BEFORE quantization so it composes with a Pollard build for free.
 
 This is the published "abliteration" technique (Arditi et al. 2024, "Refusal in
@@ -17,10 +17,10 @@ as one OPT-IN pass, OFF by default and clearly labelled:
 
 Honest scope: this is a behaviour-changing transform the USER opts into on THEIR
 model; it can cost some coherence, and stacking it on an extreme low-bit crush can
-compound that — so measure the PPL/KL delta vs the un-ablated build (pollard-kl)
+compound that -- so measure the PPL/KL delta vs the un-ablated build (pollard-kl)
 before trusting it, same as everything else. The contrast prompt SETS are supplied
 by the user (one prompt per line); this tool ships only a tiny benign smoke-test
-default so `--selftest` runs — it is NOT a real refusal set.
+default so `--selftest` runs -- it is NOT a real refusal set.
 
 Usage:
   pollard-abliterate --model <hf-dir-or-id> --harmful refuse.txt --harmless comply.txt \\
@@ -31,7 +31,7 @@ import argparse, os, sys
 import torch
 
 
-# tiny BENIGN placeholder sets — only so --selftest exercises the mechanism.
+# tiny BENIGN placeholder sets -- only so --selftest exercises the mechanism.
 # NOT a refusal set; supply real contrast prompts via --harmful/--harmless.
 _SMOKE_A = ["Describe a stormy sea at night.", "Explain how a bicycle stays upright.",
             "Summarize the plot of a heist movie.", "Write a limerick about the moon."]
@@ -117,7 +117,7 @@ def main():
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map")
     ap.add_argument("--selftest", action="store_true",
-                    help="mechanism canary on the benign smoke sets — writes nothing")
+                    help="mechanism canary on the benign smoke sets -- writes nothing")
     a = ap.parse_args()
 
     if not a.selftest and not (a.harmful and a.harmless):
@@ -145,7 +145,7 @@ def main():
     A = _load_lines(a.harmful) if a.harmful else _SMOKE_A
     B = _load_lines(a.harmless) if a.harmless else _SMOKE_B
     print(f"  contrast sets: {len(A)} vs {len(B)}"
-          f"{'  (BENIGN smoke set — mechanism only)' if a.selftest else ''}", flush=True)
+          f"{'  (BENIGN smoke set -- mechanism only)' if a.selftest else ''}", flush=True)
 
     ma = _mean_resid(model, tok, A, dev)
     mb = _mean_resid(model, tok, B, dev)
@@ -175,7 +175,7 @@ def main():
         txt = tok.decode(gen[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
         print(f"  post-surgery sample: {txt!r}", flush=True)
         ok = after < before * 0.05 and len(txt.strip()) > 0
-        print(f"SELFTEST {'PASS' if ok else 'CHECK'} — direction collapsed & model still generates.", flush=True)
+        print(f"SELFTEST {'PASS' if ok else 'CHECK'} -- direction collapsed & model still generates.", flush=True)
         return
 
     os.makedirs(a.out, exist_ok=True)

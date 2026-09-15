@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-experts — surface the measured expert usage from a routing capture.
+"""pollard-experts -- surface the measured expert usage from a routing capture.
 
 "Which experts does my workload actually use, and is there dead weight to skip?"
 This reads a routing trace (an experiments/e2 capture: one JSON row per
@@ -7,15 +7,15 @@ token-layer, {"layer": L, "experts": [...]}) and reports, per layer, which
 experts run hot, how concentrated the traffic is, and how much of the pool ever
 gets touched.
 
-What it answers — honestly:
-  - the HOT list — the top experts per layer by activation frequency. These are
+What it answers -- honestly:
+  - the HOT list -- the top experts per layer by activation frequency. These are
     the residency candidates: keep them near the compute, stream the rest.
-  - COVERAGE — how much of the pool the workload touches at all. On a
+  - COVERAGE -- how much of the pool the workload touches at all. On a
     load-balanced router this is near-total in prefill (notes/e5: 97.6% of
     experts touched by ONE domain). So you cannot prune experts by topic; "hot"
     is a residency property measured live, not a fixed per-domain skip list.
     Decode concentrates ~2x (notes/e10); capture with --gen to see it.
-  - a keep-list json (--out) — the (layer, expert) pairs that carry a target
+  - a keep-list json (--out) -- the (layer, expert) pairs that carry a target
     share of traffic, for a residency planner to consume.
 
 This is a measurement report, not a runtime. It tells you what your workload
@@ -34,7 +34,7 @@ from collections import Counter, defaultdict
 
 def load(path):
     """rows -> (prompt, pos, layer, [experts]). Tolerant of blank and torn lines
-    (a capture killed mid-write leaves a truncated final row — skip, don't crash)."""
+    (a capture killed mid-write leaves a truncated final row -- skip, don't crash)."""
     rows, skipped = [], 0
     with open(path) as f:
         for line in f:
@@ -48,7 +48,7 @@ def load(path):
             except (ValueError, KeyError, TypeError):
                 skipped += 1
     if skipped:
-        print(f"[note] skipped {skipped} malformed line(s) (torn capture) — using the rest")
+        print(f"[note] skipped {skipped} malformed line(s) (torn capture) -- using the rest")
     return rows
 
 
@@ -67,7 +67,7 @@ def main():
 
     rows = load(a.jsonl)
     if not rows:
-        raise SystemExit(f"no routing records in {a.jsonl} — did the capture run?")
+        raise SystemExit(f"no routing records in {a.jsonl} -- did the capture run?")
 
     per_layer = defaultdict(Counter)                 # layer -> Counter(expert -> hits)
     for _p, _pos, layer, experts in rows:
@@ -100,7 +100,7 @@ def main():
           f"(flat = 25%; higher = a real hot set)")
     if cov > 0.90 and tq < 0.35:
         print("  -> near-uniform: no per-topic dead weight here (prefill-style). "
-              "Capture decode\n     traffic (--gen) — it concentrates ~2x (notes/e10).")
+              "Capture decode\n     traffic (--gen) -- it concentrates ~2x (notes/e10).")
     elif tq >= 0.45:
         print("  -> real hot set: keep the top experts resident and stream the rest "
               "(feed this to pollard-run).")
@@ -137,15 +137,15 @@ def main():
             kept += acc
         n_pairs = sum(len(v) for v in keep.values())
         pool = len(layers) * n_experts
-        print(f"\nkeep-list     : {n_pairs} (layer,expert) pairs — {n_pairs/pool*100:.0f}% "
-              f"of the pool — carry {kept/total*100:.1f}% of traffic at frac {a.keep_frac}")
+        print(f"\nkeep-list     : {n_pairs} (layer,expert) pairs -- {n_pairs/pool*100:.0f}% "
+              f"of the pool -- carry {kept/total*100:.1f}% of traffic at frac {a.keep_frac}")
         if a.out:
             with open(a.out, "w") as f:
                 json.dump({"keep_frac": a.keep_frac, "n_experts": n_experts,
                            "top_k": top_k, "experts_by_layer": keep}, f, indent=2)
             print(f"  -> {a.out}")
 
-    print("\nnote: 'touched' is not 'prunable' — a load-balanced router fires nearly every\n"
+    print("\nnote: 'touched' is not 'prunable' -- a load-balanced router fires nearly every\n"
           "      expert (notes/e5). This lists what runs HOT so it can stay resident; it does\n"
           "      not delete experts. Bits: pollard-fit. Placement: pollard-run.")
 

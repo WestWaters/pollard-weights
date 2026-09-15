@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""pollard-health — is your accelerator actually at full speed, or silently degraded?
+"""pollard-health -- is your accelerator actually at full speed, or silently degraded?
 
 96% GPU utilisation and P0 do NOT mean healthy. A wedged GB10 / DGX Spark (or a
 throttling RTX, or a Mac drowning in page-outs) shows "busy" while the real clock
-sits at 1/3 speed and power at 1/5 — you lose half your throughput and never know
+sits at 1/3 speed and power at 1/5 -- you lose half your throughput and never know
 until you benchmark by accident. This reads the signals that actually matter:
 
   * NVIDIA: real SM clock vs the card's OWN max, power draw vs limit, throttle reasons
@@ -11,10 +11,10 @@ until you benchmark by accident. This reads the signals that actually matter:
 
 and calls it plainly. Cross-vendor (NVIDIA via nvidia-smi, Apple via macOS tools).
 
-  pollard-health              # check — read-only, safe
+  pollard-health              # check -- read-only, safe
   pollard-health --fix        # attempt a NO-REBOOT recovery (prints the plan; --yes to run)
 
-Root cause is usually over-committed memory (page-outs) — which `pollard-calc --ctx
+Root cause is usually over-committed memory (page-outs) -- which `pollard-calc --ctx
 --gpu` lets you avoid BEFORE you run. --fix is designed from the DGX-Spark community's
 data; validate it on real silicon before trusting it (a deep firmware wedge may still
 need a power-cycle).
@@ -40,14 +40,14 @@ def _num(s):
 
 
 def _fmt(v, suf=""):
-    """Format a metric, or 'N/A' — unified-memory hosts (GB10/DGX Spark) report power/temp as N/A;
+    """Format a metric, or 'N/A' -- unified-memory hosts (GB10/DGX Spark) report power/temp as N/A;
     never crash formatting None (the reported GB10 bug)."""
     return f"{v:.0f}{suf}" if v is not None else "N/A"
 
 
 def _aarch64_temp():
-    """nvidia-smi often reports temp N/A on GB10/Grace-Blackwell — read the SoC thermal zones instead
-    (critical on aarch64: the EC hard-powers the unit off near ~98°C). Returns max zone °C, or None."""
+    """nvidia-smi often reports temp N/A on GB10/Grace-Blackwell -- read the SoC thermal zones instead
+    (critical on aarch64: the EC hard-powers the unit off near ~98degC). Returns max zone degC, or None."""
     import glob
     temps = []
     for z in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
@@ -92,10 +92,10 @@ def check_nvidia():
         active_throttle = throttle not in ("0x0000000000000000", "Not Active", "", "N/A")
         detail = (f"SM {_fmt(sm)}/{_fmt(sm_max)} MHz"
                   + (f" ({pct:.0f}% of max)" if pct is not None else "")
-                  + f" · {_fmt(pdraw)}/{_fmt(plim)} W · {pstate} · util {_fmt(util)}% · {_fmt(temp)}°C")
+                  + f"  |  {_fmt(pdraw)}/{_fmt(plim)} W  |  {pstate}  |  util {_fmt(util)}%  |  {_fmt(temp)}degC")
         # THE WEDGE: high util, no throttle flag, yet the clock is far below the max.
         if (util and util > 40 and pct is not None and pct < 65 and not active_throttle):
-            state = ("DEGRADED", f"stuck at {pct:.0f}% clock despite {util:.0f}% util — you're "
+            state = ("DEGRADED", f"stuck at {pct:.0f}% clock despite {util:.0f}% util -- you're "
                      f"at ~{pct:.0f}% throughput. 96% util / P0 is lying to you (the wedge).")
         elif active_throttle:
             state = ("THROTTLING", f"active throttle reasons: {throttle} (thermal/power/hw)")
@@ -129,11 +129,11 @@ def check_apple():
         m = re.search(r"CPU_Speed_Limit\s*=\s*([0-9]+)", r.stdout)
         if m:
             speed_limit = int(m.group(1))
-    detail = f"swap used {swap_used/1024:.1f} GB · lifetime page-outs {pageouts:,} · CPU speed cap {speed_limit}%"
+    detail = f"swap used {swap_used/1024:.1f} GB  |  lifetime page-outs {pageouts:,}  |  CPU speed cap {speed_limit}%"
     if speed_limit < 100:
-        state = ("THROTTLING", f"thermal speed-limit at {speed_limit}% — the Mac is throttling under heat")
+        state = ("THROTTLING", f"thermal speed-limit at {speed_limit}% -- the Mac is throttling under heat")
     elif swap_used > 4096:  # >4 GB swapped = you over-committed unified memory
-        state = ("DEGRADED", f"{swap_used/1024:.1f} GB swapped out — memory-pressure thrash (the page-out "
+        state = ("DEGRADED", f"{swap_used/1024:.1f} GB swapped out -- memory-pressure thrash (the page-out "
                  f"wedge). A model + KV bigger than RAM pages to disk and everything crawls.")
     else:
         state = ("OK", "no swap thrash, no thermal cap")
@@ -147,8 +147,8 @@ def fix_plan():
     if platform.system() == "Darwin":
         return [("free inactive memory + purge page cache", ["sync", "sudo purge"]),
                 ("(then) stop the process that over-committed, and re-run within your RAM budget "
-                 "— check pollard-calc --ctx --gpu first", [])]
-    # NVIDIA / Linux — escalating, least invasive first
+                 "-- check pollard-calc --ctx --gpu first", [])]
+    # NVIDIA / Linux -- escalating, least invasive first
     return [
         ("drop page caches + compact memory (clears page-out pressure)",
          ["sync", "sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'",
@@ -185,23 +185,23 @@ def main():
             worst = "THROTTLING"
     print()
     if worst == "OK":
-        print("VERDICT: healthy — running at full speed.")
+        print("VERDICT: healthy -- running at full speed.")
         return
-    print(f"VERDICT: {worst} — you are losing throughput. "
+    print(f"VERDICT: {worst} -- you are losing throughput. "
           + ("`pollard-health --fix` attempts a no-reboot recovery." if not a.fix else ""))
 
     if a.fix:
         print("\n== recovery plan (escalating; least invasive first) ==")
-        print("NOTE: if none of these take, it's a power-cycle — a deep firmware wedge on "
+        print("NOTE: if none of these take, it's a power-cycle -- a deep firmware wedge on "
               "integrated Grace-Blackwell may not clear from software. Validate on your hardware.\n")
         for i, (label, cmds) in enumerate(fix_plan(), 1):
             print(f"  {i}. {label}")
             for c in cmds:
                 print(f"       $ {c}")
         if not a.yes:
-            print("\n(dry-run — re-run with --yes to execute these, one step at a time.)")
+            print("\n(dry-run -- re-run with --yes to execute these, one step at a time.)")
             return
-        print("\n--yes given: executing step by step, re-checking after each…")
+        print("\n--yes given: executing step by step, re-checking after each...")
         for label, cmds in fix_plan():
             if not cmds:
                 continue
@@ -210,9 +210,9 @@ def main():
                 subprocess.run(c, shell=True)
             after = check_nvidia() or check_apple() or []
             if all(s[0] == "OK" for _, s, _ in after):
-                print("   recovered — back to full speed.")
+                print("   recovered -- back to full speed.")
                 return
-        print("\nStill degraded after all soft resets — this one needs a power-cycle "
+        print("\nStill degraded after all soft resets -- this one needs a power-cycle "
               "(full disconnect ~10 min for a wedged Spark).")
 
 

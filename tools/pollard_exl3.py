@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""pollard-exl3 — emit an EXL3 (exllamav3) model with Pollard's allocation, same as the other lanes.
+"""pollard-exl3 -- emit an EXL3 (exllamav3) model with Pollard's allocation, same as the other lanes.
 
-🔒 LOCKED GOLD RECIPE (EXL3) — THE WIN: **the Pollard method (its smoothing preconditioner + Calib 3.0)
+[locked] LOCKED GOLD RECIPE (EXL3) -- THE WIN: **the Pollard method (its smoothing preconditioner + Calib 3.0)
 beats EXL3 on EXL3's OWN allocator, trellis atoms, and custom kernel.** MEASURED (Qwen2.5-3B @4bpw):
-broken 3090 → smoothed 8.699 → smoothed + Calib 3.0 **8.670**, vs EXL3 out-of-box **8.699** — a win on
+broken 3090 -> smoothed 8.699 -> smoothed + Calib 3.0 **8.670**, vs EXL3 out-of-box **8.699** -- a win on
 their own turf, untuned and with no extra calibration. And smoothing alone takes unusable low-bit (PPL
-3090) to 4bpw ≈ 8bpw quality at HALF the size. First and only tool that does this.
+3090) to 4bpw ~= 8bpw quality at HALF the size. First and only tool that does this.
 `pollard --format exl3` runs the gold recipe by DEFAULT (--no-smooth to skip). proxy_err is banned (legacy/).
 
 LOW-BIT mechanics: precondition first with `pollard-hf-smooth` (SmoothQuant folded into the RMSNorms).
 Massive-activation input channels otherwise collapse the trellis global scale and silently wreck a layer
 (measured: layer sqnr -14 -> +18 after smoothing). One-shot: `pollard-doctor --source <fp16> --repair
---lane exl3` (smooth → reconvert → verify), or `pollard --format exl3 --run`.
+--lane exl3` (smooth -> reconvert -> verify), or `pollard --format exl3 --run`.
 
-The GPU desktop lane: GGUF (llama.cpp), GPTQ (vLLM/SGLang), MLX (Apple), and THIS — EXL3 for the
+The GPU desktop lane: GGUF (llama.cpp), GPTQ (vLLM/SGLang), MLX (Apple), and THIS -- EXL3 for the
 exllamav3 runtime. It's the compatibility lane: same one command into a 4th runtime.
 
 ALLOCATION (gold path): keep **EXL3's native allocator** and win through the Pollard method's
-preconditioning + calibration — that's where the win comes from, and it lands on EXL3's own atoms. The
+preconditioning + calibration -- that's where the win comes from, and it lands on EXL3's own atoms. The
 allocator is already strong on its trellis atoms, so don't spend your bits reallocating it: the GGUF
-K-quant role-map is a DEAD LEVER on EXL3 (K-quant priors don't map to trellis atoms — measured worse, not
+K-quant role-map is a DEAD LEVER on EXL3 (K-quant priors don't map to trellis atoms -- measured worse, not
 worth the ~50 min). The gold recipe already beats EXL3 out-of-box without touching allocation. A finer
-per-tensor-KL recipe measured directly in EXL3's atom space is an open R&D lever — until one is shown to
+per-tensor-KL recipe measured directly in EXL3's atom space is an open R&D lever -- until one is shown to
 beat the gold recipe, the gold path is smoothing + Calib 3.0 + native allocator. Judge by pollard-verify.
 
 Two allocation modes:
   * budgeted (DEFAULT, the gold path): EXL3's allocator via --bits + --head_bits/--mtp_bits + --hq.
-  * recipe (--recipe): EXPERIMENTAL per-tensor bitrate YAML — R&D only. Don't port a GGUF role map here;
+  * recipe (--recipe): EXPERIMENTAL per-tensor bitrate YAML -- R&D only. Don't port a GGUF role map here;
     only use a recipe measured in EXL3's atom space and shown to beat the gold recipe.
 
   pollard-exl3 --model Qwen/Qwen3-8B --out ./Qwen3-8B-Pollard-EXL3 --bpw 3.0   # budgeted (recommended)
@@ -34,7 +34,7 @@ Two allocation modes:
   pollard-exl3 --model <hf> --out <dir> --recipe plan.yaml   # EXPERIMENTAL explicit per-tensor plan
 
 Needs exllamav3 installed AND its CUDA ext loadable (a bleeding-edge GPU like Blackwell may need a
-source build — the pip wheel's prebuilt ext can fail with 'DLL load failed importing exllamav3_ext')."""
+source build -- the pip wheel's prebuilt ext can fail with 'DLL load failed importing exllamav3_ext')."""
 import argparse, os, subprocess, sys
 
 
@@ -52,8 +52,8 @@ def detect_moe(model_id, layers_hint=0):
 
 def pack_calib(model, text_path, out_path, rows=256, cols=2048):
     """Tokenize a TEXT corpus with the model's own tokenizer and pack it into the -cd safetensors
-    EXL3 wants: {input_ids: int64[rows, cols]}. Real tokens only — NEVER tile; if the corpus is short,
-    emit fewer rows. 256 rows is the measured sweet spot (more shifts the Hessian → worse allocation)."""
+    EXL3 wants: {input_ids: int64[rows, cols]}. Real tokens only -- NEVER tile; if the corpus is short,
+    emit fewer rows. 256 rows is the measured sweet spot (more shifts the Hessian -> worse allocation)."""
     from transformers import AutoTokenizer
     import torch
     from safetensors.torch import save_file
@@ -75,14 +75,14 @@ def main():
     ap.add_argument("--bpw", type=float, default=3.0, help="target average bits/weight (EXL3 budgeted)")
     ap.add_argument("--head-bits", type=int, default=6, help="output/head layer bits (protected)")
     ap.add_argument("--mtp-bits", type=int, default=4, help="MTP layer bits (GLM/DeepSeek MTP head)")
-    ap.add_argument("--recipe", help="EXPERIMENTAL per-tensor bitrate recipe (YAML) — overrides budgeted. "
+    ap.add_argument("--recipe", help="EXPERIMENTAL per-tensor bitrate recipe (YAML) -- overrides budgeted. "
                     "A GGUF-style role map LOSES to budgeted on EXL3 (measured); use only a recipe measured "
                     "in EXL3's atom space that beats budgeted at <= same bpw.")
     ap.add_argument("--hq", dest="hq", action="store_true", default=None,
-                    help="bump bitrate of select layers (MoE) — default: auto-on for MoE")
+                    help="bump bitrate of select layers (MoE) -- default: auto-on for MoE")
     ap.add_argument("--no-hq", dest="hq", action="store_false")
     ap.add_argument("--cal-data", help="calibration data (safetensors token rows, -cd); else EXL3's bundled mix")
-    ap.add_argument("--calib-text", help="a TEXT corpus (e.g. Calib 3.0) — tokenized+packed to the -cd "
+    ap.add_argument("--calib-text", help="a TEXT corpus (e.g. Calib 3.0) -- tokenized+packed to the -cd "
                     "safetensors here, so the locked gold recipe (smoothing + Calib 3.0) runs one-shot")
     ap.add_argument("--cal-rows", type=int, default=256, help="rows to pack from --calib-text (256 = the "
                     "measured EXL3 sweet spot; more is NON-monotonic and can hurt)")
@@ -132,11 +132,11 @@ def main():
               "17.15 vs 14.30 PPL at more bits). Only use a recipe measured in EXL3's atom space.")
     print(f"== pollard-exl3 :: {a.model}  [{kind}]  "
           + (f"recipe {os.path.basename(a.recipe)}" if a.recipe
-             else f"{a.bpw} bpw · head {a.head_bits} · mtp {a.mtp_bits}"
-                  + (" · hq(MoE)" if hq else "")))
+             else f"{a.bpw} bpw  |  head {a.head_bits}  |  mtp {a.mtp_bits}"
+                  + ("  |  hq(MoE)" if hq else "")))
     print("   Pollard intent -> EXL3: crush the body to target bpw, protect head/MTP high"
           + (", bump select MoE layers (--hq)" if hq else "") + ".")
-    print("   NOTE: EXL3 trellis is the HEAVY lane (hours for a low-bit output) — that's the format, "
+    print("   NOTE: EXL3 trellis is the HEAVY lane (hours for a low-bit output) -- that's the format, "
           "not Pollard. Prefer GGUF/GPTQ/MLX unless you need the exllama runtime.")
     print("   $ " + " ".join(cmd))
     if a.plan_only:
@@ -151,13 +151,13 @@ def main():
     if work:
         os.makedirs(work, exist_ok=True)
     r = subprocess.run(cmd)
-    # verify REAL output (convert_model can print an arg error yet exit 0) — trust files, not returncode
+    # verify REAL output (convert_model can print an arg error yet exit 0) -- trust files, not returncode
     made = a.out and os.path.isdir(a.out) and any(
         f.endswith(".safetensors") for f in os.listdir(a.out)) and \
         os.path.exists(os.path.join(a.out, "config.json"))
     if r.returncode != 0 or not made:
         sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
-                 f"— see console above.")
+                 f"-- see console above.")
     try:
         import pollard_workspace as ws
         ws.record_build(a.model, "exl3", a.out, tag=f"{a.bpw}bpw", bpw=a.bpw)

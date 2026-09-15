@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-archfp — what IS this architecture, structurally, and which known one is it a twin of?
+"""pollard-archfp -- what IS this architecture, structurally, and which known one is it a twin of?
 
 Pollard keeps meeting models whose `model_type` / `general.architecture` nobody has seen, and the
 question that actually decides the work is never the name: it is whether the *layout* is something a
@@ -249,7 +249,7 @@ def names_from_gguf(path):
 
 
 def names_from_hf(model):
-    """safetensors index only — no weights downloaded."""
+    """safetensors index only -- no weights downloaded."""
     idx = None
     if os.path.isdir(model):
         for cand in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
@@ -275,7 +275,7 @@ def names_from_hf(model):
         except Exception:
             idx = None
         if idx is None:
-            raise SystemExit("no safetensors index — pass a local dir, or a GGUF with --gguf")
+            raise SystemExit("no safetensors index -- pass a local dir, or a GGUF with --gguf")
         return list(idx.get("weight_map", {})), cfg
     return list((idx or {}).get("weight_map", {})), cfg
 
@@ -328,7 +328,7 @@ def main():
         hp = {k: v for k, v in cfg.items() if isinstance(v, (int, float))}
 
     if not names:
-        raise SystemExit("no tensor names found — cannot fingerprint")
+        raise SystemExit("no tensor names found -- cannot fingerprint")
     res = twin(fingerprint(names), hp)
     print(json.dumps({**res, "arch": arch}, indent=2, default=list) if a.json else report(res, arch))
 

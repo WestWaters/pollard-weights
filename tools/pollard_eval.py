@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""pollard-eval — trajectory-divergence eval, comparable to the strong quantizers.
+"""pollard-eval -- trajectory-divergence eval, comparable to the strong quantizers.
 
-Single-token mean-KL says a quant's NEXT token is close to the reference's — but a
+Single-token mean-KL says a quant's NEXT token is close to the reference's -- but a
 quant can look great on mean-KL and still drift over a paragraph. This measures the
 stronger, publishable thing: **top-1 token agreement with the f16/bf16 reference
 over a held-out set**, plus mean KL, per quant. That is the metric family the strong
 quantizers report (e.g. Unsloth's "Divergence-300 @32" / top-1 agreement), so a
-Pollard number measured this way is directly comparable to theirs — no more guessing
+Pollard number measured this way is directly comparable to theirs -- no more guessing
 whether we win.
 
 Two ways to build the held-out set:
-  * default: score against a held-out TEXT corpus (--eval held.txt) — simple, robust.
+  * default: score against a held-out TEXT corpus (--eval held.txt) -- simple, robust.
   * --trajectory: first greedy-generate N tokens from the REFERENCE on each prompt
     in --prompts, then score the quants on those reference trajectories. This is the
     "does the quant follow BF16's own path" variant; closest to Divergence-300 @32.
 
 Point it at OUR builds AND a competitor's GGUFs in one run to get an apples-to-apples
-table (top-1 agreement + KL vs size) — and a CSV the chart reads.
+table (top-1 agreement + KL vs size) -- and a CSV the chart reads.
 
     pollard-eval --ref model-f16.gguf --eval held.txt \\
         --quants pollard-q3.gguf unsloth-UD-Q3_K_XL.gguf --out results.csv
@@ -37,7 +37,7 @@ from pollard_calc import _shard_paths, find_llama_bin
 
 _KLD = re.compile(r"Mean\s+KLD\s*[:=]\s*([0-9.eE+-]+)")
 # llama-perplexity --kl-divergence prints a top-1 agreement line; the wording has
-# shifted across versions ("Same top p", "top-1 …", "maximum top token …"), so match
+# shifted across versions ("Same top p", "top-1 ...", "maximum top token ..."), so match
 # the common shapes and take the first percentage on that line.
 _TOP1 = re.compile(
     r"(?im)^(?:.*\bsame\s+top|.*\btop[-\s]?1|.*\btop[-\s]?token).*?([0-9.]+)\s*%")
@@ -119,7 +119,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--ref", required=True, help="reference GGUF (f16/bf16) — the ground truth")
+    ap.add_argument("--ref", required=True, help="reference GGUF (f16/bf16) -- the ground truth")
     ap.add_argument("--quants", required=True, nargs="+",
                     help="quant GGUFs to score (ours AND a competitor's, in one run)")
     ap.add_argument("--eval", help="held-out text corpus to score on")
@@ -131,7 +131,7 @@ def main():
     ap.add_argument("--out", help="CSV out (label,size_gb,top1_agree,mean_kl); default: workspace charts/")
     ap.add_argument("--chart", action="store_true",
                     help="also render a PNG chart (KL + top-1 per quant) into the workspace charts/ folder")
-    ap.add_argument("--rpc", help="RPC servers to pool, 'host:port[,host:port…]'")
+    ap.add_argument("--rpc", help="RPC servers to pool, 'host:port[,host:port...]'")
     ap.add_argument("--llama-cli", default="llama-cli")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
     a = ap.parse_args()
@@ -146,7 +146,7 @@ def main():
     missing = [n for n, v in need.items() if v is None]
     if missing:
         sys.exit(f"ERROR: {', '.join(missing)} not found. install.sh builds these into "
-                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass the path "
+                 f"runtime/llama.cpp/build/bin -- re-run install.sh, or pass the path "
                  f"(e.g. --llama-perplexity /path/to/llama-perplexity).")
     if a.trajectory and not a.prompts:
         sys.exit("ERROR: --trajectory needs --prompts (the seeds to continue from f16).")
@@ -157,10 +157,10 @@ def main():
     corpus = a.eval
     if a.trajectory:
         corpus = os.path.join(tmp, "trajectories.txt")
-        prompts = [p for p in open(a.prompts).read().splitlines() if p.strip()]
+        prompts = [p for p in open(a.prompts, encoding="utf-8").read().splitlines() if p.strip()]
         print(f"== building reference trajectories :: {len(prompts)} prompts x "
               f"{a.gen_tokens} tokens from {os.path.basename(a.ref)}")
-        with open(corpus, "w") as f:
+        with open(corpus, "w", encoding="utf-8") as f:
             for i, p in enumerate(prompts):
                 cont = _greedy(a.llama_cli, a.ref, p, a.gen_tokens, a.rpc)
                 f.write(p + " " + cont + "\n")
@@ -197,7 +197,7 @@ def main():
         cdir = "."
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = a.out or os.path.join(cdir, f"eval-{stamp}.csv")
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8") as f:
         f.write("label,size_gb,top1_agree,mean_kl\n")
         for name, gb, top1, kld in rows:
             f.write(f"{name},{gb:.3f},{top1 if top1 is not None else ''},"
@@ -221,10 +221,10 @@ def main():
             fig.tight_layout(); fig.savefig(png, dpi=150, bbox_inches="tight")
             print(f"rendered chart -> {png}")
         except Exception as e:
-            print(f"(--chart skipped: matplotlib not available — {type(e).__name__}. "
+            print(f"(--chart skipped: matplotlib not available -- {type(e).__name__}. "
                   f"pip install \"pollard-weights[charts]\" then rerun with --chart)")
     if any(t is None for _, _, t, _ in rows):
-        print("\nNOTE: some 'top-1 agree' came back blank — this llama-perplexity build "
+        print("\nNOTE: some 'top-1 agree' came back blank -- this llama-perplexity build "
               "may word the agreement line differently; mean KL still ranks them.")
 
 

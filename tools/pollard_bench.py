@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-bench — the drop-in BENCHMARK. Point it at a GGUF (or two) and get the gold-card
+"""pollard-bench -- the drop-in BENCHMARK. Point it at a GGUF (or two) and get the gold-card
 board: PPL + Mean/Median KLD + top-1, all from the same harness at matched size. This is the
 symmetric half of `pollard` (which BUILDS): `pollard` makes the model, `pollard-bench` scores it.
 
@@ -9,12 +9,12 @@ symmetric half of `pollard` (which BUILDS): `pollard` makes the model, `pollard-
     pollard-bench --gguf model.gguf --coherence                             # COHERENCE GATE (loop check + sampling sweep)
     pollard-bench --gguf model.gguf --coherence --quick                     # fast one-prompt post-build sanity
 
---ref is the KL reference (f16 ideally; a Q8_0/Q6_K host if f16 won't load — KLD vs a near-lossless
+--ref is the KL reference (f16 ideally; a Q8_0/Q6_K host if f16 won't load -- KLD vs a near-lossless
 ref is what the 14B/30B cards use). --vs runs the SAME eval on a competitor's file (AWQ/GPTQ/unsloth/
-bartowski GGUF) so the comparison is honest: read it as Pareto — Pollard wins its size class (same
+bartowski GGUF) so the comparison is honest: read it as Pareto -- Pollard wins its size class (same
 quality for fewer GB, or more quality at the same GB), not as a single number.
 
-Reuses llama-perplexity; no rebuild. This is the opt-in benchmark — a plain `pollard` build never
+Reuses llama-perplexity; no rebuild. This is the opt-in benchmark -- a plain `pollard` build never
 runs it (that's the split that stopped a minutes-long shrink from taking hours).
 """
 import argparse, os, re, subprocess, sys, zlib
@@ -171,12 +171,12 @@ def print_gate(res):
         return False
     if res["verdict"] == "PASS":
         s = " ".join(res["sampling"])
-        print(f"\nVERDICT: PASS — coherent. Ship these sampling defaults on the card:\n  {s}")
+        print(f"\nVERDICT: PASS -- coherent. Ship these sampling defaults on the card:\n  {s}")
     else:
-        print("\nVERDICT: BELOW FLOOR — loops under EVERY sampling config. This is NOT a sampling\n"
+        print("\nVERDICT: BELOW FLOOR -- loops under EVERY sampling config. This is NOT a sampling\n"
               "  problem; the bit tier is below the model's coherence floor. Bump the crush one\n"
               "  tier and rebuild (e.g. --body iq1_kt -> iq2_kt), then re-gate. (Small/sparse\n"
-              "  models hit this; big models clear 1-bit fine — it's a size property.)")
+              "  models hit this; big models clear 1-bit fine -- it's a size property.)")
     return res["verdict"] == "PASS"
 
 
@@ -206,7 +206,7 @@ def _ppl_kl(ppl_bin, model, eval_f, base, ngl):
 
 
 def _fmt(v, nd=4):
-    return f"{v:.{nd}f}" if isinstance(v, float) else "—"
+    return f"{v:.{nd}f}" if isinstance(v, float) else "--"
 
 
 _SPEED = re.compile(r"Generation:\s*([\d.]+)\s*t/s")
@@ -301,7 +301,7 @@ def main():
             sys.exit(f"file not found: {a.gguf}")
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
-            sys.exit("llama-cli not found — build llama.cpp/ik_llama.cpp or pass --llama-cli.")
+            sys.exit("llama-cli not found -- build llama.cpp/ik_llama.cpp or pass --llama-cli.")
         res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick)
         gate_passed = print_gate(res)
         if not a.ref and not a.speed:      # nothing else was asked for -> exit on the verdict
@@ -310,7 +310,7 @@ def main():
     if a.speed:
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
-            sys.exit("--speed needs llama-cli — build it or pass --llama-cli.")
+            sys.exit("--speed needs llama-cli -- build it or pass --llama-cli.")
         print("\n=== decode speed ===")
         for label, m in (("this build", a.gguf), ("rival", a.rival)):
             if not m:
@@ -329,7 +329,7 @@ def main():
 
     ppl_bin = find_llama_bin(a.llama_perplexity)
     if not ppl_bin:
-        sys.exit("llama-perplexity not found — build llama.cpp/ik_llama.cpp or pass --llama-perplexity.")
+        sys.exit("llama-perplexity not found -- build llama.cpp/ik_llama.cpp or pass --llama-perplexity.")
     if not os.path.exists(a.eval) or os.path.getsize(a.eval) == 0:
         sys.exit(f"eval corpus not found or empty: {a.eval}")
     for f in [a.gguf, a.rival, a.ref]:
@@ -375,7 +375,7 @@ def main():
             elif not smaller and not better:
                 verdict = "competitor wins outright (smaller AND lower PPL)."
             else:
-                verdict = ("Pareto trade — read the size/quality curve: "
+                verdict = ("Pareto trade -- read the size/quality curve: "
                            + ("Pollard is smaller, competitor lower PPL." if smaller
                               else "Pollard is lower PPL, competitor smaller."))
             print(f"\nHead-to-head: {verdict}")

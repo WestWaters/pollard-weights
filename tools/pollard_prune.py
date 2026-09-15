@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""pollard-prune — REAP-style EXPERT PRUNING for a MoE GGUF: drop the least-important whole
+"""pollard-prune -- REAP-style EXPERT PRUNING for a MoE GGUF: drop the least-important whole
 experts so the model is STRUCTURALLY smaller, then quantize it normally. This is the lever
-`pollard-pack` only planned — the "scissors" for a trillion-param MoE (Kimi K2: 384 experts).
+`pollard-pack` only planned -- the "scissors" for a trillion-param MoE (Kimi K2: 384 experts).
 
 Quant has a floor (1T params x 1 bit ~= 125 GB); you cannot quantize a 1T MoE onto one 128 GB
 box. Pruning half the (cold) experts first drops the param count itself, THEN quant lands it.
@@ -11,10 +11,10 @@ box. Pruning half the (cold) experts first drops the param count itself, THEN qu
     # then:  pollard-automap --tensors <dry-run of pruned> --model pruned.gguf --no-imatrix ...
 
 Scoring (which experts to KEEP, per layer):
-  magnitude (default) — L2 norm of each expert's gate/up/down weights. Zero-calib, any box.
-  imatrix             — summed importance-matrix activation per expert (REAP-correct: keeps the
+  magnitude (default) -- L2 norm of each expert's gate/up/down weights. Zero-calib, any box.
+  imatrix             -- summed importance-matrix activation per expert (REAP-correct: keeps the
                         experts the calib actually routed to). Needs --imatrix.
-  router              — L2 norm of the router (ffn_gate_inp) row per expert. Cheap proxy.
+  router              -- L2 norm of the router (ffn_gate_inp) row per expert. Cheap proxy.
 
 Keeps a FIXED count K per layer (GGUF stores one expert_count); which experts differ per layer.
 K must be >= the model's active-expert count (top-k), or routing breaks. Writes a new GGUF with
@@ -141,7 +141,7 @@ def main():
             n_exp = int(field.parts[field.data[0]][0]); break
     if not n_exp or n_exp < 2:
         sys.exit(f"not a MoE (expert_count={n_exp}). pollard-prune is MoE-only; a dense model "
-                 "has no experts to drop — quantize it with pollard-fit instead.")
+                 "has no experts to drop -- quantize it with pollard-fit instead.")
     n_used = None
     for field in reader.fields.values():
         if field.name.endswith("expert_used_count"):
@@ -159,7 +159,7 @@ def main():
         sys.exit("--score imatrix needs a readable --imatrix.")
     layers = score_experts(reader, n_exp, a.score, imx)
     if not layers:
-        sys.exit("found no expert tensors to score — is this the right GGUF?")
+        sys.exit("found no expert tensors to score -- is this the right GGUF?")
     keep = keep_indices(layers, n_exp, keep_k)
     dropped = n_exp - keep_k
     print(f"  {len(layers)} MoE layers scored; dropping {dropped}/{n_exp} experts each "

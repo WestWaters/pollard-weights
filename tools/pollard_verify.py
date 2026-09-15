@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""pollard-verify — correctness/perf GATE for a converted model. Catch "weights decode fine but the
+"""pollard-verify -- correctness/perf GATE for a converted model. Catch "weights decode fine but the
 assembled model forwards to garbage" BEFORE trusting a build.
 
 Why this exists: a convert can produce per-tensor-plausible output yet a broken model. We judge builds
-ONLY by real reconstruction (the metric a convert prints is a Hessian-weighted proxy that lies — banned,
+ONLY by real reconstruction (the metric a convert prints is a Hessian-weighted proxy that lies -- banned,
 see legacy/PROXY_ERR_BANNED.md). This gate checks the two things that actually matter:
 
   1. per-tensor decode round-trip vs the fp16 SOURCE weight (cos), failing loud below --threshold
@@ -12,15 +12,15 @@ see legacy/PROXY_ERR_BANNED.md). This gate checks the two things that actually m
 Hard-won rules baked in:
   * verify against the ORIGINAL source weight, never a weight a quantizer mutated in place;
   * DLL search must include torch's OWN bundled CUDA runtime (site-packages/nvidia/*/bin), or low-bit
-    kernels silently mis-resolve and produce garbage (decode looks fine — the trap);
+    kernels silently mis-resolve and produce garbage (decode looks fine -- the trap);
   * codebook is AUTO-DETECTED per tensor from the on-disk markers (mul1/mcg/else=3inst), so we read ANY
     model's convention, not one hard-coded lane's;
-  * per-tensor correct is necessary, NOT sufficient — always run --end-to-end before trusting a build.
+  * per-tensor correct is necessary, NOT sufficient -- always run --end-to-end before trusting a build.
 
   pollard-verify --model out-exl3 --source ./Qwen2.5-3B --end-to-end        # gate a build
   pollard-verify --model out-exl3 --source ./src --sanitizer               # kernels under compute-sanitizer
 
-Lanes: exl3 (implemented). gguf/gptq/mlx share the same interface (decode(name)->weight) — add a backend.
+Lanes: exl3 (implemented). gguf/gptq/mlx share the same interface (decode(name)->weight) -- add a backend.
 Exit code is non-zero if any check fails, so it drops straight into CI / a pre-ship gate.
 """
 import argparse, glob, math, os, subprocess, sys
@@ -42,7 +42,7 @@ def _add_cuda_dll_dirs():
 
 
 def _detect_codebook(keys, prefix):
-    """Read the on-disk codebook convention for a tensor — generalized, not lane-hard-coded."""
+    """Read the on-disk codebook convention for a tensor -- generalized, not lane-hard-coded."""
     if prefix + ".mul1" in keys: return {"mul1": True}
     if prefix + ".mcg" in keys: return {"mcg": True}
     return {}                                             # else = 3inst (marker-free)
@@ -87,7 +87,7 @@ def verify_exl3(model_dir, source_dir, threshold, device, limit):
             if wk is None:
                 continue
             with safe_open(wk[0], framework="pt") as h:
-                W = h.get_tensor(wk[1]).to(device).float()   # (out, in) — the pristine source weight
+                W = h.get_tensor(wk[1]).to(device).float()   # (out, in) -- the pristine source weight
         else:
             continue
         outf, inf = W.shape
@@ -110,7 +110,7 @@ def verify_exl3(model_dir, source_dir, threshold, device, limit):
 
 
 def end_to_end(model_dir, source_dir, device, rows, length):
-    """The assembled forward vs the fp16 source — per-tensor correct is NOT sufficient."""
+    """The assembled forward vs the fp16 source -- per-tensor correct is NOT sufficient."""
     import torch, torch.nn.functional as F
     from exllamav3 import Config, Model, Cache, Tokenizer
     cfg = Config.from_directory(model_dir); m = Model.from_config(cfg)

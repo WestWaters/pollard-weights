@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""pollard-serve-eval — A/B a QUANTIZED served model against its baseline, on the real serving stack.
+"""pollard-serve-eval -- A/B a QUANTIZED served model against its baseline, on the real serving stack.
 
-The offline PPL you measured while quantizing is not the number that ships — the served model runs a
+The offline PPL you measured while quantizing is not the number that ships -- the served model runs a
 different kernel path (vLLM/SGLang paged attention, fused Marlin, a KV quant), so the honest check is
 on the endpoint. This talks to any OpenAI-compatible server (vLLM `vllm serve`, SGLang, TGI-compat)
-over plain HTTP — no torch, no transformers, stdlib only — and reports:
+over plain HTTP -- no torch, no transformers, stdlib only -- and reports:
 
-  * perplexity      — teacher-forced NLL over a text corpus, via echo+prompt_logprobs
-  * top-1 agreement — how often the quantized model's greedy next token matches the baseline's
+  * perplexity      -- teacher-forced NLL over a text corpus, via echo+prompt_logprobs
+  * top-1 agreement -- how often the quantized model's greedy next token matches the baseline's
                       (the metric that actually predicts "does it still behave like the original")
-  * KL (optional)   — mean KL(baseline || quantized) over next-token logprobs, if both serve logprobs
-  * spec-decode acceptance (optional, vLLM) — with --metrics <url>/metrics and --accept-gen N: generates N tokens per
-                      sample and reads the delta of vLLM's spec_decode counters → accepted draft tokens per step and
+  * KL (optional)   -- mean KL(baseline || quantized) over next-token logprobs, if both serve logprobs
+  * spec-decode acceptance (optional, vLLM) -- with --metrics <url>/metrics and --accept-gen N: generates N tokens per
+                      sample and reads the delta of vLLM's spec_decode counters -> accepted draft tokens per step and
                       per-position acceptance. Teacher-forced PPL never decodes, so this is the only way to see the
                       speculative head's contribution on the real stack (and it dominates single-stream speed).
 
@@ -147,7 +147,7 @@ def main():
     ap.add_argument("--max-samples", type=int, default=50, help="cap on lines used (keeps it quick)")
     ap.add_argument("--stride", type=int, default=8, help="token stride for the A/B agreement probes")
     ap.add_argument("--api-key", default=None, help="bearer token if the endpoint needs one")
-    ap.add_argument("--metrics", help="vLLM Prometheus endpoint of the model under test, e.g. http://host:8000/metrics — "
+    ap.add_argument("--metrics", help="vLLM Prometheus endpoint of the model under test, e.g. http://host:8000/metrics -- "
                     "enables the speculative-decoding acceptance read (counter deltas around real generations)")
     ap.add_argument("--accept-gen", type=int, default=128, help="tokens to generate per sample for the acceptance read")
     a = ap.parse_args()
@@ -178,7 +178,7 @@ def main():
         cmodel = a.cand_model or a.model
         try:
             cppl, _ = corpus_ppl(a.cand, cmodel, texts, key=a.api_key)
-            print(f"candidate [{cmodel}]  perplexity {cppl:.4f}   (Δ {cppl - ppl:+.4f} vs baseline)")
+            print(f"candidate [{cmodel}]  perplexity {cppl:.4f}   (delta {cppl - ppl:+.4f} vs baseline)")
         except Exception as e:
             print(f"(candidate PPL skipped: {e})")
         agree, n, kl = ab_agreement(a.base, a.model, a.cand, cmodel, texts, key=a.api_key, stride=a.stride)
@@ -192,12 +192,12 @@ def main():
             if acc is None:
                 print("spec-decode: no spec_decode counters at --metrics (server runs without a drafter?)")
             elif not acc["drafts"]:
-                print("spec-decode: counters did not move — is the drafter enabled on this model?")
+                print("spec-decode: counters did not move -- is the drafter enabled on this model?")
             else:
                 pp = " ".join(f"p{k}={v:.3f}" for k, v in acc["per_position"].items())
                 print(f"spec-decode [{tgt_model}]: {acc['drafts']} drafts, accepted {acc['accepted_per_step']:.3f} draft tokens/step "
                       f"(=> {acc['tokens_per_step']:.2f} tokens/step), draft accept rate {acc['draft_accept_rate']*100:.1f}%  {pp}")
-        except Exception as e:  # noqa: BLE001 — report, don't abort the other metrics
+        except Exception as e:  # noqa: BLE001 -- report, don't abort the other metrics
             print(f"(spec-decode acceptance skipped: {e})")
         print("\nverdict: >99% top-1 agreement and KL < ~0.05 means the quant behaves like the original;"
               "\n         a big PPL gap with high agreement usually means a KV-quant or a kernel path, not"

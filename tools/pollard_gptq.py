@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""pollard-gptq — full-Hessian error-feedback quantization (GPTQ-class), our own impl.
+"""pollard-gptq -- full-Hessian error-feedback quantization (GPTQ-class), our own impl.
 
 LOW-BIT: precondition first with `pollard-hf-smooth`. Like EXL3's LDLQ, GPTQ error-feedback has no
-input-outlier protection — a massive-activation channel collapses the scale and breaks a layer at low
+input-outlier protection -- a massive-activation channel collapses the scale and breaks a layer at low
 bit. Smooth the fp16 model, then convert. (`pollard-doctor --source <fp16> --repair --lane gptq`.)
 
 The lever llama.cpp's imatrix CANNOT replicate. imatrix stores only the DIAGONAL of
 the activation second moment (per-channel importance) and bends the rounding toward
-hot channels. GPTQ uses the FULL Hessian H = X Xᵀ: it quantizes one column at a time
-and pushes each column's rounding error into the not-yet-quantized columns via H⁻¹ —
+hot channels. GPTQ uses the FULL Hessian H = X X^T: it quantizes one column at a time
+and pushes each column's rounding error into the not-yet-quantized columns via H^-1 --
 cross-channel error compensation the diagonal can't express. That off-diagonal term is
 the entire reason GPTQ beats round-to-nearest (and imatrix) at low bits.
 
@@ -49,7 +49,7 @@ def get_wikitext(tokenizer, split, seqlen, n=None, path=None):
             return _chunks(tokenizer, "\n\n".join(ds["text"]), seqlen, n)
         except Exception:
             continue
-    raise RuntimeError("could not load wikitext — pass --calib-file/--eval-file instead")
+    raise RuntimeError("could not load wikitext -- pass --calib-file/--eval-file instead")
 
 
 def quantize_group(w, scale, zero, maxq):
@@ -67,7 +67,7 @@ def group_params(W, maxq):
 
 def _col_quant(w, scale, zero, maxq, qmode):
     """Quantize one column w [rows] given the group's scale/zero. Returns dequant [rows].
-    The GPTQ error-feedback loop is quantizer-agnostic — this is the only per-alphabet
+    The GPTQ error-feedback loop is quantizer-agnostic -- this is the only per-alphabet
     part, so ternary/binary get the SAME cross-channel compensation as INT."""
     if qmode == "int":
         return quantize_group(w.unsqueeze(1), scale, zero, maxq).squeeze(1)
@@ -82,9 +82,9 @@ def _col_quant(w, scale, zero, maxq, qmode):
 def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="int", n_tokens=None):
     """GPTQ on one linear weight W [rows, cols] with Hessian H [cols, cols].
     act_order: quantize columns in decreasing-Hessian-diagonal order (most
-    important first) — recovers markedly more of RTN's loss.
+    important first) -- recovers markedly more of RTN's loss.
     qmode: 'int' (asymmetric scale+zero, `bits` levels) | 'ternary' {-1,0,1} |
-    'binary' {-1,+1} — the last two use a symmetric per-group abs-mean scale and get
+    'binary' {-1,+1} -- the last two use a symmetric per-group abs-mean scale and get
     the SAME error feedback (that's the lever RTN ternary was missing). Returns
     dequantized weights (same shape)."""
     W = W.clone().float()
@@ -93,13 +93,13 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
     H = H.clone().float()
     # Dead channels: exactly zero OR negligible vs the mean diagonal. A big o_proj Hessian
     # (e.g. 16384-dim on GLM-5.3) has near-dead channels that aren't exactly 0 yet still wreck the
-    # Cholesky — pin them out too, not just the exact zeros.
+    # Cholesky -- pin them out too, not just the exact zeros.
     diagH = torch.diag(H)
     meandiag = diagH[diagH > 0].mean().clamp(min=1e-8) if bool((diagH > 0).any()) else diagH.new_tensor(1.0)
     dead = diagH <= 1e-10 * meandiag
     H[dead, dead] = 1.0; W[:, dead] = 0.0
     # MoE token floor: an expert that saw fewer tokens than it has input channels has a
-    # rank-deficient Hessian — the off-diagonal cross-channel structure is noise. Keep the diagonal
+    # rank-deficient Hessian -- the off-diagonal cross-channel structure is noise. Keep the diagonal
     # (per-channel importance, like imatrix) and drop the unreliable off-diagonal rather than trust it.
     if n_tokens is not None and n_tokens < cols:
         H = torch.diag(torch.diag(H))
@@ -108,8 +108,8 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
         W = W[:, perm]; H = H[perm][:, perm]
         invperm = torch.argsort(perm)
     # H^-1 via upper-Cholesky (GPTQ's stable column ordering). A near-singular Hessian (huge o_proj,
-    # massive-activation channels) can be non-PD even after nominal damping — escalate the damping
-    # ×10 up to ×100, then fall back to fp64, rather than crashing the whole layer.
+    # massive-activation channels) can be non-PD even after nominal damping -- escalate the damping
+    # x10 up to x100, then fall back to fp64, rather than crashing the whole layer.
     base = torch.mean(torch.diag(H)).clamp(min=1e-8)
     Hinv = None
     for attempt in range(6):
@@ -126,7 +126,7 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
             continue
     if Hinv is None:
         raise RuntimeError(f"GPTQ: Hessian stayed non-positive-definite for a {cols}-col layer even "
-                           "after damping ×100 and an fp64 fallback — raise --percdamp or widen the "
+                           "after damping x100 and an fp64 fallback -- raise --percdamp or widen the "
                            "calibration set (this layer's activations barely moved).")
     Q = torch.zeros_like(W)
     scale = zero = None
@@ -151,9 +151,9 @@ def gptq_quantize(W, H, bits, groupsize, percdamp=0.01, act_order=False, qmode="
 def weighted_ls_scale(g, w, Q, iters=5):
     """Closed-form importance-weighted least-squares scale (symmetric, levels in [-Q,Q]).
     For FIXED integer codes u, the SSD-optimal scale is the LS solution
-        d = Σ(w·u·x) / Σ(w·u²)
-    (∂/∂d Σ w(x - d·u)² = 0). Iterate: reassign u=clamp(round(x/d)), resolve d. Beats amax
-    because amax pins d to the single largest outlier — this is the lever Hy4's 'Sherry'
+        d = sum(w*u*x) / sum(w*u^2)
+    (d/dd sum w(x - d*u)^2 = 0). Iterate: reassign u=clamp(round(x/d)), resolve d. Beats amax
+    because amax pins d to the single largest outlier -- this is the lever Hy4's 'Sherry'
     encoder uses (measured here: ~13-32% lower weighted-SSD than amax on a real 30B tensor,
     biggest at the low bits Pollard crushes). g [rows,group], w [*,group] importance."""
     d = (g.abs().amax(1, keepdim=True) / Q).clamp(min=1e-9)
@@ -168,8 +168,8 @@ def weighted_ls_scale(g, w, Q, iters=5):
 def imatrix_quantize(W, wdiag, bits, groupsize, scale="sweep"):
     """llama.cpp-imatrix-equivalent: per group, pick the scale that minimizes the
     IMPORTANCE-WEIGHTED squared error (wdiag = per-input-channel activation
-    importance = the diagonal of the Hessian). This is exactly what imatrix does —
-    weighted scale selection, NO error feedback — so it isolates 'GPTQ's off-diagonal
+    importance = the diagonal of the Hessian). This is exactly what imatrix does --
+    weighted scale selection, NO error feedback -- so it isolates 'GPTQ's off-diagonal
     compensation vs imatrix's diagonal weighting' in ONE harness.
     scale='sweep' = llama.cpp's ~19-candidate make_qx_quants search, ASYMMETRIC (the baseline);
     scale='ls'    = the closed-form weighted-LS scale (Hy4 'Sherry' encoder), SYMMETRIC.
@@ -177,7 +177,7 @@ def imatrix_quantize(W, wdiag, bits, groupsize, scale="sweep"):
     (~+33% lower weighted-SSD than the sweep AND than amax), because there the symmetric
     solve is exact. At 2-3 bit the ASYMMETRIC sweep wins (symmetric ls wastes a level:
     -10% at 2-bit, -21% at 3-bit). So use scale='ls' for the ternary expert-crush body, NOT
-    as a blanket replacement. It is NOT the -89.7% the Sherry card claims — that's unverified."""
+    as a blanket replacement. It is NOT the -89.7% the Sherry card claims -- that's unverified."""
     W = W.clone().float(); rows, cols = W.shape; maxq = 2 ** bits - 1
     w = wdiag.clamp(min=1e-8).float()
     Q = torch.zeros_like(W)
@@ -214,7 +214,7 @@ def make_recipe(kind, ablate="none"):
     """Per-tensor rate map for the protected-mix build (Grok's Attempt C in torch):
     crush the fat MLP body, PROTECT attention + down_proj + first/last-2 blocks + head.
     `ablate` drops ONE protect class to the body atom (protect-set ablation): one of
-    {none, firstlast, attn (qkv), attnout, down} — measures which protection earns its bits.
+    {none, firstlast, attn (qkv), attnout, down} -- measures which protection earns its bits.
     Returns recipe(layer_idx, tensor_name, nlayers) -> (bits, qmode)."""
     body = (1, "binary") if kind == "aggr" else (2, "ternary")
     P = (2, "int")                                    # the protect atom
@@ -263,11 +263,11 @@ def linear_layers(module):
 def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False, qmode="int",
                     recipe=None, nlayers=None):
     """The PROPER GPTQ: process transformer blocks in order, feeding each block's
-    QUANTIZED outputs into the next block's Hessian — so every layer compensates for
+    QUANTIZED outputs into the next block's Hessian -- so every layer compensates for
     the error earlier layers actually introduced. Recovers far more of RTN's loss
     than the one-shot fp16-Hessian version.
 
-    offload=True keeps the whole model on CPU and moves ONE block to `dev` at a time —
+    offload=True keeps the whole model on CPU and moves ONE block to `dev` at a time --
     this is what lets a 7B (15 GB) quantize on a 16 GB GPU: peak VRAM is one block +
     its Hessians, never the whole model."""
     layers = model.model.layers
@@ -286,7 +286,7 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
         except RuntimeError: pass
     h.remove()
     # small kwargs (position_embeddings, attention_mask) stay on dev; DROP cache-related
-    # kwargs — a shared DynamicCache would accumulate KV across replays and blow up shapes.
+    # kwargs -- a shared DynamicCache would accumulate KV across replays and blow up shapes.
     drop = {"hidden_states", "past_key_values", "past_key_value", "use_cache"}
     kw = {k: v for k, v in cache.items() if k not in drop}
     kw["use_cache"] = False
@@ -362,7 +362,7 @@ def main():
     ap.add_argument("--embed-bits", type=int, default=0, help="quantize token embeddings to N bits (0=leave fp16).")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--offload", action="store_true",
-                    help="keep the model on CPU and move ONE block to the GPU at a time — "
+                    help="keep the model on CPU and move ONE block to the GPU at a time -- "
                     "required to quantize a model bigger than VRAM (e.g. a 7B on 16 GB)")
     a = ap.parse_args()
 

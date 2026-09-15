@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-automap — generate the memory-fit mix recipe for ANY model, automatically.
+"""pollard-automap -- generate the memory-fit mix recipe for ANY model, automatically.
 
 The Pollard POLICY (measured on 7B, Grok-blessed) as a function of the model's tensor
 list, so we never hand-roll a map again:
@@ -28,7 +28,7 @@ def imatrix_covered(path):
     """The set of tensor names an ik_llama imatrix ACTUALLY covers. ik writes the OLD
     binary format (not GGUF): int32 n_entries, then per entry int32 name_len, name,
     int32 ncall, int32 nval, float[nval]. A MoE routes to only some experts over a short
-    calib, so many `*_exps` tensors get NO entry — and a very-low-bit build hard-fails on
+    calib, so many `*_exps` tensors get NO entry -- and a very-low-bit build hard-fails on
     an uncovered tensor. Read the real coverage so we can pin the uncovered ones. Returns
     the set, or None if it can't be parsed (caller then skips pinning)."""
     import struct
@@ -50,11 +50,11 @@ def imatrix_covered(path):
 # matmul/expert tensors that a very-low-bit build needs an imatrix for; anything here
 # NOT covered by the imatrix must be pinned to a non-imatrix type or the build hard-fails.
 # Every matmul that a trellis (iq*_kt) build consults an imatrix for. Includes the MLA
-# up-/down-projections (attn_q_a/q_b, attn_k_b, attn_v_b, attn_kv_a_mqa, attn_kv_b) — ik_llama's
+# up-/down-projections (attn_q_a/q_b, attn_k_b, attn_v_b, attn_kv_a_mqa, attn_kv_b) -- ik_llama's
 # imatrix STRUCTURALLY skips attn_k_b/v_b/kv_b (its MLA forward path uses a different layout),
 # and they can't be copy-covered (their input is the compressed KV latent, shared with nothing),
 # so when uncovered they MUST be pinned to a K-quant or the low-bit build hard-fails ("Missing
-# importance matrix ... bailing out"). Norms (attn_*_norm) are excluded — they stay F32.
+# importance matrix ... bailing out"). Norms (attn_*_norm) are excluded -- they stay F32.
 _NEEDS_IMATRIX = re.compile(
     r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?"
     r"|attn_(q|k|v|qkv|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
@@ -64,7 +64,7 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
     """--custom-q rules pinning every imatrix-REQUIRED tensor the imatrix doesn't cover
     to `fallback`, so an aggressive MoE build can't crash on a rarely-routed expert. THIS
     is what makes automap robust on MoE. Empty if the imatrix can't be read (build may
-    still fail on uncovered experts — rerun the imatrix with more/diverse chunks)."""
+    still fail on uncovered experts -- rerun the imatrix with more/diverse chunks)."""
     cov = imatrix_covered(imatrix)
     if cov is None:
         return [], None
@@ -76,7 +76,7 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
 def ensure_gate_coverage(imatrix_path):
     """Auto-cover the SwiGLU gate side of a fused MoE ffn. ik_llama's imatrix routinely SKIPS
     ffn_gate_exps / ffn_gate_shexp / the dense ffn_gate (observed on Qwen3-30B-A3B, DeepSeek-V2,
-    Hy4) — gate and up share the SAME input, so their importance is identical. Left uncovered,
+    Hy4) -- gate and up share the SAME input, so their importance is identical. Left uncovered,
     the biggest param group (gate) either bloats to a q6 pin or hard-fails the low-bit build.
     Copy every covered `ffn_up*` entry to its `ffn_gate*` name, write a sibling `*.gatefix.imatrix`,
     and return its path so the whole flow (pins + build) uses the covered imatrix with NO manual
@@ -120,9 +120,9 @@ def ensure_gate_coverage(imatrix_path):
 
 def parse_tensors(path):
     """Return (names, n_layers, is_moe, arch). Detect the architecture CLASS generically and
-    route by it — dense -> dense recipe; ANY MoE -> THE MoE recipe (which covers both the
+    route by it -- dense -> dense recipe; ANY MoE -> THE MoE recipe (which covers both the
     Qwen-style tensor names AND the MLA / hyper-connection / DSA-indexer variants that Deepseek,
-    Hy4, etc. use). `arch` is a human descriptor for the label from the features present — never
+    Hy4, etc. use). `arch` is a human descriptor for the label from the features present -- never
     a per-model special case. Accepts dry-run lines or bare tensor names."""
     names = []
     for ln in open(path, encoding="utf-8", errors="ignore"):
@@ -178,7 +178,7 @@ def _bar_type(atom):
 def _cq(atom):
     """The EXACT ggml type name --custom-q expects. K-quants are `qN_K` (capital K, e.g.
     q3_K); i-/trellis quants are all-lowercase (iq1_kt). llama-quantize rejects `q3_k`
-    ('Invalid quantization type') — the tensor-type table is case-sensitive on the K."""
+    ('Invalid quantization type') -- the tensor-type table is case-sensitive on the K."""
     a = _atom(atom)
     m = re.match(r"(q\d)_k$", a)
     return f"{m.group(1)}_K" if m else a
@@ -198,7 +198,7 @@ def _atom(name):
 def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     """Emit the Mix as (base_type, custom-q rules). base_type = the crush atom (fills
     everything not matched); every protected role is named explicitly via custom-q
-    (lowercase = the reliable path — role-flags silently fell back for some atoms).
+    (lowercase = the reliable path -- role-flags silently fell back for some atoms).
     Rules are ordered general->specific; edge-block rules go LAST so they win.
     Verified against a dry-run (which prints the actual per-tensor type chosen).
 
@@ -226,8 +226,8 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
                f"ffn_gate_shexp={protect}", f"ffn_up_shexp={protect}", f"ffn_down_shexp={shexp_down}"]
         # (2b) HYV4 (MLA + hyper-connection + DSA-indexer MoE) runs through THIS recipe, not a
         # separate one. Its MLA attn (attn_k_b/v_b/q_a/q_b/kv_a_mqa) is already caught by the
-        # attn_q/k/v rules below (substring); these add the tensors those rules MISS —
-        # attn_gate, the hyper-connections, indexer.proj, output hc, and the dense block-0 FFN —
+        # attn_q/k/v rules below (substring); these add the tensors those rules MISS --
+        # attn_gate, the hyper-connections, indexer.proj, output hc, and the dense block-0 FFN --
         # protected at the same tier. All no-ops on Qwen3-MoE (those tensors don't exist there).
         cq += [f"attn_gate={protect}", f"hc_attn_fn={protect}", f"hc_ffn_fn={protect}",
                f"indexer\\.proj={protect}", f"output_hc_fn={protect}",
@@ -235,7 +235,7 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     # (3) general roles. Grok's policy: PROTECT attn v/o (they carry the distribution); q/k
     # are less critical. On DENSE the shipped 7B/14B recipe crushed k,v and still won, so keep
     # it. On MoE, crushing attn_v was measured to LOSE KLD vs uniform IQ1 (30B: mix 0.371 >
-    # uniform 0.360) — protect attn_v/k there (attention is a small fraction of a MoE anyway).
+    # uniform 0.360) -- protect attn_v/k there (attention is a small fraction of a MoE anyway).
     attn_kv = protect if (kfree or is_moe) else body
     cq += [f"attn_k={attn_kv}", f"attn_v={attn_kv}",
            f"attn_q={protect}", f"attn_output={protect}", f"ffn_down={protect}"]
@@ -265,7 +265,7 @@ def emit_bat(a, n_layers, is_moe, names):
         return (f"%BIN%\\llama-quantize.exe {im_flag}{extra} %SRC% "
                 f"{stem}-{name}.gguf {typ} 1>> %LOG% 2>&1")
     def ppl(name):
-        # PPL is offload-invariant (ngl changes speed, not the number) — so a partial
+        # PPL is offload-invariant (ngl changes speed, not the number) -- so a partial
         # offload keeps every bar comparable AND stops a big bar OOMing the card.
         return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
                 f"-ngl {a.ngl} 1>> %LOG% 2>&1")
@@ -278,7 +278,7 @@ def emit_bat(a, n_layers, is_moe, names):
     def maybe_ppl(name):
         return [] if a.no_eval else [ppl(name)]
     if not a.mix_only:
-        # baseline (uniform at the crush tier) — the bar the Mix must beat at ~same size
+        # baseline (uniform at the crush tier) -- the bar the Mix must beat at ~same size
         L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
               build(f"u-{body}", _bar_type(body), pin_extra), *maybe_ppl(f"u-{body}"), ""]
         # ceiling (uniform at the protect tier)
@@ -290,11 +290,11 @@ def emit_bat(a, n_layers, is_moe, names):
             L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
                   build(f"rival-{rv}", _bar_type(rv)), *maybe_ppl(f"rival-{rv}"), ""]
     # PollardMix: base fills with the body atom, custom-q protects the sensitive roles. This is
-    # the deliverable — always emitted; with --mix-only it's the ONLY thing built (the fast path).
+    # the deliverable -- always emitted; with --mix-only it's the ONLY thing built (the fast path).
     mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
     L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
           build("mix", _bar_type(body), mix_extra), *maybe_ppl("mix"), ""]
-    # Auto coherence gate on the finished mix — so a one-shot build also tells you if it's USABLE
+    # Auto coherence gate on the finished mix -- so a one-shot build also tells you if it's USABLE
     # (coherent + which sampling to ship, or loops-under-every-sampling => bump a tier). Runs the
     # quick loop-check + sampling sweep; resolved at emit time to this python + sibling pollard_bench.
     if getattr(a, "gate", True):
@@ -326,15 +326,15 @@ def main():
     ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
     ap.add_argument("--no-imatrix", "--kquant", dest="no_imatrix", action="store_true",
                     help="FALLBACK (not a win): imatrix-FREE K-quant MoE mix that builds off the "
-                         "F16 with no imatrix. Use ONLY when a covered imatrix is impractical — it "
+                         "F16 with no imatrix. Use ONLY when a covered imatrix is impractical -- it "
                          "does NOT beat stock Q2_K (measured). The winning path is the trellis mix "
                          "WITH an imatrix.")
     ap.add_argument("--mix-only", dest="mix_only", action="store_true",
-                    help="emit ONLY the PollardMix build — the deliverable model. Skips the "
+                    help="emit ONLY the PollardMix build -- the deliverable model. Skips the "
                          "uniform baseline/ceiling bars (those are the BENCHMARK). This is the "
                          "fast user-build path; without it you get the full 3-bar comparison.")
     ap.add_argument("--no-eval", dest="no_eval", action="store_true",
-                    help="skip the PPL eval lines — a plain build doesn't need the benchmark. "
+                    help="skip the PPL eval lines -- a plain build doesn't need the benchmark. "
                          "(Reproduce the gold-card numbers with the benchmark path instead.)")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
     ap.add_argument("--allow-dense", action="store_true",
@@ -344,7 +344,7 @@ def main():
                     help="skip the auto coherence gate appended after the mix build. By default the "
                          "emitted build runs a quick loop-check + sampling sweep on the finished mix "
                          "(PASS+recommended sampling, or BELOW-FLOOR+bump-a-tier) so a one-shot build "
-                         "tells you if it's usable — no manual pollard-bench --coherence needed.")
+                         "tells you if it's usable -- no manual pollard-bench --coherence needed.")
     ap.set_defaults(gate=True)
     a = ap.parse_args()
     # atom defaults: trellis (imatrix) by default; K-quant (imatrix-free) when --no-imatrix.
@@ -361,8 +361,8 @@ def main():
         a.protect = a.protect or "iq2_kt"
     names, n_layers, is_moe, arch = parse_tensors(a.tensors)
     if not n_layers:
-        sys.exit("no blk.N tensors found — is this a dry-run tensor list?")
-    # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate — its
+        sys.exit("no blk.N tensors found -- is this a dry-run tensor list?")
+    # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate -- its
     # win is imatrix-guided K-quants, not this. Refuse dense (saves everyone the wrong-tool
     # run) unless --allow-dense (the research 1-bit-mix / gold-card case). HYV4 IS a MoE.
     if not is_moe and not a.allow_dense:
@@ -371,7 +371,7 @@ def main():
                  "  expert-allocation here doesn't apply (no expert redundancy to reallocate).\n"
                  "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
                  "  research 1-bit-mix case (the gold-card).")
-    # Transparency: an aliased atom (e.g. Hy4's STQ1_0) is an APPROXIMATION, not the real format —
+    # Transparency: an aliased atom (e.g. Hy4's STQ1_0) is an APPROXIMATION, not the real format --
     # say so, so nobody thinks they built a true 1.31-bit STQ1_0 when they built 1.62-bit iq1_bn.
     for label, raw in [("--body", a.body), ("--protect", a.protect), ("--rival", a.rival)]:
         if raw and raw.lower() in ALIASES:
@@ -391,11 +391,11 @@ def main():
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))
     if kfree:
-        print("  imatrix : NONE — every atom is a K-quant, so the build reads no importance "
+        print("  imatrix : NONE -- every atom is a K-quant, so the build reads no importance "
               "matrix (no coverage problem, no 6-hour imatrix step, kill-proof).")
     else:
         # AUTO gate-copy: cover the SwiGLU gate side (ik's imatrix skips it) BEFORE pinning, so the
-        # experts crush cleanly instead of bloating to q6 — no manual imatrix_fix_gate step. Uses
+        # experts crush cleanly instead of bloating to q6 -- no manual imatrix_fix_gate step. Uses
         # the fixed imatrix for both the pins below AND the emitted build (a.imatrix is what set IM=).
         if is_moe:
             fixed, ncopied = ensure_gate_coverage(a.imatrix)
@@ -405,7 +405,7 @@ def main():
                 a.imatrix = fixed
         pins, ncov = uncovered_pins(names, a.imatrix)
         if ncov is None:
-            print("  imatrix : could not read coverage (skipping pins — build may fail on "
+            print("  imatrix : could not read coverage (skipping pins -- build may fail on "
                   "uncovered experts; rerun the imatrix with more/diverse chunks, or use "
                   "--no-imatrix for a K-quant MoE build that needs no imatrix at all).")
         else:
@@ -414,7 +414,7 @@ def main():
                   + ("  (!) many uncovered - use --no-imatrix (K-quant) or a fuller/diverse imatrix."
                      if len(pins) > n_layers else ""))
         if not is_moe and pins:
-            print("  (dense model with uncovered tensors — unusual; check the imatrix.)")
+            print("  (dense model with uncovered tensors -- unusual; check the imatrix.)")
     open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names))
     print(f"wrote {a.out}")
 
