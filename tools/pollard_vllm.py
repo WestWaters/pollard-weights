@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-vllm — will this build serve under vLLM, and at which tensor-parallel sizes?
+"""pollard-vllm -- will this build serve under vLLM, and at which tensor-parallel sizes?
 
 A quantized model that loads fine on one GPU can fail to load at TP=4 for reasons that have nothing
 to do with quality: vLLM shards tensors across ranks, so head counts and the intermediate dimension
@@ -48,7 +48,7 @@ def _load_config(model: str) -> dict:
         with open(local, encoding="utf-8") as f:
             return json.load(f)
     if os.path.isdir(model):
-        raise SystemExit(f"no config.json in {model} — is this a model directory?")
+        raise SystemExit(f"no config.json in {model} -- is this a model directory?")
     url = f"https://huggingface.co/{model}/raw/main/config.json"
     try:
         with urllib.request.urlopen(url, timeout=20) as r:
@@ -122,7 +122,7 @@ def main() -> None:
 
     if method == "gguf" or a.model.endswith(".gguf"):
         print("\n    GGUF is llama.cpp's format. llama.cpp splits across GPUs at RUNTIME "
-              "(`-ts 1,1,1,1`),\n    so there is no TP-specific build to make — the same file "
+              "(`-ts 1,1,1,1`),\n    so there is no TP-specific build to make -- the same file "
               "serves any number of GPUs.")
         return
 
@@ -138,13 +138,13 @@ def main() -> None:
         top = tp_ceiling(cfg)
         ok = [tp for tp in range(1, top + 1) if not check(cfg, tp)]
         print(f"\n    works at TP = {', '.join(map(str, ok)) if ok else 'nothing above 1'}")
-        print(f"    (every degree up to {top}, this model's head count — vLLM takes any positive "
+        print(f"    (every degree up to {top}, this model's head count -- vLLM takes any positive "
               "degree, not only powers of two)")
         shown = 0
         for tp in range(2, top + 1):
             bad = check(cfg, tp)
             if bad and shown < 4:            # say WHY for the first few that fail
-                print(f"      TP={tp}: no — {bad[0]}")
+                print(f"      TP={tp}: no -- {bad[0]}")
                 shown += 1
 
     if a.serve:

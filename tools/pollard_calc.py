@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-calc — know what your hardware can do BEFORE you download 300GB.
+"""pollard-calc -- know what your hardware can do BEFORE you download 300GB.
 
 Reads a Hugging Face config.json (local path or hub id) plus a hardware
 profile, and computes the memory-movement economics of running that model:
@@ -10,7 +10,7 @@ profile, and computes the memory-movement economics of running that model:
   * the verdict: FITS RESIDENT / STREAMING-VIABLE / NEEDS BIGGER TIER
 
 Zero GPU required. Zero downloads beyond the ~10KB config. Estimates, not
-gospel: every output states its assumptions — check them against your hardware.
+gospel: every output states its assumptions -- check them against your hardware.
 
 Usage:
   pollard_calc.py --config path/to/config.json
@@ -29,7 +29,7 @@ import urllib.request
 
 
 def detect_available_ram_gb():
-    """Measure what's ACTUALLY free right now — nameplate RAM lies once the OS,
+    """Measure what's ACTUALLY free right now -- nameplate RAM lies once the OS,
     the desktop, and everything else take their cut. stdlib only."""
     try:
         if sys.platform == "darwin":
@@ -62,7 +62,7 @@ QUANTS = {  # effective bits per weight, format overheads included
 def _llama_libs(bin_path):
     """Every object that might carry llama.cpp's arch table: the binary itself (static
     build) plus each libllama* shared lib beside it or in a sibling lib/ dir. The core
-    arch names live in libllama.dylib — NOT the per-tool -impl launchers — so we scan
+    arch names live in libllama.dylib -- NOT the per-tool -impl launchers -- so we scan
     them all rather than guess which file it is."""
     import glob
     out = [bin_path]
@@ -102,25 +102,25 @@ def binary_supports_arch(bin_path, arch):
 
 
 def find_llama_bin(name, arch=None):
-    """Resolve a llama.cpp binary (llama-perplexity, llama-cli, llama-quantize…):
-    honor an explicit path, else the runtime build install.sh created (PREFERRED —
+    """Resolve a llama.cpp binary (llama-perplexity, llama-cli, llama-quantize...):
+    honor an explicit path, else the runtime build install.sh created (PREFERRED --
     Pollard keeps it current), else PATH, else common spots. Returns the path or None.
 
     Pass `arch` (the model's general.architecture) to pick a binary that actually
-    SUPPORTS that architecture: a stale llama.cpp on PATH — e.g. a distro/homebrew
-    build a few weeks behind — silently shadows the fresh runtime build and then dies
+    SUPPORTS that architecture: a stale llama.cpp on PATH -- e.g. a distro/homebrew
+    build a few weeks behind -- silently shadows the fresh runtime build and then dies
     on 'unknown model architecture: bailingmoe3'. With `arch` we skip incapable
     binaries; if some exist but none support the arch we return None so the caller can
     say 'update your runtime' instead of 'not found'."""
     import shutil
     if not name:
         return None
-    if os.path.sep in name or name.startswith("~"):        # explicit path given — honored as-is
+    if os.path.sep in name or name.startswith("~"):        # explicit path given -- honored as-is
         p = os.path.expanduser(name)
         return p if os.path.exists(p) else None
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     candidates = [
-        os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),  # ours FIRST — kept current
+        os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),  # ours FIRST -- kept current
         shutil.which(name),                                                # then PATH
         os.path.expanduser(f"~/llama.cpp/build/bin/{name}"),
         f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}",
@@ -136,10 +136,10 @@ def find_llama_bin(name, arch=None):
 
 def _shard_paths(path):
     """A model may be split across shards `<prefix>-00001-of-000NN.gguf`. Given
-    ANY shard, return every shard in order (shard 1 first — it holds the full KV
-    metadata; later shards hold only their tensor slice). Non-split → [path].
+    ANY shard, return every shard in order (shard 1 first -- it holds the full KV
+    metadata; later shards hold only their tensor slice). Non-split -> [path].
     Reading a single shard against the whole param count is what produced Frank's
-    0.00 bpw / 1.6M tok/s garbage — every big model (DeepSeek, Kimi…) is sharded."""
+    0.00 bpw / 1.6M tok/s garbage -- every big model (DeepSeek, Kimi...) is sharded."""
     m = re.search(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(path))
     if not m:
         return [path]
@@ -194,7 +194,7 @@ def _read_one_gguf(path):
         tnames = []
         try:
             for _ in range(n_tensors):
-                tnames.append(rd_str())  # tensor name — the model's real layout, free while we're here
+                tnames.append(rd_str())  # tensor name -- the model's real layout, free while we're here
                 nd, = struct.unpack("<I", f.read(4))
                 dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
                 dt, = struct.unpack("<I", f.read(4)); f.read(8)  # ggml dtype + offset
@@ -228,7 +228,7 @@ def read_gguf_meta(path):
     meta["_tensor_param_sum"] = param_sum if ok else None
     meta["_total_file_bytes"] = sum(os.path.getsize(s) for s in shards)
     meta["_shard_count"] = len(shards)
-    # the most common tensor type IS the model's quant, read from the file itself —
+    # the most common tensor type IS the model's quant, read from the file itself --
     # ground truth that doesn't depend on the (drifting) general.file_type enum.
     meta["_dominant_ggml_type"] = max(dcounts, key=dcounts.get) if dcounts else None
     return meta
@@ -237,7 +237,7 @@ def read_gguf_meta(path):
 def imatrix_covered_tensors(path):
     """The set of weight tensors an imatrix ACTUALLY covers (base names, the
     `.in_sum2`/`.counts` stats suffixes stripped). Anything not in here can't take
-    an imatrix-required quant type — llama-quantize hard-fails on it (e.g. MTP /
+    an imatrix-required quant type -- llama-quantize hard-fails on it (e.g. MTP /
     `nextn` layer tensors, which look standard but are never calibrated). Pin those.
     Returns the set, or None if the imatrix can't be read (callers fall back)."""
     try:
@@ -256,8 +256,8 @@ def imatrix_covered_tensors(path):
 
 def read_gguf_tensor_names(path):
     """Every tensor name across all shards. Used by pollard-fit to catch tensors
-    that would fall through to an aggressive base preset (the exotic ones — e.g.
-    DeepSeek's indexer_compressor / output_hc_fn — that llama-quantize hard-fails
+    that would fall through to an aggressive base preset (the exotic ones -- e.g.
+    DeepSeek's indexer_compressor / output_hc_fn -- that llama-quantize hard-fails
     on when they get an imatrix-required type without coverage)."""
     _SIMPLE = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
     names = []
@@ -374,12 +374,12 @@ def analyse(cfg):
     ffn = first(cfg, "intermediate_size", "n_inner", "ffn_dim", default=4 * h)
     # Multi-head Latent Attention (DeepSeek / GLM glm-dsa): KV is a COMPRESSED latent
     # (kv_lora_rank + rope part) per token per layer, ~50x smaller than GQA's
-    # kv_heads*head_dim — the difference between "needs 256 GB" and "fits a Spark".
+    # kv_heads*head_dim -- the difference between "needs 256 GB" and "fits a Spark".
     kv_lora_rank = first(cfg, "kv_lora_rank", default=0) or 0
     qk_rope_head_dim = first(cfg, "qk_rope_head_dim", default=0) or 0
     # DeepSeek Sparse Attention (DeepSeek-V3.2, GLM-5.3 `glm_moe_dsa`, Tencent Hy4 `hy_v4`): a "lightning indexer" keeps
     # its own per-token key cache (index_head_dim per layer) NEXT to the MLA latent. Measured on GLM-5.3 (78 layers,
-    # index_head_dim 128): 41 KB/token with an NVFP4 latent vs the 22 KB the latent alone predicts — the indexer cache is
+    # index_head_dim 128): 41 KB/token with an NVFP4 latent vs the 22 KB the latent alone predicts -- the indexer cache is
     # about half the KV bytes on these models, and it is not compressed by the latent's quant. Layers with
     # indexer_types == "shared" (Hy4: 57 of 78) reuse a previous layer's top-k and keep no cache of their own.
     index_head_dim = first(cfg, "index_head_dim", default=0) or 0
@@ -404,18 +404,18 @@ def analyse(cfg):
 
     n_experts = first(cfg, "num_experts", "n_routed_experts",
                       "num_local_experts", "moe_num_experts")
-    # NOTE: bare "top_k" is deliberately excluded — it's a SAMPLING parameter
+    # NOTE: bare "top_k" is deliberately excluded -- it's a SAMPLING parameter
     # in many configs (top_k=50) and misreads as expert top-k.
     top_k = first(cfg, "num_experts_per_tok", "num_experts_per_token",
                   "experts_per_token", "moe_top_k", "moe_k",
                   "num_selected_experts", default=0)
     if n_experts and not top_k:
-        sys.exit("ERROR: MoE config but no experts-per-token field found — "
+        sys.exit("ERROR: MoE config but no experts-per-token field found -- "
                  "add the key to pollard_calc or pass a patched config.")
     shared = first(cfg, "n_shared_experts", "num_shared_experts", default=0) or 0
     moe_ffn = first(cfg, "moe_intermediate_size", default=ffn)
     # some MoEs run experts in a reduced latent space (e.g. Kimi-K3:
-    # routed_expert_hidden_size 3584 vs hidden 7168) — ignoring this key
+    # routed_expert_hidden_size 3584 vs hidden 7168) -- ignoring this key
     # doubles every expert-derived number. Found by community review.
     expert_h = first(cfg, "routed_expert_hidden_size", "expert_hidden_size",
                      "moe_hidden_size", default=h)
@@ -443,7 +443,7 @@ def analyse(cfg):
         active = total
         kind = "dense"
 
-    # A GGUF source carries the EXACT param count in its tensor table — trust it
+    # A GGUF source carries the EXACT param count in its tensor table -- trust it
     # over the dim estimate, which misses tied/extra embeddings when vocab_size
     # isn't in the metadata (undersized total -> builds that bust the RAM budget).
     if cfg.get("_tensor_param_sum"):
@@ -453,7 +453,7 @@ def analyse(cfg):
 
     # Hybrid linear-attention / SSM layers (Qwen3.5 / Mamba / DeltaNet-style): not
     # every layer is standard attention, so the attn params above are approximate,
-    # AND per-token behaviour differs — linear layers barely grow the KV cache.
+    # AND per-token behaviour differs -- linear layers barely grow the KV cache.
     lt = cfg.get("layer_types")
     n_linear = n_full = 0
     if isinstance(lt, list):
@@ -471,7 +471,7 @@ def analyse(cfg):
         "active": active, "n_experts": n_experts or 0, "top_k": top_k,
         "shared": shared, "expert_params": expert_params,
         "dense_ffn_params": dense_ffn_params,     # per-layer FFN bulk (for dense allocation)
-        "attn_params": attn,                      # per-layer attention (q,k,v,o) — its own group
+        "attn_params": attn,                      # per-layer attention (q,k,v,o) -- its own group
         "dense_layers": dense_layers,
         "multimodal": multimodal, "hybrid": hybrid,
         "n_linear": n_linear, "n_full": n_full, "mtp": mtp, "n_kv_layers": n_kv_layers,
@@ -490,7 +490,7 @@ def kv_cache_bytes(a, ctx, kv_bytes=2.0):
     # then a hybrid model's full-attention layers, then every layer.
     n_attn = a.get("n_kv_layers") or a.get("n_full") or a["layers"]
     # DSA indexer key cache: index_head_dim per token on every layer that runs its own indexer. Not compressed by the
-    # NVFP4 latent path (bf16 keys), fp8/f16 otherwise — GLM-5.3 measured: 41 KB/tok nvfp4, 57 KB fp8 (latent-only
+    # NVFP4 latent path (bf16 keys), fp8/f16 otherwise -- GLM-5.3 measured: 41 KB/tok nvfp4, 57 KB fp8 (latent-only
     # model: 22 / 45 KB). Anything below 1 byte/elem for the latent still costs ~2 bytes/elem here.
     idx = 0.0
     if a.get("index_head_dim") and a.get("n_indexer"):
@@ -535,17 +535,17 @@ def detect_gpu_gb():
 def parse_gpu(spec):
     """'5090x4' / '24x8' / 'rtx6000pro x2' / '96' -> total VRAM GB (left = per-card
     name or GB, right = count). Plain number or a bare card name = that much. None if
-    unparseable — so any stack of any card works, not a fixed menu."""
+    unparseable -- so any stack of any card works, not a fixed menu."""
     s = spec.lower().replace(" ", "")
     if s == "auto":                             # read the card that is actually installed
         return detect_gpu_gb()
-    if s in _GPU_VRAM:                          # bare card name (may contain 'x': rtx…)
+    if s in _GPU_VRAM:                          # bare card name (may contain 'x': rtx...)
         return _GPU_VRAM[s]
     try:
         return float(s)                         # plain GB total
     except ValueError:
         pass
-    if "x" in s:                                # CARDxCOUNT / GBxCOUNT — split on LAST x
+    if "x" in s:                                # CARDxCOUNT / GBxCOUNT -- split on LAST x
         card, _, cnt = s.rpartition("x")
         per = _GPU_VRAM.get(card)
         if per is None:
@@ -562,7 +562,7 @@ def parse_gpu(spec):
 
 # fraction of a device's RAM actually usable by the model. A dedicated GPU gives
 # almost all its VRAM; a phone hands an app only ~half (iOS/Android reserve the rest
-# and OOM-kill past it — an 8 GB phone ≈ 4-5 GB usable, ~3B practical cap); Apple/APU
+# and OOM-kill past it -- an 8 GB phone ~= 4-5 GB usable, ~3B practical cap); Apple/APU
 # unified memory wires ~75%. Sources: iOS jetsam limits, community mobile-LLM guides.
 _DEVICE_USABLE = {"gpu": 0.94, "unified": 0.75, "mac": 0.75, "apu": 0.75,
                   "phone": 0.55, "mobile": 0.55}
@@ -570,12 +570,12 @@ _DEVICE_USABLE = {"gpu": 0.94, "unified": 0.75, "mac": 0.75, "apu": 0.75,
 
 def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"):
     """The pre-flight: weights + KV cache at a chosen context + overhead = what it
-    takes to RUN, and which devices that fits — so you decide BEFORE the hours-long
+    takes to RUN, and which devices that fits -- so you decide BEFORE the hours-long
     build/download whether it's worth it (requested by a user running 300B MoEs)."""
     kv_gb = kv_cache_bytes(a, ctx, kv_bytes) / 1e9
     overhead_gb = 1.0 + ctx / 262144 * 2.0                  # compute/activation buffers (approx)
     total_gb = weights_gb + kv_gb + overhead_gb
-    tag = ("  (MLA — compressed latent, not GQA)" if a.get("mla")
+    tag = ("  (MLA -- compressed latent, not GQA)" if a.get("mla")
            else f"  (hybrid: {a['n_full']}/{a['layers']} layers grow KV)"
            if a.get("hybrid") and a.get("n_full") else "")
     print(f"\n== will it fit? @ {ctx:,} tokens of context ==")
@@ -589,14 +589,14 @@ def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"
         spare = usable - total_gb
         verdict = (f"FITS, {spare:.0f} GB to spare" if spare >= usable * 0.10
                    else f"TIGHT, {spare:.0f} GB headroom" if spare >= 0
-                   else f"SHORT by {-spare:.0f} GB — smaller quant/model, more cards, or --rpc")
+                   else f"SHORT by {-spare:.0f} GB -- smaller quant/model, more cards, or --rpc")
         extra = (f"  [~{frac:.0%} of {rig_gb:.0f} GB usable = {usable:.0f} GB]"
                  if frac < 0.9 else "")
         print(f"{'>> YOUR RIG (' + f'{rig_gb:.0f} GB {device})':<20}: {verdict}{extra}")
         if device in ("phone", "mobile"):
             print("   note: phones OOM-kill past ~half their RAM; iOS is practical only to "
                   "~3B, flagship Android to ~7B. Target a 1-3B at q4 for a smooth phone run.")
-    print("reference tiers — dedicated VRAM, ~6% for the OS (phones give an app ~half):")
+    print("reference tiers -- dedicated VRAM, ~6% for the OS (phones give an app ~half):")
     tiers = [("8 GB   (4060 / 8GB card)", 8), ("12 GB  (3060 / 4070)", 12),
              ("16 GB  (4080 / 5080)", 16), ("24 GB  (4090 / 3090)", 24),
              ("32 GB  (5090)", 32), ("48 GB  (2x24 / A6000)", 48),
@@ -604,7 +604,7 @@ def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"
              ("192 GB (B200 / 6x32)", 192), ("256 GB (2x Spark / 8xA100-40)", 256),
              ("512 GB (4x Spark / 8xB200)", 512), ("1 TB   (8x Spark, TP/RPC pool)", 1024),
              ("2 TB   (16x Spark / 8xB200-192)", 2048)]
-    # the ladder is illustrative; it SCALES with the pool — extend it in powers of 2 until it clears
+    # the ladder is illustrative; it SCALES with the pool -- extend it in powers of 2 until it clears
     # the model (nodes pooled over TP/RPC are one memory space), and drop in the USER's own rig as a row.
     while tiers[-1][1] < total_gb:                          # keep doubling until a tier holds the model
         top = tiers[-1][1] * 2
@@ -615,7 +615,7 @@ def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"
         star = "  <- your rig" if rig_gb and abs(cap - rig_gb) < 1.0 else ""
         print(f"  [{'YES' if total_gb <= cap * 0.94 else 'no ':<3}] {name}{star}")
     print("  -> pool scales without limit: N boxes/Sparks are ONE memory space via tensor-parallel "
-          "(vLLM) or --rpc (llama.cpp) — total RAM is the sum across nodes; add boxes until it fits.")
+          "(vLLM) or --rpc (llama.cpp) -- total RAM is the sum across nodes; add boxes until it fits.")
     if kv_bytes >= 2:
         kv_q8 = kv_cache_bytes(a, ctx, 1.0) / 1e9
         if kv_gb - kv_q8 > 0.5:
@@ -627,29 +627,29 @@ def gb(nbytes):
     return nbytes / 1e9
 
 
-# Reference-accelerator (DGX Spark / GB10 class) quant BUILD-TIME rates — hours per billion
-# params — so users know the COMPUTE cost per format BEFORE running (the "no more guessing" ask).
-# Anchored to measured datapoints (order-of-magnitude, ±~2x; calibrate to your box via --build-hw):
+# Reference-accelerator (DGX Spark / GB10 class) quant BUILD-TIME rates -- hours per billion
+# params -- so users know the COMPUTE cost per format BEFORE running (the "no more guessing" ask).
+# Anchored to measured datapoints (order-of-magnitude, +/-~2x; calibrate to your box via --build-hw):
 #   * GPTQ: Qwen2.5-0.5B = ~9 min on a 5090 (fast box) -> a Spark-class ~0.5 h/B
 #   * GGUF ladder + EXL3: a same-bit GGUF 2-6bit ladder of glm-flash ~1-2 h on ONE Spark, while
 #     EXL3 of ONE 2-bit output takes ~34 h on ONE Spark (community datapoint) -> EXL3 ~20-30x GGUF.
 #   * MEASURED 2026-09 on GLM-5.3 (744B MoE, 78 layers, 384 x 2048 calibration rows), GB10 nodes:
 #       GPTQ (Pollard-method Hessian, int4 experts / int8 attention): ~20 node-hours  -> 0.027 h/B (total params)
 #       EXL3 (exllamav3 budgeted allocator, -b 3.2 -hq, one bpw): ~66 GPU-hours (~50 min per MoE layer, ~4 min dense)
-#                                                                    -> 0.09 h/B — consistent with the 320B 2-bit datapoint
+#                                                                    -> 0.09 h/B -- consistent with the 320B 2-bit datapoint
 #                                                                       above (34 h / 320B = 0.11), so the old 3.0 was ~30x high.
 #     Both scale with TOTAL params (every expert is solved), band-parallel across nodes divides wall-clock by node count.
 _BUILD_RATE = {   # format: (basis, hours_per_billion_params_on_a_GB10_class_box)
     "gguf": ("active", 0.12),   # imatrix pass + the 2-6bit K-quant ladder (imatrix is active-bound)
     "gptq": ("total",  0.03),   # per-layer Hessian + error-feedback solve over the whole model (measured 744B: 20 node-h)
-    "mlx":  ("total",  0.05),   # group quant, no calib forward — the cheap lane
+    "mlx":  ("total",  0.05),   # group quant, no calib forward -- the cheap lane
     "exl3": ("total",  0.09),   # trellis optimization per tensor, ONE target bpw (measured 744B: 66 GPU-h; 320B: 34 h)
 }
 
 
 def estimate_build_time(arch, hw_scale=1.0):
     """Rough quant build-time per output format, on a reference GB10/Spark-class box (hw_scale<1
-    for a faster box, e.g. ~0.4 for a 5090). ESTIMATE, not gospel — anchored to the datapoints
+    for a faster box, e.g. ~0.4 for a 5090). ESTIMATE, not gospel -- anchored to the datapoints
     above; a real run calibrates it. MoE: GGUF scales with ACTIVE params (imatrix), the rest with total."""
     aB = (arch.get("active") or arch.get("total") or 0) / 1e9
     tB = (arch.get("total") or 0) / 1e9
@@ -687,13 +687,13 @@ def report(a, ram_gb, flash_gbps, rambw_gbps, qbits, cache_gb):
     print(f"RAM-bandwidth ceil  : {t_ram:6.2f} tok/s  (@ {rambw_gbps} GB/s)")
     print()
     if resident:
-        print(f"VERDICT: FITS RESIDENT in {ram_gb} GB — compute-bound, "
+        print(f"VERDICT: FITS RESIDENT in {ram_gb} GB -- compute-bound, "
               f"expect up to ~{t_ram:.1f} tok/s ceiling.")
     elif a["kind"] == "moe" and active_b <= ram_gb * 1e9 * 0.85:
         cov = cache_gb * 1e9 / total_b * 100
-        print(f"VERDICT: STREAMING-VIABLE — active set fits RAM; throughput is "
+        print(f"VERDICT: STREAMING-VIABLE -- active set fits RAM; throughput is "
               f"governed by routing reuse (cache covers {cov:.1f}% of weights "
-              f"uniform-case). CAVEAT: reuse is UNPROVEN in general — our one "
+              f"uniform-case). CAVEAT: reuse is UNPROVEN in general -- our one "
               f"measured testbed showed near-uniform routing (notes/e5), which "
               f"makes caching ineffective there. Measure your workload with "
               f"experiments/e2 before betting on this verdict.")
@@ -701,26 +701,26 @@ def report(a, ram_gb, flash_gbps, rambw_gbps, qbits, cache_gb):
         print(f"         full residency would need the ~{need:,.0f} GB tier.")
     else:
         need = gb(total_b) / 0.85
-        print(f"VERDICT: NEEDS BIGGER TIER — ~{need:,.0f} GB RAM for residency; "
+        print(f"VERDICT: NEEDS BIGGER TIER -- ~{need:,.0f} GB RAM for residency; "
               f"streaming floor here is {t_flash:.2f} tok/s.")
 
-    # Architecture notes — where a new arch makes the numbers above approximate or
+    # Architecture notes -- where a new arch makes the numbers above approximate or
     # conservative. Better to say so than to emit a dense number and stay silent.
     notes = []
     if a.get("multimodal"):
         notes.append(f"multimodal ({a['multimodal']}): the sizes above are the TEXT "
-                     "model — the vision projector (mmproj) ships separately (~1 GB in GGUF).")
+                     "model -- the vision projector (mmproj) ships separately (~1 GB in GGUF).")
     if a.get("hybrid"):
         mix = (f"{a['n_linear']}/{a['n_linear'] + a['n_full']} layers are linear-attention"
                if a.get("n_linear") else "linear-attention / SSM layers present")
         notes.append(f"hybrid attention ({mix}): the attention params are APPROXIMATE "
                      "(standard-attention formula applied to non-standard layers), and the "
-                     "linear layers barely grow the KV cache — throughput holds at long "
+                     "linear layers barely grow the KV cache -- throughput holds at long "
                      "context in a way this single-token ceiling doesn't capture.")
     if a.get("mtp"):
         notes.append(f"MTP present ({a['mtp']} predictor layer(s)): decode emits >1 token "
                      "per weight-read pass, so measured tok/s can EXCEED the RAM-bandwidth "
-                     "figure above — treat it as a FLOOR for this model, not a ceiling.")
+                     "figure above -- treat it as a FLOOR for this model, not a ceiling.")
     if notes:
         print("\narch notes:")
         for n in notes:
@@ -739,7 +739,7 @@ _FTYPE = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0",
 
 
 # GGML per-tensor type enum -> name. These are the model's ACTUAL on-disk tensor
-# types (ground truth), used when general.file_type is a value we don't recognize —
+# types (ground truth), used when general.file_type is a value we don't recognize --
 # so a brand-new or fork quant still gets named from what's really in the file.
 _GGML_TYPE = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
               8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K",
@@ -751,23 +751,23 @@ _FULL_PRECISION = {"F32", "F16", "BF16"}
 
 def describe_source(meta, bpw):
     """What quant is this GGUF, and is it a good pollard-fit source? Named from the
-    model's declared file_type (friendly preset name) OR — if that enum value is
-    unrecognized — the ACTUAL dominant tensor type read from the file. Only if BOTH
+    model's declared file_type (friendly preset name) OR -- if that enum value is
+    unrecognized -- the ACTUAL dominant tensor type read from the file. Only if BOTH
     are unknown do we say so honestly (with the raw ids), never a fake bpw label.
     Returns (label, is_full_precision, advice)."""
     ft = meta.get("general.file_type")
     dom = meta.get("_dominant_ggml_type")
     name = (_FTYPE.get(ft) if isinstance(ft, int) else None) \
         or (_GGML_TYPE.get(dom) if isinstance(dom, int) else None)
-    if name is None:                                    # truly unrecognized — be honest
+    if name is None:                                    # truly unrecognized -- be honest
         ids = [s for s in (f"file_type {ft}" if isinstance(ft, int) else None,
                            f"ggml type {dom}" if isinstance(dom, int) else None) if s]
         name = "unrecognized quant" + (f" ({', '.join(ids)})" if ids else "")
     full = name in _FULL_PRECISION or (name.startswith("unrecognized") and bpw >= 15.0)
     if full:
-        advice = "ideal source — pollard-fit builds straight from this"
+        advice = "ideal source -- pollard-fit builds straight from this"
     else:
-        advice = ("already quantized — pollard-fit CAN requantize it, but for best "
+        advice = ("already quantized -- pollard-fit CAN requantize it, but for best "
                   "quality grab the f16/bf16 source (usually the base repo, not a -GGUF one)")
     return name, full, advice
 
@@ -797,11 +797,11 @@ def main():
                    help="KV cache precision for the --ctx estimate (default f16; nvfp4 = Blackwell 4-bit KV)")
     p.add_argument("--gpu", help="your rig for the fit verdict: 'auto' to read the installed "
                                  "card from nvidia-smi, total VRAM GB, a card name, or "
-                                 "CARDxCOUNT — e.g. 'auto', '96', '16x2', '5090x4', "
+                                 "CARDxCOUNT -- e.g. 'auto', '96', '16x2', '5090x4', "
                                  "'rtx6000prox2'. Any card, listed or not: pass GB.")
     p.add_argument("--device", default="gpu", choices=["gpu", "unified", "mac", "phone"],
                    help="what --gpu's number is: dedicated 'gpu' VRAM (~94%% usable, "
-                        "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% — the OS "
+                        "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% -- the OS "
                         "OOM-kills past ~half)")
     p.add_argument("--build-hw", type=float, default=1.0,
                    help="build-time scale vs a GB10/Spark-class box (e.g. ~0.4 for a 5090, ~0.5 A100)")
@@ -820,7 +820,7 @@ def main():
     if str(a.ram).lower() == "auto":
         avail = detect_available_ram_gb()
         if avail is None:
-            sys.exit("ERROR: could not measure available RAM on this platform — "
+            sys.exit("ERROR: could not measure available RAM on this platform -- "
                      "pass --ram <GB> explicitly.")
         a.ram = avail
         print(f"[--ram auto] measured available memory: {avail:.1f} GB "
@@ -842,14 +842,14 @@ def main():
         shards = cfg.get("_shard_count", 1)
         shard_note = f", {shards} shards" if shards > 1 else ""
         print(f"source quant        : {label} (~{qbits:.2f} bpw{shard_note})  "
-              f"{'✅' if full else '⚠️'} {advice}\n")
+              f"{'OK' if full else '!'} {advice}\n")
     report(arch, a.ram, a.flash, a.rambw, qbits, cache)
     bt = estimate_build_time(arch, a.build_hw)
     hw = "GB10/Spark-class" if a.build_hw == 1.0 else f"{a.build_hw:.2f}x GB10-class"
-    print(f"est. quant build time ({hw}; ±~2x, calibrate to your box):")
-    print(f"   GGUF ladder {_fmt_hours(bt['gguf'])} · GPTQ {_fmt_hours(bt['gptq'])} · "
-          f"MLX {_fmt_hours(bt['mlx'])} · EXL3 {_fmt_hours(bt['exl3'])} (one bpw)  "
-          f"— the cheap→heavy spread: pick your lane before you run")
+    print(f"est. quant build time ({hw}; +/-~2x, calibrate to your box):")
+    print(f"   GGUF ladder {_fmt_hours(bt['gguf'])}  |  GPTQ {_fmt_hours(bt['gptq'])}  |  "
+          f"MLX {_fmt_hours(bt['mlx'])}  |  EXL3 {_fmt_hours(bt['exl3'])} (one bpw)  "
+          f"-- the cheap->heavy spread: pick your lane before you run")
     if a.ctx:
         kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}[a.kv_quant]
         rig_gb = None

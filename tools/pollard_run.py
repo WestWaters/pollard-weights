@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""pollard-run — measured expert placement for llama.cpp (RAM-streaming runtime).
+"""pollard-run -- measured expert placement for llama.cpp (RAM-streaming runtime).
 
 The RAM-streaming design (all experts resident in system RAM, active experts
-streamed to the GPU per token) is how big MoEs run on GPU boxes today —
+streamed to the GPU per token) is how big MoEs run on GPU boxes today --
 llama.cpp ships the machinery as `--cpu-moe` (all experts) and `--n-cpu-moe N`
 (the FIRST N layers, blind). pollard-run replaces the blind split with a
 measured one: it reads your routing profile (experiments/e2), ranks layers by
@@ -15,7 +15,7 @@ Usage:
   pollard-run --gguf model.gguf --profile heat_profile.json --vram 24 --launch
   pollard-run --gguf model.gguf --vram 24            # no profile: depth-order fallback
 
-The output command runs stock llama-server — nothing here forks the runtime.
+The output command runs stock llama-server -- nothing here forks the runtime.
 """
 import argparse
 import json
@@ -37,8 +37,8 @@ def main():
                     help="GPU memory budget in GB for weights (leave headroom for "
                          "KV/activations), or 'auto' to read free VRAM from nvidia-smi")
     ap.add_argument("--llama-server", default="llama-server")
-    ap.add_argument("--rpc", help="RPC servers to pool, 'host:port[,host:port…]' (run "
-                                  "ggml-rpc-server on each peer) — run a model too big for "
+    ap.add_argument("--rpc", help="RPC servers to pool, 'host:port[,host:port...]' (run "
+                                  "ggml-rpc-server on each peer) -- run a model too big for "
                                   "one box across several")
     ap.add_argument("--launch", action="store_true", help="exec the command instead of printing it")
     ap.add_argument("--extra", default="", help="extra llama-server args appended verbatim")
@@ -56,13 +56,13 @@ def main():
                     free_mb += nums[0]; total_mb += nums[1]
             if total_mb == 0:
                 raise ValueError("nvidia-smi reported no GPU memory")
-            # free VRAM reads ~0 when a model is already resident — but placement PLANS
+            # free VRAM reads ~0 when a model is already resident -- but placement PLANS
             # for when pollard's own model loads (that resident copy is gone by then), so
             # fall back to TOTAL instead of erroring on a 0 budget (Frank's 09 failure).
             if free_mb < total_mb * 0.10:
                 a.vram = total_mb / 1024 * 0.85
                 print(f"[--vram auto] only {free_mb/1024:.1f} GB free of {total_mb/1024:.1f} "
-                      f"GB — GPU is occupied; planning against TOTAL VRAM -> budget "
+                      f"GB -- GPU is occupied; planning against TOTAL VRAM -> budget "
                       f"{a.vram:.1f} GB (15% reserved). Pass --vram N to pin it.")
             else:
                 a.vram = free_mb / 1024 * 0.85          # keep 15% for KV/compute
@@ -78,7 +78,7 @@ def main():
     cfg = gguf_to_config(meta, a.gguf)
     arch = analyse(cfg)
     if arch["kind"] != "moe":
-        sys.exit("ERROR: not a MoE GGUF — measured expert placement needs experts. "
+        sys.exit("ERROR: not a MoE GGUF -- measured expert placement needs experts. "
                  "For dense models just set -ngl to what fits.")
 
     layers = arch["layers"]
@@ -110,7 +110,7 @@ def main():
     budget = a.vram - other_gb                              # non-expert weights sit on GPU
     if budget < 0:
         sys.exit(f"ERROR: non-expert weights alone ({other_gb:.1f}GB) exceed the "
-                 f"{a.vram:.0f}GB VRAM budget — lower the quant or raise --vram.")
+                 f"{a.vram:.0f}GB VRAM budget -- lower the quant or raise --vram.")
     gpu_layers, used = [], 0.0
     for i in ranked:
         if used + expert_gb_layer <= budget:
@@ -127,7 +127,7 @@ def main():
           f"streamed from RAM for {len(cpu_layers)} layers")
     print(f"ranking signal      : "
           + ("measured per-layer reuse (profile)" if heat else
-             "NONE — depth order fallback. Capture a profile with experiments/e2 "
+             "NONE -- depth order fallback. Capture a profile with experiments/e2 "
              "for a measured split."))
     if cpu_layers:
         est = len(cpu_layers) / layers
@@ -139,7 +139,7 @@ def main():
         cmd += ["--rpc", a.rpc]                         # for one box (run ggml-rpc-server there)
     if cpu_layers:
         pats = ",".join(f"blk\\.{i}\\.ffn_.*_exps\\.weight=CPU" for i in cpu_layers)
-        # RAM-streaming means experts RESIDENT in RAM, not paged from disk —
+        # RAM-streaming means experts RESIDENT in RAM, not paged from disk --
         # llama.cpp itself recommends --no-mmap when overriding tensors to CPU.
         cmd += ["-ot", pats, "--no-mmap"]
     if a.extra:
@@ -152,7 +152,7 @@ def main():
     resolved = find_llama_bin(cmd[0])
     if resolved is None:
         sys.exit(f"ERROR: {cmd[0]} not found. install.sh builds it into "
-                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass --llama-server.")
+                 f"runtime/llama.cpp/build/bin -- re-run install.sh, or pass --llama-server.")
     cmd[0] = resolved
     os.execvp(cmd[0], cmd)
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""pollard-export — take a Pollard sensitivity profile and emit a vLLM/SGLang-loadable
+"""pollard-export -- take a Pollard sensitivity profile and emit a vLLM/SGLang-loadable
 GPTQ checkpoint with Pollard's measured allocation carried over as a gptqmodel `dynamic`
 4/8-bit mix. This is the GPU-runtime lane: llama.cpp/ik_llama.cpp gets the 1-bit trellis
 flagship; vLLM/SGLang get a sensitivity-allocated 4/8 GPTQ that runs Marlin-accelerated.
 
 Why 4/8 and not 1-2: vLLM/SGLang's fast Marlin kernel supports ONLY 4-bit and 8-bit, so
-the measured mix lives there — sensitive modules kept at 8-bit, the tolerant body crushed
+the measured mix lives there -- sensitive modules kept at 8-bit, the tolerant body crushed
 to 4-bit, allocated by Pollard's profile. gptqmodel's per-module `dynamic` is "fully
 integrated into vLLM"; SGLang loads GPTQ but its mixed-bit is fragile (layer fusion), so
 `--uniform` emits a plain W4 for SGLang.
@@ -47,7 +47,7 @@ resolve_trust_remote_code = ws.resolve_trust_remote_code   # shared across every
 
 
 def detect_mla(model_id):
-    """True if the model uses Multi-head Latent Attention (DeepSeek-V2/V3, GLM-4.5/5.3) — its
+    """True if the model uses Multi-head Latent Attention (DeepSeek-V2/V3, GLM-4.5/5.3) -- its
     attention is q_a/q_b/kv_a/kv_b_proj, not q/k/v_proj. ATTN_PROJ matches both; this is only
     for the user-facing note. Detected from the low-rank KV config field."""
     try:
@@ -81,10 +81,10 @@ def allocate(sens, n_layers, hot_frac, focus=None):
 
 
 # Arch-agnostic projection matchers. Standard attention is q/k/v/o_proj; MLA (DeepSeek-V2/V3,
-# GLM-4.5/5.3) replaces them with q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj — all still end in
-# "proj", none of the norms do — so "any *proj* under self_attn" catches both without a per-arch table.
+# GLM-4.5/5.3) replaces them with q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj -- all still end in
+# "proj", none of the norms do -- so "any *proj* under self_attn" catches both without a per-arch table.
 ATTN_PROJ = r"self_attn\.[a-z_]*proj[a-z0-9_]*"
-# Dense FFN is gate/up/down_proj; MoE also carries the same names under experts.<i>. — this catches both.
+# Dense FFN is gate/up/down_proj; MoE also carries the same names under experts.<i>. -- this catches both.
 FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.\d+)?\.(?:gate|up|down)_proj"
 
 
@@ -107,9 +107,9 @@ def dynamic_config(alloc):
 def moe_dynamic_config(alloc):
     """MoE `dynamic` map (Qwen-MoE / Mixtral / DeepSeek naming). The Pollard MoE policy carried
     into the GPTQ lane: base LOW (4-bit) crushes the cold experts; the ROUTER and SHARED experts
-    are ALWAYS protected at HIGH (8-bit) — crushing the router scrambles expert selection — and the
+    are ALWAYS protected at HIGH (8-bit) -- crushing the router scrambles expert selection -- and the
     experts of the most-sensitive (`ffn`-hot) layers go HIGH. Attention follows the `attn` profile.
-    Router = `mlp.gate` (Qwen) / `block_sparse_moe.gate` (Mixtral) — matched with `\\.gate$` so it
+    Router = `mlp.gate` (Qwen) / `block_sparse_moe.gate` (Mixtral) -- matched with `\\.gate$` so it
     never catches an expert's `gate_proj`."""
     dyn = {}
     # ALWAYS protect the router (selection integrity) and the shared expert (every-token path).
@@ -150,23 +150,23 @@ def print_shard_plan(model_id, n_layers, n_nodes, bf16_gb):
     ranges = shard_ranges(n_layers, n_nodes)
     per_layer_gb = (bf16_gb / n_layers) if (bf16_gb and n_layers) else 0.0
     print(f"== pollard-export band-parallel plan :: {model_id}")
-    print(f"   {n_layers} decoder layers over {len(ranges)} node(s) — contiguous bands, "
+    print(f"   {n_layers} decoder layers over {len(ranges)} node(s) -- contiguous bands, "
           "one boundary hidden state handed to the next node:")
     for k, (s, e) in enumerate(ranges):
-        budget = f" · ~{per_layer_gb*(e-s):.1f} GB bf16 resident" if per_layer_gb else ""
+        budget = f"  |  ~{per_layer_gb*(e-s):.1f} GB bf16 resident" if per_layer_gb else ""
         print(f"   node {k}: layers [{s}..{e-1}]  ({e-s} layers){budget}")
     print("   handoff contract: node k quantizes its band with the offload path, re-runs the quantized"
           "\n     band to produce the hidden state at its last layer, and passes THAT to node k+1 as"
           "\n     its input (node 0 starts from the embedded calibration tokens).")
-    print("   NOTE: verify end-to-end on your own cluster — storage egress (~100 MB/s/box in the field)"
+    print("   NOTE: verify end-to-end on your own cluster -- storage egress (~100 MB/s/box in the field)"
           " is usually the wall-clock wall, not compute.")
 
 
 def kv_note(model_id):
     """Victor's point: vLLM pre-allocates KV hard (gpu_memory_utilization ~0.9, paged
-    attention) — far more headroom than llama.cpp. Flag it so the target VRAM is realistic."""
+    attention) -- far more headroom than llama.cpp. Flag it so the target VRAM is realistic."""
     return ("vLLM reserves KV cache up front (gpu_memory_utilization ~0.9). Budget "
-            "weights + a large KV pool + activations, not just the weight bytes — a model "
+            "weights + a large KV pool + activations, not just the weight bytes -- a model "
             "that fits in GGUF on a card can OOM in vLLM. Lower --gpu-memory-utilization or "
             "--max-model-len if it won't fit; run one load test before publishing the fit.")
 
@@ -182,7 +182,7 @@ def main():
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
     ap.add_argument("--hot-frac", type=float, default=0.35, help="fraction of layers kept at 8-bit")
     ap.add_argument("--focus-layers", help="force these layer indices to HIGH bits regardless of the "
-                    "sensitivity profile — steer the budget to layers you care about, e.g. '3,4,8' or "
+                    "sensitivity profile -- steer the budget to layers you care about, e.g. '3,4,8' or "
                     "'3-8,16'. Unions into the measured hot set (works even with no profile).")
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--uniform", action="store_true", help="plain uniform W4 (for SGLang mixed-bit fragility)")
@@ -206,7 +206,7 @@ def main():
     auto_moe, det_layers = detect_moe(a.model, n_layers)
     n_layers = n_layers or det_layers
     if not n_layers:
-        sys.exit("ERROR: could not read layer count — pass --layers.")
+        sys.exit("ERROR: could not read layer count -- pass --layers.")
     is_moe = auto_moe if a.moe is None else a.moe
 
     if a.shard_plan:
@@ -221,12 +221,12 @@ def main():
     ab = LOW if a.uniform else avg_bits(alloc)
     kind = "MoE" if is_moe else "dense"
     print(f"== pollard-export :: {a.model}  [{kind}{' auto' if a.moe is None else ''}]")
-    print(f"   {n_layers} layers · {'UNIFORM W4 (SGLang-safe)' if a.uniform else f'4/8 dynamic mix, avg {ab:.2f} bits'}"
-          f" · group_size {a.group_size} · desc_act False · sym True")
+    print(f"   {n_layers} layers  |  {'UNIFORM W4 (SGLang-safe)' if a.uniform else f'4/8 dynamic mix, avg {ab:.2f} bits'}"
+          f"  |  group_size {a.group_size}  |  desc_act False  |  sym True")
     if is_moe and not a.uniform:
         print("   MoE: router + shared experts pinned 8-bit (selection integrity); cold experts 4-bit")
     if detect_mla(a.model) and not a.uniform:
-        print("   MLA attention detected (q_a/q_b/kv_a/kv_b_proj) — allocation matches it arch-agnostically")
+        print("   MLA attention detected (q_a/q_b/kv_a/kv_b_proj) -- allocation matches it arch-agnostically")
     print(f"   8-bit modules: {len(dyn)} groups (sensitivity-ranked hot set)")
     print(f"   NOTE (KV/memory): {kv_note(a.model)}")
     if a.plan_only:
@@ -234,7 +234,7 @@ def main():
         for k, v in list(dyn.items())[:8]:
             print(f"     {k}  -> {v}")
         if len(dyn) > 8:
-            print(f"     … +{len(dyn)-8} more")
+            print(f"     ... +{len(dyn)-8} more")
         return
 
     # ---- build with gptqmodel (runs on a CUDA box; produces a vLLM/SGLang GPTQ checkpoint)

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""pollard-pack --target wafer — a WAFER CAPACITY & THROUGHPUT PLANNER for
+"""pollard-pack --target wafer -- a WAFER CAPACITY & THROUGHPUT PLANNER for
 Cerebras-class SRAM machines. It does NOT run on a wafer and it does NOT emit
 wafer weights (Cerebras is a closed 16-bit stack with no user low-bit path). It
 is an OFFLINE FORECAST: reuse Pollard's hot-set/cold-bulk ranking to produce a
 dense/sparse tensor plan, then forecast wafers-per-model, active-bytes/token, and
-a bandwidth-bound tokens/s uplift — the numbers that actually decide cost and
+a bandwidth-bound tokens/s uplift -- the numbers that actually decide cost and
 speed on an SRAM machine.
 
 HONEST MODEL (verified against Cerebras docs):
-  * Inference weights are SRAM-RESIDENT and 16-bit (FP16/BF16/cbfloat16) — a 30B
+  * Inference weights are SRAM-RESIDENT and 16-bit (FP16/BF16/cbfloat16) -- a 30B
     model is ~60 GB resident REGARDLESS of source quantization. So bit-width crush
     does NOT shrink the on-wafer footprint. The only wafer lever is PRUNING:
     the cores skip zeros, so Pollard's SENSITIVITY RANKING is re-cast here as
@@ -32,7 +32,7 @@ CHIPS = {
     "wse3t": {"name": "WSE-3 Turbo (CS-4)", "sram_gb": 44.0, "bw_pbs": 43.2},
 }
 BYTES16 = 2.0                                   # on-wafer weights are 16-bit, period
-# Calibration anchors (published single-stream, for reference — NOT used to fabricate a
+# Calibration anchors (published single-stream, for reference -- NOT used to fabricate a
 # t/s number; single-stream is layer-depth bound, so we forecast CAPACITY, not speed):
 #   gpt-oss-120B (5.1B active/117B) = 3000 t/s CS-3 / 4400 CS-4; Qwen3-235B-A22B = ~1450;
 #   Llama-70B dense = ~2500; Llama-405B dense = 969. (gpt-oss > 70B proves active-driven.)
@@ -122,7 +122,7 @@ def main():
     ap.add_argument("--target", default="wse3t", choices=list(CHIPS))
     ap.add_argument("--prune-experts", type=float, default=0.5,
                     help="fraction of experts to REAP-prune, sensitivity-ranked (0..1; ~0.5 = parity per Cerebras)")
-    ap.add_argument("--sensitivity", help="pollard sensitivity.json — ranks WHICH experts to drop")
+    ap.add_argument("--sensitivity", help="pollard sensitivity.json -- ranks WHICH experts to drop")
     ap.add_argument("--expert-usage", help="router-usage json {\"<layer>\":[per-expert score,...]} to resolve drop-ids")
     ap.add_argument("--emit-plan", help="write the actionable per-layer expert-prune plan to this path")
     ap.add_argument("--json", help="write the forecast to this path")
@@ -139,7 +139,7 @@ def main():
     print(f"   target {f['chip']}  ({f['sram_gb']:.0f} GB SRAM/wafer, weights 16-bit resident)")
     if not p["is_moe"]:
         print("   NO WAFER LEVER: dense model. On-wafer weights are 16-bit regardless of source")
-        print("   quant, and there is no user low-bit / inference-sparsity path — so Pollard cannot")
+        print("   quant, and there is no user low-bit / inference-sparsity path -- so Pollard cannot")
         print(f"   reduce the footprint. Needs {f['wafers_dense']} wafer(s) either way. (The wafer win")
         print("   is MoE expert-pruning; a dense model has none.)")
     else:
@@ -151,7 +151,7 @@ def main():
         print(f"   resident:  {p['res_dense_gb']:.1f} GB -> {p['res_pruned_gb']:.1f} GB   (-{f['resident_cut_pct']:.0f}%)")
         print(f"   WAFERS:    {f['wafers_dense']} -> {f['wafers_pruned']}   (save {f['wafers_saved']})   <- the cost lever")
         print(f"   active/token: {p['act_gb']:.2f} GB (~unchanged by pruning; top-k still routes to k survivors)")
-        print("   THROUGHPUT: not forecast here — single-stream t/s on a wafer is layer-DEPTH bound,")
+        print("   THROUGHPUT: not forecast here -- single-stream t/s on a wafer is layer-DEPTH bound,")
         print("   not active-bytes bound; active-bytes only caps CONCURRENT throughput.")
     print("   SCOPE: forecast only. Cerebras inference is 16-bit, closed-stack, no user low-bit path;")
     print("   real deployment + the sparse layout require a Cerebras partnership.")

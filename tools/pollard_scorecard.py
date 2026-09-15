@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-scorecard — emit the standardized memory-fit low-bit scorecard from measured
+"""pollard-scorecard -- emit the standardized memory-fit low-bit scorecard from measured
 results. One command -> the reproducible ruler: three bars (uniform-1bit / Mix / 2bit
 ceiling), size + PPL (+ KL when present), the allocation map, the fixed chat suite, and
 honest errata. Data-driven so the same tool scores every model in the sweep.
@@ -52,7 +52,7 @@ def interp_ppl(bars):
 
 def shrink_headline(r):
     """Lead every card with what Pollard DID: f16 size -> smallest build, % smaller, and
-    where it lands vs NVFP4 — the pitch, not buried in a table (Frank's ask)."""
+    where it lands vs NVFP4 -- the pitch, not buried in a table (Frank's ask)."""
     pb = r.get("params_b")
     bars = r.get("bars") or []
     if not pb or not bars:
@@ -61,25 +61,25 @@ def shrink_headline(r):
     small = min(b["gb"] for b in bars)
     pct = 100 * (1 - small / f16)
     nvfp4 = pb * 4.25 / 8
-    return (f"> ### Pollard shrank this model: **{f16:.1f} GB (f16) → {small:.2f} GB** "
-            f"— **{pct:.0f}% smaller, {f16/small:.1f}× down**, vs ~{nvfp4:.1f} GB at NVFP4.\n"
+    return (f"> ### Pollard shrank this model: **{f16:.1f} GB (f16) -> {small:.2f} GB** "
+            f"-- **{pct:.0f}% smaller, {f16/small:.1f}x down**, vs ~{nvfp4:.1f} GB at NVFP4.\n"
             f"> Pick the size that fits your machine from the table below.\n")
 
 
 def md(r):
     pb = r.get("params_b")
     L = []
-    L.append(f"# Pollard memory-fit scorecard — {r['model']}\n")
+    L.append(f"# Pollard memory-fit scorecard -- {r['model']}\n")
     hl = shrink_headline(r)
     if hl:
         L.append(hl)
-    L.append(f"*{r.get('runtime','')}* · source: {r.get('source','')} · eval: {r.get('eval','')}\n")
+    L.append(f"*{r.get('runtime','')}*  |  source: {r.get('source','')}  |  eval: {r.get('eval','')}\n")
     # three bars
     L.append("## Bars (same source, same eval)\n")
     L.append("| build | role | PPL | size (GB) | bpw | KL vs f16 |")
     L.append("|---|---|---:|---:|---:|---:|")
     for b in r["bars"]:
-        kl = f"{b['kl']:.4f}" if "kl" in b else "—"
+        kl = f"{b['kl']:.4f}" if "kl" in b else "--"
         L.append(f"| **{b['name']}** | {b['role']} | {b['ppl']:.2f} | {b['gb']:.3f} | "
                  f"{bpw(b['gb'], pb):.2f} | {kl} |")
     L.append("")
@@ -88,8 +88,8 @@ def md(r):
         lin, gain = ip
         mix = next(b for b in r["bars"] if b["role"] == "mix")
         base = next(b for b in r["bars"] if b["role"] == "1-bit baseline")
-        L.append(f"**Read:** Mix **{mix['ppl']:.2f}** PPL @ {mix['gb']:.3f} GB — beats uniform "
-                 f"1-bit ({base['ppl']:.2f}) and beats the 1bit→2bit size-interpolation "
+        L.append(f"**Read:** Mix **{mix['ppl']:.2f}** PPL @ {mix['gb']:.3f} GB -- beats uniform "
+                 f"1-bit ({base['ppl']:.2f}) and beats the 1bit->2bit size-interpolation "
                  f"(~{lin:.2f} at this size) by **{gain:.1f}%**. Quality win vs uniform 1-bit "
                  f"(+{mix['gb']-base['gb']:.3f} GB), under the 2-bit ceiling.\n")
     # allocation / surgery table
@@ -103,7 +103,7 @@ def md(r):
         L.append("")
     # chat suite
     if r.get("chat"):
-        L.append(f"## Chat suite  (sampling: {r.get('sampling','—')})\n")
+        L.append(f"## Chat suite  (sampling: {r.get('sampling','--')})\n")
         L.append("| prompt | result |")
         L.append("|---|---|")
         for p, v in r["chat"]:

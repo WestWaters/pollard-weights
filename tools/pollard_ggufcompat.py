@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-ggufcheck — which runtime can actually load a GGUF we built?
+"""pollard-ggufcheck -- which runtime can actually load a GGUF we built?
 
 A file's name does not decide this. Two things in its header do, and either one alone is enough to
 make a file unloadable in stock llama.cpp:

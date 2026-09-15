@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""pollard-hf-smooth — activation-aware SmoothQuant preconditioning for an HF model, IN PLACE of the
+"""pollard-hf-smooth -- activation-aware SmoothQuant preconditioning for an HF model, IN PLACE of the
 weights, folded into the RMSNorms as a mathematical identity. Run it BEFORE a low-bit convert (EXL3 /
 GPTQ / MX lanes) so massive-activation input channels can't wreck the quantization.
 
 Why it exists: low-bit trellis/GPTQ quant has NO input-outlier protection. A single massive-activation
 input channel (e.g. the residual-stream outlier that emerges in the first couple of layers) collapses the
-quantizer's global scale, so every NORMAL channel gets under-quantized and the layer forwards to garbage —
+quantizer's global scale, so every NORMAL channel gets under-quantized and the layer forwards to garbage --
 while per-tensor and Hessian-proxy metrics still look perfect (see legacy/PROXY_ERR_BANNED.md). Measured
-case: Qwen2.5-3B layer 1 MLP-input activation max 453 → 4bpw layer sqnr -14 (PPL 3090); after this
-preconditioning → sqnr +18, sane PPL, no bits spent.
+case: Qwen2.5-3B layer 1 MLP-input activation max 453 -> 4bpw layer sqnr -14 (PPL 3090); after this
+preconditioning -> sqnr +18, sane PPL, no bits spent.
 
 The fix (SmoothQuant, per input channel j, exact/identity):
     s_j = max|X_j|^alpha / max|W_j|^(1-alpha)          (clamped)
     norm.weight[j] /= s_j ;  W[:, j] *= s_j   for every consumer linear W on that seam
 X activations come from a calibration forward; the fold into RMSNorm.weight is exact (RMS is over the
-pre-weight input), so the model computes the same thing — the quantizer just sees a flatter input.
+pre-weight input), so the model computes the same thing -- the quantizer just sees a flatter input.
 
 Seams (norm -> linears), auto-detected per architecture:
     A: input_layernorm         -> q_proj, k_proj, v_proj

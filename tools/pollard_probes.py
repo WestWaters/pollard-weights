@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-probes — task-accuracy probes on a Pollard'd GGUF, via llama.cpp's OWN MCQ modes.
+"""pollard-probes -- task-accuracy probes on a Pollard'd GGUF, via llama.cpp's OWN MCQ modes.
 
 PPL + KL + top-1 (pollard-bench) say the distribution is close; they don't catch a capability the
 crush quietly broke. This measures real multiple-choice accuracy (HellaSwag / Winogrande / MMLU-style)
@@ -8,9 +8,9 @@ so you SEE reasoning regression, and it pairs with pollard-calib (calibrate on c
 Why NOT lm-eval-harness here (verified 2026-09-04): lm-eval's server backends can't do this for a
 Pollard GGUF. Its `gguf` backend needs OpenAI-legacy `logprobs.token_logprobs` with working `echo`, but
 llama-server returns `logprobs.content` and does NOT honor echo (no prompt-token logprobs). And
-llama-cpp-python (which would) bundles STOCK llama.cpp — it can't even LOAD a non-standard type like
+llama-cpp-python (which would) bundles STOCK llama.cpp -- it can't even LOAD a non-standard type like
 STQ1_0. So we use the ONE tool that both reads every Pollard type AND scores MCQ internally: our patched
-`llama-perplexity` (`--hellaswag` / `--winogrande` / `--multiple-choice`) — no server, no echo, no
+`llama-perplexity` (`--hellaswag` / `--winogrande` / `--multiple-choice`) -- no server, no echo, no
 logprobs plumbing. Verified: STQ1_0 1.5B HellaSwag 38.5% vs its f16 53.0%.
 
   pollard-probes --gguf model.gguf --label pollard                       # HellaSwag (auto-prep 400 tasks)
@@ -73,7 +73,7 @@ def main():
 
     binp = a.perplexity_bin or find_llama_bin("llama-perplexity")
     if not binp:
-        sys.exit("ERROR: llama-perplexity not found (needs the PATCHED build for STQ1_0/IQ*_KT) — "
+        sys.exit("ERROR: llama-perplexity not found (needs the PATCHED build for STQ1_0/IQ*_KT) -- "
                  "pass --perplexity-bin.")
 
     if a.winogrande:
@@ -97,7 +97,7 @@ def main():
         r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
     sc = parse_score(log)
     if r.returncode != 0 or not sc:
-        sys.exit(f"   run failed or no score parsed — see {log}")
+        sys.exit(f"   run failed or no score parsed -- see {log}")
     print(f"   {mode} accuracy: {sc[1]:.2f}%  ({sc[0]} tasks)   [{a.label}]")
     print(f"   log: {log}")
 

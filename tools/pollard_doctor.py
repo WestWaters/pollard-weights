@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""pollard-doctor (DrDiag) — diagnose, repair, or improve a model for low-bit quantization, on any lane.
+"""pollard-doctor (DrDiag) -- diagnose, repair, or improve a model for low-bit quantization, on any lane.
 
 It packages the hard-won diagnostics into one command so a user can point it at a model and get a
-straight answer: is this convert healthy, WHY is it broken, and exactly how to fix it — without ever
+straight answer: is this convert healthy, WHY is it broken, and exactly how to fix it -- without ever
 trusting a lying proxy metric (see legacy/PROXY_ERR_BANNED.md).
 
 Three things it checks:
   1. HEALTH (needs --source fp16): per-tensor decode round-trip vs the source weight, and the assembled
      end-to-end forward (next-tok acc / ppl). Real reconstruction only. (via pollard-verify)
-  2. RISK / ROOT CAUSE (scan the fp16 source): finds massive-activation input channels — the outliers
+  2. RISK / ROOT CAUSE (scan the fp16 source): finds massive-activation input channels -- the outliers
      that collapse a low-bit quantizer's global scale and silently wreck a layer (the exact bug behind
      "weights decode fine but the model is garbage"). Predicts which layers will break at low bit.
-  3. FIX: recommends (or with --repair, runs) the repair — `pollard-hf-smooth` preconditioning to migrate
+  3. FIX: recommends (or with --repair, runs) the repair -- `pollard-hf-smooth` preconditioning to migrate
      the outliers, then reconvert on the chosen lane, then re-verify.
 
   pollard-doctor --model ./M-exl3 --source ./M-fp16                 # diagnose a converted model
@@ -39,7 +39,7 @@ def scan_outliers(source_dir, device, calib, rows, cols, thresh):
     try:
         layers = model.model.layers
     except AttributeError:
-        print("   (risk-scan: unsupported arch — expected model.model.layers)"); return []
+        print("   (risk-scan: unsupported arch -- expected model.model.layers)"); return []
     amax = {}
     def mk(i, tag):
         def h(m, inp, out):
@@ -84,7 +84,7 @@ def cal_response(model_a, model_b, source, eval_dir, device):
     """Classify WHY two builds (from different calibrations) differ: allocator-shift vs dilution vs noise."""
     print("\n[cal-response] why did the calibration change move the number?")
     problems = 0
-    # 1) ALLOCATION DIFF — did the (budgeted) allocator re-decide bits? big shift = non-monotonic response to cal
+    # 1) ALLOCATION DIFF -- did the (budgeted) allocator re-decide bits? big shift = non-monotonic response to cal
     ba, bb = _exl3_bits(model_a), _exl3_bits(model_b)
     common = sorted(set(ba) & set(bb))
     changed = [(t, ba[t], bb[t]) for t in common if ba[t] != bb[t]]
@@ -94,10 +94,10 @@ def cal_response(model_a, model_b, source, eval_dir, device):
         print(f"       {t:<44} {a}b -> {b}b")
     if frac >= 0.10:
         print("     => the allocator RE-DECIDED bits from the new cal (NON-MONOTONIC response to cal volume/mix)."
-              " This is inherent allocator behavior — not fixable by mix alone; find the cal size sweet spot.")
+              " This is inherent allocator behavior -- not fixable by mix alone; find the cal size sweet spot.")
     else:
         print("     => allocation barely moved; the delta is from the cal CONTENT, not re-allocation (see step 2).")
-    # 2) MULTI-DOMAIN EVAL — domain-specific delta = dilution (fixable by mix); uniform = allocator/noise
+    # 2) MULTI-DOMAIN EVAL -- domain-specific delta = dilution (fixable by mix); uniform = allocator/noise
     if eval_dir and os.path.isdir(eval_dir):
         import glob
         print("  2) per-domain eval (domain-specific delta = mix dilution; uniform = allocator/noise):")
@@ -115,9 +115,9 @@ def cal_response(model_a, model_b, source, eval_dir, device):
     else:
         print("  2) per-domain eval: skipped (pass --eval-dir <dir of domain .txt> to test dilution vs allocator)")
         problems += 0
-    # 3) NOISE — the honest floor
+    # 3) NOISE -- the honest floor
     print("  3) noise floor: re-run the SAME cal config once; if the number moves ~as much as A-vs-B, the"
-          " difference is NOISE, not a real lever. (Convert-level noise needs a repeat convert — can't infer from one run.)")
+          " difference is NOISE, not a real lever. (Convert-level noise needs a repeat convert -- can't infer from one run.)")
     return 0
 
 
@@ -174,9 +174,9 @@ def main():
 
     problems = 0
 
-    # 1. HEALTH — delegate to pollard-verify (real reconstruction, never proxy_err)
+    # 1. HEALTH -- delegate to pollard-verify (real reconstruction, never proxy_err)
     if a.model and a.source:
-        print("\n[1] HEALTH — real reconstruction vs source (via pollard-verify)")
+        print("\n[1] HEALTH -- real reconstruction vs source (via pollard-verify)")
         here = os.path.dirname(os.path.abspath(__file__))
         cmd = [sys.executable, os.path.join(here, "pollard_verify.py"),
                "--model", a.model, "--source", a.source, "--lane", a.lane, "--end-to-end"]
@@ -185,28 +185,28 @@ def main():
             problems += 1
             print("   -> health check FAILED (broken build).")
 
-    # 2. RISK / ROOT CAUSE — scan the fp16 source for massive activations
+    # 2. RISK / ROOT CAUSE -- scan the fp16 source for massive activations
     risky = []
     if a.source and (a.predict or a.repair or (a.model and problems)):
-        print("\n[2] RISK — massive-activation input channels (low-bit break predictor)")
+        print("\n[2] RISK -- massive-activation input channels (low-bit break predictor)")
         risky = scan_outliers(a.source, a.device, a.calib, a.rows, a.cols, a.outlier_thresh)
         if risky:
             problems += 1
-            print(f"   !! {len(risky)} risky seam(s) — a low-bit convert may silently break these layers:")
+            print(f"   !! {len(risky)} risky seam(s) -- a low-bit convert may silently break these layers:")
             for i, tag, mx in risky[:8]:
                 print(f"      layer {i:>3}  {tag}-input  max|X|={mx:.1f}")
             print("   These outliers collapse the quantizer's global scale -> normal channels under-"
                   "quantized -> garbage forward (per-tensor/proxy metrics won't show it).")
         else:
-            print(f"   clean — no input channel above {a.outlier_thresh}. Low-bit convert should be safe.")
+            print(f"   clean -- no input channel above {a.outlier_thresh}. Low-bit convert should be safe.")
 
-    # 3. FIX — recommend or run the repair
+    # 3. FIX -- recommend or run the repair
     if risky or a.repair:
         out = a.out or (os.path.normpath(a.source).rstrip("/\\") + f"-sm")
         here = os.path.dirname(os.path.abspath(__file__))
         smooth = [sys.executable, os.path.join(here, "pollard_hf_smooth.py"),
                   "--model", a.source, "--out", out] + (["--calib", a.calib] if a.calib else [])
-        print("\n[3] FIX — SmoothQuant preconditioning, then reconvert on the lane")
+        print("\n[3] FIX -- SmoothQuant preconditioning, then reconvert on the lane")
         print("   smooth:    " + " ".join(smooth))
         lane_cmd = {"exl3": f"pollard-exl3 --model {out} --out {out}-exl3 --bpw {a.bpw}",
                     "gptq": f"pollard-gptq --model {out} --out {out}-gptq --bits {int(a.bpw)}",
@@ -223,7 +223,7 @@ def main():
 
     if not (a.model or a.source):
         ap.error("give --model+--source (diagnose a build), or --source (--predict / --repair).")
-    print(f"\n{'ISSUES FOUND: ' + str(problems) if problems else 'HEALTHY — no issues found.'}")
+    print(f"\n{'ISSUES FOUND: ' + str(problems) if problems else 'HEALTHY -- no issues found.'}")
     sys.exit(1 if problems and not a.repair else 0)
 
 

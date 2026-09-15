@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""pollard-fit-dit — memory-fit builds for ANY GGUF architecture, pure Python.
+"""pollard-fit-dit -- memory-fit builds for ANY GGUF architecture, pure Python.
 
-llama-quantize only speaks LLM architectures; diffusion models (DiTs — video,
+llama-quantize only speaks LLM architectures; diffusion models (DiTs -- video,
 image, audio) live in GGUF too but get rejected. This builder sidesteps the
 C++ entirely: it reads any GGUF with gguf-py, chooses a per-tensor type from a
 protection policy and a byte budget, quantizes with gguf-py's own kernels
-(Q4_0 / Q5_0 / Q8_0 / F16 ladder — the same mechanism community DiT quants
+(Q4_0 / Q5_0 / Q8_0 / F16 ladder -- the same mechanism community DiT quants
 are made with), and writes a normal GGUF back out.
 
 Usage:
@@ -31,7 +31,7 @@ LADDER = [T.Q8_0, T.Q5_0, T.Q4_0]
 BPW = {T.F32: 32, T.F16: 16, T.BF16: 16, T.Q8_0: 8.5, T.Q5_0: 5.5, T.Q4_0: 4.6}
 DEFAULT_PROTECT = ["adaln", "norm", "bias", "emb", "patch_proj", "head",
                    "modulation", "time_", "t_table", "final"]
-TINY = 1 << 16          # tensors below this stay F16 — overhead beats savings
+TINY = 1 << 16          # tensors below this stay F16 -- overhead beats savings
 
 
 def plan(reader, budget_gb, protect_frags):
@@ -89,11 +89,11 @@ def main():
     print(f"== pollard-fit-dit :: {a.gguf}  [{arch}]")
     print(f"tensors             : {len(assign)}")
     print(f"projected build     : {gb:.2f} GB  (budget {a.budget_gb:g} GB)")
-    print(f"type mix            : " + ", ".join(f"{n}×{k}" for k, n in sorted(c.items())))
+    print(f"type mix            : " + ", ".join(f"{n}x{k}" for k, n in sorted(c.items())))
     if a.plan_only:
         return
     if gb > a.budget_gb * 1.02:
-        sys.exit("ERROR: cannot reach the budget with the Q4_0 floor — "
+        sys.exit("ERROR: cannot reach the budget with the Q4_0 floor -- "
                  "lower --budget-gb expectations or prune first.")
 
     out = a.out or a.gguf.rsplit(".gguf", 1)[0] + "-pollard.gguf"

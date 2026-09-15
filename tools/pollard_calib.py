@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""pollard-calib — build a MULTI-DOMAIN calibration corpus (Calib 3.0).
+"""pollard-calib -- build a MULTI-DOMAIN calibration corpus (Calib 3.0).
 
 The calibration corpus is what lets imatrix / pollard-sensitivity route to the tensors that
-matter — and the biggest measured quality lever the good quantizers (Unsloth Dynamic 3.0) pay
+matter -- and the biggest measured quality lever the good quantizers (Unsloth Dynamic 3.0) pay
 for is NOT exotic types, it's a bigger, domain-MIXED calib (chat + code + math + multilingual +
 prose) with enough coverage. Undercovered experts hard-fail low-bit ("Missing importance matrix
-… bailing out") and bloat the build; a prose-only calib misranks. This tool assembles a balanced,
+... bailing out") and bloat the build; a prose-only calib misranks. This tool assembles a balanced,
 high-coverage corpus so every downstream imatrix/sensitivity pass sees all the domains.
 
 It emits a raw text corpus (newline-separated samples) that works for BOTH `llama-imatrix -f`
@@ -18,7 +18,7 @@ imatrix isn't overfit (KL on unseen text should track KL on the calib text).
   pollard-calib --out calib.txt --per-domain 400 --held-out calib.heldout.txt
   pollard-calib --out calib.txt --domains code,math,chat # only these (e.g. a coding model)
   pollard-calib --out calib.txt --min-chars 200 --seed 0
-The imatrix/sensitivity COMPUTE (GPU) is a separate step — this only builds the corpus.
+The imatrix/sensitivity COMPUTE (GPU) is a separate step -- this only builds the corpus.
 """
 import argparse, random, sys, textwrap
 
@@ -27,7 +27,7 @@ DOMAINS = ["prose", "code", "math", "chat", "multilingual"]
 # HF datasets to try per domain (id, split, config, text-field or (a,b) pair to join).
 # Kept small/streamable; any that fails to load just falls back to the bundled seed.
 # Proven-working source FIRST per domain, then fallbacks, then bundled seed. Updated for `datasets` 5.x
-# (bare "wikitext", bigcode/the-stack-smol, and script-based flores200 all broke — do not restore them).
+# (bare "wikitext", bigcode/the-stack-smol, and script-based flores200 all broke -- do not restore them).
 _HF = {
     "prose":        [("Salesforce/wikitext", "train", "wikitext-103-raw-v1", "text"),  # large real prose
                      ("Salesforce/wikitext", "test", "wikitext-2-raw-v1", "text")],
@@ -39,7 +39,7 @@ _HF = {
                      ("Salesforce/wikitext", "validation", "wikitext-2-raw-v1", "text")],
 }
 
-# Bundled seeds — always available so the tool never emits an empty domain. Short but real,
+# Bundled seeds -- always available so the tool never emits an empty domain. Short but real,
 # spanning structure the imatrix needs to see (prose cadence, code tokens, digits/operators,
 # instruction/answer turns, non-English scripts). Repeated+shuffled up to --per-domain.
 _SEED = {
@@ -101,7 +101,7 @@ def _from_hf(domain, need, min_chars):
             if out:
                 return out
         except Exception as e:
-            print(f"  [{domain}] HF source {name} unavailable ({repr(e)[:60]}) — trying next/seed",
+            print(f"  [{domain}] HF source {name} unavailable ({repr(e)[:60]}) -- trying next/seed",
                   file=sys.stderr)
     return out
 
@@ -160,12 +160,12 @@ def main():
     print(f"== pollard-calib :: Calib 3.0 multi-domain corpus")
     for d, src, ntr, nh in stats:
         print(f"   {d:13s} {ntr:5d} train + {nh:4d} held  [{src}]")
-    print(f"   TOTAL {len(train)} samples · ~{chars/1e6:.2f}M chars · ~{chars//4/1e3:.0f}K tokens (est)")
+    print(f"   TOTAL {len(train)} samples  |  ~{chars/1e6:.2f}M chars  |  ~{chars//4/1e3:.0f}K tokens (est)")
     print(f"   wrote {a.out}")
     if a.held_out:
         with open(a.held_out, "w", encoding="utf-8") as f:
             f.write("\n".join(s for _, s in held))
-        print(f"   wrote {a.held_out} ({len(held)} held-out samples — overfit check)")
+        print(f"   wrote {a.held_out} ({len(held)} held-out samples -- overfit check)")
     if any(src == "seed" for _, src, _, _ in stats):
         print("   NOTE: some domains fell back to bundled seeds (no `datasets` / offline). Install "
               "`datasets` on the box for full-scale real-data coverage.", file=sys.stderr)

@@ -1161,6 +1161,43 @@ def test_vllm_tp_sweep_is_bounded_by_the_model_not_by_a_constant():
 
 
 
+def test_tool_output_is_ascii_except_the_calibration_corpus():
+    """Every byte a tool can PRINT must survive a legacy Windows codepage.
+
+    Python on Windows encodes piped/redirected stdout with the locale codepage (cp1252 here), which
+    has no arrow, sigma, check-mark or box-drawing glyph -- printing one raises UnicodeEncodeError
+    and kills the run. Not cosmetic: `pollard-x ... > log.txt`, CI, and every SSH session take that
+    path. Argparse prints module docstrings as the --help epilog, so docstrings count as output.
+
+    The ONE exception is pollard-calib's multilingual seed corpus. Those samples are DATA -- the
+    Japanese and Arabic prose is the point of a multilingual calibration set, and ASCII-folding them
+    would quietly degrade calibration for non-Latin scripts. They are written to a file with an
+    explicit utf-8 encoding, never printed, so they never reach the console encoder.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    offenders = []
+    for f in sorted(tools.glob("*.py")):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            bad = [c for c in line if ord(c) > 127]
+            if not bad:
+                continue
+            if f.name == "pollard_calib.py" and _is_corpus_sample(line):
+                continue
+            offenders.append(f"{f.name}:{i} {''.join(sorted(set(bad)))!r}")
+    assert not offenders, ("non-ASCII in tool output (crashes on a cp1252 console):\n  "
+                           + "\n  ".join(offenders[:12]))
+
+    # and the corpus really is still there -- this test must not be satisfiable by deleting it
+    calib = (tools / "pollard_calib.py").read_text(encoding="utf-8")
+    assert any(ord(c) > 0x3000 for c in calib), "the multilingual calibration seeds are gone"
+
+
+def _is_corpus_sample(line):
+    """A bundled calibration seed: a quoted string literal on its own line, in the seed tables."""
+    return line.strip().startswith('"') and line.strip().endswith('",')
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

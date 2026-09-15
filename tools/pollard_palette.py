@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""pollard-palette — measured mixed-ALPHABET allocation below the 2-bit floor.
+"""pollard-palette -- measured mixed-ALPHABET allocation below the 2-bit floor.
 
 The Pollard sensitivity method, extended past 1 bit, ON TOP OF GPTQ RECONSTRUCTION
-(not RTN — RTN collapses at low bit, so allocating over it is allocating over noise).
+(not RTN -- RTN collapses at low bit, so allocating over it is allocating over noise).
 
 Each weight tensor chooses an ALPHABET from
 
@@ -10,14 +10,14 @@ Each weight tensor chooses an ALPHABET from
 
 Every candidate is GPTQ-quantized with the tensor's own Hessian, so the choice is
 between four *reconstructed* options. The per-(tensor,alphabet) COST is the Hessian-
-weighted reconstruction error GPTQ itself minimises (SqueezeLLM/OWQ sensitivity — the
+weighted reconstruction error GPTQ itself minimises (SqueezeLLM/OWQ sensitivity -- the
 principled quantity, not an invented proxy); a multiple-choice knapsack then picks the
 assignment minimising total cost under a target average-bpw budget, and the chosen
 assignment is VERIFIED with real WikiText-2 PPL.
 
 The headline is RELATIVE: does the Palette beat UNIFORM TERNARY (also GPTQ) at matched
 average bpw? On a 0.5B that relative win is the valid mechanism signal (Grok: small
-models punish low-bit hardest — read relative, not absolute). Absolute usability is a
+models punish low-bit hardest -- read relative, not absolute). Absolute usability is a
 7B result; the allocator mechanism is provable here.
 
 Pure PTQ. No QAT. Embeddings / lm_head / norms stay fp16 and are COUNTED in the average.
@@ -56,7 +56,7 @@ def unit_bpw(name, groupsize, numel):
 
 @torch.no_grad()
 def collect_hessians(model, calib, lins, dev):
-    """H = 2 X Xᵀ per linear (GPTQ's Hessian), from fp16 activations. Kept on CPU."""
+    """H = 2 X X^T per linear (GPTQ's Hessian), from fp16 activations. Kept on CPU."""
     H = {n: torch.zeros(m.in_features, m.in_features, device=dev) for n, m in lins.items()}
     cnt = {n: 0 for n in lins}; hooks = []
     def mk(n):
@@ -75,8 +75,8 @@ def collect_hessians(model, calib, lins, dev):
 
 
 def sens_cost(W, Q, Hdiag):
-    """Hessian-weighted reconstruction error = Σ_j importance_j · Σ_i (W−Q)²_ij.
-    Cheap per-tensor proxy — but it IGNORES cross-layer error propagation, so it badly
+    """Hessian-weighted reconstruction error = sum_j importance_j * sum_i (W-Q)^2_ij.
+    Cheap per-tensor proxy -- but it IGNORES cross-layer error propagation, so it badly
     mis-ranks (esp. prune). Kept as `--cost proxy`; default is measured NLL-delta."""
     e = (W.float() - Q.float()) ** 2
     return (e.sum(0) * Hdiag.clamp(min=0)).sum().item()
@@ -84,7 +84,7 @@ def sens_cost(W, Q, Hdiag):
 
 @torch.no_grad()
 def calib_nll(model, calib):
-    """Mean token NLL over calib — the GLOBAL, end-to-end signal. cost = this − fp16 ref."""
+    """Mean token NLL over calib -- the GLOBAL, end-to-end signal. cost = this - fp16 ref."""
     dev = next(model.parameters()).device; nll = ntok = 0.0
     for c in calib:
         ids = c.unsqueeze(0).to(dev)
@@ -140,7 +140,7 @@ def main():
         # interaction-aware: set EVERY tensor to the ternary floor, then measure each
         # tensor's MARGINAL hit at each alphabet from that crushed operating point
         # (Shapley-lite: "marginal cost when the others are already crushed"). This is
-        # the fix for collapsing low rungs — additive solo costs ignore cumulative error.
+        # the fix for collapsing low rungs -- additive solo costs ignore cumulative error.
         for n, m in lins.items():
             m.weight.data = quant[n]["ternary"].to(dev)
         ref_nll = calib_nll(model, probe_calib)

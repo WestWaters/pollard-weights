@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""pollard-fit — build Pollard Weights: a memory-fit quantized model for YOUR machine.
+"""pollard-fit -- build Pollard Weights: a memory-fit quantized model for YOUR machine.
 
 Takes any GGUF and a RAM budget, computes a role- and depth-aware bit allocation
 (attention and routers protected, expert FFNs carry the compression, hot layers
 keep more bits when a routing profile is supplied), then drives llama.cpp's
 `llama-quantize` per-tensor overrides to emit the build. The output is a normal
-GGUF: it runs in stock llama.cpp, Ollama, LM Studio — anywhere.
+GGUF: it runs in stock llama.cpp, Ollama, LM Studio -- anywhere.
 
 Usage:
   pollard-fit --gguf model-f16.gguf --ram 16 --out model-pollard.gguf
@@ -32,7 +32,7 @@ from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
 # quant types llama-quantize accepts for --tensor-type overrides, with effective
 # bits/weight (format overhead included) used for budget math.
 # base ggml types accepted by --tensor-type (mix presets like Q4_K_M are NOT
-# valid there — they are whole-model presets only)
+# valid there -- they are whole-model presets only)
 # Aggressive tier uses IQ lattice types, not Q_K: measured KL-divergence on
 # granite experts, IQ2_S beat Q2_K by 23% mean / 27% median AND was smaller
 # (experiments/e11 + KL runs). IQ types need an --imatrix to shine.
@@ -43,7 +43,7 @@ QTYPES = [("q8_0", 8.5), ("q6_K", 6.6), ("q5_K", 5.5), ("iq4_xs", 4.25),
           ("iq3_s", 3.4), ("iq2_s", 2.5), ("iq2_xxs", 2.1),
           ("iq1_m", 1.75), ("iq1_s", 1.56)]      # 1-bit floor (opt-in, --allow-1bit)
 BPW = dict(QTYPES)
-# the whole-model PRESET that carries "everything unmatched" — DERIVED from the
+# the whole-model PRESET that carries "everything unmatched" -- DERIVED from the
 # chosen bulk type, never hardcoded. (--tensor-type wants base types; the
 # positional base arg wants a preset name.) IQ presets need an --imatrix.
 PRESET = {"q8_0": "Q8_0", "q6_K": "Q6_K", "q5_K": "Q5_K_M", "iq4_xs": "IQ4_XS",
@@ -52,25 +52,25 @@ PRESET = {"q8_0": "Q8_0", "q6_K": "Q6_K", "q5_K": "Q5_K_M", "iq4_xs": "IQ4_XS",
 LADDER = ["q6_K", "q5_K", "iq4_xs", "iq3_s", "iq2_s", "iq2_xxs"]  # high -> low
 # 1-bit rungs are OFF by default (heavy quality loss); --allow-1bit extends the
 # floor here for the giant-MoE case, where redundancy absorbs it (753B GLM at ~q1
-# stays coherent — a community datapoint). Never used unless the budget forces it.
+# stays coherent -- a community datapoint). Never used unless the budget forces it.
 LADDER_1BIT = LADDER + ["iq1_m", "iq1_s"]
 # NOISE[type] = KL cost of that type per unit importance = the KL of a UNIFORM
 # build at that type (uniform KL = total_importance x noise). Measured on real
 # models (Qwen2.5-1.5B here; ratios match granite in notes/e11-e12). These are
 # what let the allocator SEE that crushing to iq2_xxs (~10x iq3_s) is catastrophic
-# and avoid victim layers. Data, not logic — remeasure per family to refine.
+# and avoid victim layers. Data, not logic -- remeasure per family to refine.
 # iq1_* are extrapolated from the curve's slope (no measured point yet); a
 # pollard-sensitivity run measures them per model and overrides these.
 NOISE = {"q8_0": 0.00048, "q6_K": 0.00479, "q5_K": 0.01033, "iq4_xs": 0.04090,
          "iq3_s": 0.12282, "iq2_s": 0.63394, "iq2_xxs": 1.22235,
          "iq1_m": 2.17, "iq1_s": 2.96}
-# embeddings/output/norms kept HIGH by default — measured across sizes, keeping
+# embeddings/output/norms kept HIGH by default -- measured across sizes, keeping
 # them here beat letting the allocator crush them (they carry the whole vocab).
 # Stepped down only if the budget truly can't hold them. Data, not a magic rule.
 EMB_FLOOR = "q6_K"
 
 # llama-quantize REFUSES these types (and their whole-model presets) unless the
-# imatrix covers the tensor — Frank's DeepSeek IQ2_S build bailed at tensor 3 on
+# imatrix covers the tensor -- Frank's DeepSeek IQ2_S build bailed at tensor 3 on
 # output_hc_fn. Base Q2_K and IQ3_S are exempt, which is the safe fallback.
 IMATRIX_REQUIRED_PRESETS = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M", "Q2_K_S"}
 # with no imatrix, swap the imatrix-only IQ2 types for Q2_K (exempt, ~same bpw) so
@@ -96,7 +96,7 @@ DENSE_FFN_DOWN = [r"blk\.{layer}\.ffn_down\.weight"]
 
 
 def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
-    """items: [(params, importance)] — an FFN layer, an expert layer, or the
+    """items: [(params, importance)] -- an FFN layer, an expert layer, or the
     attn/embed 'other' group. Assign each a ladder type to MINIMIZE total KL
     (~ sum importance_frac * noise[type]) subject to total size <= budget GB.
     `noise` is THIS model's measured KL-per-type curve (default only as fallback).
@@ -138,7 +138,7 @@ def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
 def _fill_noise(measured):
     """Complete the noise curve for every LADDER type from THIS model's measured
     points, log-interpolating / extrapolating in bpw for any that failed to
-    measure (a uniform build can hiccup) — keeps it model-specific. The baked
+    measure (a uniform build can hiccup) -- keeps it model-specific. The baked
     default is used only if fewer than two points were measured."""
     pts = sorted((BPW[t], math.log(v)) for t, v in measured.items() if v)
     def est(t):
@@ -164,7 +164,7 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
-    by MEASURED sensitivity (a pollard-sensitivity profile) — else uniform. There
+    by MEASURED sensitivity (a pollard-sensitivity profile) -- else uniform. There
     is no imatrix-magnitude proxy: magnitude misranks (see e13), so without a
     measured profile we allocate uniformly rather than worse-than-uniform.
     Embeddings/output/norms are one 'other' group, kept high AND counted for size
@@ -194,7 +194,7 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
         sys.exit("ERROR: does not fit at any supported type; see pollard-calc.")
 
     # per-group sensitivity: MEASURED profile, else UNIFORM. We deliberately do NOT
-    # rank layers by imatrix MAGNITUDE — e13 proved magnitude != KL sensitivity (it
+    # rank layers by imatrix MAGNITUDE -- e13 proved magnitude != KL sensitivity (it
     # says "protect attention" when attention is only 0.48x as sensitive as FFN), so
     # a magnitude-ranked build can land WORSE than uniform. The imatrix still feeds
     # llama-quantize for IQ-type quality; it just never (mis)decides the allocation.
@@ -213,7 +213,7 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
         ffn_imp = {i: 1.0 for i in range(layers)}
         attn_imp = {i: 1.0 for i in range(layers)}
         down_imp = gu_imp = {}
-        src = ("uniform (no --sensitivity profile — run pollard-sensitivity for the "
+        src = ("uniform (no --sensitivity profile -- run pollard-sensitivity for the "
                "per-layer win; any --imatrix is used for IQ quality only)")
 
     # noise curve: THIS model's measured KL-per-type if the profile carries it
@@ -315,11 +315,11 @@ def main():
                     help="target machine RAM in GB, or 'auto' to measure what is "
                          "actually available right now")
     ap.add_argument("--out", help="output path (default: <src>-pollard.gguf)")
-    ap.add_argument("--imatrix", help="importance matrix from llama-imatrix — required "
+    ap.add_argument("--imatrix", help="importance matrix from llama-imatrix -- required "
                                       "for IQ-type quality; does NOT decide the allocation")
     ap.add_argument("--sensitivity", help="measured sensitivity profile from "
                                           "pollard-sensitivity (the calibration that "
-                                          "beats uniform quants — real KL cost per tensor)")
+                                          "beats uniform quants -- real KL cost per tensor)")
     ap.add_argument("--reserve", type=float, default=3.0,
                     help="GB reserved for activations/KV (default 3)")
     ap.add_argument("--llama-quantize", default="llama-quantize",
@@ -328,7 +328,7 @@ def main():
                     help="print the allocation and the command, build nothing")
     ap.add_argument("--allow-grow", action="store_true",
                     help="permit a build LARGER than an already-quantized source "
-                         "(normally refused — requantizing up only loses)")
+                         "(normally refused -- requantizing up only loses)")
     ap.add_argument("--tier", action="append", default=[], metavar="CLASS=TYPE",
                     help="pin a whole component class to one type instead of letting measurement "
                          "decide it: attn / bulk / emb. e.g. --tier attn=q8_0 keeps every attention "
@@ -338,7 +338,7 @@ def main():
                          "it is a guarantee you are asking for, not a measurement. Repeatable.")
     ap.add_argument("--allow-1bit", action="store_true",
                     help="extend the floor to 1-bit (iq1_m/iq1_s) for models that won't "
-                         "fit at iq2_xxs — heavy quality loss, but giant MoEs absorb it. "
+                         "fit at iq2_xxs -- heavy quality loss, but giant MoEs absorb it. "
                          "Only used where the budget forces it.")
     a = ap.parse_args()
 
@@ -357,13 +357,13 @@ def main():
     if str(a.ram).lower() == "auto":
         avail = detect_available_ram_gb()
         if avail is None:
-            sys.exit("ERROR: could not measure available RAM — pass --ram <GB>.")
+            sys.exit("ERROR: could not measure available RAM -- pass --ram <GB>.")
         a.ram = avail
         print(f"[--ram auto] measured available memory: {avail:.1f} GB")
     else:
         a.ram = float(a.ram)
     if a.allow_1bit and not a.imatrix:
-        sys.exit("ERROR: --allow-1bit needs --imatrix — the 1-bit (iq1) types require a "
+        sys.exit("ERROR: --allow-1bit needs --imatrix -- the 1-bit (iq1) types require a "
                  "calibration matrix to build at all (and substituting them to a non-imatrix "
                  "type would defeat the point by growing the file). Run llama-imatrix first.")
     meta = read_gguf_meta(a.gguf)
@@ -388,19 +388,19 @@ def main():
     src_bpw = (src_bytes * 8.0 / arch["total"]) if (src_bytes and arch["total"]) else None
     requant = src_bpw is not None and src_bpw < 10.0     # source already quantized
 
-    # GUARD 1 — refuse a build LARGER than an already-quantized source. Requantizing
+    # GUARD 1 -- refuse a build LARGER than an already-quantized source. Requantizing
     # UP only adds size and loses quality (Frank's Qwen30B: Q4_K_M 18.6 -> Q6_K 23.4 GB,
-    # 23% slower — no Pollard content, just llama-quantize promoting every tensor).
+    # 23% slower -- no Pollard content, just llama-quantize promoting every tensor).
     if requant and gb > src_gb * 1.02 and not a.allow_grow:
         sys.exit(
             f"ERROR: this build (~{gb:.1f} GB) would be LARGER than the source "
             f"(~{src_gb:.1f} GB, ~{src_bpw:.1f} bpw).\n"
             f"Requantizing an already-quantized file UP only adds size and loses "
-            f"quality — there is no Pollard benefit.\n"
+            f"quality -- there is no Pollard benefit.\n"
             f"Fix: start from an f16/bf16 source, or lower --ram. Override with "
             f"--allow-grow if you really mean it.")
 
-    # GUARD 2 — no imatrix: swap the imatrix-only IQ2 types for Q2_K (exempt, ~same
+    # GUARD 2 -- no imatrix: swap the imatrix-only IQ2 types for Q2_K (exempt, ~same
     # bpw) so the build succeeds instead of crashing on uncovered tensors.
     subbed = False
     if not a.imatrix:
@@ -412,9 +412,9 @@ def main():
         for a_t, b_t in NOIMATRIX_TYPE_SUB.items():      # keep the printed summary honest
             summary = summary.replace(a_t, b_t)
 
-    # GUARD 3 — an imatrix-required type (IQ2/IQ1) on a tensor the imatrix DOESN'T
+    # GUARD 3 -- an imatrix-required type (IQ2/IQ1) on a tensor the imatrix DOESN'T
     # cover hard-crashes llama-quantize (DeepSeek's compressors; and MTP/`nextn`
-    # layer tensors, which look like standard attention — `blk.64.attn_k.weight` —
+    # layer tensors, which look like standard attention -- `blk.64.attn_k.weight` --
     # but are never calibrated). Read the imatrix's REAL coverage and pin any tensor
     # that would take an imatrix-required type but isn't covered. Fall back to the
     # "matches no override" heuristic if the imatrix can't be parsed.
@@ -449,30 +449,30 @@ def main():
     print(f"{label}     : {summary}  (base {base_preset})")
     print(f"sensitivity source  : {src}")
 
-    # WARN — no calibration signal at all means a UNIFORM build with no per-layer
+    # WARN -- no calibration signal at all means a UNIFORM build with no per-layer
     # benefit. Say it loudly; this is the difference between Pollard and llama-quantize.
     if not a.sensitivity:
         extra = " The imatrix here only sets IQ-type quality, not the allocation." if a.imatrix else ""
-        print("WARNING: no --sensitivity profile — this is a UNIFORM allocation, no "
+        print("WARNING: no --sensitivity profile -- this is a UNIFORM allocation, no "
               f"per-layer benefit.{extra}\n         Run `pollard-sensitivity` to actually "
-              "beat uniform quants (imatrix magnitude is NOT used — it misranks).")
+              "beat uniform quants (imatrix magnitude is NOT used -- it misranks).")
     if subbed:
-        print("NOTE: no --imatrix — imatrix-only IQ2 types swapped to Q2_K so the build "
+        print("NOTE: no --imatrix -- imatrix-only IQ2 types swapped to Q2_K so the build "
               "won't crash. For the real win, add --imatrix + --sensitivity.")
     if base_pins:
         print(f"NOTE: pinned {base_pins} unmatched tensor(s) to {EMB_FLOOR} so the "
               f"aggressive base preset can't crash on imatrix-uncovered tensors.")
     if requant:
-        print(f"NOTE: source is already quantized (~{src_bpw:.1f} bpw) — requantizing "
+        print(f"NOTE: source is already quantized (~{src_bpw:.1f} bpw) -- requantizing "
               f"with --allow-requantize. An f16/bf16 source gives better quality.")
     if arch.get("multimodal"):
-        print(f"NOTE: {arch['multimodal']} model — this builds the TEXT model only. To KEEP "
+        print(f"NOTE: {arch['multimodal']} model -- this builds the TEXT model only. To KEEP "
               f"vision, download the mmproj (vision projector) GGUF and ship it alongside; "
-              f"run with `llama-* --mmproj mmproj-….gguf`. Do NOT quantize the mmproj.")
+              f"run with `llama-* --mmproj mmproj-....gguf`. Do NOT quantize the mmproj.")
     n_1bit = sum(1 for _, t in overrides if str(t).startswith("iq1")) \
         + (1 if base_preset in ("IQ1_M", "IQ1_S") else 0)
     if n_1bit:
-        print(f"WARNING: {n_1bit} group(s) hit the 1-bit floor (iq1) — the budget forced "
+        print(f"WARNING: {n_1bit} group(s) hit the 1-bit floor (iq1) -- the budget forced "
               f"it. Expect real quality loss; sanity-check the output. Viable mainly on "
               f"giant MoE (redundancy absorbs it), rough on small/dense models.")
 
@@ -488,7 +488,7 @@ def main():
             a.gguf, out, base_preset]   # base preset DERIVED from the plan
     print()
     if a.plan_only:
-        print(f"plan only — {len(ov_lines)} tensor overrides; command that would run:")
+        print(f"plan only -- {len(ov_lines)} tensor overrides; command that would run:")
         print("  " + " ".join(cmd))
         return
     arch_name = cfg.get("_gguf_arch")
@@ -503,7 +503,7 @@ def main():
             # open it. Capture first, then update, then put the patches back.
             sys.exit(
                 f"ERROR: the llama.cpp build found ({present}) does not support the "
-                f"'{arch_name}' architecture — it predates support for this model.\n"
+                f"'{arch_name}' architecture -- it predates support for this model.\n"
                 f"Check what upstream has and whether this tree is carrying local work:\n"
                 f"    pollard-runtime --arch {arch_name}\n"
                 f"    pollard-runtime --dirty\n"
@@ -514,12 +514,12 @@ def main():
                 f"    pollard-runtime --verify\n"
                 f"or point at a capable binary with --llama-quantize /path/to/llama-quantize.")
         sys.exit(f"ERROR: {cmd[0]} not found. install.sh builds it into "
-                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass "
+                 f"runtime/llama.cpp/build/bin -- re-run install.sh, or pass "
                  f"--llama-quantize /path/to/llama-quantize.")
     cmd[0] = resolved
     with open(tt_file, "w") as f:
         f.write("\n".join(ov_lines) + "\n")
-    print("building…")
+    print("building...")
     r = subprocess.run(cmd)
     if r.returncode != 0:
         sys.exit(r.returncode)
@@ -530,14 +530,14 @@ def main():
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"\ndone: {out}")
-    print("run it with stock llama.cpp / Ollama / LM Studio — it is a normal GGUF.")
+    print("run it with stock llama.cpp / Ollama / LM Studio -- it is a normal GGUF.")
 
     # This build is STEP 1 of the gold recipe, not the whole thing. Say so, every time, unless the
     # caller is pollard-auto (which runs the remaining steps itself). A ladder rung shipped as if it
     # were the finished method is the single easiest mistake to make with this tool.
     if not os.environ.get("POLLARD_AUTO"):
         print("\n" + "=" * 72)
-        print("NOTE: this is the fit-your-RAM BASELINE — step 1 of the gold Pollard recipe.")
+        print("NOTE: this is the fit-your-RAM BASELINE -- step 1 of the gold Pollard recipe.")
         print("The full method is:  Calib 3.0 imatrix -> measured automap FLAGSHIP mix -> coherence gate")
         print("Still to run for a gold build:")
         print("  2. pollard-automap ...     the mixed-precision flagship (the winner; needs ik_llama.cpp")

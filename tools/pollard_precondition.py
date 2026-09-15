@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""pollard-precondition — measure which weight-preconditioner wins for THIS model +
+"""pollard-precondition -- measure which weight-preconditioner wins for THIS model +
 target quant, and emit the winning build. The "dynamic" front door.
 
-There is no single best preconditioner — it depends on the target bit-width and the
+There is no single best preconditioner -- it depends on the target bit-width and the
 model (measured, Qwen2.5-0.5B): diagonal smoothing helps SCALAR quants but hurts IQ
 codebook quants; rotation helps IQ and its win GROWS as bits drop (a wash at 3-bit,
 -5.7% at IQ2_S, -9.7% at IQ2_XXS); block-diagonal rotation keeps the imatrix useful.
@@ -12,7 +12,7 @@ uniform (candidate 'none' is always in the running).
 
 Candidates (auto-filtered by target family):
   none            uniform + imatrix (the baseline everyone ships)
-  smooth          AWQ-style diagonal (SCALAR targets only — hurts IQ)
+  smooth          AWQ-style diagonal (SCALAR targets only -- hurts IQ)
   rot-block32     block-diagonal rotation (keeps imatrix; best at the low-bit frontier)
   rot-dense       dense rotation (strongest incoherence; best ~2.5-bit)
 
@@ -51,7 +51,7 @@ def find_bin(name):
     from shutil import which
     p = which(name)
     if not p:
-        sys.exit(f"ERROR: {name} not found — build the runtime (install.sh) or add it to PATH.")
+        sys.exit(f"ERROR: {name} not found -- build the runtime (install.sh) or add it to PATH.")
     return p
 
 
@@ -95,7 +95,7 @@ def main():
     else:
         cands = ["none", "rot-block32", "rot-dense"] + (["smooth"] if scalar else [])
     if "smooth" in cands and not scalar:
-        print("   note: 'smooth' distorts IQ codebook quants — dropping it for this IQ target.")
+        print("   note: 'smooth' distorts IQ codebook quants -- dropping it for this IQ target.")
         cands = [c for c in cands if c != "smooth"]
 
     work = os.path.dirname(os.path.abspath(a.out or a.gguf)) or "."
@@ -133,7 +133,7 @@ def main():
                     cmd = [py, os.path.join(HERE, "pollard_rotate.py"), "--gguf", a.gguf,
                            "--kind", "orthogonal", "--out", tmp_f16]
                 else:
-                    print(f"   unknown candidate '{cand}' — skipping"); continue
+                    print(f"   unknown candidate '{cand}' -- skipping"); continue
                 r = sh(cmd)
                 if not (os.path.exists(tmp_f16) and os.path.getsize(tmp_f16) > 1024):
                     print("   transform FAILED:\n     " +
@@ -143,7 +143,7 @@ def main():
                 tmp_imat = f"{stem}.{cand}.imatrix"
                 sh([imatrix, "-m", tmp_f16, "-f", a.calib, "-o", tmp_imat, "-ngl", str(a.ngl)])
                 if not (os.path.exists(tmp_imat) and os.path.getsize(tmp_imat) > 1024):
-                    print("   imatrix build FAILED — skipping candidate"); continue
+                    print("   imatrix build FAILED -- skipping candidate"); continue
                 f16, imat = tmp_f16, tmp_imat
 
             out_q = f"{stem}.{cand}.{a.target}.gguf"
@@ -165,7 +165,7 @@ def main():
                     os.remove(f)
 
     if not results:
-        sys.exit("ERROR: no candidate produced a score — see failures above.")
+        sys.exit("ERROR: no candidate produced a score -- see failures above.")
     results.sort(key=lambda r: r["kl"])
     win = results[0]
     base = next((r for r in results if r["cand"] == "none"), None)
@@ -186,7 +186,7 @@ def main():
                 if r is not win and os.path.exists(r["path"]):
                     os.remove(r["path"])
     if os.path.exists(base_kld):
-        os.remove(base_kld)               # the big file — always clean it
+        os.remove(base_kld)               # the big file -- always clean it
 
 
 def _nparams(gguf):

@@ -458,7 +458,7 @@ def main():
     if a.install:
         st = install_state(a.repo_root)
         if st is None:
-            print(f"could not read {os.path.join(a.repo_root, 'pyproject.toml')} — pass --repo-root")
+            print(f"could not read {os.path.join(a.repo_root, 'pyproject.toml')} -- pass --repo-root")
             return 0
         print(f"interpreter : {sys.executable}")
         print(f"launchers in: {st['bindir']}")
@@ -467,7 +467,7 @@ def main():
         if not st["missing"]:
             print("\nevery declared command is installed.")
             return 0
-        print(f"\nMISSING {len(st['missing'])} command(s) — the code is there, the launcher is not:")
+        print(f"\nMISSING {len(st['missing'])} command(s) -- the code is there, the launcher is not:")
         for c in st["missing"]:
             print(f"   {c}")
         print(f"\nfix: {sys.executable} -m pip install -e {os.path.abspath(a.repo_root)} --no-deps")
@@ -523,7 +523,7 @@ def main():
     if a.verify:
         rows = verify_captured(trees, a.patch_dir)
         if not rows:
-            print(f"no captured patches in {a.patch_dir}/ — nothing to verify.")
+            print(f"no captured patches in {a.patch_dir}/ -- nothing to verify.")
             return 0
         rc = 0
         for r in rows:

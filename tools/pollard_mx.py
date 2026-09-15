@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""pollard-mx — emit an FP4/FP8 checkpoint for Blackwell (NVFP4 default, MXFP4 experimental), carrying
+"""pollard-mx -- emit an FP4/FP8 checkpoint for Blackwell (NVFP4 default, MXFP4 experimental), carrying
 Pollard's measured-sensitivity allocation. The 5th output lane: GGUF / GPTQ / MLX / EXL3 / **MX (FP4)**.
 
 NVFP4 is Blackwell's native 4-bit float (E2M1, per-group-16 local scale + per-tensor global scale); MXFP4
 is the OCP microscaling variant (E2M1, shared E8M0 scale per 32). Both run on Blackwell FP4 tensor cores
-via vLLM (compressed-tensors format). This lane produces a **vLLM-loadable** checkpoint — same idea as the
+via vLLM (compressed-tensors format). This lane produces a **vLLM-loadable** checkpoint -- same idea as the
 GPTQ lane, targeting the FP4 cores instead of INT4.
 
 Pollard's edge (vs a uniform NVFP4 dump): the measured-sensitivity profile decides **which layers/roles
-stay high-precision (FP8) and which drop to FP4** — protect the residual writers / salient layers, crush
-the cold bulk to 4-bit — instead of flattening everything to FP4. Same "one allocator, many emitters".
+stay high-precision (FP8) and which drop to FP4** -- protect the residual writers / salient layers, crush
+the cold bulk to 4-bit -- instead of flattening everything to FP4. Same "one allocator, many emitters".
 
 LOW-BIT: precondition first with `pollard-hf-smooth`. FP4's tiny dynamic range is exactly what massive-
 activation channels blow out; smoothing the fp16 model migrates the outliers so the FP4 groups aren't
@@ -79,7 +79,7 @@ def main():
     ap.add_argument("--calib", help="calibration text (required for real emit; NVFP4 activations need it)")
     ap.add_argument("--scheme", default="NVFP4", choices=["NVFP4", "MXFP4", "W4A16", "W8A16"],
                     help="body scheme: NVFP4 (Blackwell FP4, vLLM-validated default) / MXFP4 (OCP MX, "
-                         "experimental) / W4A16 / W8A16 (INT weight-only compressed-tensors — runs on any "
+                         "experimental) / W4A16 / W8A16 (INT weight-only compressed-tensors -- runs on any "
                          "vLLM GPU, not just Blackwell)")
     ap.add_argument("--gptq", action="store_true",
                     help="for INT schemes (W4A16/W8A16): use GPTQ error-feedback for the body (more "
@@ -88,9 +88,9 @@ def main():
                     help="precision for the protected (hot) layers")
     ap.add_argument("--hot-frac", type=float, default=0.25, help="fraction of layers kept at FP8 (not FP4)")
     ap.add_argument("--focus-layers", help="force these layers to HIGH (FP8) regardless of the profile, "
-                    "e.g. '3,4,8' or '3-8,16' — steer the budget to layers you care about")
+                    "e.g. '3,4,8' or '3-8,16' -- steer the budget to layers you care about")
     ap.add_argument("--protect-down", action="store_true",
-                    help="also keep every down_proj (residual writer) at FP8 — usually worth it at 4-bit")
+                    help="also keep every down_proj (residual writer) at FP8 -- usually worth it at 4-bit")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs like Spark2_5); 'auto' = only if "
@@ -122,7 +122,7 @@ def main():
         print(" !! MXFP4 is EXPERIMENTAL upstream (MXFP4PackedCompressor; vLLM validation pending). "
               "NVFP4 is the vLLM-validated default.")
     print(f"== pollard-mx :: {a.model}  scheme={a.scheme}  ~{ab} bpw avg  "
-          f"(body {a.scheme} · {len(hot)} hot layers + {'down_proj ' if a.protect_down else ''}@ {a.protect_scheme})")
+          f"(body {a.scheme}  |  {len(hot)} hot layers + {'down_proj ' if a.protect_down else ''}@ {a.protect_scheme})")
     print(f"   Pollard intent -> compressed-tensors: crush the cold bulk to {a.scheme}, keep measured-hot "
           f"layers at {a.protect_scheme}, lm_head high-precision."
           + ("  [INT weight-only: runs on any vLLM GPU, not just Blackwell]" if is_int else ""))
@@ -153,7 +153,7 @@ def main():
         try:
             from llmcompressor.modifiers.quantization import GPTQModifier as BodyMod
         except Exception:
-            print("   (GPTQModifier unavailable — falling back to RTN QuantizationModifier for the body)")
+            print("   (GPTQModifier unavailable -- falling back to RTN QuantizationModifier for the body)")
     mods = [BodyMod(targets="Linear", scheme=a.scheme, ignore=rec["ignore"] + rec["protect"])]
     if rec["protect"]:
         mods.append(QuantizationModifier(targets=rec["protect"], scheme=a.protect_scheme))

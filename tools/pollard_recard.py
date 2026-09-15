@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-recard — bring already-published model repos onto the Pollard master card template,
+"""pollard-recard -- bring already-published model repos onto the Pollard master card template,
 without losing what their current cards already say.
 
 Cards drift. Ours did: across 14 published repos there were 32 different section names and not one
@@ -85,7 +85,7 @@ def harvest(card, files):
                 if i >= len(cells):
                     break
                 v = cells[i].strip()
-                if not v or v == "—":
+                if not v or v == "--":
                     continue
                 if "ppl" in h or "perplex" in h:
                     rec["ppl"] = v
@@ -101,10 +101,10 @@ def harvest(card, files):
                 rec["ppl"] = nums[0]
         if not rec.get("note"):
             tail = cells[-1] if cells else ""
-            if tail and tail not in ("", "—") and ".gguf" not in tail:
+            if tail and tail not in ("", "--") and ".gguf" not in tail:
                 rec["note"] = tail
         if rec:
-            # Cards abbreviate filenames ("`…-Q6_K.gguf`"), so a raw filename key matches nothing
+            # Cards abbreviate filenames ("`...-Q6_K.gguf`"), so a raw filename key matches nothing
             # downstream and the numbers vanish. Resolve to the real file, else key by quant tag.
             real = next((f for f in files if f.endswith(fn) or fn.endswith(f)), None)
             results[real or (fn[:-5].rstrip("-").split("-")[-1] or fn)] = rec
@@ -169,7 +169,7 @@ def main():
     for rid in repos:
         name = rid.split("/")[-1]
         try:
-            card = open(hf_hub_download(rid, "README.md")).read()
+            card = open(hf_hub_download(rid, "README.md"), encoding="utf-8").read()
         except Exception:
             card = ""
         info = api.repo_info(rid, files_metadata=True)
@@ -232,7 +232,7 @@ def main():
             rows.append((name, "FAIL", (r.stderr or r.stdout).strip().splitlines()[-1][:70])); continue
 
         # did any measured number in the old card fail to survive?
-        new = open(out_md).read()
+        new = open(out_md, encoding="utf-8").read()
         onum = set(re.findall(r"\b\d+\.\d{2,}\b", card))
         lost = sorted(onum - set(re.findall(r"\b\d+\.\d{2,}\b", new)))
         note = f"{len(man['builds'])} files"
@@ -247,7 +247,7 @@ def main():
     print(f"{'repo':44s} {'status':7s} detail")
     for n, st, d in sorted(rows):
         print(f"{n:44s} {st:7s} {d}")
-    print(f"\ncards written to {a.out}/" + ("  (uploaded)" if a.upload else "  — review, then re-run with --upload"))
+    print(f"\ncards written to {a.out}/" + ("  (uploaded)" if a.upload else "  -- review, then re-run with --upload"))
     print("A 'check' note lists numbers in the old card that are not in the new one. Some are "
           "corrections (real file sizes replacing stated ones); read them before publishing.")
 

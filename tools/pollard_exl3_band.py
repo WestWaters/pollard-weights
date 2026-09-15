@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-exl3-band — band-parallel EXL3 conversion for models that do not fit one node.
+"""pollard-exl3-band -- band-parallel EXL3 conversion for models that do not fit one node.
 
 The companion to `pollard-exl3`: same lane, same gold recipe, but for a body too large to cook
 sequentially on one machine.
@@ -8,18 +8,18 @@ exllamav3's converter is sequential: module i+1 is calibrated on the quantized o
 take ~3 days on one 121 GB node. Its work dir, however, is plain: `args.json`, `ckpt/job.json` (`next_module_idx`,
 `bad_rows`), `ckpt/state.safetensors` (one F32 `[1, cols, hidden]` tensor per calibration row: the residual stream entering
 the next module), `ckpt/original_input_ids.safetensors` (I64 `[1, cols]` per row) and `qtensors/<module>.safetensors` per
-finished module — and the bit strategy is a pure function of config + flags, so every node computes the identical strategy.
+finished module -- and the bit strategy is a pure function of config + flags, so every node computes the identical strategy.
 This tool exploits that:
 
   1. one streaming bf16 pass over the calibration rows produces the residual stream at each band start (your own harness,
      or `pollard-export --shard-plan`'s boundary-handoff contract: the last hidden state of band k is the input of band k+1);
   2. every node runs `band`: fresh convert with `--max_module 0` (quantizes only the embedding, writes the canonical work
-     dir) → `inject` the band-start state and set `next_module_idx = first_layer + 1` → `--resume --max_module last_layer + 1`;
+     dir) -> `inject` the band-start state and set `next_module_idx = first_layer + 1` -> `--resume --max_module last_layer + 1`;
   3. one node runs `merge`: gather all `qtensors`, inject the post-last-layer state with `next_module_idx = num_layers + 1`,
-     resume uncapped → final norm, `lm_head`, MTP (uncalibrated), compile.
+     resume uncapped -> final norm, `lm_head`, MTP (uncalibrated), compile.
 
 Trade: at each band boundary the calibration inputs are the exact model's rather than the quantized prefix's (non-sequential
-GPTQ makes this trade at every layer with little measured loss; here it is n_bands−1 of num_layers boundaries). Measured on
+GPTQ makes this trade at every layer with little measured loss; here it is n_bands-1 of num_layers boundaries). Measured on
 GLM-5.3 (78 layers, 10 bands, GB10): ~7 h wall + ~1 h merge instead of ~3 days.
 
 Layer i is module i+1 (module 0 = embeddings, num_layers+1 = final norm, +2 = head). Boundary file = safetensors with one

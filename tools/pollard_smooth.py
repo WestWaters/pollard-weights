@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""pollard-smooth — activation-aware weight preconditioning (AWQ-style) before the quant.
+"""pollard-smooth -- activation-aware weight preconditioning (AWQ-style) before the quant.
 
 This is the step mainline llama.cpp does NOT do. imatrix bends the *rounding*
 toward hot channels; it never moves magnitude OFF them. AWQ/SmoothQuant do: they
 migrate the outlier magnitude of the salient input channels into an adjacent
 tensor via a per-channel diagonal scale, so the quantizer spends its bits where
-the activations actually are. The transform is mathematically identity — the
-inverse is folded into the paired tensor — so the output is a NORMAL GGUF that
+the activations actually are. The transform is mathematically identity -- the
+inverse is folded into the paired tensor -- so the output is a NORMAL GGUF that
 runs unchanged on CPU, CUDA, Metal, Vulkan (nothing about it is CPU-only).
 
 The salient-channel signal is free: it's the imatrix we already build
-(`<weight>.in_sum2 / .counts` = mean squared activation per input channel — the
+(`<weight>.in_sum2 / .counts` = mean squared activation per input channel -- the
 exact quantity AWQ derives its scales from). We reuse it, so no second calibration
 pass is needed.
 
 Folded seams (each validated for dimension match; mismatches are SKIPPED, never
-forced — fused-QKV / MLA / extra-norm archs simply get fewer seams, never corruption):
+forced -- fused-QKV / MLA / extra-norm archs simply get fewer seams, never corruption):
 
   D  up   -> down    scale down's input cols up, up's output rows down   (safest, universal)
   B  ffn_norm -> gate,up   fold 1/s into the RMSNorm gain
@@ -24,7 +24,7 @@ forced — fused-QKV / MLA / extra-norm archs simply get fewer seams, never corr
 Every fold is checked with a numerical identity canary (random input, output must
 match pre-fold to fp tolerance) BEFORE it is kept. Then: recompute the imatrix on
 the smoothed model, and quantize as usual (pollard-fit / pollard-sensitivity).
-The win compounds with imatrix rounding and KL allocation — measure it with
+The win compounds with imatrix rounding and KL allocation -- measure it with
 pollard-eval (KL vs the f16 base) at equal bits-per-weight.
 
 Usage:
@@ -76,7 +76,7 @@ def load_imatrix_scales(path):
         c = float(c[0]) if c.size else 1.0
         out[name] = np.sqrt(np.maximum(s2, 0.0) / max(c, 1.0))
     if not out:
-        sys.exit(f"ERROR: no .in_sum2 tensors in {path} — not a GGUF imatrix, or it's "
+        sys.exit(f"ERROR: no .in_sum2 tensors in {path} -- not a GGUF imatrix, or it's "
                  f"the old binary format. Rebuild it with a current llama-imatrix.")
     return out
 
@@ -90,7 +90,7 @@ def to_logical(t):
 def _real_quant_err_sq(W):
     """Per-element squared error of a REAL block-32 quantizer (Q4_0 via gguf-py),
     used to rank alpha. A hand-rolled absmax proxy mispredicts which tensors
-    benefit (it says q/k help; the real block quant says they don't) — so we use
+    benefit (it says q/k help; the real block quant says they don't) -- so we use
     the actual kernel. Q4_0 is the fastest real proxy and its verdict on WHICH
     tensors benefit tracks the IQ/K targets (both are block-32-along-input)."""
     Wf = W.astype(np.float32)
@@ -106,7 +106,7 @@ def choose_alpha(W_consumer, act, grid, min_gain=0.01):
     """Grid-search alpha in [0,1] minimizing the consumer's activation-weighted
     quant error, measured with a REAL block quantizer. s = (act/mean)^alpha. Returns
     (alpha, s). If the best alpha beats alpha=0 by less than min_gain (fractional),
-    returns alpha=0 with s=1 — i.e. it SELF-SKIPS tensors that don't benefit (q/k/
+    returns alpha=0 with s=1 -- i.e. it SELF-SKIPS tensors that don't benefit (q/k/
     gate), so the caller never has to hardcode which seams help."""
     a = np.asarray(act, dtype=np.float64)
     a = np.where(a > 0, a, np.median(a[a > 0]) if np.any(a > 0) else 1.0)
@@ -146,7 +146,7 @@ def main():
                     "scale across q/k/v and gate/up, dragging in tensors that don't.")
     ap.add_argument("--min-gain", type=float, default=0.01,
                     help="skip a tensor unless smoothing cuts its (real) quant error "
-                    "by at least this fraction — auto-skips q/k/gate-like tensors")
+                    "by at least this fraction -- auto-skips q/k/gate-like tensors")
     ap.add_argument("--target", default="iq3_s", choices=list(TARGET_BITS),
                     help="quant type the smoothing is tuned for (picks alpha)")
     ap.add_argument("--alpha-grid", type=int, default=11,
@@ -263,10 +263,10 @@ def main():
         print(f"   alpha: mean {al.mean():.2f}  range [{al.min():.2f},{al.max():.2f}]   "
               f"(0=no smoothing, 1=full activation scaling)")
     if not plan_rows:
-        sys.exit("ERROR: no seams folded — check --seams, imatrix coverage, and dims above. "
+        sys.exit("ERROR: no seams folded -- check --seams, imatrix coverage, and dims above. "
                  "Nothing written (a no-op smooth would just waste a requant).")
     if a.plan_only:
-        print("   (plan-only — nothing written)")
+        print("   (plan-only -- nothing written)")
         return
 
     out = a.out or a.gguf.rsplit(".gguf", 1)[0] + "-smooth.gguf"

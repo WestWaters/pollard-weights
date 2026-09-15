@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""pollard-kl — KL-to-f16 + top-1 agreement for a quantization, on the SAME eval text as
+"""pollard-kl -- KL-to-f16 + top-1 agreement for a quantization, on the SAME eval text as
 the PPL runs. The metric the 1-bit argument needs: matched-size KL says how much of the
 f16 next-token distribution survived, not just whether PPL looks fine. (PPL can look ok
-while the tail is peaky and generation loops — KL/top-1 catches that.)
+while the tail is peaky and generation loops -- KL/top-1 catches that.)
 
 Torch path (Mac): keep the f16 model as the reference, quantize a COPY with any method/
 recipe from pollard_gptq, compare their distributions token-by-token. The 7B GGUFs use

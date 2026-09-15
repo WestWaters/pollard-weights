@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""pollard-sensitivity — measure each tensor group's TRUE KL cost, per model.
+"""pollard-sensitivity -- measure each tensor group's TRUE KL cost, per model.
 
 This is the calibration that lets pollard-fit BEAT uniform quants. Instead of
-guessing which tensors matter (or trusting imatrix magnitude, which lies — big
+guessing which tensors matter (or trusting imatrix magnitude, which lies -- big
 activations are NOT the same as high KL sensitivity), it CRUSHES one group at a
 time to a probe quant and measures the actual KL hit vs a reference build. The
 layers that barely move can be compressed hard; the ones that spike must be kept
 high. Emits a profile that `pollard-fit --sensitivity` allocates on.
 
-It is not free — one build + one KL eval per group (≈ 2·num_layers passes). But
+It is not free -- one build + one KL eval per group (~= 2*num_layers passes). But
 it is one-time per model, and it is exactly the "calibration" the good quantizers
 (Unsloth Dynamic, etc.) pay for. Run it once, reuse the profile for every build.
 
@@ -19,7 +19,7 @@ Then:  pollard-fit --gguf model-f16.gguf --ram 16 --imatrix imatrix.dat \\
            --sensitivity model.sensitivity.json
 
 Measurement notes: use a held-out eval corpus (disjoint from the imatrix
-calibration) so the sensitivity is not overfit. GPU strongly recommended — this
+calibration) so the sensitivity is not overfit. GPU strongly recommended -- this
 is many perplexity passes.
 """
 import argparse
@@ -101,8 +101,8 @@ def warn_if_eval_overlaps_calib(imatrix_path, eval_path):
 
 def _kl(ppl, model, eval_f, base, rpc=None, ngl=99):
     """Mean KL-divergence of `model` vs the base logits, or None on failure.
-    `rpc` (host:port[,host:port…]) pools RPC nodes so a model too big for one box
-    can run the forward pass — the only way to profile a 300B+ MoE on one Spark.
+    `rpc` (host:port[,host:port...]) pools RPC nodes so a model too big for one box
+    can run the forward pass -- the only way to profile a 300B+ MoE on one Spark.
     `ngl` = GPU layers: lower it when the model is bigger than the GPU (KL is
     offload-invariant, so partial offload keeps the numbers, just slower)."""
     cmd = [ppl, "-m", model, "-f", eval_f, "--kl-divergence",
@@ -115,7 +115,7 @@ def _kl(ppl, model, eval_f, base, rpc=None, ngl=99):
 
 
 def _valid_gguf(path):
-    """A quantize output is valid only if it starts with the GGUF magic — a crashed
+    """A quantize output is valid only if it starts with the GGUF magic -- a crashed
     build leaves an all-zeros file that 'exists' but won't load, turning into a
     cryptic downstream error. Check the magic and fail loud at the source instead."""
     try:
@@ -125,7 +125,7 @@ def _valid_gguf(path):
         return False
 
 
-# GPU/Metal out-of-memory signatures — a forward pass at -ngl 99 that doesn't fit
+# GPU/Metal out-of-memory signatures -- a forward pass at -ngl 99 that doesn't fit
 # the GPU crashes HERE, not with a quant error. Detect it and say the actual fix
 # instead of a misleading "imatrix-uncovered tensor" guess.
 _OOM = re.compile(
@@ -139,7 +139,7 @@ def _diagnose(stderr, what):
     is the common footgun: an f16/bf16 model too big for the GPU. Give the fix."""
     s = stderr or ""
     if _OOM.search(s):
-        return (f"{what} ran OUT OF GPU MEMORY — the model is too big to run at "
+        return (f"{what} ran OUT OF GPU MEMORY -- the model is too big to run at "
                 f"-ngl 99 on this GPU/Metal. Fix: lower --ram so the reference fits, "
                 f"offload fewer layers, or build the imatrix on a smaller quantized "
                 f"host (e.g. Q8_0) instead of f16/bf16. (This is memory, not a bug.)")
@@ -162,7 +162,7 @@ _STD_MATMUL = re.compile(
 def _uncoverable_pins(gguf, imatrix):
     """--tensor-type '<name>=q6_K' for every weight the IMATRIX DOESN'T COVER, so an
     aggressive IQ2/IQ1 build can't hard-fail on it. This catches the ones a name
-    heuristic misses — MTP/`nextn` layer tensors look like standard attention
+    heuristic misses -- MTP/`nextn` layer tensors look like standard attention
     (`blk.64.attn_k.weight`) but are never calibrated, so llama-quantize refuses
     them at low bit. Falls back to the name heuristic if the imatrix can't be read.
     (token_embd/output are handled by their own flags.)"""
@@ -201,16 +201,16 @@ def main():
                          "than the GPU (e.g. a 30B on a 16GB card -> --ngl 20) so the sweep "
                          "doesn't OOM. KL is offload-invariant, so the numbers stay valid.")
     ap.add_argument("--rpc", help="RPC servers to pool for the forward pass, "
-                                  "'host:port[,host:port…]' (run ggml-rpc-server on each "
+                                  "'host:port[,host:port...]' (run ggml-rpc-server on each "
                                   "peer). REQUIRED to profile a model too big for one node "
-                                  "— the quantize step streams and needs no RPC.")
+                                  "-- the quantize step streams and needs no RPC.")
     ap.add_argument("--ram", help="usable RAM/VRAM in GB (or 'auto') to CALIBRATE ON A "
                                   "SMALL BOX: if f16 won't fit the forward pass, the base "
-                                  "reference drops to the highest quant that fits — Pollard "
+                                  "reference drops to the highest quant that fits -- Pollard "
                                   "MAKES big models on small hardware, not just runs them.")
     ap.add_argument("--allow-slow", action="store_true",
                     help="force the sweep on a BIG model (>15B) even though it's many HOURS "
-                         "(len(groups)*layers full-model quantizes). Default refuses — use the "
+                         "(len(groups)*layers full-model quantizes). Default refuses -- use the "
                          "automap trellis mix for a big MoE instead.")
     ap.add_argument("--allow-dense", action="store_true",
                     help="force the sweep on a DENSE model (it's the MoE tool; dense doesn't "
@@ -229,11 +229,11 @@ def main():
                               ("llama-perplexity", a.llama_perplexity)) if v is None]
     if missing:
         sys.exit(f"ERROR: {', '.join(missing)} not found. install.sh builds these into "
-                 f"runtime/llama.cpp/build/bin — re-run install.sh, or pass the path.")
+                 f"runtime/llama.cpp/build/bin -- re-run install.sh, or pass the path.")
 
-    # fail loud NOW if the imatrix is missing/empty — otherwise every quantize below
+    # fail loud NOW if the imatrix is missing/empty -- otherwise every quantize below
     # silently no-ops and you sit staring at a dead run. (A too-big f16 imatrix job
-    # that OOM'd on the GPU leaves no file — that's the usual cause; build it on a Q8.)
+    # that OOM'd on the GPU leaves no file -- that's the usual cause; build it on a Q8.)
     if not os.path.exists(a.imatrix) or os.path.getsize(a.imatrix) < 1024:
         sys.exit(f"ERROR: imatrix not found or empty: {a.imatrix}\n"
                  f"  build it first: llama-imatrix -m <Q8-or-smaller-host>.gguf -f calib.txt "
@@ -245,12 +245,12 @@ def main():
     meta = read_gguf_meta(a.gguf)
     arch = analyse(gguf_to_config(meta, a.gguf))
     layers = arch["layers"]
-    # GUARDRAIL: the measured-KL sensitivity sweep is the MoE tool — it pays off where
+    # GUARDRAIL: the measured-KL sensitivity sweep is the MoE tool -- it pays off where
     # expert redundancy lets the knapsack reallocate. On a DENSE model it does NOT beat
-    # uniform (measured), and this sweep is ~2·layers of quantize+KL passes (HOURS). Refuse
+    # uniform (measured), and this sweep is ~2*layers of quantize+KL passes (HOURS). Refuse
     # dense so nobody burns 3h for nothing (dense -> imatrix K-quants directly).
     if str(arch.get("kind", "")).startswith("dense") and not getattr(a, "allow_dense", False):
-        sys.exit("REFUSED: this is a DENSE model — the measured-KL sensitivity sweep is the\n"
+        sys.exit("REFUSED: this is a DENSE model -- the measured-KL sensitivity sweep is the\n"
                  "  MoE tool and does NOT beat uniform on dense (no expert redundancy to\n"
                  "  reallocate). It is ~2*layers quantize+KL passes (HOURS) that a dense model\n"
                  "  can't use. Dense -> imatrix-guided K-quants directly (seconds), no sweep.\n"
@@ -260,7 +260,7 @@ def main():
 
     # FEASIBILITY GUARD: the sweep is len(groups)*layers FULL-MODEL quantize+KL passes.
     # The knapsack pays off on a SMALL MoE (granite-3B: ~2 min/pass); on a BIG MoE each
-    # quantize is ~15-20 min, so a 30B sweep is ~20 HOURS — the trap that ate a whole
+    # quantize is ~15-20 min, so a 30B sweep is ~20 HOURS -- the trap that ate a whole
     # session. Estimate + refuse for a big model unless --allow-slow (winning alternative:
     # the automap trellis mix, minutes, no sweep).
     passes = len(groups) * layers
@@ -273,7 +273,7 @@ def main():
                  f"  For a big MoE, ship the automap trellis mix instead (pollard-automap --mix-only,\n"
                  f"  minutes) or run this on a small MoE / bigger box. Pass --allow-slow to force it.")
 
-    # FAIL FAST — the KL step writes a base-logits file of (tokens x n_vocab x 4)
+    # FAIL FAST -- the KL step writes a base-logits file of (tokens x n_vocab x 4)
     # bytes. On a big-vocab model a large eval balloons that to tens of GB and the
     # run dies deep in the sweep after wasting minutes. Reject it up front instead.
     import shutil
@@ -284,7 +284,7 @@ def main():
     if n_vocab and base_gb > min(free_gb * 0.7, 20):
         sys.exit(f"ERROR: eval corpus is too large for this model's vocab ({n_vocab:,}).\n"
                  f"  the KL base logits would need ~{base_gb:.0f} GB (only {free_gb:.0f} GB free).\n"
-                 f"  fix: use a SMALLER --eval (a ~20-50 KB held-out snippet is plenty — the "
+                 f"  fix: use a SMALLER --eval (a ~20-50 KB held-out snippet is plenty -- the "
                  f"sensitivity signal doesn't need a huge corpus).")
 
     tmp = tempfile.mkdtemp(prefix="pollard_sens_")
@@ -304,7 +304,7 @@ def main():
     # The sweep runs FORWARD passes, so the base must fit RAM. f16 is the ideal ground
     # truth but rarely fits a big model on a small box, so drop the base to the highest
     # ladder type that fits and measure against THAT. It can't see the f16->that-type
-    # loss, but it measures the crush-from-here regime — exactly the allocation decision.
+    # loss, but it measures the crush-from-here regime -- exactly the allocation decision.
     base_src, base_note, mem_budget = a.gguf, "f16 (ground truth)", None
     if a.ram:
         ram = detect_available_ram_gb() if str(a.ram).lower() == "auto" else float(a.ram)
@@ -317,13 +317,13 @@ def main():
             base_src = os.path.join(tmp, "membase.gguf")
             a.ref = PRESET[fit]                         # probes' baseline must also fit
             base_note = f"{fit} (memory-fit; f16 too big for ~{mem_budget:.0f} GB)"
-            print(f"[--ram {ram:.0f}] f16 is {f16_gb:.0f} GB > ~{mem_budget:.0f} GB usable — "
+            print(f"[--ram {ram:.0f}] f16 is {f16_gb:.0f} GB > ~{mem_budget:.0f} GB usable -- "
                   f"basing on {PRESET[fit]} ({fit_gb:.0f} GB). Signal is vs {fit}, not f16 "
                   f"(a touch weaker, but it fits YOUR box).")
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix]
                            + (PINARG if PRESET[fit] in IMATRIX_REQUIRED_PRESETS else [])
                            + [a.gguf, base_src, PRESET[fit]], capture_output=True)
-    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  — {len(groups)*layers} passes  (elapsed + ETA shown per layer)")
+    print(f"reference={a.ref}  probe={a.probe}  base={base_note}  -- {len(groups)*layers} passes  (elapsed + ETA shown per layer)")
 
     if a.rpc:
         print(f"RPC pool: {a.rpc}  (forward passes span these nodes; quantize stays local)")
@@ -334,23 +334,23 @@ def main():
         base_cmd += ["--rpc", a.rpc]
     r = _run(base_cmd)
     if not os.path.exists(base) or os.path.getsize(base) == 0:
-        sys.exit(f"ERROR: could not build the reference logits — {_diagnose(r.stderr, 'the base forward pass')}")
+        sys.exit(f"ERROR: could not build the reference logits -- {_diagnose(r.stderr, 'the base forward pass')}")
     if base_src != a.gguf and not _valid_gguf(base_src):
-        sys.exit(f"ERROR: the memory-fit base build ({a.ref}) came out invalid — "
+        sys.exit(f"ERROR: the memory-fit base build ({a.ref}) came out invalid -- "
                  f"{_diagnose(r.stderr, 'llama-quantize')}")
-    # 2. reference build — SAME pins as the base (an IQ2 ref crashes on uncovered tensors too)
+    # 2. reference build -- SAME pins as the base (an IQ2 ref crashes on uncovered tensors too)
     r = _run([a.llama_quantize, "--imatrix", a.imatrix]
              + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
              + [a.gguf, ref, a.ref])
     if not _valid_gguf(ref):
-        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid — {_diagnose(r.stderr, 'llama-quantize')}")
+        sys.exit(f"ERROR: the reference build ({a.ref}) came out invalid -- {_diagnose(r.stderr, 'llama-quantize')}")
     kl_ref = _kl(a.llama_perplexity, ref, a.eval, base, a.rpc, a.ngl)
     if kl_ref is None:
-        sys.exit("ERROR: reference GGUF built fine but perplexity couldn't score it — "
+        sys.exit("ERROR: reference GGUF built fine but perplexity couldn't score it -- "
                  "check the eval file, the tools, and free memory (the forward pass runs here).")
     print(f"reference KL = {kl_ref:.5f}")
 
-    # 2b. the NOISE curve for THIS model — uniform KL at each ladder rung. This is
+    # 2b. the NOISE curve for THIS model -- uniform KL at each ladder rung. This is
     # the per-type KL cost the allocator needs, MEASURED per model (it shifts a bit
     # model to model), so nothing is baked in. Cheap next to the sensitivity sweep.
     noise = {}
@@ -358,7 +358,7 @@ def main():
     for t in LADDER:
         if mem_budget and arch["total"] * BPW[t] / 8 / 1e9 > mem_budget:
             noise[t] = None                            # too big to eval here; interpolated
-            print(f"  {t:8} (skipped — {arch['total']*BPW[t]/8/1e9:.0f} GB > budget; interpolated)")
+            print(f"  {t:8} (skipped -- {arch['total']*BPW[t]/8/1e9:.0f} GB > budget; interpolated)")
             continue
         uni = os.path.join(tmp, "uni.gguf")
         cmd = [a.llama_quantize, "--imatrix", a.imatrix,
@@ -382,13 +382,13 @@ def main():
     for i in range(layers):
         for g in groups:
             pat = rf"blk\.{i}\.{g}_.*={a.probe}"
-            # crush this group, keep the a.ref base — but the base needs the SAME pins
+            # crush this group, keep the a.ref base -- but the base needs the SAME pins
             # (an IQ2 base crashes on uncovered tensors), so PINARG goes too.
             subprocess.run([a.llama_quantize, "--imatrix", a.imatrix, "--tensor-type", pat]
                            + (PINARG if a.ref in IMATRIX_REQUIRED_PRESETS else [])
                            + [a.gguf, probe, a.ref], capture_output=True)
             k = _kl(a.llama_perplexity, probe, a.eval, base, a.rpc, a.ngl)
-            # a FAILED probe (build/eval crashed) is UNMEASURED, not zero-cost —
+            # a FAILED probe (build/eval crashed) is UNMEASURED, not zero-cost --
             # recording 0 would tell the allocator this is the LEAST important group
             # and crush it hardest. Mark None; protect it after the sweep.
             profile[g][str(i)] = (max(0.0, k - kl_ref) if k is not None else None)
@@ -411,9 +411,9 @@ def main():
                 if v is None:
                     profile[g][k2] = hi
         print(f"\nWARNING: {len(failed)} probe build(s) failed (likely imatrix-uncovered "
-              f"tensors) — those groups were set to MAX sensitivity (PROTECTED), not 0, "
+              f"tensors) -- those groups were set to MAX sensitivity (PROTECTED), not 0, "
               f"so the allocator keeps their bits. Groups: "
-              f"{', '.join(failed[:8])}{' …' if len(failed) > 8 else ''}")
+              f"{', '.join(failed[:8])}{' ...' if len(failed) > 8 else ''}")
 
     for f in (base, ref):
         os.path.exists(f) and os.remove(f)

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""pollard-lowbit — the extreme-low-bit R&D prototype. Test whether "catching the
+"""pollard-lowbit -- the extreme-low-bit R&D prototype. Test whether "catching the
 collapse" keeps 1-2 bit coherent where plain low-bit face-plants.
 
 Two levers everyone documents but nobody stacks for GGUF:
   1. OUTLIER-CATCH (dense+sparse, SpQR/SqueezeLLM): a tiny set of high-sensitivity
-     weights carry most of the damage at 1-bit — keep THOSE in fp16, crush the rest.
+     weights carry most of the damage at 1-bit -- keep THOSE in fp16, crush the rest.
   2. RESIDUAL CAROUSEL (RVQ/additive, AQLM): quantize, take the leftover error,
-     quantize that, stack corrections — the error keeps refining, never fully dies.
+     quantize that, stack corrections -- the error keeps refining, never fully dies.
 
 Measures WikiText-2 PPL for: fp16, plain RTN (the collapse baseline), outlier-catch,
-residual, and the combination — at a target bit-width, on a small model (fast).
+residual, and the combination -- at a target bit-width, on a small model (fast).
 
 Usage:
   pollard-lowbit --model hf_qwen05 --bits 1 --keep 0.01 --levels 3 \
@@ -60,7 +60,7 @@ def q_ternary(W, groupsize):
 
 def q_binary(W, groupsize):
     """True signed 1-bit {-1,+1} with per-group abs-mean scale (sign(W)*mean(|W|)).
-    The hard constraint — no zeros. ~1.0 bpw + the group scales."""
+    The hard constraint -- no zeros. ~1.0 bpw + the group scales."""
     W = W.float(); cols = W.shape[1]; Q = torch.zeros_like(W); gs = groupsize or cols
     for c0 in range(0, cols, gs):
         g = W[:, c0:c0 + gs]

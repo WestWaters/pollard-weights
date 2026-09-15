@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-errsrc — attribute MEASURED quant error to a tensor AND to the trigger that caused it,
+"""pollard-errsrc -- attribute MEASURED quant error to a tensor AND to the trigger that caused it,
 so the budget goes where it actually buys something.
 
 pollard-sensitivity already answers *which* tensor costs how much: it crushes one group at a time and
@@ -21,7 +21,7 @@ the steering budget.
   pollard-errsrc --sensitivity model.sensitivity.json --imatrix model.imatrix
   pollard-errsrc --sensitivity s.json --imatrix m.imatrix --json > errsrc.json
 
-⚠️ The KL costs are measured. The TRIGGERS are inferred from imatrix statistics and are a hypothesis
+! The KL costs are measured. The TRIGGERS are inferred from imatrix statistics and are a hypothesis
 about cause -- test a call before trusting it (fix the calib, or apply the transform, then re-run
 pollard-sensitivity and check the cost actually fell). Read-only; nothing is rebuilt here.
 """

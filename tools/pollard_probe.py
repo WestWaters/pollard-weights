@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""pollard-probe — the CHEAP, any-box sensitivity profile. Same output as
+"""pollard-probe -- the CHEAP, any-box sensitivity profile. Same output as
 pollard-sensitivity, a fraction of the cost, so measured allocation runs on a
 laptop instead of needing a big-GPU GGUF sweep.
 
 pollard-sensitivity is the ground truth: it CRUSHES each tensor group to a real
-GGUF quant and runs a full perplexity KL pass — 2·layers subprocess builds + KL
+GGUF quant and runs a full perplexity KL pass -- 2*layers subprocess builds + KL
 evals. Accurate, but heavy and GPU-hungry. This does the same measurement the
 cheap way EXL3 does it: perturb one group at a time IN-PROCESS (torch), read the
-logit-KL directly, restore. No GGUF, no imatrix, no separate eval binary — one
+logit-KL directly, restore. No GGUF, no imatrix, no separate eval binary -- one
 forward pass per group. The RANKING is what the allocator needs, and injected
 quant-error ranks the groups the same way for a tiny cost.
 
@@ -17,7 +17,7 @@ Emits the identical `sensitivity.json` schema pollard-fit consumes:
     pollard-probe --model <hf-dir-or-id> --eval held-out.txt --out model.sensitivity.json
     pollard-fit --gguf model-f16.gguf --ram 16 --sensitivity model.sensitivity.json
 
-Note: this is the torch/RTN proxy for the GGUF crush — the per-group ranking
+Note: this is the torch/RTN proxy for the GGUF crush -- the per-group ranking
 matches; absolute KL is a proxy, not the ik_llama trellis error. For the final
 published card, confirm the winner with a pollard-sensitivity run on the box.
 """
@@ -40,7 +40,7 @@ def _chunks(tok, text, seqlen, n):
 
 @torch.no_grad()
 def _rtn(W, bits, gs=64):
-    """Per-row absmax symmetric RTN to `bits`, group size gs — the actual quant
+    """Per-row absmax symmetric RTN to `bits`, group size gs -- the actual quant
     error we perturb with (deterministic, cheap). Returns the quantized weight."""
     if bits >= 16:
         return W
@@ -77,14 +77,14 @@ def _linears(model, layer, group):
 
 @torch.no_grad()
 def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_bits):
-    """ONE forward pass over the calib set, sensitivity for EVERY group at once — for models where
-    the perturb+KL loop (layers×groups full passes) is infeasible (744B over 1.5TB).
+    """ONE forward pass over the calib set, sensitivity for EVERY group at once -- for models where
+    the perturb+KL loop (layersxgroups full passes) is infeasible (744B over 1.5TB).
 
-    For a linear y=Wx, the expected output error from quantizing W->Ŵ is
-        E‖(W-Ŵ)x‖² = Σ_ij (W-Ŵ)_ij² · E[x_j²]
-    i.e. the squared quant error weighted by the Hessian DIAGONAL h_j = E[x_j²]. We accumulate h_j
+    For a linear y=Wx, the expected output error from quantizing W->W_hat is
+        E||(W-W_hat)x||^2 = sum_ij (W-W_hat)_ij^2 * E[x_j^2]
+    i.e. the squared quant error weighted by the Hessian DIAGONAL h_j = E[x_j^2]. We accumulate h_j
     per target linear with hooks in a single pass (no per-group forward), then score each group as
-    Σ ΔW² · h. Same ranking the perturb+KL probe gives, at a fraction of the cost."""
+    sum deltaW^2 * h. Same ranking the perturb+KL probe gives, at a fraction of the cost."""
     h, cnt, index = {}, {}, {}
     hooks = []
 
@@ -115,7 +115,7 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
                     lid = id(lin)
                     if lid not in h or cnt.get(lid, 0) == 0:      # module never fired (unused/pruned expert)
                         continue
-                    hj = (h[lid] / cnt[lid]).to(lin.weight.device)   # E[x_j²]
+                    hj = (h[lid] / cnt[lid]).to(lin.weight.device)   # E[x_j^2]
                     dW = lin.weight.data.float() - _rtn(lin.weight.data, bits).float()
                     tot += float((dW * dW * hj.unsqueeze(0)).sum().item())
                 cost[g][str(i)] = tot
@@ -138,8 +138,8 @@ def main():
     ap.add_argument("--seqlen", type=int, default=1024)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--stream", action="store_true",
-                    help="ONE-pass Hessian-diagonal estimator instead of per-group perturb+KL — for "
-                         "models too big to run layers×groups forward passes (744B-scale)")
+                    help="ONE-pass Hessian-diagonal estimator instead of per-group perturb+KL -- for "
+                         "models too big to run layersxgroups forward passes (744B-scale)")
     a = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -152,7 +152,7 @@ def main():
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 
     if a.stream:
-        print(f"  {layers} layers, {len(ch)} calib chunks — one-pass Hessian-diagonal estimator", flush=True)
+        print(f"  {layers} layers, {len(ch)} calib chunks -- one-pass Hessian-diagonal estimator", flush=True)
         profile, noise = _stream_sensitivity(model, ch, dev, groups, layers, a.probe_bits, LADDER_BITS)
         method = "pollard-probe stream (Hessian-diagonal proxy)"
         for g in groups:

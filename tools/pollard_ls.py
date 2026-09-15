@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard-ls — list what's in the Pollard workspace so you never hunt for a build. Reads each model's
+"""pollard-ls -- list what's in the Pollard workspace so you never hunt for a build. Reads each model's
 MANIFEST.json and prints every build: lane, quant, size, PPL, and whether it passed pollard-verify.
 
   pollard-ls                 # everything in $POLLARD_HOME (default ~/pollard): builds + pulled sources
@@ -22,14 +22,14 @@ def main():
 
     if a.clean_downloads:
         freed = ws.clean_downloads()
-        print(f"cleared downloads/ — freed {ws.human(freed)}")
+        print(f"cleared downloads/ -- freed {ws.human(freed)}")
         return
 
     home = ws.pollard_home()
     print(f"Pollard workspace: {home}")
     models = [m for m in ws.list_models() if a.filter.lower() in m.lower()]
     if not models:
-        print("  (no builds yet — convert a model and it lands here automatically, or set $POLLARD_HOME)")
+        print("  (no builds yet -- convert a model and it lands here automatically, or set $POLLARD_HOME)")
         return
 
     total = 0
@@ -42,7 +42,7 @@ def main():
         for b in sorted(builds, key=lambda x: (x.get("lane", ""), x.get("tag", ""))):
             total += b.get("bytes") or 0
             v = b.get("verified")
-            vflag = "✓verified" if v is True else ("✗FAILED" if v is False else "· unverified")
+            vflag = "okverified" if v is True else ("xFAILED" if v is False else " |  unverified")
             ppl = f"ppl {b['ppl']:.2f}" if b.get("ppl") is not None else ""
             bpw = f"{b['bpw']:.2f}bpw" if b.get("bpw") is not None else ""
             meta = "  ".join(x for x in (b.get("lane", "").upper(), bpw, ws.human(b.get("bytes")), ppl, vflag) if x)
@@ -51,7 +51,7 @@ def main():
                 print(f"       {b.get('path','')}")
     print(f"\ntotal: {ws.human(total)} across {len(models)} model(s)")
 
-    # pulled SOURCE models (the input side) — show them so they're findable and easy to reclaim
+    # pulled SOURCE models (the input side) -- show them so they're findable and easy to reclaim
     dl = ws.downloads_dir()
     if os.path.isdir(dl):
         srcs = sorted(d for d in os.listdir(dl) if os.path.isdir(os.path.join(dl, d)) and not d.startswith("."))
@@ -66,7 +66,7 @@ def main():
                 if a.paths:
                     print(f"       {os.path.join(dl, s)}")
             if dtotal:
-                print(f"   (source total: {ws.human(dtotal)} — reclaim with `pollard-ls --clean-downloads`)")
+                print(f"   (source total: {ws.human(dtotal)} -- reclaim with `pollard-ls --clean-downloads`)")
 
 
 if __name__ == "__main__":
