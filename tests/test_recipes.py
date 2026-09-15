@@ -8,7 +8,7 @@ the MoE attn_v crush, the q3_k casing, the dense guard). Runnable two ways:
 
 Add a case whenever a recipe/guard changes — never fewer rows than the tools have behaviors.
 """
-import os, re, subprocess, sys, tempfile
+import os, pathlib, re, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 import pollard_automap as A
@@ -1098,6 +1098,67 @@ def test_flybrain_state_is_fixed_size_and_refuses_a_mismatch():
             raise AssertionError("loaded a state from a different connectome")
         except ValueError:
             pass
+
+
+def test_vllm_tp_divisibility_is_caught_before_a_load():
+    """A model that cannot shard at TP=N must be refused here, not minutes into a vLLM load.
+
+    vLLM splits tensors across ranks, so head counts and the intermediate dimension have to divide by
+    the TP degree, and group-quantized weights need whole groups per shard. Qwen2.5 has 14 attention
+    heads: TP=2 is fine, TP=4 cannot work, and the failure otherwise shows up as a shape error on
+    someone else's hardware after the model has already been downloaded.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from pollard_vllm import check
+
+    qwen = {"num_attention_heads": 14, "num_key_value_heads": 2,
+            "hidden_size": 896, "intermediate_size": 4864}
+    assert check(qwen, 1) == [], "TP=1 must always work"
+    assert check(qwen, 2) == [], "14 heads and 4864 intermediate divide by 2"
+    assert check(qwen, 4), "14 heads cannot split 4 ways"
+    assert "attention heads" in check(qwen, 4)[0]
+
+    # group-quantized: each rank's slice must still contain whole groups
+    gptq = {"num_attention_heads": 32, "num_key_value_heads": 8,
+            "hidden_size": 4096, "intermediate_size": 11008,
+            "quantization_config": {"quant_method": "gptq", "group_size": 128}}
+    assert check(gptq, 2) == [], "11008/2 = 5504 IS a multiple of 128 — this one is fine"
+    assert check(gptq, 4), "11008/4 = 2752 is not a multiple of the 128 group"
+    assert "group size" in " ".join(check(gptq, 4))
+
+    # per-channel quantization declares group_size -1: no group constraint at all
+    perchan = dict(gptq, quantization_config={"quant_method": "gptq", "group_size": -1})
+    assert not any("group size" in b for b in check(perchan, 4))
+
+
+def test_vllm_tp_sweep_is_bounded_by_the_model_not_by_a_constant():
+    """The sweep must report EVERY degree a model can serve at, not a hand-picked list.
+
+    People run 3, 6 and 10 GPUs. An arbitrary ceiling (or a powers-of-two list) silently hides a
+    working configuration, which is worse than saying no -- the user never learns the option exists.
+    The only honest bound is the model's own head count: a rank has to receive at least one head.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_vllm
+    from pollard_vllm import check, tp_ceiling
+
+    src = pathlib.Path(pollard_vllm.__file__).read_text()
+    assert "MAX_TP" not in src, "a constant TP ceiling is back -- the bound must come from the model"
+
+    big = {"num_attention_heads": 64, "num_key_value_heads": 4,
+           "hidden_size": 4096, "intermediate_size": 12288}
+    assert tp_ceiling(big) == 64, "the ceiling is the head count"
+    assert check(big, 32) == [] and check(big, 64) == [], "past any old cap, and still shardable"
+
+    # odd and non-power-of-two degrees are reachable, both ways
+    odd = {"num_attention_heads": 24, "num_key_value_heads": 24,
+           "hidden_size": 3072, "intermediate_size": 9216}
+    assert check(odd, 3) == [] and check(odd, 6) == [], "TP=3 and TP=6 divide 24 heads cleanly"
+    assert check(odd, 5), "24 heads cannot split 5 ways"
+
+    # a multimodal config keeps its text-tower geometry, not the top-level stub
+    assert tp_ceiling({"text_config": {"num_attention_heads": 40}}) == 40
+
 
 
 def main():
