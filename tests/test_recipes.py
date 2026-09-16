@@ -1531,8 +1531,12 @@ def test_gguf_lane_requires_unpooled_per_token_states():
     block = src[i:src.index("def open_backend")]
     assert "llama_batch_init" in block and "embd" in block, "must feed embeddings, not ids"
     assert "llama_get_embeddings_ith" in block, "must read per-token hidden states"
-    # llama.cpp does not expose its output embedding, and the brain needs to say so rather than guess
-    assert "does not expose its output embedding" in block
+    # The output embedding is IN THE FILE. llama.cpp not exposing it to Python looked like it needed
+    # an upstream patch; it does not -- a GGUF carries output.weight (or token_embd.weight when the
+    # model ties them) and the gguf package dequantizes either, so the lane needs no fork.
+    assert "GGUFReader" in block and "dequantize" in block, \
+        "out_weight must read the embedding from the GGUF rather than require a fork"
+    assert "token_embd.weight" in block, "must fall back to the tied embedding"
 
 
 
