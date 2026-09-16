@@ -148,6 +148,44 @@ def load_backbone(model_id: str, dtype=None, device: str = "cpu"):
     return model.to(device).eval()
 
 
+def probe_basis(model, tok, corpus: str, n_probe: int, device, plen: int = 160):
+    """One direction per probe: this model's mean hidden state while reading that probe text.
+
+    This is what lets ONE brain attach to models of different widths. The basis is built from
+    responses to the SAME probe texts on every backbone, so direction i means the same thing
+    everywhere -- measured at +0.53 correspondence across model families, against -0.02 for a random
+    per-model projection. Nothing here is trained; it is derived at attach time from the backbone
+    itself, which is why a canonical brain needs no retraining to move.
+    """
+    rows = []
+    with torch.no_grad():
+        for i in range(n_probe):
+            txt = corpus[i * plen:(i + 1) * plen]
+            if not txt.strip():
+                continue
+            ids = tok(txt, return_tensors="pt").input_ids[:, :48].to(device)
+            if ids.shape[1] < 2:
+                continue
+            h = model(input_ids=ids, output_hidden_states=True).hidden_states[-1][0].float()
+            rows.append(h.mean(0))
+    if len(rows) < n_probe:
+        raise SystemExit(f"probe corpus too short: got {len(rows)} of {n_probe} probes "
+                         f"({n_probe * plen} characters needed)")
+    A = torch.stack(rows)
+    return A / A.norm(dim=1, keepdim=True).clamp_min(1e-6)          # (C, D)
+
+
+def bridge(A: torch.Tensor):
+    """(into canonical, back out). The return path MUST be a pseudo-inverse.
+
+    The probe basis is not orthonormal, so A.t() is not its inverse. Using the transpose measured a
+    round-trip gain of 7.5 and the brain could not learn through it at all -- 400 steps stuck between
+    -5% and -60% of the gap. pinv costs one decomposition at attach time and makes the round trip
+    an identity.
+    """
+    return A, torch.linalg.pinv(A)                                   # (C, D), (D, C)
+
+
 class FlyBrain:
     """A connectome-shaped associative memory bound to one frozen backbone."""
 
@@ -170,6 +208,8 @@ class FlyBrain:
         self.bits = int(self.meta["bits"])          # recorded at training time, from the backbone
         self.span = int(self.meta.get("span", _SPAN))
         self.codec = str(self.meta.get("codec", "tokens"))   # "tokens" | "bytes"
+        self.canon = int(self.meta.get("canon", 0))   # 0 = locked to this hidden size
+        self.dim = self.canon or self.hidden          # the width the brain lives in
         self.eos_id = int(self.meta.get("eos_id", -1))   # "the answer ends here"
         self.nbit = self.bits * self.span
         self.cw = self.width - self.nbit          # continuous half; the remainder carries the signs
@@ -179,11 +219,11 @@ class FlyBrain:
             m.load_state_dict({k: torch.as_tensor(v).to(d) for k, v in blob[key].items()})
             return m.eval()
 
-        self.addr = _lin("addr", self.hidden, self.n)              # WHERE, from the hidden state
-        self.addr_e = _lin("addr_e", self.hidden, self.n, bias=False)  # WHERE, from the tokens
-        self.val = _lin("val", 2 * self.hidden, self.cw)        # HOW MUCH of the code to write
-        self.wgate = _lin("wgate", 2 * self.hidden, 1)             # does this token deserve memory
-        self.out = _lin("out", self.width, self.hidden)   # reads the whole slot, bits included            # retrieved code -> hidden space
+        self.addr = _lin("addr", self.dim, self.n)              # WHERE, from the hidden state
+        self.addr_e = _lin("addr_e", self.dim, self.n, bias=False)  # WHERE, from the tokens
+        self.val = _lin("val", 2 * self.dim, self.cw)        # HOW MUCH of the code to write
+        self.wgate = _lin("wgate", 2 * self.dim, 1)             # does this token deserve memory
+        self.out = _lin("out", self.width, self.dim)   # reads the whole slot, bits included            # retrieved code -> hidden space
         self.voice = torch.as_tensor(blob["voice"], dtype=torch.float32, device=d)
         self.temp = torch.as_tensor(blob["temp"], dtype=torch.float32, device=d)
         self.amix = torch.as_tensor(blob["amix"], dtype=torch.float32, device=d)
@@ -204,15 +244,17 @@ class FlyBrain:
     def load(cls, path: str, device: str = "cpu") -> "FlyBrain":
         return cls(torch.load(path, map_location=device, weights_only=False), device=device)
 
-    def bind(self, model, tokenizer=None, verbose: bool = True) -> "FlyBrain":
+    def bind(self, model, tokenizer=None, verbose: bool = True,
+             probe_text: Optional[str] = None) -> "FlyBrain":
         """Point the brain at a model. Reads its output embedding; changes nothing about it."""
         stack = self._find_stack(model)
         hid = self._hidden_size(model, stack)
-        if hid != self.hidden:
+        if not self.canon and hid != self.hidden:
             raise ValueError(
                 f"this brain was trained against hidden size {self.hidden}, this model is {hid}. "
-                "A brain does not transfer between backbones -- its address matrix and its token "
-                "codes are that model's. Train one with --train."
+                "A brain trained without --canon is locked to that backbone: its address matrix is "
+                "that model's width. Train with --canon to make one that attaches anywhere, or "
+                "carry this one over with --continue-from."
             )
         self.model, self.tok, self.stack = model, tokenizer, stack
         emb = (model.get_output_embeddings() or stack.embed_tokens).weight.detach()
@@ -220,6 +262,18 @@ class FlyBrain:
         self.code = code / code.norm(dim=1, keepdim=True).clamp_min(1e-6)
         if self.codec == "bytes":
             self._btbl, self._blen = self._byte_table()
+        if self.canon:
+            if probe_text is None:
+                raise ValueError("a canonical brain needs probe_text= at bind(): the bridge to this "
+                                 "backbone is derived from its own responses, not shipped with the "
+                                 f"brain. Any text works; it needs about {self.canon * 160:,} chars.")
+            A = probe_basis(model, tokenizer, probe_text, self.canon, self.device)
+            self._pin, self._pout = bridge(A)
+            if verbose:
+                x = torch.randn(64, A.shape[1], device=A.device)
+                g = ((x @ self._pin.t()) @ self._pout.t()).norm(dim=1).mean() / x.norm(dim=1).mean()
+                print(f"[flybrain] canonical {self.canon}d bridge to hidden {hid}, "
+                      f"round-trip gain {float(g):.3f} (1.000 is exact)")
         self.reset()
         if verbose:
             print(f"[flybrain] bound: {self.n:,} slots x {self.width} = {self.n * self.width:,} "
@@ -358,6 +412,14 @@ class FlyBrain:
         """
         return emb[:, -self.ek:].mean(1)
 
+    def _to_canon(self, x: torch.Tensor) -> torch.Tensor:
+        """Backbone space -> the width the brain lives in. Identity for a locked brain."""
+        return x if not self.canon else x @ self._pin.t()
+
+    def _from_canon(self, x: torch.Tensor) -> torch.Tensor:
+        """Back out to backbone space, through the pseudo-inverse."""
+        return x if not self.canon else x @ self._pout.t()
+
     def _read_raw(self, h: torch.Tensor, ek: torch.Tensor) -> torch.Tensor:
         """The retrieved value in MEMORY space. The signs live here; `out` maps out of this space,
         so slicing its output would decode noise rather than the stored bits."""
@@ -370,7 +432,7 @@ class FlyBrain:
 
     def _memory_tokens(self, emb: torch.Tensor, ekw: torch.Tensor) -> torch.Tensor:
         """What the brain hands the model before it reads the next window."""
-        q = self._read(emb.mean(1), ekw.mean(1))
+        q = self._from_canon(self._read(self._to_canon(emb.float()).mean(1), ekw.mean(1)))
         q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6) * emb.norm(dim=-1).mean()
         return q.unsqueeze(1).expand(-1, self.k_mem, -1)
 
@@ -378,10 +440,11 @@ class FlyBrain:
         """One window: read from memory, run the model, write back. Returns (logits, retrieved)."""
         emb = self.stack.embed_tokens(ids)
         self._last_ids = ids
-        ekw = self._ekey(emb)
+        ekw = self._to_canon(self._ekey(emb).float())
         o = self.model(inputs_embeds=torch.cat([self._memory_tokens(emb, ekw), emb], 1),
                        output_hidden_states=True)
-        h = o.hidden_states[-1][:, self.k_mem:].float()
+        h = self._to_canon(o.hidden_states[-1][:, self.k_mem:].float())
+        embc = self._to_canon(emb.float())
         logits = o.logits[:, self.k_mem:]
         if write:
             # KEY on the context BEFORE each token, VALUE on the token. The carry keeps the shift
@@ -392,9 +455,9 @@ class FlyBrain:
             # A token the brain judges unimportant should occupy no memory at all. Gating only the
             # VALUE still let every filler token add its full address mass to the normaliser, so the
             # fact was divided by a denominator inflated with hundreds of writes it did not make.
-            a = a * torch.sigmoid(self.wgate(torch.cat([emb, h], -1)))
+            a = a * torch.sigmoid(self.wgate(torch.cat([embc, h], -1)))
             v = torch.cat([self.code[ids[0]].unsqueeze(0)
-                           * torch.sigmoid(self.val(torch.cat([emb, h], -1))),
+                           * torch.sigmoid(self.val(torch.cat([embc, h], -1))),
                            self._bit_value(ids[0])], -1)          # continuous half ++ exact signs
             self.carry = h[:, -1:]
             # The carry must be EXACTLY ek long. A final window shorter than ek leaves a short
@@ -450,7 +513,7 @@ class FlyBrain:
             last = logits[:, -1]
         # the vote path still exists for callers that want logits; recall() reads the
         # signs directly and does not depend on it
-        return self._vote(last, self.out(retrieved))
+        return self._vote(last, self._from_canon(self.out(retrieved)))
 
     @torch.no_grad()
     def recall(self, question: str) -> str:
@@ -627,11 +690,19 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
         # Pick up where a previous run stopped -- on this backbone, or on a different one.
         ck = torch.load(continue_from, map_location=device, weights_only=False)
         prev = ck.get("meta", {})
-        if int(prev.get("bits", bits)) != bits or int(prev.get("span", span)) != span:
-            raise SystemExit(
-                f"{continue_from} stores {prev.get('bits')}x{prev.get('span')} bit codes, this run "
-                f"wants {bits}x{span}. The payload width defines what is already written; changing "
-                "it silently re-rolls the codebook and the carried memory decodes to noise.")
+        # A payload change is allowed. --continue-from carries trained WEIGHTS, and the written
+        # memory is runtime state that lives in a .flystate file, not in the checkpoint -- so there
+        # is nothing stored here for a new codebook to corrupt. Changing bits, span or codec resizes
+        # the value and decoder layers, and _carry_over re-initialises exactly those while the
+        # address path, gate and connectome carry across. People swap backbones and payloads
+        # constantly; refusing the whole transfer over a resizable layer threw away everything that
+        # did transfer. (A .flystate written by a differently shaped brain IS still refused, in
+        # load_state, because that file holds real written memory.)
+        pb, ps = int(prev.get("bits", bits)), int(prev.get("span", span))
+        pc = str(prev.get("codec", "tokens"))
+        if (pb, ps, pc) != (bits, span, codec):
+            log(f"  payload change {pb}x{ps} {pc} -> {bits}x{span} {codec}: "
+                "value and decoder layers re-initialise, addressing carries over")
         kept = _carry_over(ck, {"addr": ADDR, "addr_e": ADDR_E, "val": VAL,
                                 "wgate": WGATE, "out": ROUT}, log=log)
         with torch.no_grad():

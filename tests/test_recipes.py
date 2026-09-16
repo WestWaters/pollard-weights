@@ -1462,9 +1462,52 @@ def test_brain_payload_codec_is_recorded_not_assumed():
     assert '"codec": codec' in src, "the trainer must record the codec it wrote"
     assert 'bits = 8 if codec == "bytes"' in src, "a byte payload is 8 bits, not the vocabulary width"
     assert "decode_text" in src, "a byte brain needs a text decoder"
-    # changing the payload width mid-training silently re-rolls the codebook -- must be refused
-    assert "re-rolls the codebook" in src or "silently re-rolls" in src, \
-        "continuing with a different bits/span must be an error, not a silent reset"
+    # Changing the payload must be ALLOWED, not refused. --continue-from carries trained weights;
+    # written memory lives in a .flystate file, so a new codebook has nothing stored to corrupt.
+    # People swap backbones and payloads constantly, and refusing the whole transfer over a
+    # resizable layer threw away the address path and gate that transfer perfectly well.
+    i = src.index("if continue_from:")
+    block = src[i:i + 2000]
+    assert "raise SystemExit" not in block, "a payload change must not abort the transfer"
+    assert "payload change" in block, "a payload change must be reported, not silent"
+    # but a written-memory file from a differently shaped brain IS still refused
+    assert "state was written by a differently shaped brain" in src, \
+        "load_state must still refuse a mismatched .flystate -- that file holds real memory"
+
+
+
+def test_every_runtime_backend_declares_the_same_four_operations():
+    """A brain needs four things from a backbone, and nothing else.
+
+    embed(ids), forward(embeds) -> (logits, hidden), forward_ids(ids), out_weight(). Brains ran only
+    under transformers because those four calls were written inline against one library, not because
+    of anything in the memory. Any runtime that can be fed EMBEDDINGS can host one -- that is the
+    hard requirement, since memory is delivered by prepending vectors to the sequence.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_brain_backends as B
+
+    for cls in (B.Transformers, B.MLX, B.ExLlamaV3, B.LlamaCpp):
+        for op in ("embed", "forward", "forward_ids", "out_weight"):
+            assert callable(getattr(cls, op, None)), f"{cls.__name__} is missing {op}()"
+        assert getattr(cls, "name", "?") != "?", f"{cls.__name__} has no lane name"
+    assert {c.name for c in (B.Transformers, B.MLX, B.ExLlamaV3, B.LlamaCpp)} == \
+        {"transformers", "mlx", "exl3", "gguf"}
+
+
+def test_mlx_output_embedding_is_dequantized():
+    """A quantized MLX model reports a PACKED output embedding, and the brain's codes come from it.
+
+    A 4-bit Qwen reports (151936, 112) where the real matrix is (151936, 896). Hand the brain packed
+    bytes and it builds its codebook out of bit-patterns: every stored token decodes to noise and
+    nothing raises. The backend must dequantize before returning it.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brain_backends.py").read_text(encoding="utf-8")
+    i = src.index("class MLX")
+    block = src[i:src.index("class ExLlamaV3")]
+    assert "dequantize" in block, "MLX out_weight must dequantize a packed embedding"
+    assert 'hasattr(mod, "scales")' in block, "must detect a quantized module before unpacking"
 
 
 
