@@ -1511,6 +1511,31 @@ def test_mlx_output_embedding_is_dequantized():
 
 
 
+def test_gguf_lane_requires_unpooled_per_token_states():
+    """llama.cpp CAN host a brain -- but only unpooled.
+
+    The high-level Llama.eval() takes tokens only, which is why this lane looked closed. The C API
+    has both halves: llama_batch_init(n, embd, seq) carries EMBEDDINGS in `embd`, and
+    llama_get_embeddings_ith() returns the final hidden state per token. Verified on a Q4_K_M build:
+    embed (1,6,896) in, logits (1,6,151936) and hidden (1,6,896) out.
+
+    Pooling is the trap. With llama.cpp's default the context returns ONE pooled vector for the whole
+    sequence, so a brain has nothing per-token to address on and every write lands in the same place.
+    The context must be opened with pooling NONE.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brain_backends.py").read_text(encoding="utf-8")
+    assert "LLAMA_POOLING_TYPE_NONE" in src, "the GGUF context must disable pooling"
+    i = src.index("class LlamaCpp")
+    block = src[i:src.index("def open_backend")]
+    assert "llama_batch_init" in block and "embd" in block, "must feed embeddings, not ids"
+    assert "llama_get_embeddings_ith" in block, "must read per-token hidden states"
+    # llama.cpp does not expose its output embedding, and the brain needs to say so rather than guess
+    assert "does not expose its output embedding" in block
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

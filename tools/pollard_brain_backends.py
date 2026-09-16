@@ -111,7 +111,14 @@ class MLX(Backend):
 
 
 class ExLlamaV3(Backend):
-    """exllamav3. Accepts input embeddings and can return hidden states per layer."""
+    """exllamav3.
+
+    Model.forward() takes ids only, but the layer walk underneath it does not: forward_ls() iterates
+    `fwd_modules` and hands each module's output to the next. The first module is the embedding and
+    the last is the head, so skipping the first lets embeddings IN and stopping before the last lets
+    the hidden state OUT -- which is precisely the pair a brain needs. No fork, no patch; the seam
+    was already there.
+    """
     name = "exl3"
 
     def __init__(self, model, cache, tok):
@@ -119,60 +126,147 @@ class ExLlamaV3(Backend):
         self.torch, self.model, self.cache, self.tok = torch, model, cache, tok
         self.hidden_size = int(model.config.hidden_size)
 
+    def _mods(self):
+        return list(self.model.fwd_modules)
+
     def embed(self, ids):
-        return self.model.modules[0].forward(ids)
+        module, instance, _ = self._mods()[0]
+        params = {"layer_instance": instance}
+        return module.forward(module.prepare_for_device(ids, params), params)
 
     def forward(self, embeds, k_skip=0):
-        out = self.model.forward(input_embeddings=embeds, cache=self.cache,
-                                 return_last_state=True)
-        logits = out["logits"] if isinstance(out, dict) else out
-        h = out.get("last_state") if isinstance(out, dict) else None
-        if h is None:
-            raise RuntimeError("this exllamav3 build does not return hidden states; "
-                               "a brain needs them to address memory")
+        mods = self._mods()
+        params = {}
+        x = embeds
+        for module, instance, _ in mods[1:-1]:      # past the embedding, up to the head
+            params["layer_instance"] = instance
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+        h = x                                        # the last hidden state, before the head
+        module, instance, _ = mods[-1]
+        params["layer_instance"] = instance
+        logits = module.forward(module.prepare_for_device(h, params), params)
         return (logits[:, k_skip:], h[:, k_skip:].float())
 
     def forward_ids(self, ids):
         return self.forward(self.embed(ids))[1]
 
     def out_weight(self):
-        return self.model.modules[-1].get_weight_tensor()
+        """The head's weight, dequantized.
+
+        EXL3 stores trellis-quantized weights, so whatever the head holds is not a plain matrix. Any
+        packed tensor handed to the brain becomes a codebook of bit-patterns and every stored token
+        decodes to noise -- the same failure the MLX lane had -- so this insists on a real one.
+        """
+        head = self._mods()[-1][0]
+        for attr in ("get_weight_tensor", "get_weight", "unpack"):
+            fn = getattr(head, attr, None)
+            if callable(fn):
+                w = fn()
+                if hasattr(w, "shape") and len(w.shape) == 2 and w.shape[-1] == self.hidden_size:
+                    return w.float()
+        w = getattr(head, "weight", None)
+        if w is not None and w.shape[-1] == self.hidden_size:
+            return w.float()
+        raise RuntimeError(
+            "could not get an unpacked output embedding from this exllamav3 head. The brain derives "
+            "its token codes from it, and a packed tensor would build a codebook of bit-patterns "
+            "that decodes to noise with no error raised.")
 
 
 class LlamaCpp(Backend):
-    """llama.cpp through llama-cpp-python.
+    """llama.cpp, through the low-level bindings rather than the convenience wrapper.
 
-    llama.cpp takes embeddings (llama_batch carries an `embd` field) and exposes the final hidden
-    state, so a GGUF CAN host a brain -- it is a binding job, not a wall. What it will not do is
-    stream hidden states from an arbitrary layer, so the brain reads the last one, which is what it
-    uses anyway.
+    The high-level Llama.eval() takes tokens only, which is why this lane looked closed. The C API
+    underneath takes both halves a brain needs and llama-cpp-python exposes all of it:
+    llama_batch_init(n_tokens, embd, n_seq) allocates a batch whose `embd` field carries EMBEDDINGS
+    instead of ids, and llama_get_embeddings_ith() returns the final hidden state per token once the
+    context is put in embeddings mode. So a GGUF can host a brain; it needed a binding, not a fork.
+
+    Two things that decide whether this works at all: the context must be created with embeddings
+    enabled AND pooling set to NONE, or llama.cpp returns one pooled vector for the whole sequence
+    instead of one per token, and a brain addressing on a pooled mean has nothing to key on.
     """
     name = "gguf"
 
     def __init__(self, llama):
+        import ctypes
         import torch
-        self.torch, self.llama = torch, llama
-        self.hidden_size = int(llama.n_embd())
+        import llama_cpp.llama_cpp as C
+        self.C, self.ct, self.torch = C, ctypes, torch
+        self.llama = llama
+        self.ctx = llama._ctx.ctx
+        self.model = llama._model.model
+        self.hidden_size = int(C.llama_model_n_embd(self.model))
+        C.llama_set_embeddings(self.ctx, True)
 
     def embed(self, ids):
+        """Token ids -> embeddings, by running the input layer alone.
+
+        llama.cpp does not hand out its embedding matrix, so this decodes the ids and reads the
+        per-token states back. It costs a forward pass, which is why the brain embeds a window once
+        and reuses it rather than calling this per token.
+        """
         import numpy as np
-        tbl = self.llama.token_get_embeddings() if hasattr(self.llama, "token_get_embeddings") else None
-        if tbl is None:
-            raise RuntimeError("this llama-cpp-python build does not expose the embedding table; "
-                               "build with LLAMA_CPP_EXPOSE_EMBD=1 or use the transformers copy")
-        return self.torch.from_numpy(np.asarray(tbl)[ids.cpu().numpy()]).float()
+        toks = ids.flatten().tolist()
+        self.C.llama_memory_clear(self.C.llama_get_memory(self.ctx), True)
+        batch = self.C.llama_batch_init(len(toks), 0, 1)
+        try:
+            for k, t in enumerate(toks):
+                batch.token[k] = t
+                batch.pos[k] = k
+                batch.n_seq_id[k] = 1
+                batch.seq_id[k][0] = 0
+                batch.logits[k] = 1
+            batch.n_tokens = len(toks)
+            if self.C.llama_decode(self.ctx, batch) != 0:
+                raise RuntimeError("llama_decode failed while embedding")
+            rows = [np.ctypeslib.as_array(self.C.llama_get_embeddings_ith(self.ctx, k),
+                                          (self.hidden_size,)).copy() for k in range(len(toks))]
+        finally:
+            self.C.llama_batch_free(batch)
+        return self.torch.from_numpy(np.stack(rows)).float().unsqueeze(0)
 
     def forward(self, embeds, k_skip=0):
-        raise NotImplementedError(
-            "llama-cpp-python does not yet expose embedding input plus hidden-state output through "
-            "its Python API. The C API supports both (llama_batch.embd, llama_get_embeddings), so "
-            "this is a binding to write, not a limitation of the format.")
+        """Run FROM embeddings: the batch carries `embd`, not ids."""
+        import numpy as np
+        x = embeds[0].detach().cpu().float().numpy()
+        n = x.shape[0]
+        self.C.llama_memory_clear(self.C.llama_get_memory(self.ctx), True)
+        batch = self.C.llama_batch_init(n, self.hidden_size, 1)
+        try:
+            flat = x.reshape(-1)
+            for k in range(flat.size):
+                batch.embd[k] = float(flat[k])
+            for k in range(n):
+                batch.pos[k] = k
+                batch.n_seq_id[k] = 1
+                batch.seq_id[k][0] = 0
+                batch.logits[k] = 1
+            batch.n_tokens = n
+            if self.C.llama_decode(self.ctx, batch) != 0:
+                raise RuntimeError("llama_decode failed on an embedding batch")
+            h = np.stack([np.ctypeslib.as_array(
+                self.C.llama_get_embeddings_ith(self.ctx, k), (self.hidden_size,)).copy()
+                for k in range(n)])
+            lg = self.C.llama_get_logits(self.ctx)
+            V = int(self.C.llama_vocab_n_tokens(self.C.llama_model_get_vocab(self.model)))
+            logits = np.ctypeslib.as_array(lg, (n, V)).copy()
+        finally:
+            self.C.llama_batch_free(batch)
+        t = self.torch
+        return (t.from_numpy(logits).float().unsqueeze(0)[:, k_skip:],
+                t.from_numpy(h).float().unsqueeze(0)[:, k_skip:])
 
     def forward_ids(self, ids):
-        raise NotImplementedError(self.forward.__doc__)
+        return self.forward(self.embed(ids))[1]
 
     def out_weight(self):
-        raise NotImplementedError
+        raise RuntimeError(
+            "llama.cpp does not expose its output embedding matrix, and the brain's token codes come "
+            "from it. Train the brain against the transformers copy of this model -- the codes are a "
+            "property of the vocabulary, not of the quantization -- or use --codec bytes, which does "
+            "not need the matrix at all.")
 
 
 def open_backend(kind: str, model_id: str, device: str = "cpu", **kw) -> Backend:
@@ -200,7 +294,12 @@ def open_backend(kind: str, model_id: str, device: str = "cpu", **kw) -> Backend
     if kind == "gguf":
         try:
             from llama_cpp import Llama
+            import llama_cpp.llama_cpp as C
         except ImportError:
             raise SystemExit("the GGUF lane needs llama-cpp-python") from None
-        return LlamaCpp(Llama(model_path=model_id, embedding=True, logits_all=True, verbose=False))
+        # pooling NONE is not optional: the default pools the sequence into ONE vector, and a brain
+        # addressing on a pooled mean has nothing per-token to key on.
+        return LlamaCpp(Llama(model_path=model_id, n_ctx=kw.get("n_ctx", 4096),
+                              embedding=True, pooling_type=C.LLAMA_POOLING_TYPE_NONE,
+                              verbose=False))
     raise SystemExit(f"unknown runtime {kind!r}: auto, mlx, exl3, gguf")
