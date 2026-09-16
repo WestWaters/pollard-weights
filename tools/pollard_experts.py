@@ -32,31 +32,54 @@ import json
 from collections import Counter, defaultdict
 
 
-def load(path):
-    """rows -> (prompt, pos, layer, [experts]). Tolerant of blank and torn lines
-    (a capture killed mid-write leaves a truncated final row -- skip, don't crash)."""
-    rows, skipped = [], 0
-    with open(path) as f:
+def load(path, phase="all"):
+    """rows -> (prompt, pos, layer, [experts], phase). Tolerant of blank and torn lines
+    (a capture killed mid-write leaves a truncated final row -- skip, don't crash).
+
+    PREFILL AND DECODE MUST BE SEPARABLE. A router spreads prefill across nearly the whole pool
+    whatever the workload -- one domain touched 97.6% of experts in our measurements -- while decode
+    concentrates about 2x. Prefill also contributes far more rows than decode in any normal capture,
+    so averaging the two buries the concentration under the flat part and reports "no structure" for
+    a workload that has plenty. An agent spends its time in decode; that is the regime to measure.
+    """
+    rows, skipped, counts = [], 0, Counter()
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
                 d = json.loads(line)
+                ph = d.get("phase", "unknown")
+                counts[ph] += 1
+                if phase != "all" and ph != phase:
+                    continue
                 rows.append((d.get("prompt", 0), d.get("pos", 0), int(d["layer"]),
-                             [int(e) for e in d["experts"]]))
+                             [int(e) for e in d["experts"]], ph))
             except (ValueError, KeyError, TypeError):
                 skipped += 1
     if skipped:
         print(f"[note] skipped {skipped} malformed line(s) (torn capture) -- using the rest")
-    return rows
+    if phase != "all" and not rows and counts:
+        raise SystemExit(
+            f"no '{phase}' rows in this capture (it holds: "
+            + ", ".join(f"{v:,} {k}" for k, v in counts.most_common()) + ").\n"
+            "Recapture with `pollard-route --gen N` to record decode routing.")
+    if counts and "unknown" in counts and len(counts) == 1:
+        print("[note] this capture has no phase labels, so prefill and decode cannot be separated.\n"
+              "       Recapture with pollard-route to label them.")
+    return rows, counts
 
 
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--jsonl", required=True, help="routing capture from experiments/e2")
+    ap.add_argument("--jsonl", required=True, help="routing capture from pollard-route")
+    ap.add_argument("--phase", default="decode", choices=["decode", "prefill", "all"],
+                    help="which regime to analyse (default decode -- where an agent spends its "
+                         "time and where routing actually concentrates; prefill is near-uniform "
+                         "whatever the workload, and mixing the two hides the concentration)")
     ap.add_argument("--top", type=int, default=8, help="hot experts to list per layer (default 8)")
     ap.add_argument("--layers", default=None,
                     help="comma-separated layer indices to detail (default: a sample)")
@@ -65,17 +88,20 @@ def main():
     ap.add_argument("--out", default=None, help="write the keep-list json here")
     a = ap.parse_args()
 
-    rows = load(a.jsonl)
+    rows, phase_counts = load(a.jsonl, a.phase)
     if not rows:
         raise SystemExit(f"no routing records in {a.jsonl} -- did the capture run?")
+    if len(phase_counts) > 1:
+        breakdown = ", ".join(f"{v:,} {k}" for k, v in phase_counts.most_common())
+        print(f"phase         : analysing {a.phase} ({breakdown} in the capture)")
 
     per_layer = defaultdict(Counter)                 # layer -> Counter(expert -> hits)
-    for _p, _pos, layer, experts in rows:
+    for _p, _pos, layer, experts, _ph in rows:
         for e in experts:
             per_layer[layer][e] += 1
     layers = sorted(per_layer)
     top_k = len(rows[0][3])
-    tokens = len({(p, pos) for p, pos, _l, _e in rows})
+    tokens = len({(p, pos) for p, pos, _l, _e, _ph in rows})
     n_experts = max(max(c) for c in per_layer.values()) + 1     # inferred from ids seen
 
     print(f"== pollard-experts :: {a.jsonl}")
