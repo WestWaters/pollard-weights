@@ -156,7 +156,7 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
+    from pollard_load import load_backbone, text_layers
     print(f"== pollard-lowbit :: {a.model}  bits={a.bits} keep={a.keep} levels={a.levels}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = load_backbone(a.model, torch.float16, a.device, eval_mode=False)
@@ -165,7 +165,7 @@ def main():
 
     ppl_fp16 = eval_ppl(model, test); print(f"fp16 PPL: {ppl_fp16:.4f}", flush=True)
     import copy; state = copy.deepcopy(model.state_dict())
-    lins = linears(model.model.layers)
+    lins = linears(text_layers(model))
     print("collecting per-channel importance ...", flush=True)
     imp = per_channel_importance(model, calib, lins)
 

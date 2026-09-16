@@ -270,7 +270,7 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
     offload=True keeps the whole model on CPU and moves ONE block to `dev` at a time --
     this is what lets a 7B (15 GB) quantize on a 16 GB GPU: peak VRAM is one block +
     its Hessians, never the whole model."""
-    layers = model.model.layers
+    layers = text_layers(model)
     # --- capture the input to block 0 (+ the kwargs each block needs) for every sample.
     # A forward-PRE-hook avoids replacing the layer (so model-level attribute access like
     # `.attention_type` still works) and stops the pass right before block 0 runs.
@@ -367,7 +367,7 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
+    from pollard_load import load_backbone, text_layers
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     mdev = "cpu" if a.offload else dev                    # where the model itself lives
     print(f"== pollard-gptq :: {a.model}  W{a.bits}g{a.groupsize}  dev={dev}"
@@ -411,13 +411,13 @@ def main():
     def run(method):
         if fp16_state is not None:
             model.load_state_dict(fp16_state)
-        lins = linear_layers(model.model.layers)              # only the transformer-block linears
+        lins = linear_layers(text_layers(model))              # only the transformer-block linears
         t0 = time.time()
         if method in ("gptq-seq", "gptq-seq-ao"):
             rec = make_recipe("aggr" if a.recipe == "aggr" else "handmix", a.ablate) if a.recipe != "none" else None
             sequential_gptq(model, calib, dev, a.bits, a.groupsize,
                             act_order=method.endswith("-ao"), offload=a.offload, qmode=a.qmode,
-                            recipe=rec, nlayers=len(model.model.layers))
+                            recipe=rec, nlayers=len(text_layers(model)))
         elif method in ("gptq", "gptq-ao"):
             Hs = collect_hessians(lins)                       # {n: (Hessian, token count)}
             ao = (method == "gptq-ao")
@@ -453,9 +453,9 @@ def main():
         SYM = {"int": float(a.bits), "ternary": 1.585, "binary": 1.0}
         if a.recipe != "none" and method in ("gptq-seq", "gptq-seq-ao"):
             rec = make_recipe("aggr" if a.recipe == "aggr" else "handmix", a.ablate)
-            nl = len(model.model.layers)
+            nl = len(text_layers(model))
             qbits = 0; qw = 0                                  # quantized layer weights
-            for n, m in model.model.layers.named_modules():
+            for n, m in text_layers(model).named_modules():
                 if isinstance(m, nn.Linear):
                     # recover (layer_idx, subname) from the full module path
                     idx = int(n.split(".")[0]); sub = ".".join(n.split(".")[1:])

@@ -112,7 +112,7 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
+    from pollard_load import load_backbone, text_layers
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     print(f"== pollard-palette :: {a.model}  gs={a.groupsize}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -122,7 +122,7 @@ def main():
 
     ppl_fp16 = eval_ppl(model, test); print(f"fp16 PPL: {ppl_fp16:.4f}", flush=True)
     state = copy.deepcopy(model.state_dict())
-    lins = linear_layers(model.model.layers)
+    lins = linear_layers(text_layers(model))
     print(f"collecting Hessians for {len(lins)} tensors ...", flush=True)
     Hs = collect_hessians(model, calib, lins, dev)
     probe_calib = calib[:a.probe_chunks]

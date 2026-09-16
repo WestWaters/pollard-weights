@@ -71,7 +71,7 @@ def _kl_vs(model, chunks, ref_logp, dev):
 
 def _linears(model, layer, group):
     parent, names = GROUP_ATTR[group]
-    mod = getattr(model.model.layers[layer], parent)
+    mod = getattr(text_layers(model)[layer], parent)
     return [getattr(mod, n) for n in names if hasattr(mod, n)]
 
 
@@ -143,13 +143,13 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
+    from pollard_load import load_backbone, text_layers
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
     print(f"== pollard-probe :: {a.model}  probe={a.probe_bits}bit  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = load_backbone(a.model, torch.float16, dev)
-    layers = len(model.model.layers)
+    layers = len(text_layers(model))
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 
     if a.stream:
