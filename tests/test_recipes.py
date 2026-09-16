@@ -1198,6 +1198,41 @@ def _is_corpus_sample(line):
 
 
 
+def test_human_connectome_filters_glia_and_signs_by_dale():
+    """Two decisions separate a human connectome from a pile of detector artifacts.
+
+    H01's soma table covers ~57k cells and most are GLIA. Unfiltered, the largest single edge class
+    is astrocyte->pyramidal, which is not a synapse: astrocyte processes wrap real synapses and the
+    detector reports the wrapper. A graph whose commonest connection is biologically impossible is
+    not a connectome, so neurons are the default and glia are opt-in.
+
+    The sign has to come from Dale's law on the cell type, not from the detector's own
+    excitatory/inhibitory call, which agreed with Dale only 57.5% of the time on this data -- barely
+    better than a coin. And the sign array is indexed by position in np.unique(concat(pre, post)),
+    the same remap the trainer applies; build it any other way and every sign lands on a different
+    neuron than the one it describes, silently.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_connectome as C
+
+    assert "ASTROCYTE" not in C.NEURONS and "OLIGO" not in C.NEURONS and "MG_OPC" not in C.NEURONS
+    assert "BLOOD_VESSEL_CELL" not in C.NEURONS
+    assert "PYRAMIDAL" in C.EXCITATORY and "INTERNEURON" in C.INHIBITORY
+    assert not (C.EXCITATORY & C.INHIBITORY), "a cell type cannot be both"
+    assert C.NEURONS == C.EXCITATORY | C.INHIBITORY
+
+    # the sign vector must align to the sorted unique node ids, not to edge order
+    import numpy as np
+    pre  = np.array([50, 10, 10], dtype=np.int64)
+    post = np.array([10, 20, 50], dtype=np.int64)
+    soma = {10: ("INTERNEURON", "Layer 2"), 20: ("PYRAMIDAL", "Layer 3"), 50: ("PYRAMIDAL", "Layer 5")}
+    nodes = np.unique(np.concatenate([pre, post]))
+    signs = np.array([-1.0 if soma[int(n)][0] in C.INHIBITORY else 1.0 for n in nodes])
+    assert list(nodes) == [10, 20, 50]
+    assert list(signs) == [-1.0, 1.0, 1.0], "the inhibitory neuron must be the one at its sorted slot"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
