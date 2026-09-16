@@ -299,15 +299,8 @@ class FlyBrain:
         different vocabularies store the same bytes for the same words, so a brain carried between
         them is still readable -- which a vocabulary index never is.
         """
-        V = self.code.shape[0]
-        tbl = torch.zeros(V, self.span, dtype=torch.long, device=self.device)
-        ln = torch.zeros(V, dtype=torch.long, device=self.device)
-        for i in range(V):
-            b = self.tok.decode([i]).encode("utf-8", "ignore")[:self.span]
-            ln[i] = len(b)
-            for j, ch in enumerate(b):
-                tbl[i, j] = ch
-        return tbl, ln
+        return _byte_table_for(self.tok, self.code.shape[0], self.span, self.device,
+                               log=lambda *a, **k: None)
 
     def _bit_value(self, ids_row: torch.Tensor) -> torch.Tensor:
         """At each position, the signs for the next `span` units -- one retrieval, whole answer.
@@ -478,7 +471,7 @@ class FlyBrain:
             # (edges x width) and measured 225 ms against 24 ms for this, with identical arithmetic
             self.mem = self.mem + 0.05 * torch.tanh(
                 torch.sparse.mm(self._adj, self.mem[0]).unsqueeze(0))
-        return logits, self._read_raw(h[:, -1], self._qkey(emb))
+        return logits, self._read_raw(h[:, -1], self._to_canon(self._qkey(emb).float()))
 
     def _vote(self, last: torch.Tensor, retrieved: torch.Tensor) -> torch.Tensor:
         """Mix the brain's own answer into the model's logits.
@@ -567,6 +560,27 @@ class FlyBrain:
 
 
 # ---------------------------------------------------------------------------- training
+def _byte_table_for(tokenizer, vocab: int, span: int, device, log=print):
+    """token id -> its UTF-8 bytes, for a whole vocabulary.
+
+    Built with batch_decode. Calling decode() once per id is the obvious way and it is unusably slow:
+    151,936 separate calls stall for minutes before a single line of training output appears, which
+    reads as a hung job. Batched, it is seconds.
+    """
+    import numpy as np
+    tbl = np.zeros((vocab, span), dtype=np.int64)
+    ln = np.zeros(vocab, dtype=np.int64)
+    CH = 8192
+    for start in range(0, vocab, CH):
+        ids = list(range(start, min(start + CH, vocab)))
+        for k, txt in zip(ids, tokenizer.batch_decode([[i] for i in ids])):
+            b = txt.encode("utf-8", "ignore")[:span]
+            ln[k] = len(b)
+            tbl[k, :len(b)] = list(b)
+    log(f"byte codec: {vocab:,} token->bytes entries built")
+    return (torch.as_tensor(tbl, device=device), torch.as_tensor(ln, device=device))
+
+
 def _carry_over(ck: dict, parts: dict, log=print) -> int:
     """Load what still fits from an existing brain; keep a fresh init for what cannot.
 
@@ -602,7 +616,7 @@ def _carry_over(ck: dict, parts: dict, log=print) -> int:
 
 def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, width=328,
                 win=128, k_mem=8, span=4, ek=3, lr=1e-4, seed=1234, device="cpu",
-                continue_from="", codec="tokens", log=_progress):
+                continue_from="", codec="tokens", canon=0, log=_progress):
     """Fit a brain to THIS model. The backbone is frozen and never updated.
 
     The task is unanswerable without memory: a random string is stated once, buried under filler, and
@@ -635,6 +649,27 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     stack = FlyBrain._find_stack(model)
     D = FlyBrain._hidden_size(model, stack)
+    # Canonical space: train in a fixed width and bridge to whatever this backbone happens to be, so
+    # the resulting brain attaches to ANY model instead of only this one. The bridge is derived from
+    # the backbone's own responses to fixed probe texts -- nothing about it is trained -- and the
+    # canonical directions correspond across families at +0.95 (measured, Qwen2.5-0.5B hidden 896
+    # against SmolLM2-135M hidden 576; a random per-model projection scores ~0.00).
+    #
+    # 512 probes is the default because fidelity is measured on REAL hidden states, not random
+    # vectors: 64 probes round-trips a hidden state at 0.879, 512 at 0.962, while random vectors
+    # score 0.265 and 0.758. Hidden states occupy a low-dimensional subspace, which is the whole
+    # reason a projection this aggressive costs so little.
+    PIN = POUT = None
+    DIM = D
+    if canon:
+        _A = probe_basis(model, tokenizer, corpus, canon, device)
+        PIN, POUT = bridge(_A)
+        DIM = canon
+        with torch.no_grad():
+            _ids = tokenizer(corpus[:4000], return_tensors="pt").input_ids[:, :256].to(device)
+            _H = model(input_ids=_ids, output_hidden_states=True).hidden_states[-1][0].float()
+            _g = ((_H @ PIN.t()) @ POUT.t()).norm(dim=1).mean() / _H.norm(dim=1).mean()
+        log(f"canonical {canon}d: bridge from hidden {D}, round-trip {float(_g):.3f} on real states")
     for p in model.parameters():
         p.requires_grad_(False)
     out_emb = (model.get_output_embeddings() or stack.embed_tokens).weight
@@ -676,11 +711,11 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
     ALLIDS = torch.arange(V, device=device).float()
     BITCODE = ((ALLIDS.unsqueeze(1) // PW) % 2) * 2 - 1        # every token id, exactly
 
-    ADDR = nn.Linear(D, N).to(device)
-    ADDR_E = nn.Linear(D, N, bias=False).to(device)
-    VAL = nn.Linear(2 * D, cw).to(device)
-    WGATE = nn.Linear(2 * D, 1).to(device)
-    ROUT = nn.Linear(width, D).to(device)
+    ADDR = nn.Linear(DIM, N).to(device)
+    ADDR_E = nn.Linear(DIM, N, bias=False).to(device)
+    VAL = nn.Linear(2 * DIM, cw).to(device)
+    WGATE = nn.Linear(2 * DIM, 1).to(device)
+    ROUT = nn.Linear(width, DIM).to(device)
     VOICE = nn.Parameter(torch.full((1,), 0.1, device=device))
     TEMP = nn.Parameter(torch.ones(1, device=device) * 1.6)    # ~5-12% of slots active
     AMIX = nn.Parameter(torch.zeros(1, device=device))
@@ -771,13 +806,7 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
     if codec == "bytes":
         # token id -> its UTF-8 bytes. Built once: the memory stores TEXT, and the tokenizer is only
         # how this backbone spells it, so the same words land as the same bytes on any model.
-        BTBL = torch.zeros(V, span, dtype=torch.long, device=device)
-        BLEN = torch.zeros(V, dtype=torch.long, device=device)
-        for _i in range(V):
-            _b = tokenizer.decode([_i]).encode("utf-8", "ignore")[:span]
-            BLEN[_i] = len(_b)
-            for _j, _c in enumerate(_b):
-                BTBL[_i, _j] = _c
+        BTBL, BLEN = _byte_table_for(tokenizer, V, span, device, log)
 
     def bitval(ids_row):
         T = ids_row.shape[0]
@@ -793,6 +822,14 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
         return torch.cat([BITCODE[ids_row[torch.clamp(torch.arange(T, device=device) + j, max=T - 1)]]
                           for j in range(span)], -1).unsqueeze(0)
 
+    def tocan(x):
+        """Backbone space -> the width the brain trains in. Identity when not canonical."""
+        return x if PIN is None else x @ PIN.t()
+
+    def fromcan(x):
+        """Back out, through the pseudo-inverse -- a transpose measured a round-trip gain of 7.5."""
+        return x if POUT is None else x @ POUT.t()
+
     def run(ids, answer=None, grad=False):
         with (torch.enable_grad() if grad else torch.no_grad()):
             mem = torch.zeros(1, N, width, device=device)
@@ -803,26 +840,27 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
                 if ch.shape[1] < 1:
                     continue
                 emb = stack.embed_tokens(ch)
-                ekw = ekey(emb, e_carry)
-                q = ROUT(torch.zeros(1, width, device=device)) if raw is None else ROUT(raw)
+                ekw = tocan(ekey(emb, e_carry).float())
+                q = fromcan(ROUT(torch.zeros(1, width, device=device)) if raw is None else ROUT(raw))
                 q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-6) * emb.norm(dim=-1).mean()
                 with torch.no_grad():         # frozen backbone: activations are constants
                     o = model(inputs_embeds=torch.cat(
                         [q.detach().unsqueeze(1).expand(-1, k_mem, -1), emb], 1),
                         output_hidden_states=True)
-                h = o.hidden_states[-1][:, k_mem:].float()
+                h = tocan(o.hidden_states[-1][:, k_mem:].float())
+                embc = tocan(emb.float())
                 prev = carry if carry is not None else h[:, :1] * 0
                 a = phi(torch.cat([prev, h[:, :-1]], 1), ekw)
-                a = a * torch.sigmoid(WGATE(torch.cat([emb, h], -1)))
+                a = a * torch.sigmoid(WGATE(torch.cat([embc, h], -1)))
                 v = torch.cat([CODE[ch[0]].unsqueeze(0) *
-                               torch.sigmoid(VAL(torch.cat([emb, h], -1))), bitval(ch[0])], -1)
+                               torch.sigmoid(VAL(torch.cat([embc, h], -1))), bitval(ch[0])], -1)
                 carry, e_carry = h[:, -1:], emb[:, -ek:]
                 old = torch.einsum("btn,bnd->btd", a, mem) / \
                       ((a * z.unsqueeze(1)).sum(-1, keepdim=True) + 1e-4)
                 mem = mem + torch.einsum("btn,btd->bnd", a, v - torch.sigmoid(DBETA) * old) / a.shape[1]
                 z = z + a.sum(1) / a.shape[1]
                 mem = mem + 0.05 * torch.tanh(torch.sparse.mm(ADJ, mem[0]).unsqueeze(0))
-                aq = phi(h[:, -1], qkey(emb))
+                aq = phi(h[:, -1], tocan(qkey(emb).float()))
                 raw = torch.einsum("bn,bnd->bd", aq, mem) / ((aq * z).sum(-1, keepdim=True) + 1e-4)
             return raw
 
@@ -836,9 +874,13 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
         per = [0] * span
         cnt = [0] * span
         for _ in range(n):
-            ids, ans = sample(eval_words[r.randrange(len(eval_words))], fill_eval, r, 6)
+            w = eval_words[r.randrange(len(eval_words))]
+            ids, ans = sample(w, fill_eval, r, 6)
             got = decode(run(ids))[0]
-            want = ans[0]
+            # Same disease in mirror image: comparing decoded BYTES against expected TOKEN IDS
+            # scores 0% by construction however well the brain learned, and nothing raises.
+            want = (torch.tensor([b for b in (" " + w).encode("utf-8")[:span]], device=device)
+                    if codec == "bytes" else ans[0])
             ok = True
             for k in range(min(len(want), span)):
                 cnt[k] += 1
@@ -864,8 +906,23 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
     for it in range(1, steps + 1):
         ids, ans = sample(fresh(), fill_train, rng, rng.choice([4, 6, 6, 8]))
         raw = run(ids, grad=True)
-        nreal = ans.shape[1]
-        tgt = torch.cat([BITCODE[ans[0, k]] for k in range(nreal)]).unsqueeze(0)
+        # The target must be in the SAME units as the payload. BITCODE indexes token ids, so using
+        # it under --codec bytes trains against the id's low 8 bits while the memory stores the
+        # token's UTF-8 bytes. It does not look like a failure: byte 0 is almost always 32 -- a
+        # leading space -- so position 0 learns the constant and scores 98% while the rest sit at
+        # exactly 0%. One position high and the others at zero is the signature of a wrong target.
+        if codec == "bytes":
+            flat = []
+            for k in range(ans.shape[1]):
+                i = int(ans[0, k])
+                flat.extend(BTBL[i][:int(BLEN[i])].tolist())
+            flat = (flat + [0] * span)[:span]
+            nreal = span
+            tgt = (((torch.tensor(flat, device=device).unsqueeze(-1).float() // PW) % 2) * 2 - 1) \
+                .flatten().unsqueeze(0)
+        else:
+            nreal = ans.shape[1]
+            tgt = torch.cat([BITCODE[ans[0, k]] for k in range(nreal)]).unsqueeze(0)
         loss = nn.functional.binary_cross_entropy_with_logits(
             raw[:, -nbit:][:, :nreal * bits] * 4.0, (tgt > 0).float())
         opt.zero_grad()
@@ -896,6 +953,7 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
                                      "codec": codec,
                                      "vocab": int(V), "radius": float(radius), "seed": seed,
                                      "code_seed": _CODE_SEED, "steps": steps, "lr": lr,
+                                     "canon": int(canon),
                                      "exact": float(ex), "step": int(it)}}, out)
     log(f"saved {out} ({os.path.getsize(out)/1e6:.1f} MB) -- "
         f"exact whole word {100*best[0]:.1f}% at step {best[1]}  (floor: 0.0%)")
@@ -935,6 +993,13 @@ def main():
     ap.add_argument("--brain", required=True, help="a .pt brain, e.g. FlyBrain-Pollard-CNSv1.pt")
     ap.add_argument("--model", required=True, help="HF model id to train against / bind to")
     ap.add_argument("--probes", required=True, help="text corpus: filler for training, or a document")
+    ap.add_argument("--canon", type=int, default=0, metavar="N",
+                    help="train in an N-dim canonical space instead of this backbone's hidden size,\n"
+                         "so the brain attaches to ANY model. The bridge is derived at attach time\n"
+                         "from the backbone's own responses to probe texts and is never trained;\n"
+                         "canonical directions correspond across model families at +0.95. 512 is a\n"
+                         "good value (round-trips a real hidden state at 0.962; 64 manages 0.879).\n"
+                         "0, the default, keeps the direct path locked to this backbone.")
     ap.add_argument("--codec", default="tokens", choices=["tokens", "bytes"],
                     help="what the memory stores. 'tokens' (default) is this backbone's vocabulary\n"
                          "indices -- compact, but only this tokenizer can read them back. 'bytes'\n"
@@ -976,7 +1041,8 @@ def main():
         train_brain(model, tok, corpus,
                     (g["body_pre"].to_numpy(), g["body_post"].to_numpy(), g["weight"].to_numpy()),
                     np.load(a.signs), out=a.brain, steps=a.train, width=a.width,
-                    continue_from=a.continue_from, codec=a.codec, device=a.device)
+                    continue_from=a.continue_from, codec=a.codec, canon=a.canon,
+                    device=a.device)
         return
 
     brain = FlyBrain.load(a.brain, device=a.device).bind(model, tok)

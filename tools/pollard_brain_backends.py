@@ -41,7 +41,9 @@ class Transformers(Backend):
         self.model, self.stack, self.hidden_size = model, stack, hidden
 
     def embed(self, ids):
-        return self.stack.embed_tokens(ids)
+        # The caller does not know where this model lives, so move the ids rather than making every
+        # caller guess -- "Passed CPU tensor to MPS op" is otherwise the first thing a Mac user sees.
+        return self.stack.embed_tokens(ids.to(self.stack.embed_tokens.weight.device))
 
     def forward(self, embeds, k_skip=0):
         o = self.model(inputs_embeds=embeds, output_hidden_states=True)
@@ -72,11 +74,26 @@ class MLX(Backend):
         self.hidden_size = int(model.args.hidden_size)
 
     def _t(self, a):
+        """mlx array -> torch. Cast to float32 FIRST.
+
+        numpy has no bfloat16, and most quantized MLX models compute in it, so viewing the buffer
+        directly dies with "'bfloat16' is not a valid PEP 3118 buffer format string" -- which reads
+        as a broken model rather than a dtype that cannot cross the boundary.
+        """
         import numpy as np
-        return self.torch.from_numpy(np.array(a, copy=False)).float()
+        return self.torch.from_numpy(np.array(a.astype(self.mx.float32), copy=False)).float()
 
     def _m(self, t):
-        return self.mx.array(t.detach().cpu().numpy())
+        """torch -> mlx, preserving integer dtype.
+
+        This carries both token IDS and EMBEDDINGS. Casting everything to float breaks the id path --
+        gather refuses non-integral indices -- and casting nothing breaks the embedding path, because
+        numpy cannot view bfloat16. So the dtype decides.
+        """
+        t = t.detach().cpu()
+        if not t.is_floating_point():
+            return self.mx.array(t.numpy())
+        return self.mx.array(t.float().numpy())
 
     def embed(self, ids):
         return self._t(self.model.model.embed_tokens(self._m(ids)))
@@ -291,6 +308,55 @@ class LlamaCpp(Backend):
         return self._ow
 
 
+class VLLM(Backend):
+    """vLLM -- the serving lane.
+
+    vLLM takes embeddings: `--enable-prompt-embeds`, then a `prompt_embeds` tensor of shape
+    (seq_len, hidden_size). That is the half that looked hardest and it is already there.
+
+    The other half is narrower than under transformers. Per-token hidden states come from vLLM's
+    POOLING runner, not from generate(), so one engine cannot hand back logits and per-token states
+    in a single call through the public API. That costs less than it sounds: recall() reads the
+    memory and decodes signs, and never touches logits at all. So a brain SERVES under vLLM for
+    retrieval, and training still belongs on the transformers path where both are free.
+
+    Pooling must be NONE. The default pools a sequence to one vector, and a brain addressing on a
+    pooled mean has nothing per-token to key on -- the same trap as llama.cpp, for the same reason.
+    """
+    name = "vllm"
+
+    def __init__(self, llm, tok, pooling_llm=None):
+        import torch
+        self.torch, self.llm, self.tok = torch, llm, tok
+        self.pool = pooling_llm or llm
+        cfg = llm.llm_engine.model_config.hf_config
+        self.hidden_size = int(getattr(cfg, "hidden_size", 0) or cfg.text_config.hidden_size)
+
+    def embed(self, ids):
+        emb = self.llm.llm_engine.model_executor.driver_worker.model_runner.model \
+            .get_input_embeddings(ids.to("cuda"))
+        return emb.float().cpu()
+
+    def forward(self, embeds, k_skip=0):
+        raise NotImplementedError(
+            "vLLM does not return logits and per-token hidden states from one call. Use "
+            "forward_ids()/hidden states for retrieval -- recall() needs no logits -- and train on "
+            "the transformers backend, where both come back together.")
+
+    def forward_ids(self, ids):
+        """Per-token hidden states, through the pooling runner with pooling disabled."""
+        out = self.pool.encode(self.tok.decode(ids[0].tolist()), pooling_task="token")
+        h = out[0].outputs.data
+        return self.torch.as_tensor(h).float().unsqueeze(0)
+
+    def out_weight(self):
+        m = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        w = getattr(getattr(m, "lm_head", None), "weight", None)
+        if w is None:
+            w = m.get_input_embeddings().weight
+        return w.float().cpu()
+
+
 def open_backend(kind: str, model_id: str, device: str = "cpu", **kw) -> Backend:
     """Open a backbone under the named runtime."""
     if kind in ("auto", "transformers", "hf"):
@@ -321,7 +387,22 @@ def open_backend(kind: str, model_id: str, device: str = "cpu", **kw) -> Backend
             raise SystemExit("the GGUF lane needs llama-cpp-python") from None
         # pooling NONE is not optional: the default pools the sequence into ONE vector, and a brain
         # addressing on a pooled mean has nothing per-token to key on.
+        if not os.path.isfile(model_id):
+            raise SystemExit(
+                f"the GGUF lane needs a path to a .gguf FILE, not {model_id!r}. "
+                "Quantize one first (`pollard --hf <id> --format gguf --run`) and pass that file.")
         return LlamaCpp(Llama(model_path=model_id, n_ctx=kw.get("n_ctx", 4096),
                               embedding=True, pooling_type=C.LLAMA_POOLING_TYPE_NONE,
                               verbose=False), path=model_id)
-    raise SystemExit(f"unknown runtime {kind!r}: auto, mlx, exl3, gguf")
+    if kind == "vllm":
+        try:
+            from vllm import LLM
+        except ImportError:
+            raise SystemExit("the vLLM lane needs vllm") from None
+        from transformers import AutoTokenizer
+        # enable_prompt_embeds is what lets memory tokens in at all; without it vLLM accepts
+        # text and ids only and a brain has no way to deliver anything.
+        llm = LLM(model=model_id, enable_prompt_embeds=True,
+                  runner=kw.get("runner", "pooling"), **kw.get("engine", {}))
+        return VLLM(llm, AutoTokenizer.from_pretrained(model_id))
+    raise SystemExit(f"unknown runtime {kind!r}: auto, mlx, exl3, gguf, vllm")
