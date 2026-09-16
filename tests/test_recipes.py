@@ -1540,6 +1540,99 @@ def test_gguf_lane_requires_unpooled_per_token_states():
 
 
 
+def test_byte_codec_target_and_payload_share_units():
+    """A payload and its training target must be the same KIND of thing.
+
+    Under --codec bytes the memory stores a token's UTF-8 bytes, but the loss target was built from
+    BITCODE, which indexes token IDS. So the brain was trained against the id's low 8 bits while
+    storing the token's text, and the two have nothing to do with each other.
+
+    It did not look like a failure, which is the dangerous part. Byte 0 of an answer is almost always
+    32 -- a leading space -- so position 0 learned the constant and scored 98% while positions 1-3
+    sat at exactly 0%. One position high and the rest at zero is the signature of a wrong target; a
+    real learning failure degrades evenly. With the units matched the codec reaches 99% by step 26,
+    the same speed as the token codec.
+
+    The evaluation had the same disease in mirror image: it compared decoded BYTES against expected
+    TOKEN IDS, scoring 0% by construction however well the brain had learned.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_flybrain.py").read_text(encoding="utf-8")
+
+    i = src.index("tgt = torch.cat([BITCODE")
+    head = src[max(0, i - 1200):i]
+    assert 'if codec == "bytes":' in head, "the byte target must not be built from BITCODE"
+    assert "BTBL[i][:int(BLEN[i])]" in head, "the byte target must come from the token->bytes table"
+
+    j = src.index("def evaluate(")
+    ev = src[j:j + 1600]
+    assert 'codec == "bytes"' in ev, "the evaluation must score bytes against bytes"
+    assert 'encode("utf-8")' in ev, "the byte target must be the answer's real UTF-8"
+
+
+def test_byte_table_is_built_in_one_batch():
+    """Building it id-by-id stalls for minutes with an empty log, which reads as a hung job.
+
+    151,936 separate decode() calls against a full vocabulary take long enough that a user sees
+    nothing happen and kills a working run -- the same failure mode as unflushed training output,
+    reintroduced somewhere new. batch_decode does it in well under a second.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_flybrain.py").read_text(encoding="utf-8")
+    i = src.index("def _byte_table_for(")
+    block = src[i:i + 1400]
+    assert "batch_decode" in block, "the byte table must be built in batches"
+    assert "for _i in range(V)" not in src, "a per-id decode loop is back"
+
+
+
+def test_backends_move_inputs_and_handle_dtypes_at_the_boundary():
+    """A lane that imports is not a lane that works, and the gap is all at the boundary.
+
+    Five real failures, each the FIRST thing a user would hit, none caught by an import check:
+      - ids handed to an MPS/CUDA model still on the CPU ("Passed CPU tensor to MPS op")
+      - numpy cannot view bfloat16, which is what quantized MLX models compute in, so the buffer
+        conversion died with a PEP 3118 error that reads like a corrupt model
+      - casting everything to float to fix that broke the ID path instead: gather refuses
+        non-integral indices, so the dtype has to decide which way to go
+      - the GGUF lane given an HF id rather than a path to a .gguf file
+      - exllamav3 needing ninja on PATH to build its extensions
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brain_backends.py").read_text(encoding="utf-8")
+
+    i = src.index("class Transformers")
+    assert "ids.to(" in src[i:src.index("class MLX")], "transformers must move ids to the model"
+
+    mlx = src[src.index("class MLX"):src.index("class ExLlamaV3")]
+    assert "astype(self.mx.float32)" in mlx, "mlx->torch must cast before numpy sees bfloat16"
+    assert "is_floating_point()" in mlx, "torch->mlx must preserve integer dtype for ids"
+
+    g = src[src.index('if kind == "gguf"'):]
+    assert "os.path.isfile" in g and ".gguf FILE" in g, "the GGUF lane must demand a file path"
+
+
+def test_brainlanes_reports_the_machine_not_a_table():
+    """Which runtimes can host a brain is a property of the MACHINE, not of the brain.
+
+    Platform support belongs in a command a user can run, not a compatibility table in a document
+    that goes stale. And the tool must distinguish 'importable' from 'works' -- an import proves
+    nothing about a forward pass, which is the only claim that counts.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brainlanes.py").read_text(encoding="utf-8")
+    for lane in ("transformers", "mlx", "gguf", "exl3", "vllm"):
+        assert f'"{lane}"' in src, f"{lane} missing from the lane report"
+    assert "platform.system()" in src, "must report the platform it actually ran on"
+    assert "an import does not prove a forward pass works" in src
+    # find_spec is not enough: vLLM's Windows wheel ships WITHOUT its compiled CUDA extension, so the
+    # package directory exists and `from vllm import LLM` still dies on vllm._C_stable_libtorch. A
+    # spec check calls that "available", which is worse than a clear no because someone acts on it.
+    assert "importlib.import_module(mod)" in src, "the check must actually import, not just find"
+    assert "installed but broken" in src, "a present-but-unimportable package must say so"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

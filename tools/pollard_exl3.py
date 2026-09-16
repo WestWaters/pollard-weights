@@ -91,6 +91,21 @@ def main():
     ap.add_argument("--plan-only", action="store_true", help="print the exllamav3 command, build nothing")
     a = ap.parse_args()
 
+    # --model is documented as "dir OR id", but exllamav3's converter takes a DIRECTORY: an id went
+    # through untouched and died as FileNotFoundError on 'Qwen/Qwen2.5-0.5B-Instruct\\config.json',
+    # which reads as a broken model rather than an unresolved name. Every other lane resolves ids, so
+    # this one does too.
+    if not a.plan_only and not os.path.isdir(a.model) and "/" in a.model:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            raise SystemExit(f"--model {a.model!r} is not a directory and huggingface_hub is not "
+                             "installed to fetch it; pass a local path") from None
+        print(f"   resolving {a.model} from the Hub ...", flush=True)
+        a.model = snapshot_download(a.model, allow_patterns=[
+            "*.safetensors", "*.json", "*.model", "*.txt"])
+        print(f"   -> {a.model}", flush=True)
+
     if not a.out and not a.plan_only:                       # no --out -> organized workspace path
         import pollard_workspace as ws
         a.out = ws.resolve_out(a.model, "exl3", tag=f"{a.bpw}bpw")
