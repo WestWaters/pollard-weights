@@ -189,12 +189,14 @@ class LlamaCpp(Backend):
     """
     name = "gguf"
 
-    def __init__(self, llama):
+    def __init__(self, llama, path=None):
         import ctypes
         import torch
         import llama_cpp.llama_cpp as C
         self.C, self.ct, self.torch = C, ctypes, torch
         self.llama = llama
+        self.path = path or getattr(llama, 'model_path', None)
+        self._ow = None
         self.ctx = llama._ctx.ctx
         self.model = llama._model.model
         self.hidden_size = int(C.llama_model_n_embd(self.model))
@@ -262,11 +264,31 @@ class LlamaCpp(Backend):
         return self.forward(self.embed(ids))[1]
 
     def out_weight(self):
-        raise RuntimeError(
-            "llama.cpp does not expose its output embedding matrix, and the brain's token codes come "
-            "from it. Train the brain against the transformers copy of this model -- the codes are a "
-            "property of the vocabulary, not of the quantization -- or use --codec bytes, which does "
-            "not need the matrix at all.")
+        """The output embedding, read from the GGUF FILE and dequantized.
+
+        llama.cpp does not hand this matrix to Python, which looked like it needed an upstream patch.
+        It does not: the tensor is in the file. A GGUF carries `output.weight`, or `token_embd.weight`
+        when the model ties them, and the gguf package reads and dequantizes either. So the lane is
+        self-sufficient with no fork and no binding change -- the brain's token codes come from the
+        vocabulary, and the vocabulary is in the artifact.
+
+        Read once and cached: dequantizing a 151936 x 896 matrix is not something to repeat per call.
+        """
+        if getattr(self, "_ow", None) is not None:
+            return self._ow
+        import numpy as np
+        from gguf import GGUFReader, quants
+        r = GGUFReader(self.path)
+        by = {t.name: t for t in r.tensors}
+        t = by.get("output.weight") or by.get("token_embd.weight")
+        if t is None:
+            raise RuntimeError(f"{self.path} has neither output.weight nor token_embd.weight")
+        w = np.array(t.data)
+        if str(t.tensor_type) not in ("GGMLQuantizationType.F32", "GGMLQuantizationType.F16"):
+            w = quants.dequantize(w, t.tensor_type)
+        w = w.astype(np.float32).reshape(int(t.shape[1]), int(t.shape[0]))
+        self._ow = self.torch.from_numpy(w)
+        return self._ow
 
 
 def open_backend(kind: str, model_id: str, device: str = "cpu", **kw) -> Backend:
@@ -301,5 +323,5 @@ def open_backend(kind: str, model_id: str, device: str = "cpu", **kw) -> Backend
         # addressing on a pooled mean has nothing per-token to key on.
         return LlamaCpp(Llama(model_path=model_id, n_ctx=kw.get("n_ctx", 4096),
                               embedding=True, pooling_type=C.LLAMA_POOLING_TYPE_NONE,
-                              verbose=False))
+                              verbose=False), path=model_id)
     raise SystemExit(f"unknown runtime {kind!r}: auto, mlx, exl3, gguf")
