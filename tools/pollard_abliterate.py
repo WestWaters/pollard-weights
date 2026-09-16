@@ -156,7 +156,8 @@ def main():
         except Exception:
             sys.exit("ERROR: pass --out for the abliterated model.")
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
@@ -165,8 +166,7 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16,
-                                                trust_remote_code=trc).to(dev).eval()
+    model = load_backbone(a.model, torch.float16, dev, trust_remote_code=trc)
 
     A = _load_lines(a.harmful) if a.harmful else _SMOKE_A
     B = _load_lines(a.harmless) if a.harmless else _SMOKE_B

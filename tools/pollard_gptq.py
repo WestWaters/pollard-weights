@@ -366,13 +366,14 @@ def main():
                     "required to quantize a model bigger than VRAM (e.g. a 7B on 16 GB)")
     a = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     mdev = "cpu" if a.offload else dev                    # where the model itself lives
     print(f"== pollard-gptq :: {a.model}  W{a.bits}g{a.groupsize}  dev={dev}"
           f"{'  (block-offload)' if a.offload else ''}")
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(mdev)
+    model = load_backbone(a.model, torch.float16, mdev, eval_mode=False)
 
     print("loading wikitext-2 ...")
     calib = get_wikitext(tok, "train", a.seqlen, a.nsamples, path=a.calib_file)

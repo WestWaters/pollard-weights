@@ -114,38 +114,10 @@ def _progress(*args, **kw):
     print(*args, **kw)
 
 
-def load_backbone(model_id: str, dtype=None, device: str = "cpu"):
-    """Load any backbone a brain can attach to -- text-only or vision-language.
-
-    AutoModelForCausalLM refuses a vision-language config outright ("Unrecognized configuration
-    class ... for this kind of AutoModel"), so a VL model could not be reached at all even though
-    everything downstream already handles one: _find_stack looks for `model.language_model`, which
-    is exactly where a VL model keeps its text stack, and the token codes come from the same output
-    embedding either way. The brain attaches to the LANGUAGE side of a VL model; the vision tower is
-    untouched, like the rest of the frozen backbone.
-    """
-    import transformers
-    from transformers import AutoModelForCausalLM
-
-    dtype = torch.float32 if dtype is None else dtype
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
-    except ValueError as text_only_err:
-        model = None
-        for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
-            cls = getattr(transformers, name, None)
-            if cls is None:
-                continue
-            try:
-                model = cls.from_pretrained(model_id, dtype=dtype)
-                break
-            except Exception:
-                continue
-        if model is None:
-            raise SystemExit(
-                f"could not load {model_id!r} as a causal LM or as a vision-language model.\n"
-                f"  {text_only_err}") from None
-    return model.to(device).eval()
+def load_backbone(model_id: str, dtype=None, device: str = "cpu", **kw):
+    """Re-exported from pollard_load so there is ONE loader, not two that drift apart."""
+    from pollard_load import load_backbone as _lb
+    return _lb(model_id, dtype, device, **kw)
 
 
 def probe_basis(model, tok, corpus: str, n_probe: int, device, plen: int = 160):

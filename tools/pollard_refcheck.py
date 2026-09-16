@@ -149,13 +149,13 @@ def reference_nll(model_id, rows, max_rows=16, seq=1024, dtype="bfloat16", devic
     explained away as "hard rows"; a rising profile cannot.
     """
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
 
     tok = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=getattr(torch, dtype),
+    model = load_backbone(
+        model_id, getattr(torch, dtype),
         device_map=device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model.eval()
 
     tot, ntok, head, head_n, tail, tail_n = 0.0, 0, 0.0, 0, 0.0, 0
     with torch.no_grad():

@@ -33,9 +33,10 @@ import argparse, os, subprocess, sys
 def scan_outliers(source_dir, device, calib, rows, cols, thresh):
     """Find massive-activation input channels per layer on the fp16 source (the low-bit break predictor)."""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     tok = AutoTokenizer.from_pretrained(source_dir)
-    model = AutoModelForCausalLM.from_pretrained(source_dir, dtype=torch.float16, device_map=device).eval()
+    model = load_backbone(source_dir, torch.float16, device_map=device)
     try:
         layers = model.model.layers
     except AttributeError:

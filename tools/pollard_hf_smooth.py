@@ -56,11 +56,10 @@ def main():
     import torch
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=trc)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16, device_map=a.device,
-                                                trust_remote_code=trc)
-    model.eval()
+    model = load_backbone(a.model, torch.float16, device_map=a.device, trust_remote_code=trc)
     try:
         layers = model.model.layers
     except AttributeError:
