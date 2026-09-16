@@ -23,6 +23,7 @@ published card, confirm the winner with a pollard-sensitivity run on the box.
 """
 import argparse, json, sys
 import torch, torch.nn.functional as F
+from pollard_load import load_backbone, text_layers
 
 # LADDER types -> (bpw, RTN bits) so the cheap noise curve keys match pollard-fit.
 LADDER_BITS = [("q6_K", 6), ("q5_K", 5), ("iq4_xs", 4), ("iq3_s", 3),
@@ -143,7 +144,6 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone, text_layers
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
     print(f"== pollard-probe :: {a.model}  probe={a.probe_bits}bit  dev={dev}", flush=True)

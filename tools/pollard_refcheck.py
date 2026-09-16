@@ -30,6 +30,7 @@ import json
 import math
 import os
 import sys
+from pollard_load import load_backbone
 
 # A correct forward on in-domain rows sits well under this; scrambled positions sit far above it.
 # Deliberately loose -- this separates "broken" from "fine", it is not a quality metric.
@@ -150,7 +151,6 @@ def reference_nll(model_id, rows, max_rows=16, seq=1024, dtype="bfloat16", devic
     """
     import torch
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
 
     tok = AutoTokenizer.from_pretrained(model_id)
     model = load_backbone(

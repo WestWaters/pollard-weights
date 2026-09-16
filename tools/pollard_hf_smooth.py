@@ -26,6 +26,7 @@ Seams (norm -> linears), auto-detected per architecture:
 Verify every build with pollard-verify (never trust a proxy metric).
 """
 import argparse, os, sys
+from pollard_load import load_backbone, text_layers
 
 
 def _load_calib(path, tok, device, cols, rows):
@@ -57,7 +58,6 @@ def main():
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone, text_layers
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=trc)
     model = load_backbone(a.model, torch.float16, device_map=a.device, trust_remote_code=trc)
     try:
