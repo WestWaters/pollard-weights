@@ -34,11 +34,24 @@ LANES = [
 ]
 
 
-def installed(mod: str) -> bool:
+def installed(mod: str) -> tuple[bool, str]:
+    """Is it there AND does it import? find_spec is not enough.
+
+    find_spec only finds the package directory. vLLM's Windows wheel ships without its compiled CUDA
+    extension, so the package is present and `from vllm import LLM` raises ModuleNotFoundError on
+    vllm._C_stable_libtorch -- reported as "available" by a spec check, which is worse than a clear
+    no because someone acts on it.
+    """
     try:
-        return importlib.util.find_spec(mod) is not None
-    except (ImportError, ValueError):
-        return False
+        if importlib.util.find_spec(mod) is None:
+            return (False, "not installed")
+    except (ImportError, ValueError) as e:
+        return (False, f"not importable ({type(e).__name__})")
+    try:
+        importlib.import_module(mod)
+        return (True, "available")
+    except Exception as e:
+        return (False, f"installed but broken: {type(e).__name__}")
 
 
 def main() -> None:
@@ -62,8 +75,8 @@ def main() -> None:
     lanes = [l for l in LANES if not a.lane or l[0] == a.lane]
     usable = []
     for name, mod, note in lanes:
-        ok = installed(mod)
-        print(f"  {name:14s} {'available' if ok else 'not installed':16s} {note}")
+        ok, why = installed(mod)
+        print(f"  {name:14s} {why:32s} {note}")
         if ok:
             usable.append(name)
 

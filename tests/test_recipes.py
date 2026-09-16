@@ -1625,6 +1625,11 @@ def test_brainlanes_reports_the_machine_not_a_table():
         assert f'"{lane}"' in src, f"{lane} missing from the lane report"
     assert "platform.system()" in src, "must report the platform it actually ran on"
     assert "an import does not prove a forward pass works" in src
+    # find_spec is not enough: vLLM's Windows wheel ships WITHOUT its compiled CUDA extension, so the
+    # package directory exists and `from vllm import LLM` still dies on vllm._C_stable_libtorch. A
+    # spec check calls that "available", which is worse than a clear no because someone acts on it.
+    assert "importlib.import_module(mod)" in src, "the check must actually import, not just find"
+    assert "installed but broken" in src, "a present-but-unimportable package must say so"
 
 
 
