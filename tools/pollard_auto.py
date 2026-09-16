@@ -357,6 +357,56 @@ def _ensure_imatrix(a):
     return imat
 
 
+def attach_brain(brain_path: str, out_dir: str, fmt: str) -> None:
+    """Ship a brain alongside a build, with a note saying exactly what it attaches to.
+
+    The brain is a separate 11 MB file, not weights to quantize, so it copies into the build
+    untouched whatever lane this is. What differs per lane is whether it can be USED there yet: the
+    GPTQ lane loads under transformers, so a brain attaches directly; GGUF, MLX and EXL3 run under
+    their own engines, which have no hook to inject memory tokens into the residual stream. The file
+    still travels with the build so the pair never gets separated, and the note says which case this
+    is instead of leaving someone to find out at run time.
+    """
+    import shutil
+    if not os.path.isfile(brain_path):
+        raise SystemExit(f"--brain: no such file {brain_path}")
+    dest_dir = out_dir if os.path.isdir(out_dir) else os.path.dirname(out_dir) or "."
+    name = os.path.basename(brain_path)
+    shutil.copy2(brain_path, os.path.join(dest_dir, name))
+
+    meta = {}
+    try:
+        import torch
+        meta = torch.load(brain_path, map_location="cpu", weights_only=False).get("meta", {})
+    except Exception:
+        pass
+    live = fmt in ("gptq",)
+    note = [f"# Brain: {name}", ""]
+    note.append(f"- slots x width : {meta.get('neurons','?')} x {meta.get('width','?')}"
+                f"  ({int(meta.get('neurons',0)) * int(meta.get('width',0)) * 4 / 1e6:.1f} MB live state)"
+                if meta.get("neurons") else "- (could not read brain metadata)")
+    if meta.get("hidden"):
+        note.append(f"- trained against a backbone with hidden size {meta['hidden']}")
+    note.append("")
+    if live:
+        note += ["Attach it at run time:", "",
+                 "```python", "from pollard_flybrain import FlyBrain, load_backbone",
+                 "brain = FlyBrain.load(\"" + name + "\").bind(model, tok)",
+                 "brain.feed(open(\"long_document.txt\").read())", "```", ""]
+    else:
+        note += [f"The {fmt.upper()} lane runs under its own engine, which has no hook to inject",
+                 "memory tokens into the residual stream, so the brain cannot attach to THIS build",
+                 "yet. It ships here so the pair stays together; use it with the transformers copy of",
+                 "the same backbone, or carry it to another model with:", "",
+                 "```", f"pollard-flybrain --train 900 --continue-from {name} --model <hf-id> ...", "```", ""]
+    note += ["Verify any brain with:", "",
+             "```", f"pollard-brainverify --brain {name} --model <hf-id> --filler corpus.txt", "```"]
+    with open(os.path.join(dest_dir, "BRAIN.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(note) + "\n")
+    print(f"   brain: {name} -> {dest_dir}"
+          + ("  (attaches at run time)" if live else f"  (ships with the build; {fmt} cannot host it yet)"))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
@@ -367,6 +417,11 @@ def main():
                     " |  exl3 (exllamav3 -- the heavy trellis lane)  |  mx (Blackwell NVFP4 / any-GPU W4A16, "
                     "compressed-tensors)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
+    ap.add_argument("--brain", help="ship a trained brain (pollard-flybrain / human connectome) WITH this\n"
+                                    "build, so the pair travels as one artifact. The brain is not\n"
+                                    "quantized -- it is 11 MB of memory that attaches to the model at run\n"
+                                    "time and can be detached, moved to another backbone and carried on\n"
+                                    "with --continue-from.")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx/mx allocation; else auto-measured)")
     ap.add_argument("--no-measure", dest="measure", action="store_false",
                     help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "
@@ -459,6 +514,8 @@ def main():
             except Exception as e:
                 print(f"   [match-transformers] skipped ({e}); using the current env")
         _emit_nongguf(a)
+        if a.brain and a.run:
+            attach_brain(a.brain, a.output or ".", a.format)
         if not a.run:
             print("\n   plan only -- re-run with --run to execute.")
         return
@@ -518,6 +575,8 @@ def main():
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
+    if a.brain and a.run:
+        attach_brain(a.brain, a.out or os.path.dirname(a.gguf) or ".", "gguf")
     if not a.run:
         print("\n   plan only -- re-run with --run to execute.")
 

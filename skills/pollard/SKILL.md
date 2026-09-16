@@ -315,7 +315,7 @@ Holds as documents grow far past what it trained on, with the state size unchang
 | 1,536 tokens (12 windows) | 0.0% | 100.0% | 8.8 MB |
 | 3,072 tokens (24 windows) | 0.0% | 96.9% | 8.8 MB |
 
-**State is 8,552 slots × 256 = 8.8 MB, constant at any length.** The state update costs ~3% of one
+**State is 8,552 slots × 328 = 11.2 MB, constant at any length.** The state update costs ~3% of one
 model forward (2.1 ms vs 73.4 ms) and fits on CPU at 3.6 ms, so it can run beside the model instead
 of competing with it.
 

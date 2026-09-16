@@ -1427,6 +1427,47 @@ def test_backbone_loader_accepts_a_vision_language_model():
 
 
 
+def test_brain_query_default_matches_the_verified_prompt():
+    """The query shape is part of the experiment, not a cosmetic default.
+
+    A token is filed under the words immediately before it, so retrieval works by reproducing that
+    context. The verified construction ends with "Answer: The secret word is" -- question AND
+    continuation. Ship a default that is only the question and a brain measuring 100% measures 46%,
+    from a memory that is perfectly intact. That default shipped, and a first correction to only the
+    continuation was wrong in the same way. Both halves, or it is not the measured prompt.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_flybrain.py").read_text(encoding="utf-8")
+    verified = "Question: what is the secret word? Answer: The secret word is"
+    i = src.index('ap.add_argument("--ask"')
+    assert verified in src[i:i + 400], "--ask default is not the verified prompt"
+    # and the trainer must teach what the default asks
+    assert verified in src[:i], "the trainer's ASKS no longer contains the default query"
+
+    vsrc = (tools / "pollard_brainverify.py").read_text(encoding="utf-8")
+    assert verified in vsrc, "the verifier must use the same construction it validates"
+
+
+def test_brain_payload_codec_is_recorded_not_assumed():
+    """A brain must say how its payload is encoded, because reading it the other way is noise.
+
+    'tokens' stores this backbone's vocabulary indices; 'bytes' stores UTF-8 text, which any
+    tokenizer can read back and which is smaller for short words (6x8 against 4x18). A brain written
+    one way and read the other decodes to garbage with no error, so the codec travels in the
+    checkpoint and defaults to the original behaviour for every brain written before it existed.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_flybrain.py").read_text(encoding="utf-8")
+    assert 'self.meta.get("codec", "tokens")' in src, "codec must default to the original behaviour"
+    assert '"codec": codec' in src, "the trainer must record the codec it wrote"
+    assert 'bits = 8 if codec == "bytes"' in src, "a byte payload is 8 bits, not the vocabulary width"
+    assert "decode_text" in src, "a byte brain needs a text decoder"
+    # changing the payload width mid-training silently re-rolls the codebook -- must be refused
+    assert "re-rolls the codebook" in src or "silently re-rolls" in src, \
+        "continuing with a different bits/span must be an error, not a silent reset"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
