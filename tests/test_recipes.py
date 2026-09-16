@@ -1662,6 +1662,40 @@ def test_lane_failures_name_the_blocker_not_the_exception():
 
 
 
+def test_kquant_is_not_forced_onto_a_row_length_that_cannot_hold_it():
+    """A forced K-quant on an unaligned tensor ABORTS ggml and leaves a truncated file.
+
+    K-quants store 256 elements per block. A tensor whose row length is not a multiple of 256 cannot
+    be one, and llama.cpp falls back on its own -- unless an explicit --token-embedding-type
+    overrides it, which is exactly what the allocator passes. ggml then aborts mid-write:
+
+        ggml.c: GGML_ASSERT(start % type_traits[type].blck_size == 0) failed
+
+    The process dies partway and leaves a TRUNCATED .gguf, which is worse than an error because the
+    build reports nothing wrong. Qwen2.5-0.5B produced a 5.9 MB file that no reader would open,
+    where the real build is 506 MB -- hidden size 896, and 896 / 256 = 3.5.
+
+    q8_0 blocks are 32 wide, so it divides anything 32-aligned and costs a little size on what is
+    usually one embedding matrix.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from pollard_fit import block_safe_type, QK_K
+
+    assert QK_K == 256
+    assert block_safe_type("q6_K", 896) == "q8_0", "896 cannot hold a K-quant"
+    assert block_safe_type("q4_K", 896) == "q8_0"
+    assert block_safe_type("q6_K", 1536) == "q6_K", "1536 divides 256 -- leave it alone"
+    assert block_safe_type("q6_K", 4096) == "q6_K"
+    # non-K types have small blocks and are never substituted
+    assert block_safe_type("q8_0", 896) == "q8_0"
+    assert block_safe_type("f16", 896) == "f16"
+    # and the substitution must be announced, never silent
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath(
+        "tools", "pollard_fit.py").read_text(encoding="utf-8")
+    assert "is not a multiple of" in src, "a type substitution must be printed, not hidden"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

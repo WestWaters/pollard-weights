@@ -160,6 +160,35 @@ def _fill_noise(measured):
     return {t: est(t) for t in LADDER}
 
 
+# K-quants work in blocks of 256 (QK_K). A tensor whose row length is not a multiple of 256
+# cannot be stored as one, and llama.cpp normally falls back for such tensors on its own -- but an
+# EXPLICIT --token-embedding-type bypasses that fallback, and ggml then aborts mid-write:
+#
+#   ggml.c: GGML_ASSERT(start % type_traits[type].blck_size == 0) failed
+#
+# The process dies partway through and leaves a TRUNCATED .gguf behind, which is far worse than an
+# error: a 0.5B model produced a 5.9 MB file that no reader will open, and the build reported
+# nothing wrong. Qwen2.5-0.5B is exactly this case -- hidden 896, and 896 / 256 = 3.5.
+QK_K = 256
+_KQUANT_PREFIXES = ("q2_K", "q3_K", "q4_K", "q5_K", "q6_K", "iq2_", "iq3_", "iq4_", "iq1_")
+
+
+def _is_kquant(t: str) -> bool:
+    return any(t.lower().startswith(p.lower()) for p in _KQUANT_PREFIXES)
+
+
+def block_safe_type(t: str, row_len: int, fallback: str = "q8_0") -> str:
+    """The requested type if this row length can hold it, else one that can.
+
+    q8_0 has a block of 32, so it divides anything 32-aligned and costs a little size on a tensor
+    that is usually a single embedding matrix. Silence here is the failure mode worth avoiding, so
+    callers print when this substitutes.
+    """
+    if not row_len or not _is_kquant(t) or row_len % QK_K == 0:
+        return t
+    return fallback
+
+
 def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False, tiers=None):
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
@@ -483,6 +512,13 @@ def main():
         cmd += ["--allow-requantize"]
     if a.imatrix:
         cmd += ["--imatrix", a.imatrix]
+    # a forced K-quant on a row length that cannot hold one aborts ggml mid-write (see block_safe_type)
+    hidden = int(arch.get("hidden") or 0)
+    safe_emb = block_safe_type(emb_type, hidden)
+    if safe_emb != emb_type:
+        print(f"   embeddings: {emb_type} -> {safe_emb}  (row length {hidden} is not a multiple of "
+              f"{QK_K}; a forced K-quant aborts the build and leaves a truncated file)")
+        emb_type = safe_emb
     cmd += ["--token-embedding-type", emb_type, "--output-tensor-type", emb_type,
             "--tensor-type-file", tt_file,
             a.gguf, out, base_preset]   # base preset DERIVED from the plan
