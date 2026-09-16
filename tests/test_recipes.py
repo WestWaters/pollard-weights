@@ -1427,6 +1427,115 @@ def test_backbone_loader_accepts_a_vision_language_model():
 
 
 
+def test_brain_query_default_matches_the_verified_prompt():
+    """The query shape is part of the experiment, not a cosmetic default.
+
+    A token is filed under the words immediately before it, so retrieval works by reproducing that
+    context. The verified construction ends with "Answer: The secret word is" -- question AND
+    continuation. Ship a default that is only the question and a brain measuring 100% measures 46%,
+    from a memory that is perfectly intact. That default shipped, and a first correction to only the
+    continuation was wrong in the same way. Both halves, or it is not the measured prompt.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_flybrain.py").read_text(encoding="utf-8")
+    verified = "Question: what is the secret word? Answer: The secret word is"
+    i = src.index('ap.add_argument("--ask"')
+    assert verified in src[i:i + 400], "--ask default is not the verified prompt"
+    # and the trainer must teach what the default asks
+    assert verified in src[:i], "the trainer's ASKS no longer contains the default query"
+
+    vsrc = (tools / "pollard_brainverify.py").read_text(encoding="utf-8")
+    assert verified in vsrc, "the verifier must use the same construction it validates"
+
+
+def test_brain_payload_codec_is_recorded_not_assumed():
+    """A brain must say how its payload is encoded, because reading it the other way is noise.
+
+    'tokens' stores this backbone's vocabulary indices; 'bytes' stores UTF-8 text, which any
+    tokenizer can read back and which is smaller for short words (6x8 against 4x18). A brain written
+    one way and read the other decodes to garbage with no error, so the codec travels in the
+    checkpoint and defaults to the original behaviour for every brain written before it existed.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_flybrain.py").read_text(encoding="utf-8")
+    assert 'self.meta.get("codec", "tokens")' in src, "codec must default to the original behaviour"
+    assert '"codec": codec' in src, "the trainer must record the codec it wrote"
+    assert 'bits = 8 if codec == "bytes"' in src, "a byte payload is 8 bits, not the vocabulary width"
+    assert "decode_text" in src, "a byte brain needs a text decoder"
+    # Changing the payload must be ALLOWED, not refused. --continue-from carries trained weights;
+    # written memory lives in a .flystate file, so a new codebook has nothing stored to corrupt.
+    # People swap backbones and payloads constantly, and refusing the whole transfer over a
+    # resizable layer threw away the address path and gate that transfer perfectly well.
+    i = src.index("if continue_from:")
+    block = src[i:i + 2000]
+    assert "raise SystemExit" not in block, "a payload change must not abort the transfer"
+    assert "payload change" in block, "a payload change must be reported, not silent"
+    # but a written-memory file from a differently shaped brain IS still refused
+    assert "state was written by a differently shaped brain" in src, \
+        "load_state must still refuse a mismatched .flystate -- that file holds real memory"
+
+
+
+def test_every_runtime_backend_declares_the_same_four_operations():
+    """A brain needs four things from a backbone, and nothing else.
+
+    embed(ids), forward(embeds) -> (logits, hidden), forward_ids(ids), out_weight(). Brains ran only
+    under transformers because those four calls were written inline against one library, not because
+    of anything in the memory. Any runtime that can be fed EMBEDDINGS can host one -- that is the
+    hard requirement, since memory is delivered by prepending vectors to the sequence.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pollard_brain_backends as B
+
+    for cls in (B.Transformers, B.MLX, B.ExLlamaV3, B.LlamaCpp):
+        for op in ("embed", "forward", "forward_ids", "out_weight"):
+            assert callable(getattr(cls, op, None)), f"{cls.__name__} is missing {op}()"
+        assert getattr(cls, "name", "?") != "?", f"{cls.__name__} has no lane name"
+    assert {c.name for c in (B.Transformers, B.MLX, B.ExLlamaV3, B.LlamaCpp)} == \
+        {"transformers", "mlx", "exl3", "gguf"}
+
+
+def test_mlx_output_embedding_is_dequantized():
+    """A quantized MLX model reports a PACKED output embedding, and the brain's codes come from it.
+
+    A 4-bit Qwen reports (151936, 112) where the real matrix is (151936, 896). Hand the brain packed
+    bytes and it builds its codebook out of bit-patterns: every stored token decodes to noise and
+    nothing raises. The backend must dequantize before returning it.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brain_backends.py").read_text(encoding="utf-8")
+    i = src.index("class MLX")
+    block = src[i:src.index("class ExLlamaV3")]
+    assert "dequantize" in block, "MLX out_weight must dequantize a packed embedding"
+    assert 'hasattr(mod, "scales")' in block, "must detect a quantized module before unpacking"
+
+
+
+def test_gguf_lane_requires_unpooled_per_token_states():
+    """llama.cpp CAN host a brain -- but only unpooled.
+
+    The high-level Llama.eval() takes tokens only, which is why this lane looked closed. The C API
+    has both halves: llama_batch_init(n, embd, seq) carries EMBEDDINGS in `embd`, and
+    llama_get_embeddings_ith() returns the final hidden state per token. Verified on a Q4_K_M build:
+    embed (1,6,896) in, logits (1,6,151936) and hidden (1,6,896) out.
+
+    Pooling is the trap. With llama.cpp's default the context returns ONE pooled vector for the whole
+    sequence, so a brain has nothing per-token to address on and every write lands in the same place.
+    The context must be opened with pooling NONE.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brain_backends.py").read_text(encoding="utf-8")
+    assert "LLAMA_POOLING_TYPE_NONE" in src, "the GGUF context must disable pooling"
+    i = src.index("class LlamaCpp")
+    block = src[i:src.index("def open_backend")]
+    assert "llama_batch_init" in block and "embd" in block, "must feed embeddings, not ids"
+    assert "llama_get_embeddings_ith" in block, "must read per-token hidden states"
+    # llama.cpp does not expose its output embedding, and the brain needs to say so rather than guess
+    assert "does not expose its output embedding" in block
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
