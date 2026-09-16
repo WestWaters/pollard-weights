@@ -1696,6 +1696,28 @@ def test_kquant_is_not_forced_onto_a_row_length_that_cannot_hold_it():
 
 
 
+def test_layer_access_goes_through_text_layers():
+    """Loading a VL model is half the job; reaching its layers is the other half.
+
+    A vision-language model keeps its decoder under model.language_model, so `model.model.layers`
+    raises AttributeError even after the model loads fine. Fixing the LOADER alone moved the failure
+    two lines down -- pollard-probe loaded Qwen2-VL successfully and then died on
+    `len(model.model.layers)`, which looks like a different bug and is the same one.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    offenders = []
+    for f in sorted(tools.glob("pollard_*.py")):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if "model.model.layers" not in line:
+                continue
+            if line.lstrip().startswith(("#", "print(", "sys.exit(")) or '"' in line.split("model.model.layers")[0][-2:]:
+                continue                      # a message ABOUT the path, not a use of it
+            offenders.append(f"{f.name}:{i}")
+    assert not offenders, ("these reach layers directly and break on a VL model: "
+                           + ", ".join(offenders))
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0

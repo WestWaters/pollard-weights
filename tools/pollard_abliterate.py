@@ -30,6 +30,8 @@ Usage:
 import argparse, os, sys
 import torch
 
+from pollard_load import load_backbone, text_layers
+
 
 # tiny BENIGN placeholder sets -- only so --selftest exercises the mechanism.
 # NOT a refusal set; supply real contrast prompts via --harmful/--harmless.
@@ -112,7 +114,7 @@ def abliterate(model, r_hat, dev, strength=-1.0):
     r = r_hat.to(dev).float()
     a = float(strength)
     edited = 0
-    layers = model.model.layers
+    layers = text_layers(model)
     for blk in layers:
         for lin in (blk.self_attn.o_proj, blk.mlp.down_proj):
             W = lin.weight.data.float()                   # [D, in]
@@ -157,7 +159,6 @@ def main():
             sys.exit("ERROR: pass --out for the abliterated model.")
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
@@ -183,11 +184,11 @@ def main():
 
     # measure how much of the direction lives in the writers before/after (sanity).
     # hidden_states[j] is the OUTPUT of block j-1, so that block's o_proj produced it.
-    sj = min(max(j - 1, 0), len(model.model.layers) - 1)
-    o0 = model.model.layers[sj].self_attn.o_proj.weight.data.float()
+    sj = min(max(j - 1, 0), len(text_layers(model)) - 1)
+    o0 = text_layers(model)[sj].self_attn.o_proj.weight.data.float()
     before = (r_hat.to(dev).float() @ o0).norm().item()
     edited = abliterate(model, r_hat, dev, a.strength)
-    o1 = model.model.layers[sj].self_attn.o_proj.weight.data.float()
+    o1 = text_layers(model)[sj].self_attn.o_proj.weight.data.float()
     after = (r_hat.to(dev).float() @ o1).norm().item()
     want = "collapse to ~0" if a.strength <= -0.999 else f"scale by {1 + a.strength:.2f}x"
     verb = "orthogonalized" if a.strength < 0 else "amplified"

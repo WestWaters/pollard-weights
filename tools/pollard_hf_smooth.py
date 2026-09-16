@@ -57,11 +57,11 @@ def main():
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
+    from pollard_load import load_backbone, text_layers
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=trc)
     model = load_backbone(a.model, torch.float16, device_map=a.device, trust_remote_code=trc)
     try:
-        layers = model.model.layers
+        layers = text_layers(model)
     except AttributeError:
         sys.exit("ERROR: expected a decoder with model.model.layers (Llama/Qwen-style). "
                  "Add the seam map for this architecture.")
