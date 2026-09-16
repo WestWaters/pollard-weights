@@ -1075,24 +1075,38 @@ def test_flybrain_state_is_fixed_size_and_refuses_a_mismatch():
         return
     from pollard_flybrain import FlyBrain
 
-    n = 64
-    blob = {"src": [0, 1], "dst": [1, 0], "sign": [1.0, -1.0],
-            "w": torch.ones(2), "tau": torch.zeros(n), "write": torch.zeros(n, 8),
-            "read": torch.zeros(8, n), "gate": torch.zeros(1),
-            "meta": {"name": "t", "neurons": n, "synapses": 2, "canonical": 8, "probe_len": 4}}
-    b = FlyBrain(blob)
+    import torch.nn as nn
+    n, hid, wid = 64, 16, 12
+
+    def make(neurons):
+        bits, span = 2, 2                      # tiny codebook: the test only checks shapes and size
+        nbit, cw = bits * span, wid - bits * span
+        return {"src": [0, 1], "dst": [1, 0], "sign": [1.0, -1.0], "w": torch.ones(2),
+                "addr": nn.Linear(hid, neurons).state_dict(),
+                "addr_e": nn.Linear(hid, neurons, bias=False).state_dict(),
+                "val": nn.Linear(2 * hid, cw).state_dict(),
+                "wgate": nn.Linear(2 * hid, 1).state_dict(),
+                "out": nn.Linear(wid, hid).state_dict(),   # the decoder reads the whole slot
+                "voice": torch.zeros(1), "temp": torch.ones(1),
+                "amix": torch.zeros(1), "dbeta": torch.zeros(1),
+                "meta": {"name": "t", "neurons": neurons, "synapses": 2,
+                         "hidden": hid, "width": wid, "win": 8, "k_mem": 2,
+                         "bits": bits, "span": span, "ek": 3, "eos_id": 3}}
+
+    b = FlyBrain(make(n))
     b.reset(1)
+    assert b.state_bytes == n * wid * 4
 
     with tempfile.TemporaryDirectory() as d:
         p1 = os.path.join(d, "a.flystate")
         size_short = b.save_state(p1)
-        for _ in range(50):                      # advance the state a lot
-            b.state = b.state + 1.0
+        for _ in range(50):                      # write into the memory a lot
+            b.mem = b.mem + 1.0
+            b.z = b.z + 1.0
         size_long = b.save_state(p1)
         assert size_short == size_long, "state size must not grow with use"
 
-        b2 = FlyBrain({**blob, "meta": {**blob["meta"], "neurons": n + 1}})
-        b2.n = n + 1
+        b2 = FlyBrain(make(n + 1))
         try:
             b2.load_state(p1)
             raise AssertionError("loaded a state from a different connectome")
@@ -1231,6 +1245,32 @@ def test_human_connectome_filters_glia_and_signs_by_dale():
     assert list(nodes) == [10, 20, 50]
     assert list(signs) == [-1.0, 1.0, 1.0], "the inhibitory neuron must be the one at its sorted slot"
 
+
+
+def test_flybrain_token_code_is_an_exact_inverse():
+    """The brain stores the HOST's code for a token and reads it back with the transpose.
+
+    That only works if the projection is orthonormal: P @ P.t() must be the identity. It is what lets
+    the brain name a word it never saw in training, because the code for every token in the vocabulary
+    is defined without fitting anything. An earlier version learned its own encoder instead and scored
+    12.5% on a fixed word list, then 0% the moment the words were drawn fresh -- it had memorised 300
+    codes rather than a mechanism. If this property ever breaks, that failure comes back silently.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    try:
+        import torch
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    from pollard_flybrain import _code_projection
+
+    P = _code_projection(64, 16, "cpu")
+    assert P.shape == (16, 64)
+    eye = P @ P.t()
+    assert torch.allclose(eye, torch.eye(16), atol=1e-5), "code projection is not orthonormal"
+
+    # and it must be reproducible: a brain saved today has to decode the same way tomorrow
+    assert torch.equal(P, _code_projection(64, 16, "cpu")), "code projection is not deterministic"
 
 
 def main():

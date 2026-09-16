@@ -292,18 +292,32 @@ pollard-palette --model <hf> --calib-file calib.txt --eval-file held.txt --targe
 
 A quantized model still has the context problem: its KV cache grows with every token, and past the
 window the beginning is gone. `pollard-flybrain` attaches a measured fruit-fly connectome (MaleCNS
-v1.0) to a **frozen** model as a continuous recurrent state that never grows — so a Pollard build can
-be small AND remember.
+v1.0) to a **frozen** model as an associative memory that never grows — so a Pollard build can be
+small AND answer questions about text it can no longer see.
 
-Measured on Qwen2.5-0.5B, 128-token attention window over a 1,024-token document:
+Measured on Qwen2.5-0.5B-Instruct. A six-letter string is stated once, buried under filler, and asked
+about far beyond the window; the model never sees more than 128 tokens at a time, so it can never see
+the fact and the question together. Training words are drawn fresh for every example and never reused
+— there is nothing to memorise. 48 samples per row, through the shipped code path:
 
-| | loss | ppl |
-|---|---:|---:|
-| windowed attention only | 1.7733 | 5.89 |
-| **+ fly brain** | **1.6271** | **5.09** |
-| full attention | 1.6232 | 5.07 |
+| | accuracy |
+|---|---:|
+| no brain (the fact is outside the window) | **0.0%** |
+| **+ fly brain** | **93.8%** |
+| control — a word the document never contained | 0.0% |
+| control — brain read a *different* document | 0.0% |
 
-97.4% of the gap, **+3.1% decode**, **0.03 MB** of state at any sequence length, **35 KB** on disk.
+Holds as documents grow far past what it trained on, with the state size unchanged:
+
+| document | no brain | + fly brain | state |
+|---|---:|---:|---|
+| 768 tokens (6 windows) | 0.0% | 100.0% | 8.8 MB |
+| 1,536 tokens (12 windows) | 0.0% | 100.0% | 8.8 MB |
+| 3,072 tokens (24 windows) | 0.0% | 96.9% | 8.8 MB |
+
+**State is 8,552 slots × 256 = 8.8 MB, constant at any length.** The state update costs ~3% of one
+model forward (2.1 ms vs 73.4 ms) and fits on CPU at 3.6 ms, so it can run beside the model instead
+of competing with it.
 
 ### The full package for a user
 
@@ -311,40 +325,69 @@ Measured on Qwen2.5-0.5B, 128-token attention window over a 1,024-token document
 2. Train a brain **for that backbone** — they do not transfer between families:
 
 ```bash
-pollard-flybrain --train 400 --model <hf-id-or-path> \
+pollard-flybrain --train 1400 --model <hf-id-or-path> \
                  --connectome graph.feather --signs signs.npy \
                  --probes corpus.txt --brain MyModel-FlyBrain.pt
 ```
 
-3. Attach it at run time, and persist the conversation:
+3. Bind it at run time, read a document of any length, and persist the session:
 
 ```python
 from pollard_flybrain import FlyBrain
 brain = FlyBrain.load("MyModel-FlyBrain.pt", device="cuda")
-brain.attach(model, tokenizer=tok, probe_text=open("corpus.txt").read())
-brain.save_state("session.flystate")    # 35 KB — survives the process
+brain.bind(model, tok)                  # backbone is never modified
+brain.feed(open("long_document.txt").read())    # any length, 128 tokens at a time
+print(brain.answer("Question: what is the secret word? Answer:"))
+brain.save_state("session.flystate")    # 8.8 MB — and it does not grow
 brain.load_state("session.flystate")    # resume mid-thought
 ```
 
 ### What to tell the user honestly
 
-- **One brain per backbone family.** Loading a brain into an unrelated model runs but does not help
-  (measured **−14.6%** on an unseen backbone). Retraining is ~20 minutes, backbone frozen.
+- **It retrieves the identifying token, not yet whole strings.** Exact first token ~94%; spelling the
+  full six-letter word back is ~2.5%, because training supervised only the first token. Say
+  "finds the fact" and not "reproduces the text" until that number moves.
+- **It is not faster than attention at short lengths** — about 10–28% slower at ≤4K tokens with
+  128-token windows, because the brain still runs the model over every window. At 1,024-token windows
+  it reads a 4K document in 0.90× attention's time while holding a quarter of the KV. The durable win
+  is **flat memory**, not throughput.
+- **One brain per backbone.** The address matrix has that model's hidden size and the token codes come
+  from its output embedding; `bind()` refuses a mismatch rather than producing confident nonsense.
 - **The brain remembers; it does not reason.** Language, code and vision come from the backbone.
-  8,552 neurons are a memory, not a mind.
+  8,552 slots are a memory, not a mind.
 - **It needs the extra:** `pip install 'pollard-weights[flybrain]'` (torch, transformers, pandas,
   scipy). Core Pollard stays light.
 - The wiring is doing the work, not recurrence alone: a degree-preserving shuffle — same neurons,
-  synapses, degrees and weights, only the connectivity randomised — lost all four seeds (mean −9.2pts).
+  synapses, degrees and weights, only the connectivity randomised — carries 2.2–2.6× less traffic.
 
 ### Gotchas that waste a run
 
-- The probe basis is **not orthonormal** → the return path must be a pseudo-inverse. Using the
-  transpose inflates the round trip several-fold and the brain never learns.
-- The gate must start **non-zero** (0.05). At exactly 0 the readout is scaled by `tanh(0)=0`, which
-  also zeroes the gradient into the adapters — held-out loss then sits exactly on the floor forever.
-- Train against the backbone the user will actually run. A brain fitted to a different hidden size
-  attaches (and warns) but contributes nothing.
+Every one of these was measured the hard way, and each alone pins accuracy at exactly 0%.
+
+- **Never truncate the prompt to a token budget** — cut the *filler* instead. Building
+  `fact + filler + question` and slicing to N tokens removes the question from the end of every
+  example, and the task then has no answer at all. This sat under an entire night of work and produced
+  eight different architectures that all scored zero.
+- **Key on the context BEFORE a token, value on the token.** Keyed on the fact itself, a random string
+  is unfindable — the question shares nothing with it (measured 0.00×–0.007× against a filler token).
+  Keyed one token earlier, on "…the secret word is", the question finds it at 1.6×–4.3×.
+- **Addresses must be sharp.** `elu(x)+1`-style dense positive features make every query match
+  everything about equally; top-5 then stalls around 8% no matter how wide the state gets. Use a
+  softmax over slots — but standardise or norm-pin the logits, or they grow until the softmax is
+  one-hot and two addresses overlap by exactly zero.
+- **Generate training words on the fly.** On a fixed 300-word list the brain hits ~12% and then 0% as
+  soon as words are drawn fresh: it learned 300 codes, not a mechanism. Store the *host's* token code
+  (`P @ out_embedding[token]`, read back with `P.t()`) so unseen words work by construction.
+- **The brain must be audible.** Its vote needs standardising to the backbone's logit scale and a
+  mixing weight that does not start at zero — measured 58.3% for the brain alone against 8.3% for the
+  mix when it was too quiet. Give that scalar its own (larger) learning rate.
+- **Hidden-state similarity will not give you addressing for free.** Across all 25 layers the question
+  looks *more* like random filler than like the fact's context. The address function has to be
+  supervised explicitly; nothing in the answer loss teaches it.
+- **Controls must exclude first-token collisions.** 200 random six-letter words share only 26 distinct
+  first tokens, so a "wrong" word often shares the right one's first token and the control reports
+  leakage that is not there (6.2% → 0.0% once excluded).
+- Train against the backbone the user will actually run. `bind()` refuses a hidden-size mismatch.
 
 ## Guards & gotchas (why runs fail or waste time)
 
