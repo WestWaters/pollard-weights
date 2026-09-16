@@ -87,20 +87,39 @@ def _pick_layer(diff, layer):
 
 
 @torch.no_grad()
-def abliterate(model, r_hat, dev):
-    """Orthogonalize every residual-WRITING weight against r_hat (unit, [D]).
-    o_proj/down_proj write columns into the stream (out-dim = D): W -= r r^T W.
-    embed_tokens rows ARE stream vectors (dim 1 = D):            W -= (W r) r^T."""
+def abliterate(model, r_hat, dev, strength=-1.0):
+    """Scale the r_hat component of every residual-WRITING weight by (1 + strength).
+
+    The published technique removes a direction: W -= r r^T W. That is this function at
+    strength=-1.0, and it stays the default. But removal is one point on a dial, and the same
+    diff-of-means direction that mediates refusal also mediates any behaviour you can write two
+    contrasting prompt sets for -- terse against discursive, tool-calling against prose. So the
+    coefficient is exposed:
+
+        -1.0   remove the direction entirely (abliteration, the default)
+        -0.5   halve it -- a softer touch when full removal costs coherence
+         0.0   no-op
+        +0.5   amplify by 1.5x: steer the model TOWARD the behaviour set A shows
+
+    Amplifying is not free and is not symmetric with removal. Pushing a direction hard enough will
+    make a model do that one thing at the cost of everything else, and the failure looks like
+    fluent nonsense rather than an error. Start near +0.25, measure with pollard-kl against the
+    unedited build, and stop when the KL delta stops buying you behaviour.
+
+    o_proj/down_proj write columns into the stream (out-dim = D): W += a * r r^T W.
+    embed_tokens rows ARE stream vectors (dim 1 = D):             W += a * (W r) r^T.
+    """
     r = r_hat.to(dev).float()
+    a = float(strength)
     edited = 0
     layers = model.model.layers
     for blk in layers:
         for lin in (blk.self_attn.o_proj, blk.mlp.down_proj):
             W = lin.weight.data.float()                   # [D, in]
-            lin.weight.data = (W - torch.outer(r, r @ W)).to(lin.weight.dtype)
+            lin.weight.data = (W + a * torch.outer(r, r @ W)).to(lin.weight.dtype)
             edited += 1
     emb = model.model.embed_tokens.weight.data.float()    # [vocab, D]
-    model.model.embed_tokens.weight.data = (emb - torch.outer(emb @ r, r)).to(model.model.embed_tokens.weight.dtype)
+    model.model.embed_tokens.weight.data = (emb + a * torch.outer(emb @ r, r)).to(model.model.embed_tokens.weight.dtype)
     edited += 1
     return edited
 
@@ -109,8 +128,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", required=True, help="HF model dir or id (FP16/BF16)")
-    ap.add_argument("--harmful", help="prompts the model should stop refusing (one/line)")
-    ap.add_argument("--harmless", help="matched benign prompts (one/line)")
+    ap.add_argument("--harmful", "--set-a", dest="harmful",
+                    help="prompt set A, one per line: the behaviour the direction points TOWARD "
+                         "(refusals, for ablation; the target mode, for steering)")
+    ap.add_argument("--harmless", "--set-b", dest="harmless",
+                    help="matched contrast set B, one per line")
+    ap.add_argument("--strength", type=float, default=-1.0,
+                    help="how much of the direction to keep: -1.0 removes it (abliteration, the "
+                         "default), -0.5 halves it, +0.5 amplifies it by 1.5x to steer TOWARD set "
+                         "A. Measure with pollard-kl before trusting any positive value.")
     ap.add_argument("--out", help="output dir for the abliterated FP16 model")
     ap.add_argument("--layer", default="auto", help="direction layer index, or 'auto'")
     ap.add_argument("--device", default="mps")
@@ -160,11 +186,17 @@ def main():
     sj = min(max(j - 1, 0), len(model.model.layers) - 1)
     o0 = model.model.layers[sj].self_attn.o_proj.weight.data.float()
     before = (r_hat.to(dev).float() @ o0).norm().item()
-    edited = abliterate(model, r_hat, dev)
+    edited = abliterate(model, r_hat, dev, a.strength)
     o1 = model.model.layers[sj].self_attn.o_proj.weight.data.float()
     after = (r_hat.to(dev).float() @ o1).norm().item()
-    print(f"  orthogonalized {edited} residual-writers; "
-          f"proj(o_proj@blk{sj}) {before:.3f} -> {after:.3f} (should collapse to ~0)", flush=True)
+    want = "collapse to ~0" if a.strength <= -0.999 else f"scale by {1 + a.strength:.2f}x"
+    verb = "orthogonalized" if a.strength < 0 else "amplified"
+    print(f"  {verb} {edited} residual-writers at strength {a.strength:+.2f}; "
+          f"proj(o_proj@blk{sj}) {before:.3f} -> {after:.3f} (should {want})", flush=True)
+    if a.strength > 0:
+        print("  NOTE: steering TOWARD a direction can degrade everything else and the failure "
+              "reads as fluent nonsense.\n        Measure against the unedited build with "
+              "pollard-kl before you ship this.", flush=True)
 
     if a.selftest:
         # coherence canary: the model must still produce fluent text after surgery

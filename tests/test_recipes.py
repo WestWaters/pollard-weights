@@ -1273,6 +1273,78 @@ def test_flybrain_token_code_is_an_exact_inverse():
     assert torch.equal(P, _code_projection(64, 16, "cpu")), "code projection is not deterministic"
 
 
+def test_steering_strength_generalises_ablation_without_changing_its_default():
+    """Removing a direction is one point on a dial, and the default must stay where it was.
+
+    The published technique orthogonalises a residual-writing weight against the direction that
+    mediates a behaviour: W -= r r^T W. That is strength -1.0. The same diff-of-means direction
+    works for any behaviour you can write two contrasting prompt sets for, so the coefficient is
+    exposed -- but anyone who was running abliteration before must keep getting abliteration, so
+    -1.0 stays the default and has to remain EXACTLY the old arithmetic, not an approximation of it.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    try:
+        import torch
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    from pollard_abliterate import abliterate
+
+    import torch.nn as nn
+
+    def toy(D=8, n_in=5):
+        torch.manual_seed(0)
+        blk = type("B", (), {})()
+        blk.self_attn = type("A", (), {})(); blk.mlp = type("M", (), {})()
+        blk.self_attn.o_proj = nn.Linear(n_in, D, bias=False)
+        blk.mlp.down_proj = nn.Linear(n_in, D, bias=False)
+        m = type("Mo", (), {})(); m.model = type("Inner", (), {})()
+        m.model.layers = [blk]
+        m.model.embed_tokens = nn.Embedding(11, D)
+        return m
+
+    r = torch.zeros(8); r[3] = 1.0                      # a unit direction, axis-aligned for clarity
+
+    # strength -1.0 must remove the component completely -- the old behaviour, bit for bit
+    m = toy()
+    abliterate(m, r, "cpu", -1.0)
+    W = m.model.layers[0].self_attn.o_proj.weight.data
+    assert torch.allclose(W[3], torch.zeros(5), atol=1e-6), "ablation left the direction behind"
+    import inspect
+    assert inspect.signature(abliterate).parameters["strength"].default == -1.0, \
+        "the default must stay at full ablation -- existing users get what they had"
+
+    # 0.0 is a no-op, and +0.5 amplifies rather than removes
+    base = toy().model.layers[0].self_attn.o_proj.weight.data.clone()
+    m0 = toy(); abliterate(m0, r, "cpu", 0.0)
+    assert torch.allclose(m0.model.layers[0].self_attn.o_proj.weight.data, base, atol=1e-6)
+    mp = toy(); abliterate(mp, r, "cpu", 0.5)
+    amp = mp.model.layers[0].self_attn.o_proj.weight.data
+    assert torch.allclose(amp[3], base[3] * 1.5, atol=1e-5), "positive strength must amplify"
+    # and it must touch ONLY that direction
+    assert torch.allclose(amp[4], base[4], atol=1e-6), "steering leaked into other directions"
+
+
+def test_routing_capture_exists_for_every_tool_that_consumes_one():
+    """A tool must not require an input that no shipped tool can produce.
+
+    pollard-experts reads a routing capture. The capture used to come from an in-repo experiment
+    directory that was never shipped, so from a clean install the expert-residency path could not be
+    run at all -- the model was never the limitation, the missing producer was.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    assert (tools / "pollard_route.py").is_file(), "the routing-capture producer is missing"
+
+    src = (tools / "pollard_route.py").read_text(encoding="utf-8")
+    for field in ('"layer"', '"experts"', '"phase"'):
+        assert field in src, f"capture rows must carry {field} for pollard-experts"
+    assert "--gen" in src, "decode capture is the whole point; prefill alone understates it"
+
+    pyproject = (tools.parent / "pyproject.toml").read_text(encoding="utf-8")
+    assert "pollard-route" in pyproject, "the tool exists but is not registered as a command"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
