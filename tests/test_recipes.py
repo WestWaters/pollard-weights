@@ -1345,6 +1345,56 @@ def test_routing_capture_exists_for_every_tool_that_consumes_one():
 
 
 
+def test_expert_analysis_separates_decode_from_prefill():
+    """Mixing the two regimes hides the only structure worth measuring.
+
+    A router spreads PREFILL across nearly the whole pool whatever the workload -- one domain touched
+    97.6% of experts in our measurements -- while DECODE concentrates about 2x. Prefill also produces
+    far more rows than decode in any normal capture, so averaging them buries the concentration under
+    the flat part and reports "no structure" for a workload that has plenty. An agent lives in
+    decode, so decode is the default here, and asking for a regime a capture does not contain is an
+    error with a fix in it rather than a silently empty report.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import json as _json
+    from pollard_experts import load
+
+    rows = []
+    for pos in range(20):                      # prefill: every expert equally, the flat case
+        rows.append({"prompt": 0, "pos": pos, "phase": "prefill", "layer": 0,
+                     "experts": [pos % 4]})
+    for pos in range(20, 26):                  # decode: concentrated on one expert
+        rows.append({"prompt": 0, "pos": pos, "phase": "decode", "layer": 0, "experts": [3]})
+
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        f.write("\n".join(_json.dumps(r) for r in rows))
+        path = f.name
+
+    dec, counts = load(path, "decode")
+    pre, _ = load(path, "prefill")
+    allr, _ = load(path, "all")
+    assert len(dec) == 6 and len(pre) == 20 and len(allr) == 26
+    assert counts["prefill"] == 20 and counts["decode"] == 6
+
+    # the point of the split: decode is one expert, the mix is not
+    assert {e for _p, _pos, _l, ex, _ph in dec for e in ex} == {3}
+    assert len({e for _p, _pos, _l, ex, _ph in allr for e in ex}) == 4, \
+        "mixing prefill back in hides that decode used a single expert"
+
+    # a capture with no phase labels must say so, not report an empty result
+    legacy = [{k: v for k, v in r.items() if k != "phase"} for r in rows]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        f.write("\n".join(_json.dumps(r) for r in legacy))
+        lpath = f.name
+    try:
+        load(lpath, "decode")
+        raise AssertionError("an unlabelled capture must not pass as a decode capture")
+    except SystemExit as e:
+        assert "pollard-route" in str(e), "the error must say how to fix it"
+    os.unlink(path); os.unlink(lpath)
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
