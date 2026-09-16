@@ -51,7 +51,24 @@ def installed(mod: str) -> tuple[bool, str]:
         importlib.import_module(mod)
         return (True, "available")
     except Exception as e:
-        return (False, f"installed but broken: {type(e).__name__}")
+        return (False, f"installed but broken: {_why(e)}")
+
+
+def _why(e: Exception) -> str:
+    """Name the actual blocker, because the exception type alone sends people the wrong way.
+
+    Every one of these was hit on a real machine tonight, and each one's bare error points somewhere
+    unhelpful: "Ninja is required" after pip install ninja succeeded, a missing CUDA_HOME on a box
+    with no toolkit, and a vLLM package that imports its own missing extension.
+    """
+    msg = str(e)
+    if "Ninja is required" in msg:
+        return "needs ninja ON PATH (pip installs it into the venv's bin; activate the venv)"
+    if "CUDA_HOME" in msg:
+        return "needs a CUDA toolkit (no nvcc found); this lane compiles CUDA extensions"
+    if "_C" in msg and "No module named" in msg:
+        return "wheel has no compiled extension for this platform"
+    return f"{type(e).__name__}: {msg.splitlines()[0][:60]}"
 
 
 def main() -> None:
