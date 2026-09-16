@@ -1633,6 +1633,24 @@ def test_brainlanes_reports_the_machine_not_a_table():
 
 
 
+def test_lane_failures_name_the_blocker_not_the_exception():
+    """An exception type sends people the wrong way; the blocker tells them what to do.
+
+    All three were hit on real machines: "Ninja is required" AFTER pip install ninja succeeded (the
+    binary lands in the venv's bin, which is not on PATH unless the venv is activated); a missing
+    CUDA_HOME on a machine with no toolkit, where the lane compiles CUDA extensions; and a package
+    whose wheel ships without its compiled extension for that platform, which imports far enough to
+    look installed and then dies on its own _C module.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_brainlanes.py").read_text(encoding="utf-8")
+    assert "def _why(" in src, "lane failures must be translated, not re-printed"
+    assert "ninja ON PATH" in src, "the ninja-installed-but-not-on-PATH case must be named"
+    assert "CUDA toolkit" in src, "a missing toolkit must be named, not shown as OSError"
+    assert "no compiled extension for this platform" in src
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
