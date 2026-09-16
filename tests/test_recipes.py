@@ -1395,6 +1395,38 @@ def test_expert_analysis_separates_decode_from_prefill():
 
 
 
+def test_backbone_loader_accepts_a_vision_language_model():
+    """A VL backbone must be reachable, because everything downstream already handles one.
+
+    AutoModelForCausalLM refuses a vision-language config outright -- "Unrecognized configuration
+    class Qwen2VLConfig for this kind of AutoModel" -- so a VL model could not be loaded at all, even
+    though _find_stack already looks for `model.language_model`, which is exactly where a VL model
+    keeps its text stack. One missing fallback was the whole gap; with it, the shipped trainer
+    reaches 100% exact recall on Qwen2-VL from a cold start, against 51.4% for the old VL-specific
+    script that predated the bit payload.
+
+    The brain attaches to the LANGUAGE side. Exact recall stores token ids as bits, and a continuous
+    vision encoder emits no ids -- so this makes a VL backbone usable, not images recallable.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    try:
+        import torch
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    import pollard_flybrain as F
+
+    assert hasattr(F, "load_backbone"), "the VL-capable loader is missing"
+    src = pathlib.Path(F.__file__).read_text(encoding="utf-8")
+    for cls in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+        assert cls in src, f"no fallback to {cls}: a VL model would be unreachable"
+    assert "AutoModelForCausalLM.from_pretrained(a.model" not in src, \
+        "main() still loads the backbone directly, bypassing the VL fallback"
+    # the text stack of a VL model lives under language_model -- the finder must still look there
+    assert "model.language_model" in src, "the VL text-stack path was dropped"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
