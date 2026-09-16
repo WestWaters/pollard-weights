@@ -17,6 +17,7 @@ Usage:
 """
 import argparse, time, sys
 import torch, torch.nn as nn
+from pollard_load import load_backbone, text_layers
 
 
 def _chunks(tok, text, seqlen, n=None):
@@ -156,7 +157,6 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone, text_layers
     print(f"== pollard-lowbit :: {a.model}  bits={a.bits} keep={a.keep} levels={a.levels}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = load_backbone(a.model, torch.float16, a.device, eval_mode=False)

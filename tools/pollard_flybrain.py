@@ -52,6 +52,7 @@ from __future__ import annotations
 import math
 import os
 from typing import Optional
+from pollard_load import load_backbone as _lb
 
 try:
     import torch
@@ -116,7 +117,6 @@ def _progress(*args, **kw):
 
 def load_backbone(model_id: str, dtype=None, device: str = "cpu", **kw):
     """Re-exported from pollard_load so there is ONE loader, not two that drift apart."""
-    from pollard_load import load_backbone as _lb
     return _lb(model_id, dtype, device, **kw)
 
 

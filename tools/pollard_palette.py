@@ -31,6 +31,7 @@ import argparse, json, time, copy
 import torch, torch.nn as nn
 
 from pollard_gptq import gptq_quantize, eval_ppl, _chunks, linear_layers
+from pollard_load import load_backbone, text_layers
 
 # alphabet: name -> (symbol-bits, quantizer(W, H) -> dequant fp16)
 def _q_prune(W, H, gs):        return torch.zeros_like(W)
@@ -112,7 +113,6 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone, text_layers
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     print(f"== pollard-palette :: {a.model}  gs={a.groupsize}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)

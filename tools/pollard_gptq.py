@@ -22,6 +22,7 @@ Usage:
 """
 import argparse, sys, time
 import torch, torch.nn as nn
+from pollard_load import load_backbone, text_layers
 
 
 def _hms(s):
@@ -367,7 +368,6 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone, text_layers
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     mdev = "cpu" if a.offload else dev                    # where the model itself lives
     print(f"== pollard-gptq :: {a.model}  W{a.bits}g{a.groupsize}  dev={dev}"

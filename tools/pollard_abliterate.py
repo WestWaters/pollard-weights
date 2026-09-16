@@ -29,7 +29,6 @@ Usage:
 """
 import argparse, os, sys
 import torch
-
 from pollard_load import load_backbone, text_layers
 
 

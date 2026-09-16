@@ -17,6 +17,7 @@ import argparse, copy, json, time
 import torch, torch.nn as nn, torch.nn.functional as F
 
 from pollard_gptq import _chunks, sequential_gptq, make_recipe, linear_layers
+from pollard_load import load_backbone
 
 
 @torch.no_grad()
@@ -55,7 +56,6 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     print(f"== pollard-kl :: {a.model}  recipe={a.recipe} qmode={a.qmode}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)

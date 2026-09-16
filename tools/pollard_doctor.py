@@ -28,13 +28,13 @@ Lanes: exl3 health implemented; risk-scan + repair plan are lane-agnostic (they 
 source). Works on any CUDA GPU. Verify is the source of truth; a proxy metric is never consulted.
 """
 import argparse, os, subprocess, sys
+from pollard_load import load_backbone, text_layers
 
 
 def scan_outliers(source_dir, device, calib, rows, cols, thresh):
     """Find massive-activation input channels per layer on the fp16 source (the low-bit break predictor)."""
     import torch
     from transformers import AutoTokenizer
-    from pollard_load import load_backbone, text_layers
     tok = AutoTokenizer.from_pretrained(source_dir)
     model = load_backbone(source_dir, torch.float16, device_map=device)
     try:
