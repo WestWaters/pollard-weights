@@ -1415,15 +1415,26 @@ def test_backbone_loader_accepts_a_vision_language_model():
         print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
         return
     import pollard_flybrain as F
+    import pollard_load as L
 
-    assert hasattr(F, "load_backbone"), "the VL-capable loader is missing"
-    src = pathlib.Path(F.__file__).read_text(encoding="utf-8")
+    assert hasattr(F, "load_backbone") and hasattr(L, "load_backbone")
+    src = pathlib.Path(L.__file__).read_text(encoding="utf-8")
     for cls in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
         assert cls in src, f"no fallback to {cls}: a VL model would be unreachable"
-    assert "AutoModelForCausalLM.from_pretrained(a.model" not in src, \
-        "main() still loads the backbone directly, bypassing the VL fallback"
-    # the text stack of a VL model lives under language_model -- the finder must still look there
     assert "model.language_model" in src, "the VL text-stack path was dropped"
+
+    # ONE loader. Eleven tools each called AutoModelForCausalLM directly and each died on a VL
+    # config; a second copy is how they drift back apart.
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    offenders = []
+    for f in sorted(tools.glob("pollard_*.py")):
+        if f.name in ("pollard_load.py", "pollard_route.py"):
+            continue
+        body = f.read_text(encoding="utf-8")
+        if "AutoModelForCausalLM.from_pretrained" in body:
+            offenders.append(f.name)
+    assert not offenders, ("these load a backbone directly and will refuse a VL model: "
+                           + ", ".join(offenders))
 
 
 

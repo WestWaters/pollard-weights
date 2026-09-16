@@ -142,12 +142,13 @@ def main():
                          "models too big to run layersxgroups forward passes (744B-scale)")
     a = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
     print(f"== pollard-probe :: {a.model}  probe={a.probe_bits}bit  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(dev).eval()
+    model = load_backbone(a.model, torch.float16, dev)
     layers = len(model.model.layers)
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 

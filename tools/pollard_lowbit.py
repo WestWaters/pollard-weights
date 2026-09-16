@@ -155,10 +155,11 @@ def main():
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     print(f"== pollard-lowbit :: {a.model}  bits={a.bits} keep={a.keep} levels={a.levels}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(a.device)
+    model = load_backbone(a.model, torch.float16, a.device, eval_mode=False)
     calib = _chunks(tok, open(a.calib_file, encoding="utf-8").read(), a.seqlen, a.nsamples)
     test = _chunks(tok, open(a.eval_file, encoding="utf-8").read(), a.seqlen, a.eval_chunks)
 

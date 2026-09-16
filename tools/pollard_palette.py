@@ -111,11 +111,12 @@ def main():
     ap.add_argument("--device", default="mps")
     a = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from pollard_load import load_backbone
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
     print(f"== pollard-palette :: {a.model}  gs={a.groupsize}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16).to(dev)
+    model = load_backbone(a.model, torch.float16, dev, eval_mode=False)
     calib = _chunks(tok, open(a.calib_file, encoding="utf-8").read(), a.seqlen, a.nsamples)
     test = _chunks(tok, open(a.eval_file, encoding="utf-8").read(), a.seqlen, a.eval_chunks)
 
