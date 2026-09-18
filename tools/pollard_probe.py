@@ -94,12 +94,19 @@ def plan_placement(model_id, dev, offload_dir):
     probe failure as "no profile", the build quietly degraded to a UNIFORM allocation, which is the
     one thing pollard-fit warns has no quality win. Measure first, then place:
 
-      fits the accelerator -> use it (fast path, unchanged)
-      fits host RAM        -> CPU (slower, still exact)
-      fits neither         -> shard across accelerator+CPU and offload the tail to disk
+      fits the accelerator      -> use it (fast path, unchanged)
+      fits host RAM             -> CPU (slower, still exact)
+      within OVERSPILL of RAM   -> CPU anyway, and let the OS page it
+      bigger than that          -> shard across accelerator+CPU, offload the tail to disk
+
+    The third case is deliberate. accelerate's disk-offload path took an access violation on Windows
+    loading a 22.3GB model against 14.2GB free, before writing a single offload file; the OS pager
+    does the same job for a modest overspill and does not crash. Reserve offload for the case where
+    paging really cannot cope -- a model several times larger than RAM.
 
     Returns (device, load_kwargs, note).
     """
+    OVERSPILL = 2.0                     # page up to 2x RAM before trusting disk offload
     need = _weights_bytes(model_id)
     if not need:                                            # hub id / unknown: keep the old behaviour
         return dev, {}, ""
@@ -111,6 +118,9 @@ def plan_placement(model_id, dev, offload_dir):
     if host and need_hdr <= host * 0.85:
         why = f"{need/G:.1f}GB exceeds {dev} ({accel/G:.1f}GB)" if accel else f"{need/G:.1f}GB"
         return "cpu", {}, f"{why} -> CPU ({host/G:.1f}GB RAM)"
+    if host and need_hdr <= host * OVERSPILL:
+        return "cpu", {}, (f"{need/G:.1f}GB over {host/G:.1f}GB free RAM -> CPU, OS-paged "
+                           f"(under {OVERSPILL:g}x; disk offload is the fragile path)")
     os.makedirs(offload_dir, exist_ok=True)
     if accel and sys.platform == "darwin":
         # Apple Silicon is UNIFIED memory: the GPU and the CPU spend the same pool, so budgeting

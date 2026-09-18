@@ -8,7 +8,7 @@ the MoE attn_v crush, the q3_k casing, the dense guard). Runnable two ways:
 
 Add a case whenever a recipe/guard changes — never fewer rows than the tools have behaviors.
 """
-import os, pathlib, re, subprocess, sys, tempfile
+import json, os, pathlib, re, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 import pollard_automap as A
@@ -1777,6 +1777,31 @@ def test_gold_path_never_degrades_to_uniform_silently():
     assert "returncode" in imat and "raise SystemExit" in imat, (
         "llama-imatrix's exit code is unchecked -- a missing imatrix stays invisible until "
         "llama-quantize fails to open it")
+
+
+def test_converter_is_matched_to_the_model_not_just_found():
+    """The driver used to return the bare string "convert_hf_to_gguf.py" and trust the shell. A
+    converter too old for the architecture then failed deep in a build, reading as a problem with
+    the model rather than the toolchain -- and the apparent fix was moving a 23.8GB GGUF across the
+    network instead of copying a 3MB script. Capability is per-architecture, so verify it."""
+    import pollard_convert as C
+    d = tempfile.mkdtemp()
+    pathlib.Path(d, "config.json").write_text(json.dumps(
+        {"architectures": ["TotallyMadeUpForCausalLM"]}), encoding="utf-8")
+    assert C.model_architectures(d) == ["TotallyMadeUpForCausalLM"]
+    conv, why = C.find_converter(d)
+    assert conv is None, "an architecture no converter registers was reported convertible"
+    assert "TotallyMadeUpForCausalLM" in why, f"the refusal does not name the architecture: {why}"
+    # registrations live in conversion/*.py, not the ~16KB entry point -- scanning only the script
+    # would call every modern converter incapable
+    root = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    body = (root / "pollard_convert.py").read_text(encoding="utf-8")
+    assert "conversion" in body and "rglob" in body, "only the entry point is scanned for classes"
+    drv = (root / "pollard_auto.py").read_text(encoding="utf-8")
+    seg = drv.split("def _find_convert", 1)[1].split("\ndef ", 1)[0]
+    assert "find_converter" in seg, "the one-shot still guesses at a converter"
+    assert not re.search(r'return\s+["\']convert_hf_to_gguf\.py["\']', seg), (
+        "the bare-PATH fallback is back -- the driver hands the shell a name it never verified")
 
 
 def test_probe_estimator_is_one_that_can_finish():

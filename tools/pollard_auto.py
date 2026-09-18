@@ -253,14 +253,20 @@ def _automap_mix(a, is_moe):
     return out
 
 
-def _find_convert():
-    """Locate convert_hf_to_gguf.py (our runtime llama.cpp first, then PATH/common spots)."""
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for c in (os.path.join(repo, "runtime", "llama.cpp", "convert_hf_to_gguf.py"),
-              os.path.expanduser("~/llama.cpp/convert_hf_to_gguf.py")):
-        if os.path.exists(c):
-            return c
-    return "convert_hf_to_gguf.py"                          # assume on PATH / same dir
+def _find_convert(hf_dir=None):
+    """Locate a converter that can handle THIS model, not just any file with the right name.
+
+    This used to check two paths and then hand back the bare string "convert_hf_to_gguf.py",
+    trusting the shell. When the converter was absent or too old for the architecture, the failure
+    surfaced deep in the build as something about the model -- and the apparent fix was to move a
+    23.8GB GGUF across the network rather than copy a 3MB script."""
+    from pollard_convert import find_converter
+    conv, note = find_converter(hf_dir)
+    if conv is None:
+        raise SystemExit(f"\n   cannot convert on this machine: {note}")
+    if hf_dir:
+        print(f"   converter: {note}")
+    return str(conv)
 
 
 def _precondition_hf(a, hf_dir):
@@ -310,7 +316,7 @@ def _resolve_hf(a):
 def _hf_to_gguf(a):
     """HF weights -> f16 GGUF so the GGUF flagship pipeline can run one-shot from a repo/dir."""
     hf_dir = _resolve_hf(a)
-    conv = _find_convert()
+    conv = _find_convert(hf_dir)
     here = os.path.abspath(a.output) if a.output else os.path.dirname(os.path.abspath(hf_dir)) or "."
     out = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + "-f16.gguf")
     print(f"   convert HF -> f16 GGUF: python {os.path.basename(conv)} {hf_dir} --outtype f16 --outfile {out}")
