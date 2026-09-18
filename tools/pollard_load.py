@@ -23,6 +23,10 @@ def load_backbone(model_id: str, dtype=None, device: str = "cpu", eval_mode: boo
 
     dtype defaults to float32; pass torch.float16 etc for the lanes that want it. Extra kwargs
     (trust_remote_code, attn_implementation, ...) pass straight through.
+
+    Pass `device_map=` (plus the usual `max_memory=` / `offload_folder=`) to shard a model that is
+    bigger than the accelerator across GPU+CPU+disk. accelerate owns placement once a model is
+    dispatched that way, and moving it afterwards raises -- so `device` is ignored in that case.
     """
     import torch
     import transformers
@@ -47,7 +51,8 @@ def load_backbone(model_id: str, dtype=None, device: str = "cpu", eval_mode: boo
         if model is None:
             raise SystemExit(f"could not load {model_id!r} as a causal LM or a vision-language "
                              "model:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
-    model = model.to(device)
+    if kw.get("device_map") is None:            # accelerate already placed a dispatched model
+        model = model.to(device)
     return model.eval() if eval_mode else model
 
 
