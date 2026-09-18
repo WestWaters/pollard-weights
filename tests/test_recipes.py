@@ -1779,6 +1779,35 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_probe_never_emits_a_profile_from_unreadable_weights():
+    """A model too big to hold gets offloaded, and most of its weights then sit on the meta device
+    holding NO data. The estimator reads every weight to compute dW, so taking meta at face value
+    yields a profile that LOOKS measured and is not -- which produces a confidently bad allocation.
+    Resolve from the checkpoint, and refuse rather than emit a partial profile."""
+    try:
+        import torch
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    import pollard_probe as P
+
+    class _Lin:
+        def __init__(self, w): self.weight = w
+    real = _Lin(torch.zeros(2, 2))
+    ws = P.WeightSource.__new__(P.WeightSource)          # no checkpoint on disk
+    ws.names, ws.dir, ws.map, ws.missing = {}, "", {}, 0
+    assert ws.get(real) is not None, "a resident weight must be returned as-is"
+    assert ws.missing == 0
+    meta = _Lin(torch.zeros(2, 2, device="meta"))
+    assert ws.get(meta) is None, "a meta weight was returned as if it held data"
+    assert ws.missing == 1, "an unresolvable weight must be COUNTED, not silently dropped"
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_probe.py").read_text(
+        encoding="utf-8")
+    seg = src.split("def _stream_sensitivity", 1)[1]
+    assert "weights.missing" in seg and "raise SystemExit" in seg, (
+        "the estimator still returns a profile built from weights it could not read")
+
+
 def test_probe_skips_submodules_an_architecture_leaves_unset():
     """An architecture whose layers differ declares the full submodule set and leaves the unused
     ones None (Gemma4). hasattr() is True for those, so taking them at face value put a None into

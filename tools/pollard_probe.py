@@ -195,8 +195,60 @@ def _linears(model, layer, group):
     return [m for m in (getattr(mod, n, None) for n in names) if m is not None]
 
 
+class WeightSource:
+    """A linear's weight, even when accelerate left it on the meta device.
+
+    The one-pass estimator needs two different things: E[x_j^2], which comes from HOOKS and so only
+    needs a forward pass, and dW = W - RTN(W), which needs the weights themselves. Those have very
+    different memory costs, and conflating them caps the probe at models that fit in memory. Once a
+    model is big enough to be offloaded, most of its weights sit on the meta device holding NO data
+    -- reading them there yields a wrong answer, and a wrong sensitivity profile is worse than none,
+    because it produces a confidently bad allocation that still looks like a measured build.
+
+    So resolve the weight from the checkpoint on disk instead, one tensor at a time: O(1) memory,
+    and the probe stops caring how big the model is."""
+
+    def __init__(self, model, model_dir):
+        self.names = {id(m): n for n, m in model.named_modules()}
+        self.dir = model_dir
+        self.map = {}                         # tensor key -> shard filename
+        self.missing = 0
+        idx = os.path.join(model_dir or "", "model.safetensors.index.json")
+        single = os.path.join(model_dir or "", "model.safetensors")
+        try:
+            if os.path.isfile(idx):
+                with open(idx, encoding="utf-8") as f:
+                    self.map = json.load(f).get("weight_map", {})
+            elif os.path.isfile(single):
+                from safetensors import safe_open
+                with safe_open(single, framework="pt") as f:
+                    self.map = {k: "model.safetensors" for k in f.keys()}
+        except Exception:
+            self.map = {}
+
+    def get(self, lin):
+        w = getattr(lin, "weight", None)
+        if w is None:
+            return None
+        if not (w.is_meta or w.device.type == "meta"):
+            return w.data
+        key = self.names.get(id(lin))
+        shard = self.map.get(f"{key}.weight") if key else None
+        if not shard:
+            self.missing += 1
+            return None
+        try:
+            from safetensors import safe_open
+            with safe_open(os.path.join(self.dir, shard), framework="pt") as f:
+                return f.get_tensor(f"{key}.weight")
+        except Exception:
+            self.missing += 1
+            return None
+
+
 @torch.no_grad()
-def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_bits):
+def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_bits,
+                        model_dir=None):
     """ONE forward pass over the calib set, sensitivity for EVERY group at once -- for models where
     the perturb+KL loop (layersxgroups full passes) is infeasible (744B over 1.5TB).
 
@@ -235,14 +287,24 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
                     lid = id(lin)
                     if lid not in h or cnt.get(lid, 0) == 0:      # module never fired (unused/pruned expert)
                         continue
-                    hj = (h[lid] / cnt[lid]).to(lin.weight.device)   # E[x_j^2]
-                    dW = lin.weight.data.float() - _rtn(lin.weight.data, bits).float()
+                    W = weights.get(lin)
+                    if W is None:                                # unreadable and unresolvable
+                        continue
+                    hj = (h[lid] / cnt[lid]).to(W.device)        # E[x_j^2]
+                    dW = W.float() - _rtn(W, bits).float()
                     tot += float((dW * dW * hj.unsqueeze(0)).sum().item())
                 cost[g][str(i)] = tot
         return cost
 
+    weights = WeightSource(model, model_dir)
     profile = cost_at(probe_bits)
     noise = {t: sum(sum(cost_at(bits)[g].values()) for g in groups) for t, bits in ladder_bits}
+    if weights.missing:
+        # Silently dropping tensors would hand back a profile that looks measured and is not.
+        raise SystemExit(f"\n  {weights.missing} weights were unreadable (offloaded to the meta "
+                         "device and not resolvable from the checkpoint on disk).\n"
+                         "  REFUSING to emit a partial sensitivity profile -- a wrong allocation "
+                         "that looks measured is worse than none.")
     return profile, noise
 
 
@@ -288,7 +350,8 @@ def main():
 
     if a.stream:
         print(f"  {layers} layers, {len(ch)} calib chunks -- one-pass Hessian-diagonal estimator", flush=True)
-        profile, noise = _stream_sensitivity(model, ch, dev, groups, layers, a.probe_bits, LADDER_BITS)
+        profile, noise = _stream_sensitivity(model, ch, dev, groups, layers, a.probe_bits,
+                                             LADDER_BITS, model_dir=a.model)
         method = "pollard-probe stream (Hessian-diagonal proxy)"
         for g in groups:
             vals = list(profile[g].values())
