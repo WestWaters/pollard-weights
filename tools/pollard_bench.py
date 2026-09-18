@@ -29,10 +29,18 @@ from pollard_calc import find_llama_bin
 # bit tier is below the model's coherence floor -> it loops under EVERY sampling -> bump a tier.
 # This gate runs the model, detects loops, sweeps sampling, and returns which case it is.
 
+# (prompt, any-of expected in the CONTINUATION). The gate used to check only that output did not
+# LOOP, then call the result "coherent" -- so a build emitting fluent-looking token salad
+# ("isletedGESarz Svensri--st IC himself1 andict zichzelf") passed, because salad does not repeat.
+# A known answer is the cheapest real check: a model that cannot finish these is broken, whatever
+# its perplexity says.
 GATE_PROMPTS = [
-    "Paris is the capital of France. The largest planet in our solar system is",
-    "Here is a short explanation of how photosynthesis works:",
-    "# Python function to compute the nth Fibonacci number\ndef fib(n):",
+    ("Paris is the capital of France. The largest planet in our solar system is",
+     ("jupiter",)),
+    ("Here is a short explanation of how photosynthesis works:",
+     ("light", "sun", "water", "carbon", "energy", "plant", "chloroph")),
+    ("# Python function to compute the nth Fibonacci number\ndef fib(n):",
+     ("return", "fib", "n-1", "n - 1", "if n")),
 ]
 # tried in order; first config where ALL prompts are loop-free wins. Escalating anti-repetition.
 SAMPLING_CONFIGS = [
@@ -105,7 +113,10 @@ def _one_shot_flag(cli_bin):
     return _NO_CNV[cli_bin]
 
 
-def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80):
+def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=220):
+    # 220, not 80: a reasoning-tuned model spends its first hundred-odd tokens inside a
+    # thinking block, so a short budget cuts it off mid-thought and the known-answer check
+    # fails a build that was about to answer correctly.
     cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-c", "2048", "-n", str(n_predict), "-p", prompt]
            + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else [])
            + sampling)
@@ -140,7 +151,7 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
     last = []
     for cfg_name, sampling in configs:
         rows, looped = [], False
-        for p in prompts:
+        for p, expect in prompts:
             gen = _generate(cli_bin, model, p, sampling, ngl)
             if isinstance(gen, _NoOutput) or not gen.strip():
                 rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
@@ -148,9 +159,15 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
                              "sample": ""})
                 return {"verdict": "NO_OUTPUT", "config": cfg_name, "rows": rows}
             is_loop, metric, reason = detect_loop(gen)
-            rows.append({"prompt": p.splitlines()[0][:48], "loop": is_loop, "reason": reason,
+            # Not looping is not the same as coherent. Check the model actually produced the
+            # known answer; salad passes a loop test and fails this.
+            knows = any(e.lower() in gen.lower() for e in expect)
+            if not is_loop and not knows:
+                reason = f"INCOHERENT (no {'/'.join(expect[:3])} in the continuation)"
+            rows.append({"prompt": p.splitlines()[0][:48], "loop": is_loop or not knows,
+                         "reason": reason,
                          "sample": gen.strip().replace("\n", " ")[:120]})
-            looped = looped or is_loop
+            looped = looped or is_loop or not knows
         last = rows
         if not looped:
             return {"verdict": "PASS", "config": cfg_name, "sampling": sampling, "rows": rows}

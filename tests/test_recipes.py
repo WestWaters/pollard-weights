@@ -1801,6 +1801,27 @@ def test_the_model_tools_know_nothing_about_brains():
     assert not offenders, ("brain code has grown back into model tooling: " + "; ".join(offenders))
 
 
+
+def test_coherence_gate_rejects_fluent_garbage():
+    """The gate ran detect_loop() and, finding no repetition, reported "coherent". A build emitting
+    token salad does not repeat, so it PASSED -- the IQ1_KT gemma4 flagship answered "The capital of
+    France is isletedGESarz Svensri--st IC himself1 andict zichzelf" and the gate green-lit it for
+    publication. Not-looping is not coherent. Each prompt carries a known answer now."""
+    import pollard_bench as B
+    assert all(isinstance(p, tuple) and len(p) == 2 for p in B.GATE_PROMPTS), (
+        "gate prompts carry no expected answer, so nothing checks what the model said")
+    joined = " ".join(" ".join(e).lower() for _p, e in B.GATE_PROMPTS)
+    assert "jupiter" in joined, "the solar-system probe has no known answer to check"
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
+        encoding="utf-8")
+    seg = src.split("def coherence_gate", 1)[1].split("\ndef ", 1)[0]
+    assert "knows" in seg and "not knows" in seg, (
+        "the gate still passes on absence of looping alone")
+    # salad must fail even though it never repeats
+    salad = "isletedGESarz Svensri--st IC himself1 andict zichzelf-int-just"
+    assert not any(e.lower() in salad.lower() for e in B.GATE_PROMPTS[0][1])
+
+
 def test_bench_parses_the_kl_report_llama_cpp_actually_prints():
     """Under --kl-divergence llama-perplexity prints a different report: no "Final estimate", but
     both perplexities and a top-1 agreement. Two ways this went wrong at once -- PPL came back
