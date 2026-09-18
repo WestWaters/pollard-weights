@@ -67,7 +67,8 @@ def corpus_ppl(base, model, texts, key=None):
 
 def spec_counters(metrics_url):
     """Snapshot vLLM's speculative-decoding Prometheus counters (returns None if the server has none)."""
-    import re, urllib.request
+    import re                       # urllib.request is module scope -- re-importing it here would
+                                    # make `urllib` local and break every earlier use in this function
     txt = urllib.request.urlopen(metrics_url, timeout=20).read().decode()
     def val(name):
         tot = 0.0; seen = False

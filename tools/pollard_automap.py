@@ -82,7 +82,7 @@ def ensure_gate_coverage(imatrix_path):
     and return its path so the whole flow (pins + build) uses the covered imatrix with NO manual
     step. Returns (path_to_use, n_copied); the original path + 0 when nothing needed copying or the
     file can't be parsed (caller then proceeds unchanged)."""
-    import struct, os
+    import struct
     try:
         d = open(imatrix_path, "rb").read()
         n = struct.unpack_from("<i", d, 0)[0]; pos = 4

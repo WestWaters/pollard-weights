@@ -181,9 +181,18 @@ def _kl_vs(model, chunks, ref_logp, dev):
 
 
 def _linears(model, layer, group):
+    """The linears of `group` in `layer` that actually EXIST.
+
+    `hasattr` is not enough: an architecture whose layers differ from one another declares the full
+    set of submodules and leaves the ones a given layer does not use set to None (Gemma4 does this).
+    Taking those at face value put a None in the hook list and killed the probe with
+    'NoneType has no attribute register_forward_hook' -- after loading 12B of weights. A layer with
+    none of a group is legitimate; it simply contributes nothing to that group's cost."""
     parent, names = GROUP_ATTR[group]
-    mod = getattr(text_layers(model)[layer], parent)
-    return [getattr(mod, n) for n in names if hasattr(mod, n)]
+    mod = getattr(text_layers(model)[layer], parent, None)
+    if mod is None:
+        return []
+    return [m for m in (getattr(mod, n, None) for n in names) if m is not None]
 
 
 @torch.no_grad()
@@ -325,7 +334,10 @@ def main():
         out = a.out
     else:
         try:
-            import pollard_workspace as ws, os
+            # NOT `, os`: a function-local import of a module already imported at file scope makes
+            # the name local to the WHOLE function, so every earlier use in main() raises
+            # UnboundLocalError -- which is how this failed on the box and not here.
+            import pollard_workspace as ws
             out = os.path.join(ws.calibration_dir(a.model, create=True),
                                ws.model_basename(a.model) + ".sensitivity.json")
         except Exception:

@@ -1779,6 +1779,58 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_probe_skips_submodules_an_architecture_leaves_unset():
+    """An architecture whose layers differ declares the full submodule set and leaves the unused
+    ones None (Gemma4). hasattr() is True for those, so taking them at face value put a None into
+    the forward-hook list and killed the probe AFTER loading 12B of weights."""
+    try:
+        import torch  # noqa: F401  (pollard_probe imports it at module scope)
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    import pollard_probe as P
+
+    class _Blank:                       # a layer that declares gate/up/down but only uses one
+        pass
+    mlp = _Blank(); mlp.gate_proj = None; mlp.up_proj = "REAL"; mlp.down_proj = None
+    layer = _Blank(); layer.mlp = mlp
+    holder = _Blank(); holder.layers = [layer]
+    model = _Blank(); model.model = holder
+
+    got = P._linears(model, 0, "ffn")
+    assert got == ["REAL"], f"unset submodules leaked into the hook list: {got}"
+    noattn = P._linears(model, 0, "attn")        # whole group absent is legitimate
+    assert noattn == [], f"a layer with no attn group should contribute nothing, got {noattn}"
+
+
+def test_no_function_local_import_shadows_a_module_level_one():
+    """`import os` inside a function makes `os` local to the WHOLE function, so every use of it
+    EARLIER in that function raises UnboundLocalError -- even though the module imports os at the
+    top and the code reads as correct. It only fires on the path that reaches the earlier use, so
+    it ships green: this one ran fine on the Mac and killed the probe on the box."""
+    import ast
+    root = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    offenders = []
+    for f in sorted(root.glob("pollard_*.py")):
+        tree = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+        top = set()
+        for n in tree.body:                                  # module-level imports only
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                top.update((al.asname or al.name.split(".")[0]) for al in n.names)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for n in ast.walk(fn):
+                if not isinstance(n, (ast.Import, ast.ImportFrom)):
+                    continue
+                for al in n.names:
+                    name = al.asname or al.name.split(".")[0]
+                    if name in top:
+                        offenders.append(f"{f.name}:{n.lineno} re-imports '{name}'")
+    assert not offenders, ("function-local import shadows a module-level one, making every earlier "
+                           "use in that function an UnboundLocalError: " + "; ".join(offenders))
+
+
 def test_converter_is_matched_to_the_model_not_just_found():
     """The driver used to return the bare string "convert_hf_to_gguf.py" and trust the shell. A
     converter too old for the architecture then failed deep in a build, reading as a problem with

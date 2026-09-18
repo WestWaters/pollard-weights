@@ -542,7 +542,7 @@ def detect_gpu_gb():
     A name table can only ever cover the cards someone thought to list. Detection covers the card
     the user actually owns -- including the ones we got wrong ourselves (this box is a 5070 Ti with
     16 GB, and was budgeted as a 32 GB 5090 for a whole week)."""
-    import subprocess
+    pass  # subprocess is imported at module scope
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=10).stdout
