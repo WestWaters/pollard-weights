@@ -465,7 +465,12 @@ def _ensure_imatrix(a):
     if a.run:
         if not a.calib and not os.path.exists(calib):
             _run(["pollard-calib", "--out", calib], True, cwd=here)
-        r = subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", ngl], cwd=here)
+        # --output-format dat, NOT the gguf default. Mainline llama.cpp reads both, but ik_llama --
+        # which builds the trellis flagship, the whole reason an imatrix is computed here -- reads
+        # only the legacy format and fails with "load_imatrix: failed reading number of values".
+        # The ladder still builds, so the loss is silent: the flagship is simply skipped.
+        r = subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", ngl,
+                            "--output-format", "dat"], cwd=here)
         # An unchecked imatrix is how a build gets all the way to llama-quantize before anyone finds
         # out there is no imatrix -- at which point it reports "failed to open" and quietly ships a
         # stock K-quant. Fail here, where the cause is still on screen.

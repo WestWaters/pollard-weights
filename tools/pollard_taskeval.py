@@ -51,10 +51,27 @@ SUITES = {
     # comparable to theirs rather than merely similar-looking
     "core":  ["gsm8k", "minerva_math500", "ifeval", "mmlu_redux_generative",
               "gpqa_diamond_zeroshot", "humaneval_plus", "mbpp_plus"],
+    # Mirrors the task list a competing low-bit 27B release quotes, category for category, so our
+    # per-category and overall figures answer theirs directly instead of being merely adjacent.
+    # Three of their tasks have no lm-eval implementation (see UNAVAILABLE) -- the suite says so
+    # rather than quietly averaging over a smaller set and calling it the same number.
+    "bonsai": ["mmlu_redux_generative", "leaderboard_musr",          # Knowledge & reasoning
+               "gsm8k", "minerva_math500", "aime25", "aime26",       # Math
+               "humaneval_plus", "mbpp_plus",                        # Coding
+               "ifeval"],                                            # Instruction following
     # lmms-eval, not lm-eval -- different harness, different runner, same reporting here
     "vision": ["charxiv", "realworldqa", "ok_vqa", "ocrbench"],
 }
 VISION_SUITE = "vision"
+
+# Tasks Pollard ships itself, because the releases we are answering quote them and lm-eval has no
+# implementation. Loaded via --include_path so they register like any built-in.
+TASK_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tasks")
+
+# Still quoted by that release with nothing to run them. Named so a reader knows the overall covers
+# 9 of their 11 rather than silently being a different quantity.
+UNAVAILABLE = {"LiveCodeBench": "needs its own execution harness (sandboxed run + date filtering)",
+               "IFBench": "needs its per-constraint verifiers"}
 
 # Not runnable from a task name. Both need a live environment: tau2-bench stands up a dual-control
 # customer-service simulator, BFCL a function-calling executor. Declared so the gap is visible.
@@ -65,9 +82,10 @@ AGENTIC = {
 
 # The category each task reports under, so the summary lines up with how these are usually quoted.
 CATEGORY = {
-    "gsm8k": "Math", "minerva_math500": "Math",
+    "gsm8k": "Math", "minerva_math500": "Math", "aime25": "Math",
     "ifeval": "Instruction Following",
     "mmlu_redux_generative": "Knowledge & Reasoning", "gpqa_diamond_zeroshot": "Knowledge & Reasoning",
+    "leaderboard_musr": "Knowledge & Reasoning",
     "humaneval_plus": "Coding", "mbpp_plus": "Coding",
     "charxiv": "Vision", "realworldqa": "Vision", "ok_vqa": "Vision",
     "ocrbench": "Vision",
@@ -137,6 +155,8 @@ def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_di
     def _invoke(backend, margs, extra=()):
         cmd = [sys.executable, "-m", harness, "--model", backend, "--model_args", margs,
                "--tasks", ",".join(tasks), "--batch_size", batch, "--output_path", out_dir]
+        if harness == "lm_eval" and os.path.isdir(TASK_DIR):
+            cmd += ["--include_path", TASK_DIR]      # Pollard's own tasks (e.g. aime26)
         cmd += list(extra)
         if limit:
             cmd += ["--limit", str(limit)]

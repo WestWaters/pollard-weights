@@ -1779,6 +1779,18 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_imatrix_is_written_in_the_format_the_flagship_can_read():
+    """llama-imatrix now defaults to a GGUF-format imatrix. Mainline reads both, but ik_llama --
+    which builds the trellis flagship, the entire reason an imatrix is computed -- reads only the
+    legacy .dat and dies with 'load_imatrix: failed reading number of values'. The K-quant ladder
+    still builds, so the flagship is skipped and nothing says so."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py").read_text(
+        encoding="utf-8")
+    seg = src.split("def _ensure_imatrix", 1)[1].split("\ndef ", 1)[0]
+    assert "--output-format" in seg and '"dat"' in seg, (
+        "the imatrix is left in the gguf default, which the trellis flagship cannot read")
+
+
 def test_taskeval_scores_a_gguf_on_the_quantized_kernel():
     """lm-eval's HF backend opens a GGUF by DEQUANTIZING it, so a 5.9GB build becomes ~55GB of fp32:
     it cannot open the models Pollard exists for, and where it can, it scores an fp32 copy rather
