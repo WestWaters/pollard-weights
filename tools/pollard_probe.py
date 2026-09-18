@@ -21,9 +21,109 @@ Note: this is the torch/RTN proxy for the GGUF crush -- the per-group ranking
 matches; absolute KL is a proxy, not the ik_llama trellis error. For the final
 published card, confirm the winner with a pollard-sensitivity run on the box.
 """
-import argparse, json, sys
+import argparse, glob, json, os, sys
 import torch, torch.nn.functional as F
 from pollard_load import load_backbone, text_layers
+
+
+def _weights_bytes(model_id):
+    """On-disk weight bytes, so we can tell BEFORE loading whether this fits. 0 = unknown (hub id)."""
+    tot = 0
+    for pat in ("*.safetensors", "*.bin"):
+        for f in glob.glob(os.path.join(model_id, pat)):
+            tot += os.path.getsize(f)
+    return tot
+
+
+def _accel_bytes(dev):
+    """Usable accelerator memory, or 0 if `dev` is the CPU."""
+    if dev == "cuda" and torch.cuda.is_available():
+        return int(torch.cuda.get_device_properties(0).total_memory * 0.90)
+    if dev == "mps":
+        rec = getattr(torch.mps, "recommended_max_memory", None)
+        return int(rec() * 0.90) if rec else 0
+    return 0
+
+
+def _win_mem():
+    """(total, avail) physical bytes on Windows. There is no sysconf and no /proc there, so a
+    POSIX-only probe reads 0 RAM and offloads to disk on a box with plenty free."""
+    import ctypes
+
+    class _MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    m = _MS()
+    m.dwLength = ctypes.sizeof(_MS)
+    if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+        return int(m.ullTotalPhys), int(m.ullAvailPhys)
+    return 0, 0
+
+
+def _host_bytes():
+    """RAM we can actually SPEND right now, on macOS, Linux and Windows alike.
+
+    Not the nameplate: the build box has 31.8GB installed but 15.4GB free with a desktop session
+    on it, and budgeting a 22GB model against the 31.8 lands it in swap. Total is only the
+    fallback for a platform that won't tell us what's free."""
+    try:
+        from pollard_calc import detect_available_ram_gb
+        avail = detect_available_ram_gb()
+        if avail:
+            return int(avail * 1e9)
+    except Exception:
+        pass
+    try:
+        if sys.platform == "win32":
+            tot, avail = _win_mem()
+            return avail or tot
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def plan_placement(model_id, dev, offload_dir):
+    """Where does this model actually go?
+
+    The probe used to pin the WHOLE model to one device. That silently worked for every model small
+    enough to fit and then OOM'd on the first one that wasn't -- and because the caller treated a
+    probe failure as "no profile", the build quietly degraded to a UNIFORM allocation, which is the
+    one thing pollard-fit warns has no quality win. Measure first, then place:
+
+      fits the accelerator -> use it (fast path, unchanged)
+      fits host RAM        -> CPU (slower, still exact)
+      fits neither         -> shard across accelerator+CPU and offload the tail to disk
+
+    Returns (device, load_kwargs, note).
+    """
+    need = _weights_bytes(model_id)
+    if not need:                                            # hub id / unknown: keep the old behaviour
+        return dev, {}, ""
+    G = 1 << 30
+    need_hdr = int(need * 1.15)                             # weights + activations//logits headroom
+    accel, host = _accel_bytes(dev), _host_bytes()
+    if accel and need_hdr <= accel:
+        return dev, {}, f"{need/G:.1f}GB fits {dev} ({accel/G:.1f}GB)"
+    if host and need_hdr <= host * 0.85:
+        why = f"{need/G:.1f}GB exceeds {dev} ({accel/G:.1f}GB)" if accel else f"{need/G:.1f}GB"
+        return "cpu", {}, f"{why} -> CPU ({host/G:.1f}GB RAM)"
+    os.makedirs(offload_dir, exist_ok=True)
+    if accel and sys.platform == "darwin":
+        # Apple Silicon is UNIFIED memory: the GPU and the CPU spend the same pool, so budgeting
+        # them separately would promise ~2x the RAM that exists and thrash swap. One budget, split.
+        budget = max(int(host * 0.70 / G), 2)
+        mm = {dev: f"{budget - budget // 4}GiB", "cpu": f"{max(budget // 4, 1)}GiB"}
+    else:
+        mm = {"cpu": f"{max(int(host * 0.70 / G), 2)}GiB"}
+        if accel:
+            mm[0 if dev == "cuda" else dev] = f"{max(int(accel / G), 1)}GiB"
+    kw = {"device_map": "auto", "max_memory": mm, "offload_folder": offload_dir}
+    return dev, kw, (f"{need/G:.1f}GB exceeds both {dev} ({accel/G:.1f}GB) and RAM "
+                     f"({host/G:.1f}GB) -> sharded, tail offloaded to {offload_dir}")
 
 # LADDER types -> (bpw, RTN bits) so the cheap noise curve keys match pollard-fit.
 LADDER_BITS = [("q6_K", 6), ("q5_K", 5), ("iq4_xs", 4), ("iq3_s", 3),
@@ -137,18 +237,33 @@ def main():
     ap.add_argument("--probe-bits", type=int, default=2, help="RTN bits to crush a group to (default 2)")
     ap.add_argument("--chunks", type=int, default=4)
     ap.add_argument("--seqlen", type=int, default=1024)
-    ap.add_argument("--device", default="mps")
+    ap.add_argument("--device", default="auto",
+                    help="auto (default: cuda>mps>cpu, and shard+offload if the model is bigger "
+                         "than the accelerator) or an explicit cuda/mps/cpu")
+    ap.add_argument("--offload-dir", help="where to spill layers when the model fits neither the "
+                                          "accelerator nor RAM (default: alongside --out)")
     ap.add_argument("--stream", action="store_true",
                     help="ONE-pass Hessian-diagonal estimator instead of per-group perturb+KL -- for "
                          "models too big to run layersxgroups forward passes (744B-scale)")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
+    dev = a.device
+    if dev == "auto":
+        dev = ("cuda" if torch.cuda.is_available()
+               else "mps" if torch.backends.mps.is_available() else "cpu")
+    elif dev == "mps" and not torch.backends.mps.is_available():
+        dev = "cpu"
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+    offdir = a.offload_dir or os.path.join(os.path.dirname(a.out or ".") or ".", "pollard-offload")
+    dev, loadkw, note = plan_placement(a.model, dev, offdir)
     print(f"== pollard-probe :: {a.model}  probe={a.probe_bits}bit  dev={dev}", flush=True)
+    if note:
+        print(f"   placement: {note}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = load_backbone(a.model, torch.float16, dev)
+    model = load_backbone(a.model, torch.float16, dev, **loadkw)
+    if loadkw.get("device_map"):            # accelerate hooks move inputs; stage them on the CPU
+        dev = "cpu"
     layers = len(text_layers(model))
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 

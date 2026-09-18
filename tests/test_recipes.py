@@ -1744,6 +1744,62 @@ def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
                            + ", ".join(offenders))
 
 
+def test_probe_places_a_model_too_big_for_the_accelerator():
+    """The probe pinned the WHOLE model to one device, so the first model bigger than the box OOM'd
+    (Gemma4 12B: 22GB onto a 16GB Mac). It must shard+offload instead of dying."""
+    import pollard_probe as P
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "model-00001-of-00001.safetensors"), "wb") as f:
+        f.truncate(400 * (1 << 30))                     # 400GB: bigger than any dev box
+    _, kw, note = P.plan_placement(d, "mps", os.path.join(d, "off"))
+    assert kw.get("device_map") == "auto", f"a 400GB model was not sharded: {kw}"
+    assert kw.get("offload_folder"), "nothing offloaded, so it will OOM"
+    # unified memory: the GPU and the CPU spend the SAME pool, so the budgets must not double-count
+    if sys.platform == "darwin":
+        tot = sum(int(re.sub(r"[^0-9]", "", v)) for v in kw["max_memory"].values())
+        ram = P._host_bytes() / (1 << 30)
+        assert tot <= ram * 0.80, f"budgeted {tot}GiB of {ram:.0f}GB unified RAM"
+
+
+def test_gold_path_never_degrades_to_uniform_silently():
+    """A uniform allocation is what pollard-fit itself warns has no quality win. Losing the probe or
+    the imatrix must STOP the build, not quietly ship a stock K-quant wearing Pollard's name."""
+    src = pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py"
+    txt = src.read_text(encoding="utf-8")
+    probe = txt.split("def _ensure_sensitivity", 1)[1].split("\ndef ", 1)[0]
+    assert "raise SystemExit" in probe, "a failed probe still falls back to uniform allocation"
+    imat = txt.split("def _ensure_imatrix", 1)[1].split("\ndef ", 1)[0]
+    assert "returncode" in imat and "raise SystemExit" in imat, (
+        "llama-imatrix's exit code is unchecked -- a missing imatrix stays invisible until "
+        "llama-quantize fails to open it")
+
+
+def test_memory_detection_covers_all_three_platforms():
+    """Pollard is cross-platform, so a POSIX-only memory probe is a silent Windows downgrade: no
+    sysconf and no /proc there, so RAM reads as 0/None and every budget built on it is wrong --
+    on the box that actually does the builds."""
+    import pollard_probe as P
+    from pollard_calc import detect_available_ram_gb
+    assert P._host_bytes() > 0, f"RAM unreadable on {sys.platform}"
+    if sys.platform != "win32":
+        assert detect_available_ram_gb(), f"available RAM unreadable on {sys.platform}"
+    root = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    for fn, name in ((root / "pollard_probe.py", "_host_bytes"),
+                     (root / "pollard_calc.py", "detect_available_ram_gb")):
+        txt = fn.read_text(encoding="utf-8")
+        body = txt.split(f"def {name}", 1)[1].split("\ndef ", 1)[0]
+        helper = txt.split("def _win_mem", 1)[1].split("\ndef ", 1)[0] if "_win_mem" in txt else ""
+        assert "win32" in body, f"{fn.name}:{name} has no Windows branch"
+        assert "GlobalMemoryStatusEx" in body + helper, f"{fn.name}:{name} never asks Windows for RAM"
+        assert ("darwin" in body or "sysconf" in body), f"{fn.name}:{name} lost its macOS path"
+        assert ("meminfo" in body or "sysconf" in body), f"{fn.name}:{name} lost its Linux path"
+
+
+def test_imatrix_ngl_fits_the_box_it_runs_on():
+    """-ngl 99 offloads every layer: right when it fits, fatal when it doesn't."""
+    import pollard_auto as A2
+    assert A2._fit_ngl("/nonexistent.gguf", "7") == "7", "an explicit --ngl must be honoured"
+
 
 def test_taskeval_reports_retention_against_a_reference():
     """Every other Pollard metric is intrinsic; nobody else quotes those.

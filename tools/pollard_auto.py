@@ -33,7 +33,44 @@ pollard-probe, --no-measure to skip); EXL3 = smoothing + Calib 3.0 packed to -cd
 """
 import argparse, os, subprocess, sys
 
-from pollard_calc import read_gguf_meta, gguf_to_config, analyse, find_llama_bin
+from pollard_calc import (read_gguf_meta, gguf_to_config, analyse, find_llama_bin,
+                          detect_gpu_gb, detect_available_ram_gb)
+
+
+def _accel_gb():
+    """GB the accelerator can actually hold: VRAM on NVIDIA, the shared pool on Apple Silicon
+    (where the GPU spends host RAM, so nameplate VRAM is the wrong question). 0 = unknown."""
+    vram = detect_gpu_gb()
+    if vram:
+        return vram * 0.90
+    if sys.platform == "darwin":
+        return detect_available_ram_gb() * 0.80
+    return 0.0
+
+
+def _fit_ngl(gguf, ngl):
+    """How many layers actually fit on the accelerator.
+
+    `-ngl 99` asks llama.cpp to offload EVERY layer. That is right for a model that fits and fatal
+    for one that doesn't -- and because a failed imatrix only surfaces later, as llama-quantize
+    being unable to open the file, the whole build lands on a uniform allocation with nobody the
+    wiser. Offload the share that fits and stream the rest."""
+    if str(ngl).lower() != "auto":
+        return str(ngl)
+    try:
+        size_gb = os.path.getsize(gguf) / (1 << 30)
+        layers = int(gguf_to_config(read_gguf_meta(gguf), gguf).get("num_hidden_layers") or 0)
+    except Exception:
+        return "99"
+    budget = _accel_gb()
+    if not budget or not layers:
+        return "99"
+    if size_gb * 1.10 <= budget:
+        return "99"
+    n = max(int(layers * budget / (size_gb * 1.10)), 0)
+    print(f"      (-ngl auto: {size_gb:.1f}GB model vs {budget:.1f}GB usable -> {n}/{layers} layers "
+          f"offloaded, rest streamed)")
+    return str(n)
 
 # reference bits-per-weight for the common formats, so a user can see where a Pollard
 # build lands vs f16 / NVFP4 / the usual GGUF tiers ("half the size of NVFP4" etc.).
@@ -283,11 +320,20 @@ def _ensure_sensitivity(a, hf_dir, calib, here):
     evalf = heldout if (heldout and (not a.run or os.path.exists(heldout))) else calib
     print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
     if a.run:
-        # tolerate a probe failure -- fall back to uniform rather than killing the whole build
         r = subprocess.run(["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof], cwd=here)
+        # This used to fall back to uniform "rather than killing the whole build". But a uniform
+        # allocation is not a lesser Pollard build -- it is the thing pollard-fit itself warns has
+        # no quality win over a stock K-quant. Degrading to it silently spends hours producing a
+        # model whose entire selling point is missing. Uniform is a CHOICE (--no-measure), not a
+        # fallback.
         if r.returncode != 0 or not os.path.exists(prof):
-            print("   (probe unavailable/failed -- falling back to uniform allocation for this lane)")
-            return None
+            raise SystemExit(
+                f"\n   pollard-probe failed (exit {r.returncode}) -- no sensitivity profile.\n"
+                "   REFUSING to fall back to a uniform allocation: the measured per-layer profile\n"
+                "   IS the Pollard method, and without it this build is a stock K-quant wearing\n"
+                "   our name. See the probe's error above (it places a too-big model automatically,\n"
+                "   so an OOM here usually means something else).\n"
+                "   To accept a uniform build on purpose, pass --no-measure.")
     return prof
 
 
@@ -346,12 +392,23 @@ def _ensure_imatrix(a):
     print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) -- no manual calibration step:")
     if not a.calib:
         print(f"      pollard-calib --out {os.path.basename(calib)}")
+    ngl = _fit_ngl(a.gguf, a.ngl)
     print(f"      {binim} -m {os.path.basename(a.gguf)} -f {os.path.basename(calib)} "
-          f"-o {os.path.basename(imat)} -ngl {a.ngl}")
+          f"-o {os.path.basename(imat)} -ngl {ngl}")
     if a.run:
         if not a.calib and not os.path.exists(calib):
             _run(["pollard-calib", "--out", calib], True, cwd=here)
-        subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", str(a.ngl)], cwd=here)
+        r = subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", ngl], cwd=here)
+        # An unchecked imatrix is how a build gets all the way to llama-quantize before anyone finds
+        # out there is no imatrix -- at which point it reports "failed to open" and quietly ships a
+        # stock K-quant. Fail here, where the cause is still on screen.
+        if r.returncode != 0 or not os.path.exists(imat):
+            raise SystemExit(
+                f"\n   llama-imatrix failed (exit {r.returncode}) -- no imatrix at {imat}.\n"
+                "   Pollard will NOT continue without it: the imatrix is what makes this a Pollard\n"
+                "   mix rather than a stock K-quant ladder. If the model is too big for this box,\n"
+                "   lower --ngl (or leave it 'auto') or build the imatrix on a Q8_0 host.\n"
+                "   To deliberately accept the stock ladder instead, pass --no-auto-imatrix.")
     print("      (big MoE won't fit f16 for the forward pass -> compute on a Q6_K host at a "
           "partial --ngl; see SKILL.md. Undercovered experts hard-fail low-bit -- Calib 3.0 covers them.)")
     return imat
@@ -438,7 +495,9 @@ def main():
                          "'auto' = only when the majors differ; 'off' = always use the current env.")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
-    ap.add_argument("--ngl", default="99", help="GPU layers for auto-imatrix (lower for a big model)")
+    ap.add_argument("--ngl", default="auto",
+                    help="GPU layers for auto-imatrix. 'auto' (default) offloads the share that "
+                         "fits this box and streams the rest; a number forces it.")
     ap.add_argument("--no-auto-imatrix", dest="auto_imatrix", action="store_false",
                     help="do NOT auto-generate an imatrix when --imatrix is omitted (K-quant ladder only)")
     ap.set_defaults(auto_imatrix=True)

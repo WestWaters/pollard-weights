@@ -45,6 +45,26 @@ def detect_available_ram_gb():
             free = (stats.get("Pages free", 0) + stats.get("Pages inactive", 0)
                     + stats.get("Pages speculative", 0) + stats.get("Pages purgeable", 0))
             return free * page / 1e9
+        if sys.platform == "win32":
+            # No sysconf, no /proc. Without this branch every Windows box reads as "RAM unknown",
+            # which silently downgrades every budget decision made on it -- and the build box IS
+            # Windows.
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            m = _MS()
+            m.dwLength = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.ullAvailPhys) / 1e9
+            return None
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
