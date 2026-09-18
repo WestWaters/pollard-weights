@@ -1747,6 +1747,11 @@ def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
 def test_probe_places_a_model_too_big_for_the_accelerator():
     """The probe pinned the WHOLE model to one device, so the first model bigger than the box OOM'd
     (Gemma4 12B: 22GB onto a 16GB Mac). It must shard+offload instead of dying."""
+    try:
+        import torch  # noqa: F401  (pollard_probe imports it at module scope)
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
     import pollard_probe as P
     d = tempfile.mkdtemp()
     with open(os.path.join(d, "model-00001-of-00001.safetensors"), "wb") as f:
@@ -1778,11 +1783,8 @@ def test_memory_detection_covers_all_three_platforms():
     """Pollard is cross-platform, so a POSIX-only memory probe is a silent Windows downgrade: no
     sysconf and no /proc there, so RAM reads as 0/None and every budget built on it is wrong --
     on the box that actually does the builds."""
-    import pollard_probe as P
-    from pollard_calc import detect_available_ram_gb
-    assert P._host_bytes() > 0, f"RAM unreadable on {sys.platform}"
-    if sys.platform != "win32":
-        assert detect_available_ram_gb(), f"available RAM unreadable on {sys.platform}"
+    # The source scan runs EVERYWHERE, torch or not -- it is the actual regression guard, and CI is
+    # exactly the machine that would otherwise let a POSIX-only probe through unnoticed.
     root = pathlib.Path(__file__).resolve().parents[1] / "tools"
     for fn, name in ((root / "pollard_probe.py", "_host_bytes"),
                      (root / "pollard_calc.py", "detect_available_ram_gb")):
@@ -1793,6 +1795,16 @@ def test_memory_detection_covers_all_three_platforms():
         assert "GlobalMemoryStatusEx" in body + helper, f"{fn.name}:{name} never asks Windows for RAM"
         assert ("darwin" in body or "sysconf" in body), f"{fn.name}:{name} lost its macOS path"
         assert ("meminfo" in body or "sysconf" in body), f"{fn.name}:{name} lost its Linux path"
+    # pollard_calc is torch-free, so the live read is checked on every platform CI runs on
+    from pollard_calc import detect_available_ram_gb
+    if sys.platform != "win32":
+        assert detect_available_ram_gb(), f"available RAM unreadable on {sys.platform}"
+    try:
+        import torch  # noqa: F401  (pollard_probe imports it at module scope)
+    except ImportError:
+        return
+    import pollard_probe as P
+    assert P._host_bytes() > 0, f"RAM unreadable on {sys.platform}"
 
 
 def test_imatrix_ngl_fits_the_box_it_runs_on():
