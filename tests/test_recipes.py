@@ -1779,6 +1779,26 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_the_model_tools_know_nothing_about_brains():
+    """A brain is an OPTIONAL thing a user may attach to a finished model. It is not part of
+    quantizing one, so no model tool should carry brain code -- attach_brain() and a --brain flag
+    had grown into the middle of the build driver, which is why every edit to a model tool raised
+    the question of whether the brains had been touched. `pollard` builds models; brains live in
+    the brain tools and attach afterwards."""
+    tools = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    offenders = []
+    for f in sorted(tools.glob("pollard_*.py")):
+        if re.search(r"brain|connectome|flybrain", f.name):
+            continue                                   # the brain tools themselves, naturally
+        txt = f.read_text(encoding="utf-8")
+        hits = [i for i, l in enumerate(txt.splitlines(), 1)
+                if re.search(r"\b(flybrain|connectome|attach_brain)\b", l, re.I)
+                or re.search(r"--brain\b", l)]
+        if hits:
+            offenders.append(f"{f.name}:{hits[:3]}")
+    assert not offenders, ("brain code has grown back into model tooling: " + "; ".join(offenders))
+
+
 def test_imatrix_is_written_in_the_format_the_flagship_can_read():
     """llama-imatrix now defaults to a GGUF-format imatrix. Mainline reads both, but ik_llama --
     which builds the trellis flagship, the entire reason an imatrix is computed -- reads only the
