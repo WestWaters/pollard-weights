@@ -298,10 +298,40 @@ def _precondition_hf(a, hf_dir):
     return cur
 
 
+def _preflight(a, hf_dir):
+    """Can this machine finish the build, asked BEFORE it starts one.
+
+    Every capability this needs is knowable in seconds from the model's shape -- is there a
+    converter here that knows the architecture, will the weights fit anywhere sensible. Asking
+    afterwards is how a missing 3MB converter surfaces hours in, looking like a problem with the
+    model. A build that cannot finish should say so before it spends anything."""
+    if not getattr(a, "preflight", True):
+        return
+    try:
+        from pollard_convert import find_converter, model_architectures
+        from pollard_probe import plan_placement
+    except ImportError:
+        return                                          # no extra installed: nothing to check with
+    archs = model_architectures(hf_dir)
+    conv, note = find_converter(hf_dir)
+    print(f"   preflight: {', '.join(archs) or 'architecture unknown'}")
+    if conv is None:
+        raise SystemExit(f"   STOPPING before this build spends anything -- {note}\n"
+                         "   (--no-preflight to try anyway)")
+    print(f"      converter  {note}")
+    try:
+        _, _, where = plan_placement(hf_dir, "cpu", os.path.join(hf_dir, ".pollard-offload"))
+        if where:
+            print(f"      placement  {where}")
+    except Exception:
+        pass                                            # placement is advisory, never a blocker
+
+
 def _resolve_hf(a):
     """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
     Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
+        _preflight(a, a.hf)
         a._hf_dir = _precondition_hf(a, a.hf)
         return a._hf_dir
     import pollard_workspace as ws
@@ -309,6 +339,8 @@ def _resolve_hf(a):
     print(f"   fetch HF repo -> {local}  (workspace downloads/)")
     if a.run:
         local = ws.fetch_source(a.hf)                   # single copy, no ~/.cache dup
+    if os.path.isdir(local):
+        _preflight(a, local)
     a._hf_dir = _precondition_hf(a, local)
     return a._hf_dir
 
@@ -514,6 +546,10 @@ def main():
                                     "quantized -- it is 11 MB of memory that attaches to the model at run\n"
                                     "time and can be detached, moved to another backbone and carried on\n"
                                     "with --continue-from.")
+    ap.add_argument("--no-preflight", dest="preflight", action="store_false",
+                    help="skip the up-front capability check (converter knows this architecture, "
+                         "weights fit somewhere) and start the build regardless")
+    ap.set_defaults(preflight=True)
     ap.add_argument("--probe-method", choices=("auto", "stream", "kl"), default="auto",
                     help="sensitivity estimator: 'kl' = perturb+KL (layers*groups forward passes), "
                          "'stream' = one-pass Hessian diagonal, 'auto' (default) picks stream when "

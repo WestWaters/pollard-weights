@@ -104,9 +104,16 @@ def find_converter(model_dir=None):
                 return c, f"{c} registers {a}"
     names = ", ".join(archs)
     where = "\n  ".join(str(p) for p in present)
+    where_arg = model_dir or "<repo-or-dir>"
+    # A converter that does not know this architecture IS the new-architecture case, which Pollard
+    # already has a path for: onboard it, and the contribution makes the next person's model of that
+    # family one-shot. Dead-ending here throws that away.
     return None, (f"no converter on this machine registers {names}.\n  Checked:\n  {where}\n"
-                  "  Update llama.cpp (or copy a newer convert_hf_to_gguf.py + conversion/ + "
-                  "gguf-py/ beside it) -- it is ~3MB, far less than moving the model.")
+                  f"  -> onboard this architecture:  pollard-onboard --model {where_arg} --contribute\n"
+                  "     (audits the real tensor names against Pollard's matchers and writes a\n"
+                  "      PR-ready contribution -- read-only, no weights downloaded)\n"
+                  "  If the converter is merely older than the model, copying a newer\n"
+                  "  convert_hf_to_gguf.py + conversion/ + gguf-py/ beside it is ~3MB.")
 
 
 def main():
