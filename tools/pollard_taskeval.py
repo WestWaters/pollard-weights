@@ -37,10 +37,12 @@ Suites, chosen for signal per GPU-hour:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import time
 
 SUITES = {
     # minutes, for checking a rung is sane before spending hours on it
@@ -84,21 +86,70 @@ def model_args(path: str) -> tuple[str, str]:
     return "hf", f"pretrained={path}"
 
 
+@contextlib.contextmanager
+def served(gguf: str, ngl: str, port: int, ctx: int):
+    """Host a GGUF on llama-server for the duration, and yield its base_url.
+
+    lm-eval's HF backend loads a GGUF by DEQUANTIZING it, so a 5.9GB build becomes ~55GB of fp32 in
+    RAM -- it scores the small models fine and cannot open the ones Pollard exists for. Worse, it
+    would not be measuring what ships: the point of the number is the quantized build on the
+    quantized kernel. llama-server keeps it quantized and on the GPU, and lm-eval's `gguf` backend
+    talks to it over HTTP."""
+    import urllib.request
+    from pollard_calc import find_llama_bin
+    binsrv = find_llama_bin("llama-server") or "llama-server"
+    cmd = [binsrv, "-m", gguf, "--host", "127.0.0.1", "--port", str(port),
+           "-ngl", str(ngl), "-c", str(ctx)]
+    print(f"   serving: {' '.join(os.path.basename(c) for c in cmd[:3])} ... -ngl {ngl}", flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(600):                                   # a big model takes a while to load
+            if proc.poll() is not None:
+                raise SystemExit(f"llama-server exited ({proc.returncode}) before serving {gguf}")
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                time.sleep(1)
+        else:
+            raise SystemExit(f"llama-server never became ready for {gguf}")
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            proc.kill()
+
+
 def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_dir: str,
-        harness: str = "lm_eval") -> dict:
+        harness: str = "lm_eval", serve: bool = True, ngl: str = "99", port: int = 8080,
+        ctx: int = 4096) -> dict:
     """Run one harness over one model. lmms-eval takes the same shape of arguments as lm-eval,
     which is why a single runner covers both: the difference is the module and the model wrapper."""
     backend, margs = model_args(path)
     if harness == "lmms_eval":
         # lmms-eval drives a vision-language model, so the wrapper differs from lm-eval's plain hf
         backend = "hf-multimodal" if not path.endswith(".gguf") else "hf-multimodal"
-    cmd = [sys.executable, "-m", harness, "--model", backend, "--model_args", margs,
-           "--tasks", ",".join(tasks), "--device", device, "--batch_size", batch,
-           "--output_path", out_dir]
-    if limit:
-        cmd += ["--limit", str(limit)]
-    print(f"   $ {' '.join(cmd[2:])}", flush=True)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+
+    def _invoke(backend, margs, extra=()):
+        cmd = [sys.executable, "-m", harness, "--model", backend, "--model_args", margs,
+               "--tasks", ",".join(tasks), "--batch_size", batch, "--output_path", out_dir]
+        cmd += list(extra)
+        if limit:
+            cmd += ["--limit", str(limit)]
+        print(f"   $ {' '.join(cmd[2:])}", flush=True)
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    # A GGUF is scored ON the quantized kernel, served, not dequantized into RAM through the HF
+    # backend -- otherwise the number describes an fp32 copy of the build rather than the build.
+    if serve and harness == "lm_eval" and path.endswith(".gguf"):
+        with served(path, ngl, port, ctx) as base:
+            r = _invoke("gguf", f"base_url={base}")
+    else:
+        r = _invoke(backend, margs, ("--device", device))
     if r.returncode != 0:
         # The last N lines of a harness that logs progress are all INFO, so the real cause scrolls
         # past. Pull the lines that look like a failure first, and only fall back to the tail.
@@ -152,6 +203,14 @@ def main() -> None:
     ap.add_argument("--batch-size", default="1",
                     help="lm-eval batch size. Default 1 because 'auto' probes for a batch that "
                          "fits and dies on CPU without a useful message; raise it on a GPU.")
+    ap.add_argument("--no-serve", dest="serve", action="store_false",
+                    help="score a GGUF through the HF backend, which DEQUANTIZES it into RAM "
+                         "(~9x its file size) and measures an fp32 copy rather than the build. "
+                         "Only sensible for a small model on a machine with room.")
+    ap.set_defaults(serve=True)
+    ap.add_argument("--ngl", default="99", help="GPU layers for the served GGUF (default all)")
+    ap.add_argument("--port", type=int, default=8080, help="llama-server port (--ref uses port+1)")
+    ap.add_argument("--ctx", type=int, default=4096, help="server context size")
     ap.add_argument("--out", default="taskeval", help="directory for lm-eval's raw output")
     a = ap.parse_args()
 
@@ -177,9 +236,10 @@ def main() -> None:
     print(f"\n== pollard-taskeval :: {len(tasks)} task(s), limit={a.limit or 'full'}\n")
 
     got = run(a.model, tasks, a.limit, a.device, a.batch_size,
-              os.path.join(a.out, "model"), harness)
+              os.path.join(a.out, "model"), harness, a.serve, a.ngl, a.port, a.ctx)
+    # a second server would collide on the port, so the reference gets its own
     ref = run(a.ref, tasks, a.limit, a.device, a.batch_size,
-              os.path.join(a.out, "ref"), harness) if a.ref else {}
+              os.path.join(a.out, "ref"), harness, a.serve, a.ngl, a.port + 1, a.ctx) if a.ref else {}
 
     print(f"\n  {'task':30s} {'score':>8s}" + (f" {'ref':>8s} {'retention':>10s}" if ref else ""))
     cats: dict[str, list[float]] = {}

@@ -1779,6 +1779,23 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_taskeval_scores_a_gguf_on_the_quantized_kernel():
+    """lm-eval's HF backend opens a GGUF by DEQUANTIZING it, so a 5.9GB build becomes ~55GB of fp32:
+    it cannot open the models Pollard exists for, and where it can, it scores an fp32 copy rather
+    than the build that ships. A GGUF must be SERVED and scored on the quantized kernel."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_taskeval.py").read_text(
+        encoding="utf-8")
+    assert "def served(" in src, "no server path: a GGUF is still dequantized to be scored"
+    seg = src.split("def run(", 1)[1].split("\ndef ", 1)[0]
+    assert 'serve and harness == "lm_eval" and path.endswith(".gguf")' in seg, (
+        "the served path is not what a GGUF actually takes")
+    assert '"gguf"' in seg and "base_url=" in seg, "lm-eval is not pointed at the server"
+    # the reference model must not collide with the model's server
+    call = src.split("os.path.join(a.out, \"ref\")", 1)
+    assert len(call) > 1 and "port + 1" in src, "--ref would reuse the same port and fail"
+    assert "--no-serve" in src, "no escape hatch for the dequantized path"
+
+
 def test_llama_bin_resolves_on_windows_and_from_the_workspace():
     """Binary lookup had three Unix-only prefixes, no workspace bin/, and checked bare names -- so on
     Windows, where the file is llama-quantize.EXE, it resolved NOTHING and told the build box to
