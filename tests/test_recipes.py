@@ -1779,6 +1779,31 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_llama_bin_resolves_on_windows_and_from_the_workspace():
+    """Binary lookup had three Unix-only prefixes, no workspace bin/, and checked bare names -- so on
+    Windows, where the file is llama-quantize.EXE, it resolved NOTHING and told the build box to
+    update a runtime it already had. That silently disables the trellis flagship."""
+    import pollard_calc as C
+    src = pathlib.Path(C.__file__).read_text(encoding="utf-8")
+    seg = src.split("def find_llama_bin", 1)[1].split("\ndef ", 1)[0]
+    assert "POLLARD_HOME" in seg, "the workspace's own bin/ is not searched"
+    assert '".exe"' in seg or "'.exe'" in seg, "a bare name never matches llama-quantize.exe"
+    assert "win32" in seg, "no Windows branch in binary resolution"
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "bin"), exist_ok=True)
+    exe = "llama-smoketest" + (".exe" if sys.platform == "win32" else "")
+    open(os.path.join(d, "bin", exe), "wb").close()
+    old = os.environ.get("POLLARD_HOME")
+    os.environ["POLLARD_HOME"] = d
+    try:
+        got = C.find_llama_bin("llama-smoketest")
+        assert got and os.path.exists(got), f"workspace bin/ not searched (got {got})"
+    finally:
+        os.environ.pop("POLLARD_HOME", None)
+        if old is not None:
+            os.environ["POLLARD_HOME"] = old
+
+
 def test_probe_never_emits_a_profile_from_unreadable_weights():
     """A model too big to hold gets offloaded, and most of its weights then sit on the meta device
     holding NO data. The estimator reads every weight to compute dW, so taking meta at face value

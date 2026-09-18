@@ -139,12 +139,20 @@ def find_llama_bin(name, arch=None):
         p = os.path.expanduser(name)
         return p if os.path.exists(p) else None
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
     candidates = [
         os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),  # ours FIRST -- kept current
+        os.path.join(home, "bin", name),                    # the workspace's own bin/
+        os.path.join(home, "llama.cpp", "build", "bin", name),
         shutil.which(name),                                                # then PATH
         os.path.expanduser(f"~/llama.cpp/build/bin/{name}"),
         f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}",
     ]
+    # Windows names the file llama-quantize.exe, so every bare candidate above misses it -- including
+    # our own runtime path. Three of the fallbacks are Unix-only prefixes; without this the Windows
+    # build box resolves NOTHING and the caller is told to update a runtime it already has.
+    if sys.platform == "win32":
+        candidates = [c + ext for c in candidates if c for ext in ("", ".exe")]
     existing = [c for c in candidates if c and os.path.exists(c)]
     if not existing:
         return None
