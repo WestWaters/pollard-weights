@@ -29,7 +29,6 @@ Usage:
 """
 import argparse, os, sys
 import torch
-from pollard_load import load_backbone, text_layers
 
 
 # tiny BENIGN placeholder sets -- only so --selftest exercises the mechanism.
@@ -39,6 +38,23 @@ _SMOKE_A = ["Describe a stormy sea at night.", "Explain how a bicycle stays upri
 _SMOKE_B = ["Describe a calm meadow at noon.", "Explain how a kite flies.",
             "Summarize the plot of a comedy.", "Write a limerick about the sun."]
 
+
+
+def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
+    """This tool's own backbone loader -- model tooling does not depend on the brain-side one."""
+    import torch as _torch
+    from transformers import AutoModelForCausalLM
+    if dtype is None:
+        dtype = _torch.float32
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
+    if kw.get("device_map") is None:
+        model = model.to(device)
+    return model.eval() if eval_mode else model
+
+
+def text_layers(model):
+    """The decoder layer list for this tool."""
+    return model.model.layers
 
 def _load_lines(path):
     with open(path, encoding="utf-8") as f:

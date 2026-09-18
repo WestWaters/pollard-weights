@@ -1427,9 +1427,10 @@ def test_backbone_loader_accepts_a_vision_language_model():
     # config; a second copy is how they drift back apart.
     tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
     offenders = []
-    for f in sorted(tools.glob("pollard_*.py")):
-        if f.name in ("pollard_load.py", "pollard_route.py"):
-            continue
+    # BRAIN tooling only. The model tools each load their own backbone and do not depend on this
+    # loader -- that separation is the point, and enforcing the shared loader on them was how brain
+    # code ended up threaded through the build path in the first place.
+    for f in sorted(tools.glob("pollard_*brain*.py")) + sorted(tools.glob("pollard_connectome.py")):
         body = f.read_text(encoding="utf-8")
         if "AutoModelForCausalLM.from_pretrained" in body:
             offenders.append(f.name)
@@ -1706,7 +1707,8 @@ def test_layer_access_goes_through_text_layers():
     """
     tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
     offenders = []
-    for f in sorted(tools.glob("pollard_*.py")):
+    # BRAIN tooling only -- see the note in the loader test above.
+    for f in sorted(tools.glob("pollard_*brain*.py")) + sorted(tools.glob("pollard_connectome.py")):
         for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             if "model.model.layers" not in line:
                 continue

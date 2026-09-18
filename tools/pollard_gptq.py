@@ -22,8 +22,24 @@ Usage:
 """
 import argparse, sys, time
 import torch, torch.nn as nn
-from pollard_load import load_backbone, text_layers
 
+
+
+def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
+    """This tool's own backbone loader -- model tooling does not depend on the brain-side one."""
+    import torch as _torch
+    from transformers import AutoModelForCausalLM
+    if dtype is None:
+        dtype = _torch.float32
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
+    if kw.get("device_map") is None:
+        model = model.to(device)
+    return model.eval() if eval_mode else model
+
+
+def text_layers(model):
+    """The decoder layer list for this tool."""
+    return model.model.layers
 
 def _hms(s):
     s = int(s); m, s = divmod(s, 60); return f"{m}m{s:02d}s" if m else f"{s}s"

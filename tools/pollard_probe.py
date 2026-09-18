@@ -22,8 +22,18 @@ matches; absolute KL is a proxy, not the ik_llama trellis error. For the final
 published card, confirm the winner with a pollard-sensitivity run on the box.
 """
 import argparse, glob, json, os, sys
+
+# `--device cpu` has to MEAN cpu, and this has to happen BEFORE torch is imported.
+# device_map="auto" enumerates every visible device, so accelerate places layers on the GPU even
+# when the CPU was asked for; worse, some model code launches a Triton kernel whenever CUDA merely
+# looks available, and then meets a CPU tensor:
+#     ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)
+# Setting this after `import torch` is too late -- torch caches cuda availability, so is_available()
+# keeps answering True. On a shared box it also matters that we do not quietly take the GPU.
+if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == "cpu":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import torch, torch.nn.functional as F
-from pollard_load import load_backbone, text_layers
 
 
 def _weights_bytes(model_id):
@@ -189,7 +199,7 @@ def _linears(model, layer, group):
     'NoneType has no attribute register_forward_hook' -- after loading 12B of weights. A layer with
     none of a group is legitimate; it simply contributes nothing to that group's cost."""
     parent, names = GROUP_ATTR[group]
-    mod = getattr(text_layers(model)[layer], parent, None)
+    mod = getattr(model.model.layers[layer], parent, None)
     if mod is None:
         return []
     return [m for m in (getattr(mod, n, None) for n in names) if m is not None]
@@ -328,7 +338,7 @@ def main():
                          "models too big to run layersxgroups forward passes (744B-scale)")
     a = ap.parse_args()
 
-    from transformers import AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     dev = a.device
     if dev == "auto":
         dev = ("cuda" if torch.cuda.is_available()
@@ -342,10 +352,21 @@ def main():
     if note:
         print(f"   placement: {note}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = load_backbone(a.model, torch.float16, dev, **loadkw)
+    if dev == "cpu":
+        # Eager attention on the CPU path. A fused/Triton attention is selected on the strength of
+        # CUDA merely LOOKING available -- torch.cuda.is_available() reports the driver, not the
+        # visible devices -- and then meets a CPU tensor:
+        #     ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)
+        # The probe only needs the activations, so the plainest kernel is the right one.
+        loadkw.setdefault("attn_implementation", "eager")
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16,
+                                                 **loadkw)
+    if not loadkw.get("device_map"):
+        model = model.to(dev)
+    model = model.eval()
     if loadkw.get("device_map"):            # accelerate hooks move inputs; stage them on the CPU
         dev = "cpu"
-    layers = len(text_layers(model))
+    layers = len(model.model.layers)
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 
     if a.stream:

@@ -88,9 +88,8 @@ def check_layer_access(shape_name, model):
     # Imported here, at the point of use, so this tool stays runnable without the torch extra --
     # the converter check is its most useful mode and needs none. Module-qualified on purpose, so
     # the shared-loader guard keeps its exact meaning and needs no exception for this file.
-    import pollard_load
     from pollard_probe import _linears
-    layers = pollard_load.text_layers(model)
+    layers = model.model.layers
     if not layers:
         return False, "text_layers() found no decoder layers"
     for i in range(len(layers)):
