@@ -48,6 +48,30 @@ def _accel_gb():
     return 0.0
 
 
+def _weights_gb(hf_dir):
+    """On-disk weight GB for an HF checkout. 0 = unknown."""
+    import glob
+    tot = 0
+    for pat in ("*.safetensors", "*.bin"):
+        tot += sum(os.path.getsize(f) for f in glob.glob(os.path.join(hf_dir, pat)))
+    return tot / (1 << 30)
+
+
+def _use_stream_probe(hf_dir, forced):
+    """Which sensitivity estimator can actually finish on this box.
+
+    The default perturb+KL probe crushes one group and re-runs the eval, so it costs layers*groups
+    full forward passes -- ~100 for a 48-layer model. That is fine for a model that sits in memory
+    and hopeless for one streaming off disk, which is precisely when a measured allocation matters
+    most. The gold path would be 'available' and simply never finish. The one-pass Hessian-diagonal
+    estimator ranks the same groups for a single forward, so use it when the weights do not fit."""
+    if forced in ("stream", "kl"):
+        return forced == "stream"
+    need = _weights_gb(hf_dir)
+    ram = detect_available_ram_gb() or 0.0
+    return bool(need and ram and need * 1.15 > ram)
+
+
 def _fit_ngl(gguf, ngl):
     """How many layers actually fit on the accelerator.
 
@@ -320,7 +344,12 @@ def _ensure_sensitivity(a, hf_dir, calib, here):
     evalf = heldout if (heldout and (not a.run or os.path.exists(heldout))) else calib
     print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
     if a.run:
-        r = subprocess.run(["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof], cwd=here)
+        cmd = ["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof]
+        if _use_stream_probe(hf_dir, getattr(a, "probe_method", "auto")):
+            cmd.append("--stream")
+            print(f"      ({_weights_gb(hf_dir):.1f}GB of weights vs {detect_available_ram_gb() or 0:.1f}GB "
+                  "free -- one-pass estimator; perturb+KL would need ~layers*groups full passes)")
+        r = subprocess.run(cmd, cwd=here)
         # This used to fall back to uniform "rather than killing the whole build". But a uniform
         # allocation is not a lesser Pollard build -- it is the thing pollard-fit itself warns has
         # no quality win over a stock K-quant. Degrading to it silently spends hours producing a
@@ -479,6 +508,10 @@ def main():
                                     "quantized -- it is 11 MB of memory that attaches to the model at run\n"
                                     "time and can be detached, moved to another backbone and carried on\n"
                                     "with --continue-from.")
+    ap.add_argument("--probe-method", choices=("auto", "stream", "kl"), default="auto",
+                    help="sensitivity estimator: 'kl' = perturb+KL (layers*groups forward passes), "
+                         "'stream' = one-pass Hessian diagonal, 'auto' (default) picks stream when "
+                         "the weights do not fit memory")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx/mx allocation; else auto-measured)")
     ap.add_argument("--no-measure", dest="measure", action="store_false",
                     help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "

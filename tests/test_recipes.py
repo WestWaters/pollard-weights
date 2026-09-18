@@ -1779,6 +1779,22 @@ def test_gold_path_never_degrades_to_uniform_silently():
         "llama-quantize fails to open it")
 
 
+def test_probe_estimator_is_one_that_can_finish():
+    """Perturb+KL costs layers*groups full forward passes (~100 on a 48-layer model). On a model
+    streaming off disk that never finishes -- so the gold path would be 'available' and hang. A
+    model too big for RAM must fall to the one-pass estimator."""
+    import pollard_auto as A2
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "model.safetensors"), "wb") as f:
+        f.truncate(400 * (1 << 30))                     # 400GB: bigger than any dev box
+    assert A2._use_stream_probe(d, "auto"), "a model far bigger than RAM still uses perturb+KL"
+    assert not A2._use_stream_probe(d, "kl"), "an explicit --probe-method kl must be honoured"
+    small = tempfile.mkdtemp()
+    with open(os.path.join(small, "model.safetensors"), "wb") as f:
+        f.truncate(8 * (1 << 20))                       # 8MB: fits anywhere
+    assert not A2._use_stream_probe(small, "auto"), "a tiny model gave up the accurate estimator"
+
+
 def test_memory_detection_covers_all_three_platforms():
     """Pollard is cross-platform, so a POSIX-only memory probe is a silent Windows downgrade: no
     sysconf and no /proc there, so RAM reads as 0/None and every budget built on it is wrong --
