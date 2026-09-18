@@ -1745,6 +1745,58 @@ def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
 
 
 
+def test_taskeval_reports_retention_against_a_reference():
+    """Every other Pollard metric is intrinsic; nobody else quotes those.
+
+    KL-to-f16, top-1 agreement and perplexity are the right things to ALLOCATE against -- cheap,
+    dense, sensitive. They are not what competing releases publish. Those quote task scores and a
+    retention figure, and a reader holding a KL number next to "98.2% of the full-precision
+    baseline" has no basis for comparison. This tool closes that gap in their units.
+
+    Retention is only meaningful against a reference measured the same way -- same tasks, same shot
+    count, same limit -- so the tool prints that caveat rather than letting a number travel without
+    it.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_taskeval.py").read_text(encoding="utf-8")
+
+    assert "retention" in src.lower(), "the headline figure must be retention, not a bare score"
+    assert "--ref" in src, "retention needs a reference build"
+    assert "published against a different suite" in src, \
+        "the tool must say a retention figure is not comparable across suites"
+
+    # the suite must match what competing releases actually run, or the comparison is theatre
+    import sys as _s
+    _s.path.insert(0, str(tools))
+    import pollard_taskeval as TE
+    for task in ("gsm8k", "ifeval", "mmlu_redux_generative", "gpqa_diamond_zeroshot",
+                 "humaneval_plus", "mbpp_plus", "minerva_math500"):
+        assert task in TE.SUITES["core"], f"{task} missing from the core suite"
+    assert set(TE.CATEGORY.values()) >= {"Math", "Coding", "Knowledge & Reasoning",
+                                         "Instruction Following"}
+
+    # agentic is declared but NOT wired -- it needs a live tool environment, and a stub that
+    # returned zeros would be worse than an honest refusal
+    assert "tau2_bench" in TE.AGENTIC and "bfcl" in TE.AGENTIC
+    assert "agentic" not in TE.SUITES, "agentic must not look runnable while it is not"
+
+
+def test_taskeval_batch_default_is_not_auto():
+    """lm-eval's 'auto' batch probes for a size that fits, and the probe dies on CPU.
+
+    It fails without a usable message, which then looked like the tool was broken. 1 is slow and
+    always works; a GPU user raises it.
+    """
+    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
+    src = (tools / "pollard_taskeval.py").read_text(encoding="utf-8")
+    i = src.index('"--batch-size"')
+    assert 'default="1"' in src[i:i + 120], "auto batch-size dies on CPU"
+    # and a harness failure must surface the CAUSE, not the last lines of a progress log
+    assert "Traceback" in src and "hits or blob" in src, \
+        "error reporting must pick failure lines, not the tail"
+
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     fails = 0
