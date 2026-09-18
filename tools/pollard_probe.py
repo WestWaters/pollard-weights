@@ -34,6 +34,7 @@ if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import torch, torch.nn.functional as F
+from pollard_backbone import load_backbone, text_layers
 
 
 def _weights_bytes(model_id):
@@ -199,7 +200,7 @@ def _linears(model, layer, group):
     'NoneType has no attribute register_forward_hook' -- after loading 12B of weights. A layer with
     none of a group is legitimate; it simply contributes nothing to that group's cost."""
     parent, names = GROUP_ATTR[group]
-    mod = getattr(model.model.layers[layer], parent, None)
+    mod = getattr(text_layers(model)[layer], parent, None)
     if mod is None:
         return []
     return [m for m in (getattr(mod, n, None) for n in names) if m is not None]
@@ -338,7 +339,7 @@ def main():
                          "models too big to run layersxgroups forward passes (744B-scale)")
     a = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     dev = a.device
     if dev == "auto":
         dev = ("cuda" if torch.cuda.is_available()
@@ -359,14 +360,10 @@ def main():
         #     ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)
         # The probe only needs the activations, so the plainest kernel is the right one.
         loadkw.setdefault("attn_implementation", "eager")
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float16,
-                                                 **loadkw)
-    if not loadkw.get("device_map"):
-        model = model.to(dev)
-    model = model.eval()
+    model = load_backbone(a.model, torch.float16, dev, **loadkw)
     if loadkw.get("device_map"):            # accelerate hooks move inputs; stage them on the CPU
         dev = "cpu"
-    layers = len(model.model.layers)
+    layers = len(text_layers(model))
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 
     if a.stream:

@@ -26,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from pollard_backbone import text_layers as _text_layers
+
 QK_K = 256                      # K-quant block: a row not divisible by this cannot hold one
 
 
@@ -89,7 +91,7 @@ def check_layer_access(shape_name, model):
     # the converter check is its most useful mode and needs none. Module-qualified on purpose, so
     # the shared-loader guard keeps its exact meaning and needs no exception for this file.
     from pollard_probe import _linears
-    layers = model.model.layers
+    layers = _text_layers(model)
     if not layers:
         return False, "text_layers() found no decoder layers"
     for i in range(len(layers)):

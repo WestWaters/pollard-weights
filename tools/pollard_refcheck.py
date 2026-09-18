@@ -30,6 +30,7 @@ import json
 import math
 import os
 import sys
+from pollard_backbone import load_backbone
 
 # A correct forward on in-domain rows sits well under this; scrambled positions sit far above it.
 # Deliberately loose -- this separates "broken" from "fine", it is not a quality metric.
@@ -46,18 +47,6 @@ TAIL_RATIO_SUSPECT = 1.10
 # Written against a duck-typed array so the convention itself is testable with numpy alone, with no
 # torch and no checkpoint. The bug is a one-line difference between these two and it is worth having
 # a test that states which is which.
-
-def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
-    """This tool's own backbone loader -- model tooling does not depend on the brain-side one."""
-    import torch as _torch
-    from transformers import AutoModelForCausalLM
-    if dtype is None:
-        dtype = _torch.float32
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
-    if kw.get("device_map") is None:
-        model = model.to(device)
-    return model.eval() if eval_mode else model
-
 def rope_rotate_half(x, cos, sin, xp):
     """NeoX / rotate-half: pairs element i with i + d/2."""
     d = x.shape[-1] // 2
