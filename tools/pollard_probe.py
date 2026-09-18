@@ -224,6 +224,7 @@ class WeightSource:
         self.dir = model_dir
         self.map = {}                         # tensor key -> shard filename
         self.missing = 0
+        self.unresolved = []
         idx = os.path.join(model_dir or "", "model.safetensors.index.json")
         single = os.path.join(model_dir or "", "model.safetensors")
         try:
@@ -245,14 +246,29 @@ class WeightSource:
             return w.data
         key = self.names.get(id(lin))
         shard = self.map.get(f"{key}.weight") if key else None
+        if not shard and key:
+            # The module path and the checkpoint key need not agree: a vision-language checkpoint
+            # nests the text stack (model.language_model.layers.N...), and wrappers can add or drop
+            # a prefix. The tail is what identifies the tensor, so match on it.
+            tail = key.split(".")
+            for n in range(min(5, len(tail)), 1, -1):
+                suffix = ".".join(tail[-n:]) + ".weight"
+                hits = [k for k in self.map if k.endswith(suffix)]
+                if len(hits) == 1:
+                    shard, key = self.map[hits[0]], hits[0][:-len(".weight")]
+                    break
         if not shard:
+            if len(self.unresolved) < 5:
+                self.unresolved.append(key or f"<unnamed {type(lin).__name__}>")
             self.missing += 1
             return None
         try:
             from safetensors import safe_open
             with safe_open(os.path.join(self.dir, shard), framework="pt") as f:
                 return f.get_tensor(f"{key}.weight")
-        except Exception:
+        except Exception as e:
+            if len(self.unresolved) < 5:
+                self.unresolved.append(f"{key}: {type(e).__name__}")
             self.missing += 1
             return None
 
@@ -315,7 +331,8 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
         raise SystemExit(f"\n  {weights.missing} weights were unreadable (offloaded to the meta "
                          "device and not resolvable from the checkpoint on disk).\n"
                          "  REFUSING to emit a partial sensitivity profile -- a wrong allocation "
-                         "that looks measured is worse than none.")
+                         "that looks measured is worse than none.\n  first unresolved: "
+                         + ", ".join(weights.unresolved))
     return profile, noise
 
 

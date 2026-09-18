@@ -1801,6 +1801,39 @@ def test_the_model_tools_know_nothing_about_brains():
     assert not offenders, ("brain code has grown back into model tooling: " + "; ".join(offenders))
 
 
+def test_bench_parses_the_kl_report_llama_cpp_actually_prints():
+    """Under --kl-divergence llama-perplexity prints a different report: no "Final estimate", but
+    both perplexities and a top-1 agreement. Two ways this went wrong at once -- PPL came back
+    empty for every rung, and `Same top[^:]*:` latched onto the TABLE HEADER, because [^:] matches
+    newlines, then ran to the next colon anywhere below and reported 818.3 as a percentage. A wrong
+    number that looks like a result is worse than a blank."""
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
+        encoding="utf-8")
+    assert "re.M" in src, "patterns are not line-anchored, so they can match across the table"
+    assert "[^:]*:" not in src, "an unanchored [^:] pattern can still swallow newlines"
+    sample = (
+        "chunk   PPL   ln(PPL(Q)/PPL(base))   KL Divergence   \u0394p RMS   Same top p\n"
+        "[1]394.4999,0.1,0.5,1.2,88.1\n"
+        "====== Perplexity statistics ======\n"
+        "Mean PPL(Q)                   :  12.345678 \u00b1   0.123456\n"
+        "Mean PPL(base)                :  11.111111 \u00b1   0.100000\n"
+        "====== KL divergence statistics ======\n"
+        "Mean    KLD:   0.425925 \u00b1   0.001\n"
+        "Median  KLD:   0.081144\n"
+        "Same top p: 91.234 \u00b1 0.123 %\n")
+    got = {k: (lambda pat: (lambda m: float(m.group(1)) if m else None)(re.search(pat, sample, re.M)))(pat)
+           for k, pat in (("ppl", r"^Mean PPL\(Q\)\s*:\s*([0-9.]+)"),
+                          ("ref_ppl", r"^Mean PPL\(base\)\s*:\s*([0-9.]+)"),
+                          ("mean_kld", r"^Mean\s+KLD:\s*([0-9.]+)"),
+                          ("median_kld", r"^Median\s+KLD:\s*([0-9.]+)"),
+                          ("top1", r"^Same top p:\s*([0-9.]+)"))}
+    assert got["ppl"] == 12.345678 and got["ref_ppl"] == 11.111111, got
+    assert got["mean_kld"] == 0.425925 and got["median_kld"] == 0.081144, got
+    assert got["top1"] == 91.234, f"top-1 must be a percentage, got {got['top1']}"
+    assert 0.0 <= got["top1"] <= 100.0
+
+
 def test_imatrix_is_written_in_the_format_the_flagship_can_read():
     """llama-imatrix now defaults to a GGUF-format imatrix. Mainline reads both, but ik_llama --
     which builds the trellis flagship, the entire reason an imatrix is computed -- reads only the
@@ -1871,7 +1904,7 @@ def test_probe_never_emits_a_profile_from_unreadable_weights():
         def __init__(self, w): self.weight = w
     real = _Lin(torch.zeros(2, 2))
     ws = P.WeightSource.__new__(P.WeightSource)          # no checkpoint on disk
-    ws.names, ws.dir, ws.map, ws.missing = {}, "", {}, 0
+    ws.names, ws.dir, ws.map, ws.missing, ws.unresolved = {}, "", {}, 0, []
     assert ws.get(real) is not None, "a resident weight must be returned as-is"
     assert ws.missing == 0
     meta = _Lin(torch.zeros(2, 2, device="meta"))

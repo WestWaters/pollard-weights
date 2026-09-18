@@ -17,7 +17,7 @@ quality for fewer GB, or more quality at the same GB), not as a single number.
 Reuses llama-perplexity; no rebuild. This is the opt-in benchmark -- a plain `pollard` build never
 runs it (that's the split that stopped a minutes-long shrink from taking hours).
 """
-import argparse, os, re, subprocess, sys, zlib
+import argparse, os, re, shutil, subprocess, sys, zlib
 from collections import Counter
 
 from pollard_calc import find_llama_bin
@@ -187,21 +187,30 @@ def _size_gb(p):
         return None
 
 
-def _ppl_kl(ppl_bin, model, eval_f, base, ngl):
+def _ppl_kl(ppl_bin, model, eval_f, base, ngl, chunks=0):
     """Run llama-perplexity and parse PPL (+ Mean/Median KLD + top-1 when a base is given)."""
     cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", "2048", "-ngl", str(ngl)]
+    if chunks:
+        cmd += ["--chunks", str(chunks)]
     if base:
         cmd += ["--kl-divergence", "--kl-divergence-base", base]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     out = r.stdout + r.stderr
     def g(pat):
-        m = re.search(pat, out)
+        m = re.search(pat, out, re.M)
         return float(m.group(1)) if m else None
+    # llama-perplexity prints a different report under --kl-divergence: no "Final estimate", but
+    # BOTH perplexities, which is what the card wants anyway. Every pattern is anchored to its own
+    # line: a negated-colon class matches NEWLINES too, so the old top-1 pattern latched onto the
+    # table header ("... Same top p") and ran on to the next colon anywhere below, reporting a
+    # number that was not a percentage and looked like a result.
     return {
-        "ppl":    g(r"Final estimate:\s*PPL[^=]*=\s*([0-9.]+)"),
-        "mean_kld":   g(r"Mean\s+KLD:\s*([0-9.]+)"),
-        "median_kld": g(r"Median\s+KLD:\s*([0-9.]+)"),
-        "top1":   g(r"Same top[^:]*:\s*([0-9.]+)"),      # top-1 agreement %
+        "ppl":    g(r"^Mean PPL\(Q\)\s*:\s*([0-9.]+)")
+                  or g(r"Final estimate:\s*PPL[^=\n]*=\s*([0-9.]+)"),
+        "ref_ppl":    g(r"^Mean PPL\(base\)\s*:\s*([0-9.]+)"),
+        "mean_kld":   g(r"^Mean\s+KLD:\s*([0-9.]+)"),
+        "median_kld": g(r"^Median\s+KLD:\s*([0-9.]+)"),
+        "top1":   g(r"^Same top p:\s*([0-9.]+)"),        # top-1 agreement %
     }
 
 
@@ -274,6 +283,10 @@ def main():
     ap.add_argument("--ref", help="KL reference GGUF (f16, or a near-lossless Q8_0/Q6_K host). "
                                   "Omit for PPL-only (no KLD/top-1).")
     ap.add_argument("--eval", default="wikitext2_test.txt", help="held-out eval text")
+    ap.add_argument("--chunks", type=int, default=0,
+                    help="cap the eval at N chunks. The KL base holds FULL logits, so a large "
+                         "vocab over a long eval runs to tens of GB; 200 gives the same "
+                         "comparison at a fraction of the size. 0 = whole file.")
     ap.add_argument("--ngl", type=int, default=99, help="GPU layers (lower for a model bigger than the GPU)")
     ap.add_argument("--out", help="write a results.json (feeds pollard-scorecard)")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
@@ -338,14 +351,27 @@ def main():
 
     base = None
     if a.ref:
-        base = os.path.splitext(a.gguf)[0] + ".klbase.dat"
-        print(f"[1] KL base logits from {os.path.basename(a.ref)} (ngl {a.ngl}) ...")
-        r = subprocess.run([ppl_bin, "-m", a.ref, "-f", a.eval, "-c", "2048",
-                            "-ngl", str(a.ngl), "--kl-divergence-base", base],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if not os.path.exists(base) or os.path.getsize(base) == 0:
-            sys.exit("could not build KL base logits (ref too big for the GPU? lower --ngl, or use "
-                     "a smaller near-lossless --ref like Q6_K).")
+        # Named from the REFERENCE, not the model being scored: the base logits depend only on
+        # the reference, so one file serves every rung. Naming it per-model wrote a full copy
+        # each time -- 76GB apiece for a 152k vocab -- and filled the disk, after which the
+        # remaining rungs silently reported "--".
+        base = os.path.splitext(a.ref)[0] + ".klbase.dat"
+        if os.path.exists(base) and os.path.getsize(base) > 0:
+            print(f"[1] reusing KL base {os.path.basename(base)} "
+                  f"({os.path.getsize(base)/1e9:.1f} GB)")
+        else:
+            print(f"[1] KL base logits from {os.path.basename(a.ref)} (ngl {a.ngl}) ...")
+            cmd = [ppl_bin, "-m", a.ref, "-f", a.eval, "-c", "2048",
+                   "-ngl", str(a.ngl), "--kl-divergence-base", base]
+            if a.chunks:
+                cmd += ["--chunks", str(a.chunks)]
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
+            if not os.path.exists(base) or os.path.getsize(base) == 0:
+                sys.exit(f"could not build KL base logits ({free/1e9:.1f} GB free). The base holds "
+                         "FULL logits -- tokens x vocab x 4 bytes -- so a large vocab over a long "
+                         "eval runs to tens of GB. Cap it with --chunks, lower --ngl, or use a "
+                         "smaller near-lossless --ref like Q6_K.")
     else:
         print("[1] no --ref -> PPL only (pass --ref f16/Q8/Q6 for Mean/Median KLD + top-1).")
 
@@ -353,7 +379,7 @@ def main():
     rows = []
     for i, (tag, m) in enumerate(targets, 2):
         print(f"[{i}] scoring {os.path.basename(m)} ...")
-        r = _ppl_kl(ppl_bin, m, a.eval, base, a.ngl)
+        r = _ppl_kl(ppl_bin, m, a.eval, base, a.ngl, a.chunks)
         r.update({"tag": tag, "name": os.path.basename(m), "gb": _size_gb(m)})
         rows.append(r)
 
