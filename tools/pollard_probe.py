@@ -21,7 +21,7 @@ Note: this is the torch/RTN proxy for the GGUF crush -- the per-group ranking
 matches; absolute KL is a proxy, not the ik_llama trellis error. For the final
 published card, confirm the winner with a pollard-sensitivity run on the box.
 """
-import argparse, glob, json, os, sys
+import argparse, glob, json, os, re, sys
 
 # `--device cpu` has to MEAN cpu, and this has to happen BEFORE torch is imported.
 # device_map="auto" enumerates every visible device, so accelerate places layers on the GPU even
@@ -156,6 +156,179 @@ LADDER_BITS = [("q6_K", 6), ("q5_K", 5), ("iq4_xs", 4), ("iq3_s", 3),
                ("iq2_s", 2), ("iq2_xxs", 2)]
 GROUP_ATTR = {"ffn": ("mlp", ("gate_proj", "up_proj", "down_proj")),
               "attn": ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj"))}
+
+# The imatrix path works in GGUF tensor namespace, not HF module names. Both MoE spellings are
+# here because the imatrix covers whatever the GGUF actually contains.
+#
+# "attn" is really the SEQUENCE-MIXING group -- whatever moves information between positions --
+# as opposed to "ffn", which mixes channels. On a plain transformer that is q/k/v/output. On a
+# HYBRID (Mamba/SSM + attention) model most blocks mix with a state-space operator instead, and
+# its matmuls (fused attn_qkv, attn_gate, ssm_in/out, the alpha/beta projections) belong in the
+# same group for allocation: the dense recipe protects the mixing path and crushes the FFN, and
+# that reasoning does not change because the mixer is an SSM.
+#
+# Qwen3.8-27B is exactly this shape -- 48 of its 65 blocks are SSM, only 17 carry real attention.
+# Leaving the SSM names out scored 256 of 496 covered matmuls and handed back 48 layers at cost
+# 0.0, which reads to the allocator as "free to crush". Hence the invariant enforced below.
+GROUP_GGUF = {"ffn": ("ffn_gate", "ffn_up", "ffn_down",
+                      "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+                      "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"),
+              "attn": ("attn_q", "attn_k", "attn_v", "attn_output",
+                       "attn_qkv", "attn_gate",
+                       "ssm_in", "ssm_out", "ssm_alpha", "ssm_beta", "ssm_x", "ssm_dt")}
+
+
+def _gguf_slot(name, groups):
+    """`blk.<N>.<base>.weight` -> (group, layer), or None for anything not in a scored group."""
+    m = re.match(r"^blk\.(\d+)\.(.+)\.weight$", name)
+    if not m:
+        return None
+    layer, base = int(m.group(1)), m.group(2)
+    for g in groups:
+        if base in GROUP_GGUF.get(g, ()):
+            return g, layer
+    return None
+
+
+def _hessians_from_imatrix(path):
+    """tensor name -> E[x_j^2], from EITHER imatrix format. Returns {} if neither parses."""
+    from pollard_calc import read_imatrix_legacy
+    try:                                                    # ik_llama's format, and ours
+        raw = read_imatrix_legacy(path)
+        return {n: [v / max(e["ncall"], 1) for v in e["values"]]
+                for n, e in raw.items() if e["values"]}
+    except Exception:
+        pass
+    try:                                                    # llama.cpp's newer GGUF imatrix
+        from gguf import GGUFReader
+        rd = GGUFReader(path)
+        sums = {t.name[:-len(".in_sum2")]: t for t in rd.tensors if t.name.endswith(".in_sum2")}
+        cnts = {t.name[:-len(".counts")]: t for t in rd.tensors if t.name.endswith(".counts")}
+        out = {}
+        for n, t in sums.items():
+            c = float(cnts[n].data.reshape(-1)[0]) if n in cnts else 1.0
+            out[n] = (t.data.reshape(-1).astype("float64") / max(c, 1.0)).tolist()
+        return out
+    except Exception:
+        return {}
+
+
+def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bits):
+    """The measured profile with NO forward pass, NO model load, and O(one tensor) memory.
+
+    The one-pass estimator scores a group as sum dW^2 * h, where h_j = E[x_j^2] is the Hessian
+    diagonal it gathers with forward hooks. An imatrix IS that quantity -- llama-imatrix accumulates
+    exactly sum_j x_j^2 per tensor, which is why it can steer quantization at all. So whenever an
+    imatrix exists (and for any real build one does, because the imatrix IS the calibration) the
+    expensive half is already paid for -- on the full model, in full precision, over far more data
+    than a probe run: 510 chunks of Calib 3.0 versus the probe's default 4.
+
+    That leaves only dW = W - RTN(W,b), which needs one tensor at a time and streams off the GGUF.
+    No torch model, no accelerate, no device_map, no disk offload. Model size stops mattering:
+    a 27B profile becomes possible on a box that could not page 51.7GB of HF weights through the
+    Windows commit limit (OSError 1455), which is the wall the HF probe hit.
+
+    Same formula, same JSON, better activation statistics. The HF probe stays for the case this
+    cannot serve: no imatrix yet, or a model with no GGUF."""
+    import numpy as np
+    from gguf import GGUFReader
+
+    H = _hessians_from_imatrix(imatrix_path)
+    if not H:
+        raise SystemExit(f"could not read an imatrix from {imatrix_path} (tried legacy .dat and "
+                         f"GGUF). Build one with llama-imatrix first.")
+    rd = GGUFReader(gguf_path)
+    bitset = sorted({probe_bits} | {b for _, b in ladder_bits})
+    cost = {g: {} for g in groups}
+    noise = {t: 0.0 for t, _ in ladder_bits}
+    layers, scored, skipped = 0, 0, []
+    nscored = {}                                            # (group, layer) -> tensors scored
+    pinned = {}                                             # layer -> uncovered tensor names
+    seen_covered = set()                                    # imatrix tensors we actually scored
+
+    for t in rd.tensors:
+        slot = _gguf_slot(t.name, groups)
+        if slot is None:
+            continue
+        g, i = slot
+        layers = max(layers, i + 1)
+        nscored.setdefault((g, i), 0)
+        hj = H.get(t.name)
+        if hj is None:
+            # In the GGUF, never calibrated -- an MTP/`nextn` head is the usual case. It must be
+            # PINNED by the allocator, not scored: emitting 0.0 here would read as "costs nothing
+            # to crush", which is the opposite of the truth for an uncalibrated tensor.
+            pinned.setdefault(i, []).append(t.name)
+            continue
+        try:
+            W = torch.from_numpy(np.asarray(_dequant(t))).float()
+        except Exception as e:
+            skipped.append(f"{t.name} ({e})")
+            continue
+        if W.ndim != 2 or W.shape[1] != len(hj):
+            skipped.append(f"{t.name} (shape {tuple(W.shape)} vs imatrix {len(hj)})")
+            continue
+        h = torch.tensor(hj, dtype=torch.float32).unsqueeze(0)
+        for b in bitset:                                    # ONE read, every bit-width off it
+            dW = W - _rtn(W, b).float()
+            c = float((dW * dW * h).sum())
+            if b == probe_bits:
+                cost[g][str(i)] = cost[g].get(str(i), 0.0) + c
+            for ty, tb in ladder_bits:
+                if tb == b:
+                    noise[ty] += c
+        scored += 1
+        nscored[(g, i)] += 1
+        seen_covered.add(t.name)
+        del W
+
+    if not scored:
+        raise SystemExit("no scored tensors -- the imatrix and the GGUF do not share tensor names.")
+    if skipped:
+        # A partial profile that LOOKS measured is the failure mode this whole tool guards against.
+        raise SystemExit(f"\n  {len(skipped)} tensors could not be scored, so the profile would be "
+                         f"partial.\n  REFUSING to emit it. first: " + ", ".join(skipped[:3]))
+
+    # THE INVARIANT: the imatrix is the ground truth for what actually gets quantized -- it holds an
+    # entry for every matmul llama-quantize will touch. So a covered tensor we did not score means
+    # this architecture has a weight family the group map has never heard of, and every layer built
+    # from it silently lands at cost 0.0 -- i.e. "free to crush", the most damaging thing we can
+    # tell the allocator. Qwen3.8-27B is how this was found: 48 of 65 blocks mix with an SSM rather
+    # than attention, 240 of 496 covered matmuls went unscored, and the profile looked fine.
+    missed = sorted({re.sub(r"^blk\.\d+\.", "", n) for n in H
+                     if re.match(r"^blk\.\d+\..+\.weight$", n) and n not in seen_covered})
+    if missed:
+        raise SystemExit(
+            f"\n  {len(missed)} calibrated tensor KIND(S) were not scored, so whole layers would "
+            f"come back at cost 0.0\n  (= 'free to crush'). REFUSING to emit a profile this tool "
+            f"cannot account for.\n  unscored: " + ", ".join(missed) +
+            "\n  Add them to GROUP_GGUF in pollard_probe.py -- sequence mixers (attention or SSM) "
+            "go in\n  'attn', channel mixers in 'ffn'.")
+
+    # Drop any layer that scored nothing rather than emitting a zero for it.
+    for g in groups:
+        for i in [i for (gg, i) in nscored if gg == g and nscored[(gg, i)] == 0]:
+            cost[g].pop(str(i), None)
+    if not any(cost[g] for g in groups):
+        raise SystemExit("every layer scored zero tensors -- nothing to allocate on.")
+
+    print(f"  scored {scored} tensors across {layers} layers", flush=True)
+    if pinned:
+        ex = sorted(pinned)[:4]
+        print(f"  {sum(len(v) for v in pinned.values())} tensors in {len(pinned)} layer(s) are NOT "
+              f"in the imatrix (layers {ex}{' ...' if len(pinned) > 4 else ''}) -- left out of the "
+              f"profile so the allocator PINS them rather than reading 0.0 as free.", flush=True)
+    return cost, noise, layers
+
+
+def _dequant(t):
+    """Tensor data as a 2-D float array, whatever the GGUF stored it as."""
+    import numpy as np
+    from gguf import GGUFReader                             # noqa: F401  (import-time type table)
+    if t.tensor_type.name in ("F32", "F16", "BF16"):
+        return t.data.astype(np.float32)
+    from gguf.quants import dequantize                      # lets a Q6_K host serve as the source
+    return dequantize(t.data, t.tensor_type).astype(np.float32)
 
 
 def _chunks(tok, text, seqlen, n):
@@ -344,8 +517,10 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--eval", required=True, help="held-out text (disjoint from any calib)")
+    # Neither is needed by --from-imatrix (it reads the GGUF and the imatrix, nothing else), so
+    # they are validated per-mode below rather than demanded up front.
+    ap.add_argument("--model", help="HF model dir/id (the forward-pass probe)")
+    ap.add_argument("--eval", help="held-out text (disjoint from any calib); forward-pass probe only")
     ap.add_argument("--out", help="profile path (default <model>.sensitivity.json)")
     ap.add_argument("--groups", default="ffn,attn")
     ap.add_argument("--probe-bits", type=int, default=2, help="RTN bits to crush a group to (default 2)")
@@ -359,7 +534,39 @@ def main():
     ap.add_argument("--stream", action="store_true",
                     help="ONE-pass Hessian-diagonal estimator instead of per-group perturb+KL -- for "
                          "models too big to run layersxgroups forward passes (744B-scale)")
+    ap.add_argument("--from-imatrix", metavar="IMATRIX",
+                    help="derive the profile from an EXISTING imatrix + --gguf, with no forward "
+                         "pass and no model load (O(one tensor) memory -- any model size on any "
+                         "box). The imatrix already IS E[x_j^2]; reuse it instead of re-measuring.")
+    ap.add_argument("--gguf", help="source GGUF for --from-imatrix (f16 preferred; a quantized "
+                                   "host works and is dequantized per tensor)")
     a = ap.parse_args()
+
+    groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+    if a.from_imatrix:
+        if not a.gguf:
+            sys.exit("--from-imatrix needs --gguf (the weights the imatrix was measured against).")
+        for p in (a.from_imatrix, a.gguf):
+            if not os.path.exists(p):
+                sys.exit(f"not found: {p}")
+        print(f"== pollard-probe :: {a.gguf}  probe={a.probe_bits}bit  "
+              f"from-imatrix (no forward pass)", flush=True)
+        profile, noise, layers = _imatrix_sensitivity(a.gguf, a.from_imatrix, groups,
+                                                      a.probe_bits, LADDER_BITS)
+        out = a.out or (os.path.splitext(a.gguf)[0] + ".sensitivity.json")
+        json.dump({**profile, "noise": noise, "probe": f"rtn{a.probe_bits}", "layers": layers,
+                   "source": a.gguf, "method": "imatrix-hessian"}, open(out, "w"), indent=2)
+        for g in groups:
+            vals = [v for v in profile[g].values()]
+            if vals:
+                lo, hi = min(vals), max(vals)
+                print(f"  {g}: spread {hi/max(lo,1e-9):.1f}x  (min {lo:.4f}  max {hi:.4f})", flush=True)
+        print(f"\ndone: {out}\n  feed it:  pollard-fit --gguf <f16>.gguf --ram <GB> "
+              f"--sensitivity {out}", flush=True)
+        return
+    if not a.model or not a.eval:
+        sys.exit("the forward-pass probe needs --model and --eval "
+                 "(or use --from-imatrix IMATRIX --gguf MODEL.gguf).")
 
     from transformers import AutoTokenizer
     dev = a.device

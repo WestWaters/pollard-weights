@@ -2320,3 +2320,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_probe_groups_cover_ssm_sequence_mixers():
+    """A HYBRID model mixes sequence information with a state-space operator in most of its blocks,
+    not attention. Qwen3.8-27B is 48 SSM blocks to 17 attention blocks out of 65.
+
+    The group map originally knew only q/k/v/output, so 240 of that model's 496 imatrix-covered
+    matmuls were never scored and 48 layers came back at cost 0.0 -- which the allocator reads as
+    'free to crush'. The profile looked perfectly well-formed. Sequence mixers belong in 'attn'
+    whether they are attention or an SSM; the allocator's dense recipe protects the mixing path
+    and crushes the FFN either way."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    P = importlib.import_module("pollard_probe")
+    groups = ["ffn", "attn"]
+    for base in ("attn_qkv", "attn_gate", "ssm_out", "ssm_alpha", "ssm_beta", "ssm_in"):
+        slot = P._gguf_slot(f"blk.7.{base}.weight", groups)
+        assert slot == ("attn", 7), f"{base} must group as a sequence mixer, got {slot}"
+    for base in ("ffn_gate", "ffn_up", "ffn_down"):
+        assert P._gguf_slot(f"blk.7.{base}.weight", groups) == ("ffn", 7)
+    # a norm/bias is not a matmul and must not be grouped at all
+    assert P._gguf_slot("blk.7.ssm_norm.weight", groups) is None
