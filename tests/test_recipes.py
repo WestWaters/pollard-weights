@@ -1809,6 +1809,30 @@ def test_the_model_tools_know_nothing_about_brains():
 
 
 
+
+def test_one_shot_serializes_and_finishes_the_job():
+    """Two gaps that existed only in whatever script was driving a build, never in the tool:
+
+    Nothing stopped a second heavy job starting on the same machine. Quantizing, imatrix and
+    perplexity all want the same GPU, disk and cores; started together they thrash, and on a shared
+    machine the other person feels it first. A lock is advisory and self-healing -- a dead pid is
+    taken over, never a reason to be stuck -- and --force ignores it.
+
+    And a build ended with files but no card, so nobody could tell what the rungs were or which
+    runtime each needed."""
+    import pollard_auto as A
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py").read_text(
+        encoding="utf-8")
+    assert hasattr(A, "MachineLock"), "no machine lock: two builds can still thrash one box"
+    assert "_pid_alive" in src, "a stale lock would wedge every later run"
+    assert "--force" in src, "no way past a lock the user knows is finished"
+    assert hasattr(A, "_emit_card"), "a run still ends without a card"
+    assert '"--no-card"' in src, "no way to skip the card"
+    body = src.split("def _emit_card", 1)[1].split("\ndef ", 1)[0]
+    assert "pollard-card" in body and "--results" in body, (
+        "the card step does not pass measured numbers through")
+
+
 def test_the_eval_corpus_is_chosen_for_the_model_not_hardcoded():
     """automap wrote `set EV=wikitext2_test.txt` into every generated build script, so a user
     benchmarking a reasoning or instruct model measured the mismatch rather than the build --

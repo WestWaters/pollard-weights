@@ -31,7 +31,7 @@ EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix 
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
 pollard-probe, --no-measure to skip); EXL3 = smoothing + Calib 3.0 packed to -cd + EXL3's native allocator.
 """
-import argparse, os, subprocess, sys
+import argparse, contextlib, json, os, subprocess, sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse, find_llama_bin,
                           detect_gpu_gb, detect_available_ram_gb)
@@ -486,6 +486,97 @@ def _ensure_imatrix(a):
     return imat
 
 
+def _pid_alive(pid):
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True,
+                                 text=True, timeout=10).stdout
+            return str(pid) in out
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+class MachineLock:
+    """One heavy Pollard job on a machine at a time.
+
+    Quantizing, computing an imatrix and running perplexity all want the same GPU, the same disk and
+    most of the cores. Started together they do not go faster -- they thrash, and on a shared machine
+    the other person notices first. Nothing enforced this, so the only thing standing between a user
+    and an unusable desktop was remembering not to.
+
+    Advisory and self-healing: a lock whose process is gone is taken over, never a reason to be
+    stuck. --force ignores it outright."""
+
+    def __init__(self, what, force=False):
+        home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+        os.makedirs(home, exist_ok=True)
+        self.path, self.what, self.force, self.held = os.path.join(home, ".pollard.lock"), what, force, False
+
+    def __enter__(self):
+        if self.force:
+            return self
+        try:
+            if os.path.exists(self.path):
+                prev = json.loads(open(self.path, encoding="utf-8").read() or "{}")
+                pid = int(prev.get("pid", 0))
+                if pid and pid != os.getpid() and _pid_alive(pid):
+                    raise SystemExit(
+                        f"\n   another Pollard job is running on this machine (pid {pid}): "
+                        f"{prev.get('what', '?')}\n"
+                        "   Running two at once does not finish sooner -- they contend for the GPU,\n"
+                        "   the disk and the cores, and on a shared machine someone else feels it.\n"
+                        "   Wait for it, or pass --force if you know it is finished.")
+        except SystemExit:
+            raise
+        except Exception:
+            pass                                            # an unreadable lock never blocks a build
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "what": self.what}, f)
+            self.held = True
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        return False
+
+
+
+def _emit_card(a):
+    """Write the model card for what was just built.
+
+    A build is not finished when the files exist: without a card nobody knows what the rungs are,
+    which runtime each needs, or what was measured. That step lived in whatever script happened to
+    be driving the build, which means it existed for us and not for anyone else."""
+    src = a.gguf or getattr(a, "_hf_dir", None) or a.hf
+    if not src:
+        return
+    cmd = ["pollard-card", "--model", src]
+    results = getattr(a, "results", None)
+    if results and os.path.exists(results):
+        cmd += ["--results", results]
+    out = os.path.join(os.path.dirname(os.path.abspath(a.out or src)) or ".", "README.md")
+    cmd += ["--out", out]
+    print("\n   3) the card (what was built, which runtime each rung needs, what was measured):")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        print("   (card step failed -- the builds are fine; run pollard-card yourself to write it)")
+        return
+    print(f"   wrote {out}")
+    if not results:
+        print("   NOTE: no --results, so the card carries sizes but no measured numbers. Produce "
+              "them with\n         pollard-bench --gguf <rung> --ref <f16> --out results.json, "
+              "then re-run with --results.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
@@ -496,6 +587,13 @@ def main():
                     " |  exl3 (exllamav3 -- the heavy trellis lane)  |  mx (Blackwell NVFP4 / any-GPU W4A16, "
                     "compressed-tensors)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
+    ap.add_argument("--results", help="measured numbers (pollard-bench --out) to put on the card")
+    ap.add_argument("--no-card", dest="card", action="store_false",
+                    help="skip writing the model card after a build")
+    ap.set_defaults(card=True)
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the machine lock and start even if another Pollard job is "
+                         "running here. They will contend for the GPU, disk and cores.")
     ap.add_argument("--no-preflight", dest="preflight", action="store_false",
                     help="skip the up-front capability check (converter knows this architecture, "
                          "weights fit somewhere) and start the build regardless")
@@ -554,6 +652,14 @@ def main():
                          "model is usable and which sampling to ship, without a manual step.")
     ap.set_defaults(gate=True)
     a = ap.parse_args()
+
+    # One heavy job per machine. Everything below contends for the same GPU, disk and cores.
+    with MachineLock(" ".join(sys.argv[1:])[:120], force=getattr(a, "force", False)) if a.run \
+            else contextlib.nullcontext():
+        _dispatch(a)
+
+
+def _dispatch(a):
     if not a.gguf and not a.hf:
         ap.error("pass --gguf <file> or --hf <repo-or-dir>")
 
@@ -657,6 +763,8 @@ def main():
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
+    if a.run and getattr(a, "card", True):
+        _emit_card(a)
     if not a.run:
         print("\n   plan only -- re-run with --run to execute.")
 
