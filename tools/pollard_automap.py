@@ -256,8 +256,22 @@ def emit_bat(a, n_layers, is_moe, names):
     pin_cq = (",".join(pins) + ",") if pins else ""
     cqs = pin_cq + ",".join(cq)                     # pins FIRST (custom-q is first-match-wins)
     im_flag = "" if kfree else "--imatrix %IM% "    # the whole point: no imatrix on the K-quant path
+    # The eval corpus has to suit the MODEL, or the PPL lines describe the mismatch rather than the
+    # build. Ask what this model is instead of defaulting everyone to raw Wikipedia.
+    ev = a.eval
+    if not ev:
+        ev, why = "wikitext2_test.txt", ""
+        try:
+            from pollard_modelkind import classify, describe
+            k = classify(base)
+            if k["eval"] != "raw-text":
+                ev = "pollard_eval_heldout.txt"
+                why = (f"   # {describe(k)}: raw text would score the mismatch. Build this with\n"
+                       f"   #   pollard-calib --out train.txt --held-out {ev}")
+        except Exception:
+            pass
     L = ["@echo off", f"set BIN={a.bin}", f"set IM={a.imatrix}", f"set SRC={base}",
-         f"set EV={a.eval}", f"set LOG={a.log}",
+         f"set EV={ev}", f"set LOG={a.log}",
          f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  imatrix={'no (K-quant)' if kfree else 'yes'}  "
          f"body={body}({QUANT_BPW.get(body,'?')}) protect={protect}({QUANT_BPW.get(protect,'?')})"
          f"=== 1> %LOG% 2>&1", ""]
@@ -312,7 +326,12 @@ def main():
     ap.add_argument("--tensors", required=True, help="llama-quantize --dry-run tensor list")
     ap.add_argument("--model", required=True, help="source F16 gguf path (as seen on the box)")
     ap.add_argument("--imatrix", default="ik.imatrix")
-    ap.add_argument("--eval", default="wikitext2_test.txt")
+    ap.add_argument("--eval", default="",
+                    help="held-out eval corpus for the PPL lines. Left empty, Pollard picks one "
+                         "that suits the model: raw text for a base model, in-domain (Calib 3.0 "
+                         "held-out) for an instruct/reasoning model, because a model tuned away "
+                         "from raw-text modelling scores its own mismatch on WikiText -- "
+                         "gemma-4-12B-it reads ~664 there where a plain 7B reads 5.4.")
     ap.add_argument("--ngl", type=int, default=99,
                     help="GPU layers for the PPL eval. Lower it for a big build that would OOM "
                          "the card (PPL is offload-invariant, so bars stay comparable).")

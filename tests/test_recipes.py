@@ -1808,6 +1808,20 @@ def test_the_model_tools_know_nothing_about_brains():
 
 
 
+
+def test_the_eval_corpus_is_chosen_for_the_model_not_hardcoded():
+    """automap wrote `set EV=wikitext2_test.txt` into every generated build script, so a user
+    benchmarking a reasoning or instruct model measured the mismatch rather than the build --
+    gemma-4-12B-it reads ~664 on WikiText where a plain 7B reads 5.4. The corpus has to follow
+    what the model IS, and that is knowable from its chat template."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_automap.py").read_text(
+        encoding="utf-8")
+    assert 'default="wikitext2_test.txt"' not in src, (
+        "--eval still defaults to raw text for every model, whatever it is")
+    assert "pollard_modelkind" in src, "automap does not ask what the model is"
+    assert "raw-text" in src, "no branch for a model that raw text cannot score"
+
+
 def test_modelkind_detects_what_a_model_actually_is():
     """Pollard measured every model as though it were plain text. gemma-4-12B-it is instruct,
     thinking, tool-calling AND image+audio+video -- score that on raw Wikipedia and you measure the
