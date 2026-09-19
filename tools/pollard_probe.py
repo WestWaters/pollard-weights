@@ -136,8 +136,13 @@ def plan_placement(model_id, dev, offload_dir):
     if accel and sys.platform == "darwin":
         # Apple Silicon is UNIFIED memory: the GPU and the CPU spend the same pool, so budgeting
         # them separately would promise ~2x the RAM that exists and thrash swap. One budget, split.
+        # Carve the CPU share OUT of the budget, never in addition to it: with budget < 4,
+        # budget//4 is 0 and the 1GiB floor used to be ADDED on top, so a 3GiB budget was handed
+        # out as 3+1=4 -- the double-count this branch exists to stop, visible only when the box
+        # is already short on RAM, which is exactly when it matters.
         budget = max(int(host * 0.70 / G), 2)
-        mm = {dev: f"{budget - budget // 4}GiB", "cpu": f"{max(budget // 4, 1)}GiB"}
+        cpu_share = max(budget // 4, 1)
+        mm = {dev: f"{max(budget - cpu_share, 1)}GiB", "cpu": f"{cpu_share}GiB"}
     else:
         mm = {"cpu": f"{max(int(host * 0.70 / G), 2)}GiB"}
         if accel:
