@@ -55,9 +55,15 @@ def imatrix_covered(path):
 # and they can't be copy-covered (their input is the compressed KV latent, shared with nothing),
 # so when uncovered they MUST be pinned to a K-quant or the low-bit build hard-fails ("Missing
 # importance matrix ... bailing out"). Norms (attn_*_norm) are excluded -- they stay F32.
+# A HYBRID (Mamba/SSM) block mixes sequence information with a state-space operator instead of
+# attention, and its projections (ssm_in/out, the alpha/beta/x/dt projections) are ordinary
+# matmuls the imatrix covers exactly like q/k/v -- verified on Qwen3.8-27B, where all 240 of them
+# carry entries. Leaving them out of this pattern means a low-bit build never checks their
+# coverage, which is how "Missing importance matrix ... bailing out" arrives at build time.
 _NEEDS_IMATRIX = re.compile(
     r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?"
-    r"|attn_(q|k|v|qkv|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
+    r"|ssm_(in|out|alpha|beta|x|dt)"
+    r"|attn_(q|k|v|qkv|gate|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
 
 
 def uncovered_pins(all_names, imatrix, fallback="q6_K"):
@@ -137,6 +143,14 @@ def parse_tensors(path):
     if any("attn_k_b" in n or "kv_a_mqa" in n or "attn_q_b" in n for n in names): feats.append("MLA")
     if any(".hc_" in n for n in names): feats.append("hyper-conn")
     if any(".indexer." in n for n in names): feats.append("DSA-indexer")
+    # HYBRID: most blocks mix with a state-space operator, only a minority carry real attention.
+    # Worth naming in the arch line -- on Qwen3.8-27B it is 48 SSM blocks to 17 attention ones,
+    # and a recipe written for "dense" silently crushes the mixing path of the other 48.
+    n_ssm = len({m.group(1) for n in names for m in [re.match(r"blk\.(\d+)\.ssm_", n)] if m})
+    if n_ssm:
+        n_attn = len({m.group(1) for n in names
+                      for m in [re.match(r"blk\.(\d+)\.attn_(q|qkv)\.weight", n)] if m})
+        feats.append(f"hybrid-SSM {n_ssm}ssm/{max(n_attn - n_ssm, 0)}attn")
     arch = ("MoE" if is_moe else "dense") + (f" +{'+'.join(feats)}" if feats else "")
     return names, n_layers, is_moe, arch
 
@@ -239,6 +253,16 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     attn_kv = protect if (kfree or is_moe) else body
     cq += [f"attn_k={attn_kv}", f"attn_v={attn_kv}",
            f"attn_q={protect}", f"attn_output={protect}", f"ffn_down={protect}"]
+    # (4) HYBRID (Mamba/SSM) blocks mix the sequence with a state-space operator instead of
+    # attention, so the rules above -- which name attention tensors -- reach none of them and the
+    # whole mixing path falls through to the body crush atom. On Qwen3.8-27B that is 48 of 65
+    # blocks: ssm_out alone is ~1.5B parameters, the mixer's OUTPUT projection, crushed to ~1 bit.
+    # Apply the same policy attention gets: protect the writer (ssm_out, the analogue of
+    # attn_output) and the gate, and the alpha/beta projections, which are tiny (48 x n_embd) and
+    # cost nothing to keep. The fused attn_qkv is already caught by the attn_q rule above.
+    # No-ops on a model with no SSM blocks.
+    cq += [f"ssm_out={protect}", f"attn_gate={protect}",
+           f"ssm_alpha={protect}", f"ssm_beta={protect}", f"ssm_in={protect}"]
     return flags, cq
 
 

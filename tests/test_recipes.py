@@ -2361,3 +2361,23 @@ def test_probe_groups_cover_ssm_sequence_mixers():
         assert P._gguf_slot(f"blk.7.{base}.weight", groups) == ("ffn", 7)
     # a norm/bias is not a matmul and must not be grouped at all
     assert P._gguf_slot("blk.7.ssm_norm.weight", groups) is None
+
+
+def test_automap_protects_the_ssm_mixing_path():
+    """A hybrid Mamba/SSM model mixes the sequence with a state-space operator in most blocks.
+    The dense recipe names only attention tensors, so on Qwen3.8-27B (48 SSM blocks of 65) the
+    whole mixing path of 74% of the model fell through to the body CRUSH atom -- ssm_out alone
+    is ~1.5B parameters, the mixer's output projection, at ~1 bit. It gets the same protection
+    attention's output projection gets."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    A = importlib.import_module("pollard_automap")
+    _, cq = A.recipe_flags(65, is_moe=False, body="iq1_kt", protect="iq2_kt")
+    rules = dict(r.split("=", 1) for r in cq if "=" in r and not r.startswith("blk"))
+    for t in ("ssm_out", "attn_gate", "ssm_alpha", "ssm_beta"):
+        assert t in rules, f"{t} unprotected -- it falls through to the body crush atom"
+        assert rules[t] != A._cq("iq1_kt"), f"{t} must not take the body atom"
+    # and the imatrix-coverage pattern has to know they need one
+    assert A._NEEDS_IMATRIX.match("blk.7.ssm_out.weight"), "ssm_out excluded from coverage checking"
+    assert A._NEEDS_IMATRIX.match("blk.7.ssm_alpha.weight")
+    assert not A._NEEDS_IMATRIX.match("blk.7.ssm_norm.weight"), "norms stay F32, never imatrix"
