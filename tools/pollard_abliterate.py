@@ -29,7 +29,6 @@ Usage:
 """
 import argparse, os, sys
 import torch
-from pollard_load import load_backbone, text_layers
 
 
 # tiny BENIGN placeholder sets -- only so --selftest exercises the mechanism.
@@ -110,6 +109,7 @@ def abliterate(model, r_hat, dev, strength=-1.0):
     o_proj/down_proj write columns into the stream (out-dim = D): W += a * r r^T W.
     embed_tokens rows ARE stream vectors (dim 1 = D):             W += a * (W r) r^T.
     """
+    from pollard_load import load_backbone, text_layers
     r = r_hat.to(dev).float()
     a = float(strength)
     edited = 0
@@ -126,6 +126,7 @@ def abliterate(model, r_hat, dev, strength=-1.0):
 
 
 def main():
+    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", required=True, help="HF model dir or id (FP16/BF16)")

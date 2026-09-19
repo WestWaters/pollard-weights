@@ -22,7 +22,6 @@ Usage:
 """
 import argparse, sys, time
 import torch, torch.nn as nn
-from pollard_load import load_backbone, text_layers
 
 
 def _hms(s):
@@ -271,6 +270,7 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
     offload=True keeps the whole model on CPU and moves ONE block to `dev` at a time --
     this is what lets a 7B (15 GB) quantize on a 16 GB GPU: peak VRAM is one block +
     its Hessians, never the whole model."""
+    from pollard_load import load_backbone, text_layers
     layers = text_layers(model)
     # --- capture the input to block 0 (+ the kwargs each block needs) for every sample.
     # A forward-PRE-hook avoids replacing the layer (so model-level attribute access like
@@ -342,6 +342,7 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
 
 
 def main():
+    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True)
     ap.add_argument("--bits", type=int, default=4)

@@ -30,7 +30,6 @@ import json
 import math
 import os
 import sys
-from pollard_load import load_backbone
 
 # A correct forward on in-domain rows sits well under this; scrambled positions sit far above it.
 # Deliberately loose -- this separates "broken" from "fine", it is not a quality metric.
@@ -149,6 +148,7 @@ def reference_nll(model_id, rows, max_rows=16, seq=1024, dtype="bfloat16", devic
     with scrambled pairing scores worse at the end of a sequence than the start. A single mean can be
     explained away as "hard rows"; a rising profile cannot.
     """
+    from pollard_load import load_backbone
     import torch
     from transformers import AutoTokenizer
 

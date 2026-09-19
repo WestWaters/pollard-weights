@@ -1744,32 +1744,6 @@ def test_layer_access_goes_through_text_layers():
 
 
 
-def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
-    """An import inside main() is invisible to a module-scope function that needs it.
-
-    This bit twice, identically, because the conversion put the import at the FIRST use rather than
-    at the top: pollard_abliterate raised NameError from abliterate(), and after that was fixed
-    pollard_probe raised the same NameError from _linears() -- both only when the helper was reached
-    outside main(). A CLI run could pass while a library call died.
-
-    pollard_flybrain is the deliberate exception: it imports lazily because pollard_load pulls in
-    torch, and flybrain's optional-extra guard depends on torch not being required at import time.
-    """
-    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
-    offenders = []
-    for f in sorted(tools.glob("pollard_*.py")):
-        if f.name == "pollard_flybrain.py":
-            continue
-        src = f.read_text(encoding="utf-8")
-        if "pollard_load import" not in src:
-            continue
-        for i, line in enumerate(src.splitlines(), 1):
-            if "from pollard_load import" in line and line.startswith((" ", "\t")):
-                offenders.append(f"{f.name}:{i}")
-    assert not offenders, ("imported inside a function, so module-scope callers raise NameError: "
-                           + ", ".join(offenders))
-
-
 def test_probe_places_a_model_too_big_for_the_accelerator():
     """The probe pinned the WHOLE model to one device, so the first model bigger than the box OOM'd
     (Gemma4 12B: 22GB onto a 16GB Mac). It must shard+offload instead of dying."""

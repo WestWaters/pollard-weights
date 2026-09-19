@@ -26,7 +26,6 @@ Seams (norm -> linears), auto-detected per architecture:
 Verify every build with pollard-verify (never trust a proxy metric).
 """
 import argparse, os, sys
-from pollard_load import load_backbone, text_layers
 
 
 def _load_calib(path, tok, device, cols, rows):
@@ -39,6 +38,7 @@ def _load_calib(path, tok, device, cols, rows):
 
 
 def main():
+    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", required=True, help="source HF model dir/id (fp16/bf16)")

@@ -34,7 +34,6 @@ if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import torch, torch.nn.functional as F
-from pollard_load import load_backbone, text_layers
 
 
 def _weights_bytes(model_id):
@@ -377,6 +376,7 @@ def _linears(model, layer, group):
     Taking those at face value put a None in the hook list and killed the probe with
     'NoneType has no attribute register_forward_hook' -- after loading 12B of weights. A layer with
     none of a group is legitimate; it simply contributes nothing to that group's cost."""
+    from pollard_load import load_backbone, text_layers
     parent, names = GROUP_ATTR[group]
     mod = getattr(text_layers(model)[layer], parent, None)
     if mod is None:
@@ -515,6 +515,7 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
 
 
 def main():
+    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     # Neither is needed by --from-imatrix (it reads the GGUF and the imatrix, nothing else), so

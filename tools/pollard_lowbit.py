@@ -17,7 +17,6 @@ Usage:
 """
 import argparse, time, sys
 import torch, torch.nn as nn
-from pollard_load import load_backbone, text_layers
 
 
 def _chunks(tok, text, seqlen, n=None):
@@ -142,6 +141,7 @@ def per_channel_importance(model, calib, lins):
 
 
 def main():
+    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True)
     ap.add_argument("--bits", type=int, default=1)

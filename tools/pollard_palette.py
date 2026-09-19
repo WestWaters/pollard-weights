@@ -31,7 +31,6 @@ import argparse, json, time, copy
 import torch, torch.nn as nn
 
 from pollard_gptq import gptq_quantize, eval_ppl, _chunks, linear_layers
-from pollard_load import load_backbone, text_layers
 
 # alphabet: name -> (symbol-bits, quantizer(W, H) -> dequant fp16)
 def _q_prune(W, H, gs):        return torch.zeros_like(W)
@@ -95,6 +94,7 @@ def calib_nll(model, calib):
 
 
 def main():
+    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True)
     ap.add_argument("--groupsize", type=int, default=64)

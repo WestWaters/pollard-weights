@@ -17,7 +17,6 @@ import argparse, copy, json, time
 import torch, torch.nn as nn, torch.nn.functional as F
 
 from pollard_gptq import _chunks, sequential_gptq, make_recipe, linear_layers
-from pollard_load import load_backbone
 
 
 @torch.no_grad()
@@ -38,6 +37,7 @@ def kl_top1(ref, q, chunks, dev):
 
 
 def main():
+    from pollard_load import load_backbone
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True)
     ap.add_argument("--method", default="gptq-seq-ao")
