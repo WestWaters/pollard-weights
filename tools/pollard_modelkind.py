@@ -64,6 +64,44 @@ def _template_and_arch(model):
     return tpl or "", archs, conf
 
 
+
+def _encoder_tensor_counts(model_dir):
+    """How many tensors each modality's encoder actually has. None if the weights are unreadable.
+
+    Config flags say what a family supports; the checkpoint says what THIS release shipped."""
+    import glob
+    pats = {"image": ("vision", "visual", "image", "vit"),
+            "audio": ("audio", "speech", "whisper"),
+            "video": ("video", "temporal")}
+    counts = {k: 0 for k in pats}
+    layers = {k: set() for k in pats}
+    files = glob.glob(os.path.join(model_dir, "*.safetensors"))
+    if not files:
+        return None
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return None
+    try:
+        for f in files:
+            with safe_open(f, framework="pt") as h:
+                for k in h.keys():
+                    low = k.lower()
+                    if "language_model" in low:
+                        continue                       # the text stack, whatever else it mentions
+                    for m, words in pats.items():
+                        if any(w in low for w in words):
+                            counts[m] += 1
+                            # An encoder TOWER is repeated blocks. A projection layer and a patch
+                            # embedder are not an encoder, however many tensors they add up to.
+                            hit = re.search(r"(?:layers?|blocks?|h)\.(\d+)\.", low)
+                            if hit:
+                                layers[m].add(int(hit.group(1)))
+    except Exception:
+        return None
+    return {m: (len(layers[m]) if layers[m] else 0) for m in counts}
+
+
 def classify(model) -> dict:
     """What this model is, and what that implies for measuring it."""
     tpl, archs, conf = _template_and_arch(model)
@@ -94,6 +132,20 @@ def classify(model) -> dict:
         "speech_out": r"vocoder|codec_config|snac|speech_decoder|tts|audio_head",
     }
     modalities = [m for m, pat in MODALITY.items() if re.search(pat, blob)]
+    # A declared modality is not a usable one. gemma-4-12B-it carries vision_config, audio_config
+    # and the projection layers, but the encoder TOWERS are not in the release -- the checkpoint
+    # holds 666 language-model tensors, one embed_vision, one embed_audio and a 9-tensor embedder.
+    # Reporting it as image+audio+video would put a capability on the card the weights cannot do.
+    declared = list(modalities)
+    if modalities and os.path.isdir(model):
+        have = _encoder_tensor_counts(model)
+        if have is not None:
+            modalities = [m for m in modalities
+                          if have.get(m, 0) >= 2 or m == "speech_out"]
+            for m in declared:
+                if m not in modalities:
+                    why.append(f"{m}: declared in the config, but no encoder tower is in the "
+                               f"checkpoint ({have.get(m, 0)} encoder blocks) -- not usable here")
     vision = "image" in modalities
     for m in modalities:
         why.append(f"{m} signals in the template/config/architecture")

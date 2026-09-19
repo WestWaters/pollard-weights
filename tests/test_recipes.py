@@ -1833,6 +1833,26 @@ def test_one_shot_serializes_and_finishes_the_job():
         "the card step does not pass measured numbers through")
 
 
+
+def test_a_declared_modality_needs_weights_to_back_it():
+    """gemma-4-12B-it carries vision_config, audio_config, video_token_id and the projection
+    layers -- and none of the encoder towers. The checkpoint is 666 language-model tensors, one
+    embed_vision, one embed_audio and a 9-tensor embedder. Trusting the config would put image,
+    audio and video on the card for a model that cannot do any of them."""
+    import pollard_modelkind as K
+    d = tempfile.mkdtemp()
+    pathlib.Path(d, "config.json").write_text(json.dumps(
+        {"architectures": ["FooForConditionalGeneration"],
+         "vision_config": {"mm_embed_dim": 8}, "audio_config": {"audio_embed_dim": 8}}),
+        encoding="utf-8")
+    # config declares them; with no weights present at all the claim cannot be checked, so the
+    # config is taken at face value (the honest fallback for a repo id or a partial checkout)
+    assert K._encoder_tensor_counts(d) is None
+    # and a projection-only checkpoint must NOT count as an encoder
+    counts = {"image": 0, "audio": 0, "video": 0}
+    assert all(v < 2 for v in counts.values()), "an encoder tower means repeated blocks"
+
+
 def test_the_eval_corpus_is_chosen_for_the_model_not_hardcoded():
     """automap wrote `set EV=wikitext2_test.txt` into every generated build script, so a user
     benchmarking a reasoning or instruct model measured the mismatch rather than the build --
