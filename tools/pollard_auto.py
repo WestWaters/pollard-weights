@@ -11,8 +11,8 @@ WINNING PATH -- the SAME for dense AND MoE (no losing fallback):
   (There is NO "imatrix-free mix": it loses to stock Q2_K, so it's deprecated, not a path here.)
 
 STOP LOSING / TRAP paths -- never the default, opt-in only:
-  - sensitivity SWEEP on DENSE = loses (no expert redundancy) -> pollard-sensitivity refuses dense.
-  - sensitivity SWEEP on a BIG MoE = ~2*layers full-model quantizes = many HOURS; opt-in R&D only.
+  - sensitivity SWEEP on a BIG model = ~2*layers full-model quantizes = many HOURS; opt-in R&D only
+    (dense is NOT refused -- it is a cost guard, not an arch guard; bench the two arms).
   - the 3-bar comparison + KL/PPL = the BENCHMARK, opt-in via --benchmark (see benchmarks/).
 
 Plans by default (prints the exact commands for THIS model); `--run` executes them.

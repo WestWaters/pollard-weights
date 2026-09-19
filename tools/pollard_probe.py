@@ -593,18 +593,15 @@ def main():
     if loadkw.get("device_map"):            # accelerate hooks move inputs; stage them on the CPU
         dev = "cpu"
     layers = len(text_layers(model))
-    # A DENSE model has no expert redundancy for the allocator to reallocate, and a measured
-    # profile does NOT beat uniform there -- pollard-sensitivity refuses dense outright for this
-    # reason. This tool is the cheap estimator for the same thing, so it inherits the caveat:
-    # measured here on Qwen2.5-0.5B at matched size, imatrix-only IQ3_S came out +7.48% over fp16
-    # while imatrix + measured allocation came out +14.17%. The profile made the build WORSE, and
-    # nothing said so, because only the expensive path carried the warning.
+    # Dense profiles are produced, not refused. The only dense measurement we have is a 0.5B
+    # (below), which is far too small to settle the question for a 12B or a 27B -- so it is
+    # stated as the data point it is and the user benches the two arms.
     if not any(getattr(l, "mlp", None) and hasattr(getattr(l, "mlp"), "experts")
                for l in text_layers(model)):
-        print("   NOTE: this model looks DENSE. A measured profile is the MoE lever -- on dense it\n"
-              "         does not beat uniform (no expert redundancy to reallocate) and can lose to\n"
-              "         plain imatrix-guided quantization. Dense -> imatrix directly; measure only\n"
-              "         if you intend to compare the two.", flush=True)
+        print("   NOTE: dense model. Per-layer allocation has the most headroom on MoE. The one\n"
+              "         dense measurement on record is Qwen2.5-0.5B at matched size -- imatrix-only\n"
+              "         IQ3_S +7.48% over fp16 vs imatrix+profile +14.17% -- i.e. the profile lost\n"
+              "         on a 0.5B. Larger dense models are untested; bench both arms.", flush=True)
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
 
     if a.stream:

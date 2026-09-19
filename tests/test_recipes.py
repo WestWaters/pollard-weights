@@ -235,14 +235,33 @@ def test_gate_appended_to_oneshot_build():
     assert "--coherence" not in bat_off, "--no-gate must omit the gate"
 
 
-# ---- guards (dense refused; deprecation warns) -----------------------------------------------
-def test_dense_guard():
+# ---- guards (dense RUNS; deprecation warns) --------------------------------------------------
+def test_dense_is_not_refused():
+    """automap carries a real dense recipe (crush ffn_gate/up, protect attn+down+edges) and the
+    shipped dense flagships were all built with it. Refusing dense and then applying that same
+    recipe the moment someone passed --allow-dense was the tool arguing with itself: the guard
+    encoded a conclusion from ONE 0.5B, which is no evidence at all about a 12B or a 27B.
+    Dense must run, pick the dense recipe, and leave the verdict to a bench."""
+    tf = _tensorfile(_dense())
+    out = os.path.join(tempfile.gettempdir(), "g.bat")
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "tools",
+                        "pollard_automap.py"), "--tensors", tf, "--model", "d.gguf",
+                        "--out", out], capture_output=True, text=True)
+    blob = r.stdout + r.stderr
+    assert "REFUSED" not in blob, f"automap must NOT refuse a dense model:\n{blob}"
+    assert r.returncode == 0, f"dense automap must succeed, got {r.returncode}:\n{blob}"
+    assert "dense recipe" in blob, f"a dense model must route to the dense recipe:\n{blob}"
+
+
+def test_allow_dense_still_accepted():
+    """--allow-dense is a no-op now, but every existing script and pollard_auto's own flagship
+    path passes it. Removing the flag would break them, so it must still parse."""
     tf = _tensorfile(_dense())
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "tools",
                         "pollard_automap.py"), "--tensors", tf, "--model", "d.gguf",
-                        "--out", os.path.join(tempfile.gettempdir(), "g.bat")],
+                        "--allow-dense", "--out", os.path.join(tempfile.gettempdir(), "g2.bat")],
                        capture_output=True, text=True)
-    assert "REFUSED" in (r.stdout + r.stderr), "automap must REFUSE a dense model without --allow-dense"
+    assert r.returncode == 0, f"--allow-dense must still be accepted:\n{r.stdout}{r.stderr}"
 
 
 def _glm(nl=8):

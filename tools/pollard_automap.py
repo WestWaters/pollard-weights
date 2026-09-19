@@ -357,7 +357,7 @@ def main():
                          "(Reproduce the gold-card numbers with the benchmark path instead.)")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
     ap.add_argument("--allow-dense", action="store_true",
-                    help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
+                    help="accepted and ignored -- dense is no longer refused. (was: MoE path; dense uses imatrix "
                          "K-quants). Only for the research 1-bit-mix case (the gold-card).")
     ap.add_argument("--no-gate", dest="gate", action="store_false",
                     help="skip the auto coherence gate appended after the mix build. By default the "
@@ -381,15 +381,10 @@ def main():
     names, n_layers, is_moe, arch = parse_tensors(a.tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found -- is this a dry-run tensor list?")
-    # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate -- its
-    # win is imatrix-guided K-quants, not this. Refuse dense (saves everyone the wrong-tool
-    # run) unless --allow-dense (the research 1-bit-mix / gold-card case). HYV4 IS a MoE.
-    if not is_moe and not a.allow_dense:
-        sys.exit("REFUSED: this is a DENSE model, and automap is the MoE path.\n"
-                 "  Dense models -> imatrix-guided K-quants (IQ3_S/IQ4_XS/Q6_K); the measured\n"
-                 "  expert-allocation here doesn't apply (no expert redundancy to reallocate).\n"
-                 "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
-                 "  research 1-bit-mix case (the gold-card).")
+    # Dense runs. automap has carried a real dense recipe all along (crush ffn_gate/up, protect
+    # attn+down+edges) -- refusing dense and then applying that recipe the moment someone passed
+    # --allow-dense was the tool arguing with itself. The shipped dense flagships all came out of
+    # the forced path, so the forced path IS the path.
     # Transparency: an aliased atom (e.g. Hy4's STQ1_0) is an APPROXIMATION, not the real format --
     # say so, so nobody thinks they built a true 1.31-bit STQ1_0 when they built 1.62-bit iq1_bn.
     for label, raw in [("--body", a.body), ("--protect", a.protect), ("--rival", a.rival)]:
