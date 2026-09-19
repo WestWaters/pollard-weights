@@ -1853,6 +1853,12 @@ def test_gate_names_the_symptom_and_leads_with_the_cheap_lever():
     assert re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", "<|channel>thought <|channel>thought")
     verdict = src.split("BELOW FLOOR", 1)[1][:4000]
     assert "TOKEN EMBEDDING" in verdict, "the cheapest lever is not offered"
+    # every lever Pollard actually ships should be reachable from the failure, not just the ones
+    # whoever wrote the message happened to remember
+    for tool in ("pollard-probe", "pollard-sensitivity", "pollard-calib", "pollard-precondition",
+                 "pollard-rotate", "pollard-smooth", "pollard-hf-smooth", "pollard-palette",
+                 "pollard-lowbit", "pollard-prune", "pollard-automap"):
+        assert tool in verdict, f"{tool} is never offered to someone whose build failed"
     assert verdict.index("TOKEN EMBEDDING") < verdict.index("bump the body tier"), (
         "bumping the tier is still suggested before protecting one tensor")
 
