@@ -52,7 +52,6 @@ from __future__ import annotations
 import math
 import os
 from typing import Optional
-from pollard_backbone import load_backbone as _lb
 
 try:
     import torch
@@ -116,9 +115,37 @@ def _progress(*args, **kw):
 
 
 def load_backbone(model_id: str, dtype=None, device: str = "cpu", **kw):
-    """Re-exported from pollard_backbone -- Pollard's model-side loader. The brain uses the
-    model tooling, never the other way round."""
-    return _lb(model_id, dtype, device, **kw)
+    """The brain's OWN backbone loader. Self-contained on purpose: the brain lane shares no code
+    with the model-building lane, so neither can change under the other. A brain is a feature that
+    ATTACHES to a model -- it is not part of building one, and the two were never meant to meet.
+
+    A brain binds to the language side, so a vision-language checkpoint has to be reachable too:
+    AutoModelForCausalLM refuses one outright, hence the fallback."""
+    import torch
+    import transformers
+    from transformers import AutoModelForCausalLM
+
+    if dtype is None:
+        dtype = torch.float32
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
+    except ValueError as text_only_err:
+        model, errs = None, [f"AutoModelForCausalLM: {text_only_err}"]
+        for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+            cls = getattr(transformers, name, None)
+            if cls is None:
+                continue
+            try:
+                model = cls.from_pretrained(model_id, dtype=dtype, **kw)
+                break
+            except Exception as e:
+                errs.append(f"{name}: {e}")
+        if model is None:
+            raise SystemExit(f"could not load {model_id!r} as a causal LM or a vision-language "
+                             "model:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
+    if kw.get("device_map") is None:
+        model = model.to(device)
+    return model.eval()
 
 
 def probe_basis(model, tok, corpus: str, n_probe: int, device, plen: int = 160):

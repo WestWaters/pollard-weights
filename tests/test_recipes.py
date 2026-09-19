@@ -1430,9 +1430,14 @@ def test_backbone_loader_accepts_a_vision_language_model():
     # BRAIN tooling only. The model tools each load their own backbone and do not depend on this
     # loader -- that separation is the point, and enforcing the shared loader on them was how brain
     # code ended up threaded through the build path in the first place.
+    # Each lane carries its own loader now -- brains share no code with model building, so neither
+    # can change under the other. What still has to hold is the CAPABILITY: a brain binds to the
+    # language side, so a VL checkpoint must be reachable. Calling AutoModelForCausalLM is fine;
+    # calling it with no vision-language fallback is not.
     for f in sorted(tools.glob("pollard_*brain*.py")) + sorted(tools.glob("pollard_connectome.py")):
         body = f.read_text(encoding="utf-8")
-        if "AutoModelForCausalLM.from_pretrained" in body:
+        if "AutoModelForCausalLM.from_pretrained" in body and not any(
+                c in body for c in ("AutoModelForImageTextToText", "AutoModelForVision2Seq")):
             offenders.append(f.name)
     assert not offenders, ("these load a backbone directly and will refuse a VL model: "
                            + ", ".join(offenders))
