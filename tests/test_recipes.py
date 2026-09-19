@@ -1802,6 +1802,36 @@ def test_the_model_tools_know_nothing_about_brains():
 
 
 
+
+def test_modelkind_detects_what_a_model_actually_is():
+    """Pollard measured every model as though it were plain text. gemma-4-12B-it is instruct,
+    thinking, tool-calling AND image+audio+video -- score that on raw Wikipedia and you measure the
+    mismatch (PPL ~664, where a plain 7B reads 5.4 on the same corpus), and gate it with a short
+    budget and its thinking block gets cut off, failing a build that was about to answer."""
+    import pollard_modelkind as K
+    d = tempfile.mkdtemp()
+    # a thinking + tool-calling + multimodal checkout
+    pathlib.Path(d, "chat_template.jinja").write_text(
+        "{% if thinking %}<think>{% endif %} tool_call tool_response function_call thinking think",
+        encoding="utf-8")
+    pathlib.Path(d, "config.json").write_text(json.dumps(
+        {"architectures": ["FooForConditionalGeneration"],
+         "audio_config": {"audio_embed_dim": 8}, "vision_config": {"mm_embed_dim": 8},
+         "video_token_id": 7}), encoding="utf-8")
+    k = K.classify(d)
+    assert k["instruct"] and k["thinking"] and k["agentic"], k
+    assert set(["image", "audio", "video"]) <= set(k["modalities"]), k["modalities"]
+    assert k["eval"] == "multimodal", "a text corpus cannot score a multimodal model"
+    assert k["gate_tokens"] >= 200, "a thinking model needs room to finish thinking"
+
+    # a plain base model: raw-text perplexity is the right measurement there
+    b = tempfile.mkdtemp()
+    pathlib.Path(b, "config.json").write_text(json.dumps({"architectures": ["FooForCausalLM"]}),
+                                              encoding="utf-8")
+    kb = K.classify(b)
+    assert kb["base"] and kb["eval"] == "raw-text" and not kb["modalities"], kb
+
+
 def test_coherence_gate_rejects_fluent_garbage():
     """The gate ran detect_loop() and, finding no repetition, reported "coherent". A build emitting
     token salad does not repeat, so it PASSED -- the IQ1_KT gemma4 flagship answered "The capital of

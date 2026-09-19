@@ -148,11 +148,20 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
     quick=True: one prompt, default sampling only (a fast post-build sanity, not the full gate)."""
     prompts = GATE_PROMPTS[:1] if quick else GATE_PROMPTS
     configs = SAMPLING_CONFIGS[:1] if quick else SAMPLING_CONFIGS
+    # A thinking model reasons before it answers, so a fixed budget cuts it off mid-thought
+    # and the known-answer check fails a build that was about to be right. Ask what it is.
+    try:
+        from pollard_modelkind import classify, describe
+        kind = classify(model)
+        budget = kind["gate_tokens"]
+        print(f"  model kind: {describe(kind)}  (gate budget {budget} tokens)")
+    except Exception:
+        budget = 220
     last = []
     for cfg_name, sampling in configs:
         rows, looped = [], False
         for p, expect in prompts:
-            gen = _generate(cli_bin, model, p, sampling, ngl)
+            gen = _generate(cli_bin, model, p, sampling, ngl, budget)
             if isinstance(gen, _NoOutput) or not gen.strip():
                 rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
                              "reason": "NO OUTPUT (timeout or the run produced nothing)",
@@ -190,10 +199,34 @@ def print_gate(res):
         s = " ".join(res["sampling"])
         print(f"\nVERDICT: PASS -- coherent. Ship these sampling defaults on the card:\n  {s}")
     else:
-        print("\nVERDICT: BELOW FLOOR -- loops under EVERY sampling config. This is NOT a sampling\n"
-              "  problem; the bit tier is below the model's coherence floor. Bump the crush one\n"
-              "  tier and rebuild (e.g. --body iq1_kt -> iq2_kt), then re-gate. (Small/sparse\n"
-              "  models hit this; big models clear 1-bit fine -- it's a size property.)")
+        print("\nVERDICT: BELOW FLOOR -- every sampling config was tried and none held together, so\n"
+              "  this is not a sampling problem. It is also not the end of the road: a build lands\n"
+              "  here when the bits it was given cannot carry the model, and Pollard has levers for\n"
+              "  that. Work them in this order -- each is cheaper than the one after it:\n"
+              "\n"
+              "   1. CALIBRATION first. A low-bit build leans on the imatrix harder than any other\n"
+              "      rung, and a short corpus is the usual reason one tier looks impossible.\n"
+              "        pollard-calib --out calib.txt            # full Calib 3.0, do not trim it\n"
+              "        llama-imatrix -m <f16>.gguf -f calib.txt -o <m>.dat --output-format dat\n"
+              "      (--output-format dat: ik_llama, which builds the trellis flagship, cannot read\n"
+              "       the gguf-format imatrix that llama-imatrix now writes by default.)\n"
+              "\n"
+              "   2. PRECONDITION the weights before quantizing. Measured here: rotation is the\n"
+              "      lever that pays at IQ low-bit (~-9.7% at 2-bit), smoothing pays higher up the\n"
+              "      ladder. The best lever is bit-width dependent, so try the one for your tier.\n"
+              "        pollard-precondition --model <hf-dir> --rotate      # low-bit\n"
+              "        pollard-hf-smooth   --model <hf-dir>               # 4-bit and up\n"
+              "\n"
+              "   3. PROTECT more of the model. Raise the atom on the tensors that carry the most\n"
+              "      error rather than the whole body -- that is what the measured profile is for.\n"
+              "        pollard-probe --model <hf-dir> --eval held.txt --out m.sensitivity.json\n"
+              "        pollard-automap ... --protect iq3_kt\n"
+              "\n"
+              "   4. ONLY THEN bump the body tier (e.g. --body iq1_kt -> iq2_kt) and re-gate. It is\n"
+              "      last because it costs size, and the levers above often make it unnecessary.\n"
+              "\n"
+              "  (Small/sparse models hit the floor sooner; big models clear 1-bit fine -- it is a\n"
+              "   size property, not a defect in the build.)")
     return res["verdict"] == "PASS"
 
 
@@ -392,6 +425,16 @@ def main():
     else:
         print("[1] no --ref -> PPL only (pass --ref f16/Q8/Q6 for Mean/Median KLD + top-1).")
 
+    try:
+        from pollard_modelkind import classify, describe
+        k = classify(a.gguf)
+        if k["eval"] == "in-domain":
+            print(f"  NOTE: this is a {describe(k)} model. Perplexity on RAW text measures the")
+            print("        mismatch, not the build -- gemma-4-12B-it reads ~664 on WikiText where a")
+            print("        plain 7B reads 5.4 on the same corpus and binary. Score it on text it was")
+            print("        tuned for:  pollard-calib --out train.txt --held-out eval.txt")
+    except Exception:
+        pass
     targets = [("model", a.gguf)] + ([("rival", a.rival)] if a.rival else [])
     rows = []
     for i, (tag, m) in enumerate(targets, 2):
