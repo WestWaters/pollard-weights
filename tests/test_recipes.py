@@ -2381,3 +2381,25 @@ def test_automap_protects_the_ssm_mixing_path():
     assert A._NEEDS_IMATRIX.match("blk.7.ssm_out.weight"), "ssm_out excluded from coverage checking"
     assert A._NEEDS_IMATRIX.match("blk.7.ssm_alpha.weight")
     assert not A._NEEDS_IMATRIX.match("blk.7.ssm_norm.weight"), "norms stay F32, never imatrix"
+
+
+def test_emb_ladder_never_descends_into_an_imatrix_required_type():
+    """token_embd/output are NOT collected by llama-imatrix. The embed/output type walks DOWN the
+    ladder when the budget is tight, and the ladder ends in iq2_xxs -- imatrix-required. On
+    Qwen3.8-27B (248320 vocab = 2.54B params in embed+output, ~2.1GB at q6_K against a 5.9GB
+    budget) the descent is forced, output.weight was assigned iq2_xxs, and llama-quantize aborted
+    with GGML_ASSERT(imatrix != NULL) after the whole plan had already printed.
+
+    With coverage unknown or absent the ladder must substitute the non-imatrix equivalent."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    F = importlib.import_module("pollard_fit")
+    req = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m"}
+    unsafe = [t for t in F.LADDER if t in req]
+    assert unsafe, "ladder no longer contains an imatrix-required type; this test needs updating"
+    substituted = [F.NOIMATRIX_TYPE_SUB.get(t, t) for t in F.LADDER]
+    assert not (set(substituted) & req), (
+        f"the substituted embed ladder still contains imatrix-required types: {substituted}")
+    # and the substitute must be a real type the bpw table knows, or the budget math breaks
+    for t in substituted:
+        assert t in F.BPW, f"{t} missing from BPW"
