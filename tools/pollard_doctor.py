@@ -28,7 +28,7 @@ Lanes: exl3 health implemented; risk-scan + repair plan are lane-agnostic (they 
 source). Works on any CUDA GPU. Verify is the source of truth; a proxy metric is never consulted.
 """
 import argparse, os, subprocess, sys
-from pollard_backbone import load_backbone, text_layers
+from pollard_load import load_backbone, text_layers
 
 
 def scan_outliers(source_dir, device, calib, rows, cols, thresh):

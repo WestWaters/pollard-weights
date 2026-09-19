@@ -34,7 +34,7 @@ if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import torch, torch.nn.functional as F
-from pollard_backbone import load_backbone, text_layers
+from pollard_load import load_backbone, text_layers
 
 
 def _weights_bytes(model_id):

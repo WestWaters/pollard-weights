@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pollard_backbone import text_layers as _text_layers
+from pollard_load import text_layers as _text_layers
 
 QK_K = 256                      # K-quant block: a row not divisible by this cannot hold one
 

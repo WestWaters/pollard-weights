@@ -22,7 +22,7 @@ Usage:
 """
 import argparse, sys, time
 import torch, torch.nn as nn
-from pollard_backbone import load_backbone, text_layers
+from pollard_load import load_backbone, text_layers
 
 
 def _hms(s):

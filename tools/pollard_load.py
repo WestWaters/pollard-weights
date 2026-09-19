@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pollard_backbone -- how Pollard loads a model, including a vision-language one.
+"""pollard_load -- how Pollard loads a model, including a vision-language one.
 
 This is MODEL infrastructure. Pollard quantizes vision-language models like any other, so reaching a
 VL backbone is a Pollard capability and belongs here, owned by the model path -- not inherited from
@@ -79,4 +79,4 @@ def text_layers(model):
     if layers is not None:
         return layers
     raise SystemExit(f"could not find the decoder layers on {type(model).__name__}; "
-                     "pollard_backbone.text_layers needs a path for this architecture")
+                     "pollard_load.text_layers needs a path for this architecture")

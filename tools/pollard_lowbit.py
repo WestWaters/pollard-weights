@@ -17,7 +17,7 @@ Usage:
 """
 import argparse, time, sys
 import torch, torch.nn as nn
-from pollard_backbone import load_backbone, text_layers
+from pollard_load import load_backbone, text_layers
 
 
 def _chunks(tok, text, seqlen, n=None):

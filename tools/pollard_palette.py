@@ -31,7 +31,7 @@ import argparse, json, time, copy
 import torch, torch.nn as nn
 
 from pollard_gptq import gptq_quantize, eval_ppl, _chunks, linear_layers
-from pollard_backbone import load_backbone, text_layers
+from pollard_load import load_backbone, text_layers
 
 # alphabet: name -> (symbol-bits, quantizer(W, H) -> dequant fp16)
 def _q_prune(W, H, gs):        return torch.zeros_like(W)

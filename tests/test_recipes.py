@@ -1415,7 +1415,7 @@ def test_backbone_loader_accepts_a_vision_language_model():
         print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
         return
     import pollard_flybrain as F
-    import pollard_backbone as L
+    import pollard_load as L
 
     assert hasattr(F, "load_backbone") and hasattr(L, "load_backbone")
     src = pathlib.Path(L.__file__).read_text(encoding="utf-8")
@@ -1733,7 +1733,7 @@ def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
     pollard_probe raised the same NameError from _linears() -- both only when the helper was reached
     outside main(). A CLI run could pass while a library call died.
 
-    pollard_flybrain is the deliberate exception: it imports lazily because pollard_backbone pulls in
+    pollard_flybrain is the deliberate exception: it imports lazily because pollard_load pulls in
     torch, and flybrain's optional-extra guard depends on torch not being required at import time.
     """
     tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
@@ -1742,10 +1742,10 @@ def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
         if f.name == "pollard_flybrain.py":
             continue
         src = f.read_text(encoding="utf-8")
-        if "pollard_backbone import" not in src:
+        if "pollard_load import" not in src:
             continue
         for i, line in enumerate(src.splitlines(), 1):
-            if "from pollard_backbone import" in line and line.startswith((" ", "\t")):
+            if "from pollard_load import" in line and line.startswith((" ", "\t")):
                 offenders.append(f"{f.name}:{i}")
     assert not offenders, ("imported inside a function, so module-scope callers raise NameError: "
                            + ", ".join(offenders))

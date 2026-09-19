@@ -17,7 +17,7 @@ import argparse, copy, json, time
 import torch, torch.nn as nn, torch.nn.functional as F
 
 from pollard_gptq import _chunks, sequential_gptq, make_recipe, linear_layers
-from pollard_backbone import load_backbone
+from pollard_load import load_backbone
 
 
 @torch.no_grad()

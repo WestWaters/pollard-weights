@@ -26,7 +26,7 @@ Seams (norm -> linears), auto-detected per architecture:
 Verify every build with pollard-verify (never trust a proxy metric).
 """
 import argparse, os, sys
-from pollard_backbone import load_backbone, text_layers
+from pollard_load import load_backbone, text_layers
 
 
 def _load_calib(path, tok, device, cols, rows):
