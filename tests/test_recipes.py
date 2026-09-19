@@ -1836,6 +1836,27 @@ def test_one_shot_serializes_and_finishes_the_job():
 
 
 
+
+def test_gate_names_the_symptom_and_leads_with_the_cheap_lever():
+    """BELOW FLOOR told everyone the same thing: bump the body tier. But gemma-4's flagship failed
+    by repeating a CONTROL token (<|channel>thought, over and over) -- that is the token embedding
+    losing resolution on a 152k vocabulary, not the body collapsing, and protecting one tensor costs
+    a few hundred MB against a whole tier. Advice that ignores the symptom sends people to the most
+    expensive fix first."""
+    import re
+    import pollard_bench as B
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
+        encoding="utf-8")
+    seg = src.split("def coherence_gate", 1)[1].split("\ndef ", 1)[0]
+    assert "control tokens repeating" in seg, "the gate does not distinguish this failure mode"
+    # the pattern must actually catch what gemma-4 emitted
+    assert re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", "<|channel>thought <|channel>thought")
+    verdict = src.split("BELOW FLOOR", 1)[1][:4000]
+    assert "TOKEN EMBEDDING" in verdict, "the cheapest lever is not offered"
+    assert verdict.index("TOKEN EMBEDDING") < verdict.index("bump the body tier"), (
+        "bumping the tier is still suggested before protecting one tensor")
+
+
 def test_card_detects_its_facts_instead_of_being_told_them():
     """Input support, imatrix and parameter count were flags a person had to remember, and
     forgetting one puts a wrong fact on a published card: gemma-4-12B-it generated as

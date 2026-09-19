@@ -261,6 +261,35 @@ def human_gb(nbytes):
 
 
 
+
+
+def _fmt_num(v, nd=4):
+    """Numbers a reader can scan: 56.8803, not 56.880311."""
+    return f"{float(v):.{nd}f}".rstrip("0").rstrip(".") if isinstance(v, (int, float)) else "--"
+
+
+def auto_note(idx, n, ppl, f16_ppl, tag):
+    """The one-line verdict a reader wants per rung: what it costs against f16, and which to take.
+
+    Said in PERCENT, not raw PPL, and earned rather than assigned by position. "near-lossless"
+    meant +0.08 on a 11.28 baseline for one model and would have meant +3.57 on 23.04 for the next
+    -- 15% worse, printed as near-lossless, on a published card."""
+    if not (ppl and f16_ppl):
+        return {0: "smallest"}.get(idx, "recommended default" if idx < n - 1 else "largest")
+    pct = (float(ppl) - float(f16_ppl)) / float(f16_ppl) * 100.0
+    if pct <= 1.0:
+        cost = "near-lossless"
+    elif pct <= 5.0:
+        cost = f"+{pct:.1f}% vs f16"
+    else:
+        cost = f"+{pct:.0f}% vs f16"
+    if idx == 0:
+        return f"smallest -- {cost}"
+    if idx == n - 1:
+        return f"highest fidelity here -- {cost}"
+    return f"recommended default -- {cost}"
+
+
 def detect_card_facts(model_id, builds_dir, cfg, builds=()):
     """Input support, imatrix and parameter count -- read off what was actually built.
 
@@ -453,7 +482,13 @@ def main():
     NONSTOCK = ("ik_llama", "fork", "newer", "unknown")
     ik_builds = [b for b in builds if runtimes.get(b.get("path")) in NONSTOCK]
 
-    pb = parse_params_b(a.params, cfg)
+    # Detect first: the parameter count drives f16_gb, which drives the shrink block. Detecting
+    # afterwards left a card with no "Pollard shrank this model" hero at all whenever the config
+    # was unreachable -- the single most useful line on the page, silently absent.
+    bdir = next((os.path.dirname(b["path"]) for b in builds
+                 if isinstance(b, dict) and b.get("path") and os.path.dirname(b["path"])), None)
+    facts = detect_card_facts(a.model, bdir, cfg, builds)
+    pb = parse_params_b(a.params, cfg) or facts.get("params_b") or 0.0
     f16_gb = pb * 2.0
     builds_sorted = sorted(builds, key=lambda b: -(b.get("bytes") or 0))
     smallest = builds_sorted[-1] if builds_sorted else {}
@@ -530,7 +565,6 @@ def main():
     facts = detect_card_facts(a.model, bdir, cfg, builds)
     inp = a.input_support if a.input_support and a.input_support != "text" else (facts["input"] or a.input_support)
     imat = a.imatrix_file or facts["imatrix"]
-    pb = pb or facts.get("params_b")
     out.append(f"| Parameter count | ~{pb:.1f}B |" if pb else "| Parameter count | -- |")
     out.append(f"| Architecture | `{arch}` |")
     out.append(f"| Input support | {inp} |")
@@ -580,15 +614,18 @@ def main():
     rt_s = "---|" if mixed else ""
     out += [f"| file | PPL | size |{tps_h} Mean KLD |{rt_h} notes |",
             f"|---|---:|---:|{tps_s}---:|{rt_s}---|"]
-    for b in sorted(builds, key=lambda x: (x.get("bytes") or 0)):
+    for _i, b in enumerate(sorted(builds, key=lambda x: (x.get("bytes") or 0))):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','--')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
         rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain,
                   "unknown": "unverified", "stock": "any llama.cpp"}.get(rt, "--")
         rt_c = (" " + rt_lbl + " |") if mixed else ""
-        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','--')} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{r.get('kld','--')} |{rt_c} {r.get('note', b.get('tag',''))} |")
+        _ppl, _kld = r.get("ppl"), r.get("kld")
+        note = r.get("note") or auto_note(_i, len(builds), _ppl, results.get("_f16_ppl"),
+                                          b.get("tag", ""))
+        out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
+                   f"{_fmt_num(_kld)} |{rt_c} {note} |")
     if has_tps:
         hw = results.get("_hw")
         out.append("")

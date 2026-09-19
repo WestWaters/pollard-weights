@@ -168,6 +168,11 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
                              "sample": ""})
                 return {"verdict": "NO_OUTPUT", "config": cfg_name, "rows": rows}
             is_loop, metric, reason = detect_loop(gen)
+            # A CONTROL token repeating (<|channel|>, <|im_start|>, <pad>) is not the body of the
+            # model collapsing -- it is the token embedding losing resolution, and the fix is to
+            # protect that tensor, not to spend size on every layer.
+            if is_loop and re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", gen):
+                reason += "  [control tokens repeating -> token-embedding precision]"
             # Not looping is not the same as coherent. Check the model actually produced the
             # known answer; salad passes a loop test and fails this.
             knows = any(e.lower() in gen.lower() for e in expect)
@@ -204,25 +209,32 @@ def print_gate(res):
               "  here when the bits it was given cannot carry the model, and Pollard has levers for\n"
               "  that. Work them in this order -- each is cheaper than the one after it:\n"
               "\n"
-              "   1. CALIBRATION first. A low-bit build leans on the imatrix harder than any other\n"
+              "   1. PROTECT THE TOKEN EMBEDDING AND OUTPUT TENSOR. Cheapest by far, and the first\n"
+              "      thing to try when the failure looks like a control token repeating\n"
+              "      (<|channel|>, <|im_start|>): a big vocabulary crushed to Q4_K loses the\n"
+              "      special tokens first, and the model cannot stop generating them.\n"
+              "        pollard-automap ... --output-tensor-type Q6_K --token-embedding-type Q6_K\n"
+              "      It costs a few hundred MB on a 150k-vocab model, against a whole tier.\n"
+              "\n"
+              "   2. CALIBRATION. A low-bit build leans on the imatrix harder than any other\n"
               "      rung, and a short corpus is the usual reason one tier looks impossible.\n"
               "        pollard-calib --out calib.txt            # full Calib 3.0, do not trim it\n"
               "        llama-imatrix -m <f16>.gguf -f calib.txt -o <m>.dat --output-format dat\n"
               "      (--output-format dat: ik_llama, which builds the trellis flagship, cannot read\n"
               "       the gguf-format imatrix that llama-imatrix now writes by default.)\n"
               "\n"
-              "   2. PRECONDITION the weights before quantizing. Measured here: rotation is the\n"
+              "   3. PRECONDITION the weights before quantizing. Measured here: rotation is the\n"
               "      lever that pays at IQ low-bit (~-9.7% at 2-bit), smoothing pays higher up the\n"
               "      ladder. The best lever is bit-width dependent, so try the one for your tier.\n"
               "        pollard-precondition --model <hf-dir> --rotate      # low-bit\n"
               "        pollard-hf-smooth   --model <hf-dir>               # 4-bit and up\n"
               "\n"
-              "   3. PROTECT more of the model. Raise the atom on the tensors that carry the most\n"
+              "   4. PROTECT more of the model. Raise the atom on the tensors that carry the most\n"
               "      error rather than the whole body -- that is what the measured profile is for.\n"
               "        pollard-probe --model <hf-dir> --eval held.txt --out m.sensitivity.json\n"
               "        pollard-automap ... --protect iq3_kt\n"
               "\n"
-              "   4. ONLY THEN bump the body tier (e.g. --body iq1_kt -> iq2_kt) and re-gate. It is\n"
+              "   5. ONLY THEN bump the body tier (e.g. --body iq1_kt -> iq2_kt) and re-gate. It is\n"
               "      last because it costs size, and the levers above often make it unnecessary.\n"
               "\n"
               "  (Small/sparse models hit the floor sooner; big models clear 1-bit fine -- it is a\n"
