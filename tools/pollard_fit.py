@@ -478,6 +478,18 @@ def main():
     print(f"{label}     : {summary}  (base {base_preset})")
     print(f"sensitivity source  : {src}")
 
+    # WARN -- a measured profile is the MoE lever. On a DENSE model there is no expert redundancy
+    # to reallocate, and the reallocation can COST more than it buys: measured on Qwen2.5-0.5B at
+    # matched size, imatrix-only IQ3_S came out +7.48% over fp16 and imatrix + measured allocation
+    # +14.17%. pollard-sensitivity refuses dense outright for this reason; consuming a dense
+    # profile here silently produced the worse build.
+    if a.sensitivity and arch["kind"] != "moe":
+        print("WARNING: a measured profile on a DENSE model. Per-layer allocation is the MoE lever "
+              "-- dense\n         has no expert redundancy to reallocate, and the crush on the "
+              "layers it demotes can\n         cost more than the protection buys. Compare against "
+              "a plain imatrix build before\n         shipping this; pollard-sensitivity refuses "
+              "dense for the same reason.")
+
     # WARN -- no calibration signal at all means a UNIFORM build with no per-layer
     # benefit. Say it loudly; this is the difference between Pollard and llama-quantize.
     if not a.sensitivity:
