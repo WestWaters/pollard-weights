@@ -148,7 +148,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=512)
     a = ap.parse_args()
 
-    from pollard_backbone import load_backbone, text_layers
+    from pollard_load import load_backbone, text_layers
     from transformers import AutoTokenizer
     from datasets import load_dataset
 

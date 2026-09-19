@@ -2403,3 +2403,25 @@ def test_emb_ladder_never_descends_into_an_imatrix_required_type():
     # and the substitute must be a real type the bpw table knows, or the budget math breaks
     for t in substituted:
         assert t in F.BPW, f"{t} missing from BPW"
+
+
+def test_no_dangling_pollard_imports_anywhere():
+    """Every `import pollard_X` in the repo must name a module that exists.
+
+    Renaming pollard_backbone.py -> pollard_load.py updated tools/ and tests/ and silently left
+    experiments/recirculation_vs_quant.py importing a module that no longer existed. Nothing caught
+    it, because no test imports that file -- it surfaced only when the experiment was next run.
+    A rename must not be able to leave a dangling import anywhere in the tree."""
+    import re, os, glob
+    root = os.path.join(os.path.dirname(__file__), "..")
+    tools = os.path.join(root, "tools")
+    have = {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(tools, "*.py"))}
+    pat = re.compile(r"^\s*(?:from|import)\s+(pollard_[A-Za-z0-9_]+)", re.M)
+    dangling = []
+    for d in ("tools", "tests", "experiments"):
+        for p in glob.glob(os.path.join(root, d, "**", "*.py"), recursive=True):
+            src = open(p, encoding="utf-8", errors="replace").read()
+            for mod in set(pat.findall(src)):
+                if mod not in have:
+                    dangling.append(f"{os.path.relpath(p, root)} -> {mod}")
+    assert not dangling, "imports naming modules that do not exist:\n  " + "\n  ".join(sorted(dangling))
