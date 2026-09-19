@@ -1754,9 +1754,9 @@ def test_probe_places_a_model_too_big_for_the_accelerator():
         return
     import pollard_probe as P
     d = tempfile.mkdtemp()
-    with open(os.path.join(d, "model-00001-of-00001.safetensors"), "wb") as f:
-        f.truncate(400 * (1 << 30))                     # 400GB: bigger than any dev box
-    _, kw, note = P.plan_placement(d, "mps", os.path.join(d, "off"))
+    # State the size; do not write it. Truncating 400GB here is free on a filesystem with sparse
+    # files and writes 400 REAL GB on one without -- running this suite on NTFS filled a disk.
+    _, kw, note = P.plan_placement(d, "mps", os.path.join(d, "off"), need=400 * (1 << 30))
     assert kw.get("device_map") == "auto", f"a 400GB model was not sharded: {kw}"
     assert kw.get("offload_folder"), "nothing offloaded, so it will OOM"
     # unified memory: the GPU and the CPU spend the SAME pool, so the budgets must not double-count
@@ -2203,14 +2203,17 @@ def test_probe_estimator_is_one_that_can_finish():
     model too big for RAM must fall to the one-pass estimator."""
     import pollard_auto as A2
     d = tempfile.mkdtemp()
-    with open(os.path.join(d, "model.safetensors"), "wb") as f:
-        f.truncate(400 * (1 << 30))                     # 400GB: bigger than any dev box
-    assert A2._use_stream_probe(d, "auto"), "a model far bigger than RAM still uses perturb+KL"
-    assert not A2._use_stream_probe(d, "kl"), "an explicit --probe-method kl must be honoured"
+    # Sizes are stated, not written -- see the placement test above for why a 400GB truncate is a
+    # disk-filling landmine on any filesystem without sparse files.
+    assert A2._use_stream_probe(d, "auto", need_gb=400.0), \
+        "a model far bigger than RAM still uses perturb+KL"
+    assert not A2._use_stream_probe(d, "kl", need_gb=400.0), \
+        "an explicit --probe-method kl must be honoured"
     small = tempfile.mkdtemp()
-    with open(os.path.join(small, "model.safetensors"), "wb") as f:
-        f.truncate(8 * (1 << 20))                       # 8MB: fits anywhere
-    assert not A2._use_stream_probe(small, "auto"), "a tiny model gave up the accurate estimator"
+    # 0.008 GB, stated: a size of ZERO would pass this for the wrong reason, since unknown-size
+    # also returns False. This has to be small-and-known, not merely absent.
+    assert not A2._use_stream_probe(small, "auto", need_gb=0.008), \
+        "a tiny model gave up the accurate estimator"
 
 
 def test_memory_detection_covers_all_three_platforms():

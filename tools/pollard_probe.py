@@ -96,7 +96,7 @@ def _host_bytes():
         return 0
 
 
-def plan_placement(model_id, dev, offload_dir):
+def plan_placement(model_id, dev, offload_dir, need=None):
     """Where does this model actually go?
 
     The probe used to pin the WHOLE model to one device. That silently worked for every model small
@@ -117,7 +117,12 @@ def plan_placement(model_id, dev, offload_dir):
     Returns (device, load_kwargs, note).
     """
     OVERSPILL = 2.0                     # page up to 2x RAM before trusting disk offload
-    need = _weights_bytes(model_id)
+    # `need` lets a caller state the weight size instead of having a checkpoint on disk. Exercising
+    # the too-big-for-this-machine path used to mean truncating a 400GB file into a temp dir, which
+    # is only free on a filesystem with sparse files -- on NTFS it writes real bytes and filled the
+    # build box's disk to 560MB mid-quantize. Nothing about this decision needs the file to exist.
+    if need is None:
+        need = _weights_bytes(model_id)
     if not need:                                            # hub id / unknown: keep the old behaviour
         return dev, {}, ""
     G = 1 << 30

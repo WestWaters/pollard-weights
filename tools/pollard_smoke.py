@@ -122,9 +122,10 @@ def check_placement(model_dir=None):
         dev, kw, note = plan_placement(model_dir, "cpu", os.path.join(tempfile.gettempdir(), "pollard-smoke"))
         return True, note or f"placed on {dev}"
     d = tempfile.mkdtemp()
-    with open(os.path.join(d, "model.safetensors"), "wb") as f:
-        f.truncate(400 * (1 << 30))                            # bigger than any machine
-    _, kw, note = plan_placement(d, "cpu", os.path.join(d, "off"))
+    # State the size instead of writing it. This used to truncate a 400GB file here, which costs
+    # nothing on a filesystem with sparse files and writes 400 REAL GB on one without -- it filled
+    # the build box mid-quantize. 8x the machine's RAM is past every threshold this decides on.
+    _, kw, note = plan_placement(d, "cpu", os.path.join(d, "off"), need=_host_bytes() * 8)
     if not kw and "paged" not in note:
         return False, f"a 400GB model was neither paged nor offloaded: {note}"
     return True, note

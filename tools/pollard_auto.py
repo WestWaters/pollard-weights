@@ -57,7 +57,7 @@ def _weights_gb(hf_dir):
     return tot / (1 << 30)
 
 
-def _use_stream_probe(hf_dir, forced):
+def _use_stream_probe(hf_dir, forced, need_gb=None):
     """Which sensitivity estimator can actually finish on this box.
 
     The default perturb+KL probe crushes one group and re-runs the eval, so it costs layers*groups
@@ -67,7 +67,10 @@ def _use_stream_probe(hf_dir, forced):
     estimator ranks the same groups for a single forward, so use it when the weights do not fit."""
     if forced in ("stream", "kl"):
         return forced == "stream"
-    need = _weights_gb(hf_dir)
+    # `need_gb` states the weight size rather than requiring a checkpoint on disk -- exercising the
+    # bigger-than-RAM path should not mean writing a 400GB file, which is free only on a filesystem
+    # with sparse files and writes real bytes on one without.
+    need = need_gb if need_gb is not None else _weights_gb(hf_dir)
     ram = detect_available_ram_gb() or 0.0
     return bool(need and ram and need * 1.15 > ram)
 
