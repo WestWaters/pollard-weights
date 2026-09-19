@@ -185,9 +185,13 @@ def check_imatrix_plan(gguf=None, imatrix=None, ftype=None, out_type=None, emb_t
     # `ssm_dt.bias` is noise that buries the real hits. The GGUF itself says which is which: a
     # 2-D tensor is a matmul. That is ground truth from the file, so this needs no rule table and
     # cannot drift from one.
+    # A tensor is only quantized if it is a matmul AND its rows can hold a quant block: ne[0] must
+    # divide by QK_K. Qwen3.8's ssm_conv1d is 2-D but only 4 wide, so it stays F32 -- reporting its
+    # 48 copies buried the 7 that actually abort the build (an MTP head's attention tensors).
     try:
         from gguf import GGUFReader
-        names = [t.name for t in GGUFReader(gguf).tensors if len(t.shape) >= 2]
+        names = [t.name for t in GGUFReader(gguf).tensors
+                 if len(t.shape) >= 2 and int(t.shape[0]) % QK_K == 0]
     except Exception:
         pass                                                 # names-only fallback: over-report, never miss
     base = (ftype or "").lower()
