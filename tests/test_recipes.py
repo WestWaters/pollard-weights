@@ -1837,6 +1837,38 @@ def test_one_shot_serializes_and_finishes_the_job():
 
 
 
+
+def test_stop_only_selects_pollard_build_work_and_waits_for_the_save():
+    """Two ways a stop goes wrong, pulling opposite directions.
+
+    Too gentle leaves ORPHANS: `schtasks /end` takes the shell and leaves the worker, and an
+    imatrix here survived its task holding 11.4GB until someone looked.
+
+    Too hard corrupts the ARTIFACT: llama-imatrix rewrites its .dat every few chunks and
+    llama-quantize streams a GGUF tensor by tensor. Killed mid-write the file is short and
+    perfectly well-formed -- it loads, it is wrong, nothing says so.
+
+    And it must never guess WHAT to stop: a first pass matched any command line containing
+    'pollard', which selected the operator's own shells and an unrelated project's llama-server."""
+    import pollard_stop as S
+    # a shell whose cwd merely mentions pollard is not a job
+    procs = [(1, 0, "/bin/zsh", "/bin/zsh -c cd /Users/x/pollard-weights && ls"),
+             (2, 0, "llama-server", "/other/project/llama-server -m /models/foo.gguf"),
+             (3, 0, "llama-imatrix", "/p/bin/llama-imatrix -m f16.gguf -o m.dat"),
+             (4, 0, "python.exe", "python.exe C:/pollard/pw/tools/pollard_bench.py --gguf x")]
+    picked = {p for p, *_ in S.find_jobs(procs)}
+    assert 1 not in picked, "a shell was selected as a job"
+    assert 2 not in picked, "an unrelated llama-server was selected -- stopping it is someone's outage"
+    assert 3 in picked and 4 in picked, f"real build work missed: {picked}"
+    # the save-wait is the reason this tool exists
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_stop.py").read_text(
+        encoding="utf-8")
+    assert "def wait_for_save" in src and "SETTLE_SECONDS" in src
+    seg = src.split("def stop(", 1)[1].split("\ndef ", 1)[0]
+    assert seg.index("wait_for_save") < seg.rindex("/F"), (
+        "it force-kills before waiting for the write to settle")
+
+
 def test_gate_names_the_symptom_and_leads_with_the_cheap_lever():
     """BELOW FLOOR told everyone the same thing: bump the body tier. But gemma-4's flagship failed
     by repeating a CONTROL token (<|channel>thought, over and over) -- that is the token embedding
