@@ -140,6 +140,104 @@ def check_converter(model_dir=None):
     return True, note if archs else f"{note} (no model given -- capability not verified)"
 
 
+# Types llama-quantize REFUSES to produce without importance data for the tensor. Assigning one of
+# these to an uncovered tensor is not a warning -- it is GGML_ASSERT(imatrix != NULL) and a dead run.
+IMATRIX_REQUIRED = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q2_k_s",
+                    "iq1_kt", "iq2_kt", "iq3_kt", "iq4_kt"}
+
+
+def check_imatrix_plan(gguf=None, imatrix=None, ftype=None, out_type=None, emb_type=None):
+    """Would this quantize ABORT on a tensor the imatrix does not cover?
+
+    llama-quantize hard-aborts with GGML_ASSERT(imatrix != NULL) when a tensor is assigned an
+    imatrix-REQUIRED type and the imatrix holds no entry for it -- and it does so AFTER loading the
+    model and printing the entire plan. On a 27B that is a long wait for a crash whose cause is one
+    line of output scrolled far off the top.
+
+    It is not an exotic case. llama-imatrix does not collect token_embd/output at all, so any build
+    tight enough to push those down the ladder walks straight into it; and MTP/`nextn` heads look
+    like ordinary attention (`blk.64.attn_k.weight`) while never being calibrated.
+
+    Everything needed to answer this is metadata -- tensor names and imatrix keys -- so it costs
+    seconds and no weights. Run it before the build, not after.
+    """
+    from pollard_calc import imatrix_covered_tensors, read_gguf_tensor_names
+    if not gguf:
+        return True, "no --gguf given -- not checked"
+    names = read_gguf_tensor_names(gguf)
+    if not names:
+        return False, f"no tensors readable from {gguf}"
+    if not imatrix:
+        planned = {(ftype or "").lower(), (out_type or "").lower(), (emb_type or "").lower()}
+        bad = sorted(t for t in planned if t in IMATRIX_REQUIRED)
+        if bad:
+            return False, (f"no --imatrix, but {', '.join(bad)} REQUIRES one -- this aborts. "
+                           f"Build an imatrix, or pick a K-quant.")
+        return True, "no imatrix needed for these types"
+
+    covered = imatrix_covered_tensors(imatrix)
+    if covered is None:
+        return False, (f"could not read {imatrix} as either a GGUF or a legacy .dat imatrix -- "
+                       f"coverage unknown, so an imatrix-required type cannot be cleared")
+
+    # Only MATMULS are quantized -- norms and biases stay F32, so flagging `attn_norm.weight` or
+    # `ssm_dt.bias` is noise that buries the real hits. The GGUF itself says which is which: a
+    # 2-D tensor is a matmul. That is ground truth from the file, so this needs no rule table and
+    # cannot drift from one.
+    try:
+        from gguf import GGUFReader
+        names = [t.name for t in GGUFReader(gguf).tensors if len(t.shape) >= 2]
+    except Exception:
+        pass                                                 # names-only fallback: over-report, never miss
+    base = (ftype or "").lower()
+    overrides = {"output.weight": (out_type or "").lower(),
+                 "token_embd.weight": (emb_type or "").lower()}
+    risky = []
+    for nm in names:
+        ty = overrides.get(nm) or base
+        if ty in IMATRIX_REQUIRED and nm not in covered:
+            risky.append((nm, ty))
+    if risky:
+        shown = ", ".join(f"{n} -> {t}" for n, t in risky[:4])
+        more = f" (+{len(risky) - 4} more)" if len(risky) > 4 else ""
+        fix = ""
+        if any(n in ("output.weight", "token_embd.weight") for n, _ in risky):
+            fix = ("  FIX: --output-tensor-type / --token-embedding-type to a non-imatrix type "
+                   "(Q6_K, Q5_K, IQ4_XS, IQ3_S, Q2_K).")
+        elif risky:
+            fix = "  FIX: pin these to a non-imatrix type, or extend the calibration to cover them."
+        return False, (f"{len(risky)} tensor(s) would take an imatrix-required type with NO "
+                       f"coverage -- llama-quantize ABORTS on these: {shown}{more}.{fix}")
+    return True, f"{len(covered)} covered; every imatrix-required assignment is backed"
+
+
+def check_arch_coverage(gguf=None, imatrix=None):
+    """Does Pollard RECOGNISE every matmul this model's calibration covers?
+
+    The imatrix is the ground truth for what actually gets quantized. A covered tensor that no
+    group rule matches is a weight family the tooling has never seen -- and the silent result is
+    whole layers scored at cost 0.0, which the allocator reads as 'free to crush'.
+
+    Qwen3.8-27B is how this was found: 48 of its 65 blocks mix with a state-space operator rather
+    than attention, 240 of 496 covered matmuls matched nothing, and the profile looked healthy."""
+    if not (gguf and imatrix):
+        return True, "needs --gguf and --imatrix -- not checked"
+    import re as _re
+    from pollard_calc import imatrix_covered_tensors
+    from pollard_probe import _gguf_slot
+    covered = imatrix_covered_tensors(imatrix)
+    if covered is None:
+        return False, "imatrix unreadable -- cannot verify architecture coverage"
+    unknown = sorted({_re.sub(r"^blk\.\d+\.", "", n) for n in covered
+                      if _re.match(r"^blk\.\d+\..+\.weight$", n)
+                      and _gguf_slot(n, ["ffn", "attn"]) is None})
+    if unknown:
+        return False, (f"{len(unknown)} calibrated tensor kind(s) match no group rule, so their "
+                       f"layers would score 0.0 (= free to crush): {', '.join(unknown)}. "
+                       f"Add them to GROUP_GGUF in pollard_probe.py.")
+    return True, "every calibrated matmul maps to a group"
+
+
 # ---- run ----------------------------------------------------------------------------------------
 def _line(ok, name, detail):
     print(f"  {'PASS' if ok else 'FAIL'}  {name:22} {detail}")
@@ -151,8 +249,27 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", help="a real checkpoint to check (else synthetic shapes only)")
     ap.add_argument("--shapes", default="all", help="comma-separated subset of: " + ", ".join(SHAPES))
+    # The BUILD preflight: the questions that otherwise abort a 27B quantize an hour in.
+    ap.add_argument("--gguf", help="the source GGUF you are about to quantize")
+    ap.add_argument("--imatrix", help="the imatrix that build will use (.dat or GGUF)")
+    ap.add_argument("--ftype", help="the quant type you are about to build (e.g. IQ2_XXS)")
+    ap.add_argument("--output-tensor-type", help="as passed to llama-quantize")
+    ap.add_argument("--token-embedding-type", help="as passed to llama-quantize")
     a = ap.parse_args()
     ok = True
+
+    if a.gguf or a.imatrix:
+        print(f"== pollard-smoke :: build preflight")
+        for name, fn in (("imatrix plan", lambda: check_imatrix_plan(
+                              a.gguf, a.imatrix, a.ftype,
+                              a.output_tensor_type, a.token_embedding_type)),
+                         ("arch coverage", lambda: check_arch_coverage(a.gguf, a.imatrix))):
+            try:
+                good, detail = fn()
+            except Exception as e:
+                good, detail = False, f"{type(e).__name__}: {e}"
+            ok &= _line(good, name, detail)
+        print()
 
     if a.model:
         print(f"== pollard-smoke :: {a.model}")

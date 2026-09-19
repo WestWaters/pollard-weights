@@ -2425,3 +2425,32 @@ def test_no_dangling_pollard_imports_anywhere():
                 if mod not in have:
                     dangling.append(f"{os.path.relpath(p, root)} -> {mod}")
     assert not dangling, "imports naming modules that do not exist:\n  " + "\n  ".join(sorted(dangling))
+
+
+def test_smoke_preflight_catches_an_uncovered_imatrix_required_type():
+    """The abort that cost a 27B build: output.weight assigned an imatrix-required type while the
+    imatrix has no entry for it. llama-quantize reports this as GGML_ASSERT(imatrix != NULL) AFTER
+    loading the model and printing the whole plan. The preflight must call it from metadata alone,
+    before anything long starts."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    S = importlib.import_module("pollard_smoke")
+    names = ["token_embd.weight", "output.weight", "blk.0.ffn_gate.weight"]
+    covered = {"blk.0.ffn_gate.weight"}              # what llama-imatrix actually collects
+    monkey = {"read_gguf_tensor_names": lambda _p: names,
+              "imatrix_covered_tensors": lambda _p: covered}
+    calc = importlib.import_module("pollard_calc")
+    saved = {k: getattr(calc, k) for k in monkey}
+    try:
+        for k, v in monkey.items():
+            setattr(calc, k, v)
+        ok, detail = S.check_imatrix_plan("m.gguf", "i.dat", ftype="IQ2_XXS")
+        assert not ok, f"an uncovered output.weight at IQ2_XXS must FAIL preflight: {detail}"
+        assert "output.weight" in detail, f"the failure must name the tensor: {detail}"
+        # and pinning them to a safe type must clear it
+        ok2, d2 = S.check_imatrix_plan("m.gguf", "i.dat", ftype="IQ2_XXS",
+                                       out_type="Q6_K", emb_type="Q4_K")
+        assert ok2, f"pinned output/embeddings should pass: {d2}"
+    finally:
+        for k, v in saved.items():
+            setattr(calc, k, v)
