@@ -352,6 +352,7 @@ def _hf_to_gguf(a):
     here = os.path.abspath(a.output) if a.output else os.path.dirname(os.path.abspath(hf_dir)) or "."
     out = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + "-f16.gguf")
     print(f"   convert HF -> f16 GGUF: python {os.path.basename(conv)} {hf_dir} --outtype f16 --outfile {out}")
+    _emit_mmproj(a, conv, hf_dir, out)
     if a.run:
         subprocess.run([sys.executable, conv, hf_dir, "--outtype", "f16", "--outfile", out])
     return out
@@ -548,6 +549,40 @@ class MachineLock:
                 pass
         return False
 
+
+
+
+def _emit_mmproj(a, conv, hf_dir, gguf_out):
+    """Export the multimodal projector when the model has one, so the build can still see and hear.
+
+    A text GGUF is only the language half of a multimodal model. Ship it alone and the model loses
+    image and audio with nothing saying so -- the weights for them are right there in the source.
+
+    NOT --outtype f16. Gemma 4 is encoder-free: the 550M vision encoder is replaced by one large
+    matmul, so `v.patch_embd.weight` IS the vision pathway, and the reference build keeps it at F32
+    while the projections are BF16. Passing f16 downcast it and produced a 122MB projector where the
+    reference is 175MB. bf16 reproduces the reference byte for byte."""
+    try:
+        from pollard_modelkind import classify
+        k = classify(hf_dir)
+    except Exception:
+        return
+    mods = [m for m in k.get("modalities", []) if m != "speech_out"]
+    if not mods:
+        return
+    out = os.path.join(os.path.dirname(os.path.abspath(gguf_out)) or ".",
+                       "mmproj-" + os.path.basename(gguf_out).replace("-f16.gguf", "-BF16.gguf"))
+    print(f"   + multimodal projector ({'/'.join(mods)}): --mmproj --outtype bf16 -> "
+          f"{os.path.basename(out)}")
+    if not a.run:
+        return
+    r = subprocess.run([sys.executable, str(conv), str(hf_dir), "--mmproj",
+                        "--outtype", "bf16", "--outfile", out])
+    if r.returncode != 0 or not os.path.exists(out):
+        print("   (mmproj export failed -- the text build is unaffected, but this model's image/"
+              "audio will not work until one is produced)")
+        return
+    print(f"   wrote {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
 
 
 def _emit_card(a):

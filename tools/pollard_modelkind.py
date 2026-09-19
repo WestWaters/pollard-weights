@@ -65,23 +65,25 @@ def _template_and_arch(model):
 
 
 
-def _encoder_tensor_counts(model_dir):
-    """How many tensors each modality's encoder actually has. None if the weights are unreadable.
+def _modality_evidence(model_dir):
+    """(encoder blocks per modality, projection tensors per modality). None if weights unreadable.
 
-    Config flags say what a family supports; the checkpoint says what THIS release shipped."""
+    Config flags say what a family supports; the checkpoint says what THIS release shipped -- and a
+    model can ship a modality two ways: an encoder tower, or (encoder-free) projection weights."""
     import glob
     pats = {"image": ("vision", "visual", "image", "vit"),
             "audio": ("audio", "speech", "whisper"),
             "video": ("video", "temporal")}
     counts = {k: 0 for k in pats}
     layers = {k: set() for k in pats}
+    projs = {k: 0 for k in pats}
     files = glob.glob(os.path.join(model_dir, "*.safetensors"))
     if not files:
-        return None
+        return None, None
     try:
         from safetensors import safe_open
     except ImportError:
-        return None
+        return None, None
     try:
         for f in files:
             with safe_open(f, framework="pt") as h:
@@ -97,9 +99,11 @@ def _encoder_tensor_counts(model_dir):
                             hit = re.search(r"(?:layers?|blocks?|h)\.(\d+)\.", low)
                             if hit:
                                 layers[m].add(int(hit.group(1)))
+                            if re.search(r"embed|proj|patch", low):
+                                projs[m] += 1
     except Exception:
-        return None
-    return {m: (len(layers[m]) if layers[m] else 0) for m in counts}
+        return None, None
+    return ({m: (len(layers[m]) if layers[m] else 0) for m in counts}, projs)
 
 
 def classify(model) -> dict:
@@ -138,14 +142,23 @@ def classify(model) -> dict:
     # Reporting it as image+audio+video would put a capability on the card the weights cannot do.
     declared = list(modalities)
     if modalities and os.path.isdir(model):
-        have = _encoder_tensor_counts(model)
+        have, proj = _modality_evidence(model)
         if have is not None:
+            # A modality is usable if the checkpoint carries EITHER an encoder tower (repeated
+            # blocks, the classic design) OR the projection weights an encoder-free model uses
+            # instead. Gemma 4 is encoder-free on purpose: Google replaced a 550M vision encoder
+            # with one 35M matmul and dropped the audio conformer entirely, projecting 40ms/16kHz
+            # chunks straight into the embedding space. Demanding blocks there would report a
+            # genuinely multimodal model as text-only.
             modalities = [m for m in modalities
-                          if have.get(m, 0) >= 2 or m == "speech_out"]
+                          if have.get(m, 0) >= 2 or proj.get(m, 0) >= 1 or m == "speech_out"]
             for m in declared:
                 if m not in modalities:
-                    why.append(f"{m}: declared in the config, but no encoder tower is in the "
-                               f"checkpoint ({have.get(m, 0)} encoder blocks) -- not usable here")
+                    why.append(f"{m}: declared in the config, but neither an encoder tower nor "
+                               f"projection weights are in the checkpoint -- not usable here")
+                elif have.get(m, 0) < 2:
+                    why.append(f"{m}: encoder-free -- projection weights, no tower "
+                               f"(needs the mmproj alongside the model)")
     vision = "image" in modalities
     for m in modalities:
         why.append(f"{m} signals in the template/config/architecture")

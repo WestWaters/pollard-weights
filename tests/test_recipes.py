@@ -1834,6 +1834,24 @@ def test_one_shot_serializes_and_finishes_the_job():
 
 
 
+
+def test_multimodal_builds_ship_their_projector_at_full_precision():
+    """A text GGUF is only the language half of a multimodal model, and the weights for the rest are
+    in the source. Gemma 4 is ENCODER-FREE -- Google replaced a 550M vision encoder with one large
+    matmul and dropped the audio conformer, projecting 40ms/16kHz chunks straight into the embedding
+    space -- so v.patch_embd.weight IS the vision pathway. Exporting with --outtype f16 downcast it
+    and produced a 122MB projector where the reference is 175MB; bf16 reproduces the reference
+    exactly (F32 patch embedding, BF16 projections)."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py").read_text(
+        encoding="utf-8")
+    assert "_emit_mmproj" in src, "a multimodal build ships without its projector"
+    seg = src.split("def _emit_mmproj", 1)[1].split("\ndef ", 1)[0]
+    assert '"--mmproj"' in seg, "no projector export"
+    assert '"bf16"' in seg and '"f16"' not in seg.split("NOT --outtype")[-1].split('"""')[0], (
+        "the projector is downcast to f16, which loses the vision pathway's precision")
+    assert "pollard_modelkind" in seg, "it exports blindly instead of asking what the model is"
+
+
 def test_a_declared_modality_needs_weights_to_back_it():
     """gemma-4-12B-it carries vision_config, audio_config, video_token_id and the projection
     layers -- and none of the encoder towers. The checkpoint is 666 language-model tensors, one
@@ -1847,7 +1865,7 @@ def test_a_declared_modality_needs_weights_to_back_it():
         encoding="utf-8")
     # config declares them; with no weights present at all the claim cannot be checked, so the
     # config is taken at face value (the honest fallback for a repo id or a partial checkout)
-    assert K._encoder_tensor_counts(d) is None
+    assert K._modality_evidence(d) == (None, None)
     # and a projection-only checkpoint must NOT count as an encoder
     counts = {"image": 0, "audio": 0, "video": 0}
     assert all(v < 2 for v in counts.values()), "an encoder tower means repeated blocks"
