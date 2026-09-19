@@ -25,7 +25,7 @@ Data-driven from the workspace manifest + the base model's config -- never hand-
 `--results` (optional) supplies per-file PPL / Mean-KLD / eval string so the files table carries real
 numbers; without it those columns show "--". `--builds-from` reads builds recorded under a different
 manifest key (e.g. the f16 GGUF path). Sizes/bpw come from the manifest."""
-import argparse
+import argparse, glob
 import json
 import os
 import re
@@ -260,6 +260,77 @@ def human_gb(nbytes):
     return f"{nbytes/1e9:.2f} GB" if nbytes else "--"
 
 
+
+def detect_card_facts(model_id, builds_dir, cfg, builds=()):
+    """Input support, imatrix and parameter count -- read off what was actually built.
+
+    These were flags a person had to remember. Forgetting one puts a wrong fact on a published
+    card: gemma-4-12B-it went out reading "Input support: text" while its 175MB projector sat in
+    the same folder, and "imatrix: no" for a build an imatrix produced. What shipped is knowable
+    from the model and the build directory, so read it."""
+    facts = {"input": None, "imatrix": None, "params_b": None}
+    # classify needs something on disk. A repo id reads nothing, so fall back to a built GGUF
+    # (which carries the chat template) or the pulled source in the workspace.
+    probe = model_id if os.path.isdir(str(model_id)) else None
+    if not probe:
+        probe = next((b["path"] for b in builds
+                      if isinstance(b, dict) and str(b.get("path", "")).endswith(".gguf")
+                      and os.path.isfile(b["path"])), None)
+    if not probe:
+        home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+        cand = os.path.join(home, "downloads", str(model_id).replace("/", "__"))
+        probe = cand if os.path.isdir(cand) else model_id
+    try:
+        from pollard_modelkind import classify
+        k = classify(probe)
+        mods = [m for m in k.get("modalities", []) if m != "speech_out"]
+        # A modality only ships if the projector that carries it ships too.
+        # The text GGUF carries no modality signals by construction -- the projector does, and it
+        # says so itself (clip.has_vision_encoder / clip.has_audio_encoder). Ask the file that
+        # actually ships the capability rather than the one that cannot.
+        mm = glob.glob(os.path.join(builds_dir, "*mmproj*.gguf")) if builds_dir else []
+        shipped = []
+        if mm:
+            try:
+                from pollard_calc import read_gguf_meta
+                meta = read_gguf_meta(mm[0])
+                if meta.get("clip.has_vision_encoder"):
+                    shipped.append("image")
+                if meta.get("clip.has_audio_encoder"):
+                    shipped.append("audio")
+            except Exception:
+                shipped = mods
+        facts["input"] = ", ".join(["text"] + shipped)
+        if mods and not shipped:
+            facts["input"] += ("   (the source also does " + "/".join(mods) +
+                               " -- build the projector with --mmproj to ship it)")
+    except Exception:
+        pass
+    # Parameter count: the config may be unreachable for a gated/renamed repo, but a built GGUF
+    # records what it holds, so a card need never print "--" for a model we actually built.
+    try:
+        from pollard_calc import read_gguf_meta, gguf_to_config, analyse
+        g = next((b["path"] for b in builds
+                  if isinstance(b, dict) and str(b.get("path", "")).endswith(".gguf")
+                  and os.path.isfile(b["path"])), None)
+        if g:
+            tot = read_gguf_meta(g).get("_tensor_param_sum")
+            if tot:
+                facts["params_b"] = float(tot) / 1e9
+    except Exception:
+        pass
+    if builds_dir:
+        home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+        # the imatrix is written beside the SOURCE gguf, which is a sibling tree of the builds
+        im = []
+        for d in (builds_dir, os.path.dirname(builds_dir.rstrip("/\\")),
+                  os.path.join(home, "downloads")):
+            for pat in ("*.imatrix", "*.dat"):
+                im += glob.glob(os.path.join(d, pat))
+        facts["imatrix"] = im[0] if im else None
+    return facts
+
+
 def parse_params_b(params, cfg):
     if params:
         s = str(params).upper().replace("B", "").strip()
@@ -452,10 +523,18 @@ def main():
     # ---- Model details: the at-a-glance table every good Pollard card opens with
     arch = a.arch or mtype or "--"
     out += ["## Model details", "", "| | |", "|---|---|"]
+    # Detected from the model and the build directory; an explicit flag still wins.
+    # the directory the builds actually live in, from the manifest entries themselves
+    bdir = next((os.path.dirname(b["path"]) for b in builds
+                 if isinstance(b, dict) and b.get("path") and os.path.dirname(b["path"])), None)
+    facts = detect_card_facts(a.model, bdir, cfg, builds)
+    inp = a.input_support if a.input_support and a.input_support != "text" else (facts["input"] or a.input_support)
+    imat = a.imatrix_file or facts["imatrix"]
+    pb = pb or facts.get("params_b")
     out.append(f"| Parameter count | ~{pb:.1f}B |" if pb else "| Parameter count | -- |")
     out.append(f"| Architecture | `{arch}` |")
-    out.append(f"| Input support | {a.input_support} |")
-    out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if a.imatrix_file else 'no'} |")
+    out.append(f"| Input support | {inp} |")
+    out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if imat else 'no'} |")
     out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
     out.append("")
 

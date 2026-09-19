@@ -1835,6 +1835,25 @@ def test_one_shot_serializes_and_finishes_the_job():
 
 
 
+
+def test_card_detects_its_facts_instead_of_being_told_them():
+    """Input support, imatrix and parameter count were flags a person had to remember, and
+    forgetting one puts a wrong fact on a published card: gemma-4-12B-it generated as
+    'Input support: text' with its 175MB projector sitting in the same folder, and 'imatrix: no'
+    for a build an imatrix produced. Each is knowable from what was actually built."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_card.py").read_text(
+        encoding="utf-8")
+    assert "def detect_card_facts" in src, "the card still relies on flags alone"
+    seg = src.split("def detect_card_facts", 1)[1].split("\ndef ", 1)[0]
+    # the text GGUF cannot know about modalities -- the projector declares them
+    assert "clip.has_vision_encoder" in seg and "clip.has_audio_encoder" in seg, (
+        "input support is not read from the projector that actually ships the capability")
+    assert "_tensor_param_sum" in seg, "parameter count is not read from the build"
+    assert ".imatrix" in seg and ".dat" in seg, "the imatrix is not looked for"
+    # a modality is only claimed when the projector that carries it ships
+    assert "shipped" in seg, "a modality could be claimed without the projector"
+
+
 def test_multimodal_builds_ship_their_projector_at_full_precision():
     """A text GGUF is only the language half of a multimodal model, and the weights for the rest are
     in the source. Gemma 4 is ENCODER-FREE -- Google replaced a 550M vision encoder with one large
