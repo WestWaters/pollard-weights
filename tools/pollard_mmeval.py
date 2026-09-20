@@ -149,16 +149,36 @@ def find_mtmd(explicit=None):
 
 
 def ask(cli, model, mmproj, image, prompt, ngl, timeout=300):
-    """One image + one question -> the model's reply, or None if it produced nothing."""
-    cmd = [cli, "-m", model, "--mmproj", mmproj, "--image", image,
-           "-p", prompt, "-ngl", str(ngl), "-n", "48", "--temp", "0"]
+    """One image + one question -> the model's reply, or None if it produced nothing.
+
+    --jinja is tried FIRST. Gemma4's chat template is one llama.cpp's built-in parser refuses --
+    it aborts with `std::runtime_error: this custom template is not supported, try using --jinja`
+    before generating a single token. Without this the tool reports <no output> on every probe,
+    which reads exactly like a model that has gone blind. It is worth being loud about: a harness
+    bug that mimics the failure it is looking for is the worst kind, and this one would have had us
+    "discover" that a published rung could not see.
+    """
     kw = {}
     if os.name == "nt":                                    # keep console events off the child
         kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **kw)
-    except subprocess.TimeoutExpired:
+    base = [cli, "-m", model, "--mmproj", mmproj, "--image", image,
+            # 220, not 48: a reasoning-tuned model spends its first hundred-odd tokens inside a
+            # thinking block, so a short budget cuts it off before the answer and scores a MISS on
+            # a model that was about to be right. pollard-bench's gate learned this the same way.
+            "-p", prompt, "-ngl", str(ngl), "-n", "220", "--temp", "0"]
+    r = None
+    for extra in (["--jinja"], []):                        # builds without --jinja fall through
+        try:
+            r = subprocess.run(base + extra, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **kw)
+        except subprocess.TimeoutExpired:
+            return None
+        blob = (r.stdout or "") + (r.stderr or "")
+        if "unrecognized argument" not in blob and "invalid argument" not in blob:
+            if "not supported, try using --jinja" in blob:
+                continue                                   # this build needs it and did not get it
+            break
+    if r is None:
         return None
     text = (r.stdout or "")
     # mtmd-cli echoes the prompt and prints timings; keep what follows the prompt, drop the log tail
