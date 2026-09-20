@@ -70,6 +70,75 @@ def _env_threads():
         return None
 
 
+# Keys and values do not want the same precision. Their outlier structure differs -- published
+# work quantizes keys channel-wise and values token-wise for exactly this reason -- so the
+# asymmetric rows below are not filler: q8/q4 is usually the row that wins, and it is the one a
+# symmetric sweep never tries.
+KV_SWEEP = [
+    ("f16",   "f16",   "baseline -- what the ladder's numbers were measured at"),
+    ("q8_0",  "q8_0",  "halves the cache; the safe first step"),
+    ("q8_0",  "q4_0",  "keys high, values low -- values tolerate it better"),
+    ("q4_0",  "q4_0",  "quarter cache; check this one before trusting it"),
+    ("q4_0",  "q8_0",  "the inverse, included to show it is the worse half"),
+]
+
+
+def kv_sweep(ppl_bin, model, eval_f, ngl, chunks, ctx, rows=None):
+    """What each KV precision actually costs on THIS model.
+
+    pollard-calc can already tell you a quantized cache halves your memory. Nothing measured what
+    it costs in quality, and at long context the cache -- not the weights -- is what fills the
+    machine, so the trade is usually made blind. The damage also lands hardest where it is least
+    visible: extended-context retention and long-horizon agentic work, neither of which a short
+    perplexity run exercises.
+    """
+    out, base = [], None
+    for k, v, note in (rows or KV_SWEEP):
+        cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", str(ctx), "-ngl", str(ngl),
+               "-ctk", k, "-ctv", v] + _t()
+        if chunks:
+            cmd += ["--chunks", str(chunks)]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        blob = r.stdout + r.stderr
+        m = re.search(r"Final estimate: PPL = ([0-9.]+)", blob)
+        if not m:
+            out.append({"k": k, "v": v, "ppl": None, "note": note,
+                        "error": "no PPL in the output (unsupported cache type for this build?)"})
+            continue
+        ppl = float(m.group(1))
+        if base is None:
+            base = ppl
+        out.append({"k": k, "v": v, "ppl": ppl, "note": note,
+                    "delta": round(ppl - base, 4),
+                    "pct": round((ppl - base) / base * 100, 2) if base else 0.0,
+                    # bytes per element per KV entry, relative to f16
+                    "cache_frac": round({"f16": 1.0, "q8_0": 0.5, "q4_0": 0.28}.get(k, 1.0) / 2
+                                        + {"f16": 1.0, "q8_0": 0.5, "q4_0": 0.28}.get(v, 1.0) / 2, 3)})
+    return out
+
+
+def print_kv_sweep(rows, ctx):
+    print(f"\n=== KV cache sweep ===   context {ctx}")
+    print(f"{'K':>6} {'V':>6} {'PPL':>9} {'delta':>8} {'%':>7} {'cache':>7}   note")
+    for r in rows:
+        if r.get("ppl") is None:
+            print(f"{r['k']:>6} {r['v']:>6} {'--':>9} {'':>8} {'':>7} {'':>7}   {r['error']}")
+            continue
+        print(f"{r['k']:>6} {r['v']:>6} {r['ppl']:9.4f} {r.get('delta', 0):+8.4f} "
+              f"{r.get('pct', 0):+6.2f}% {r.get('cache_frac', 1):6.2f}x   {r['note']}")
+    ok = [r for r in rows if r.get("ppl") is not None and r.get("pct") is not None]
+    cheap = [r for r in ok if abs(r["pct"]) < 1.0 and r["cache_frac"] < 0.9]
+    if cheap:
+        best = min(cheap, key=lambda r: r["cache_frac"])
+        print(f"\n  cheapest cache under 1% PPL cost: -ctk {best['k']} -ctv {best['v']}  "
+              f"({best['cache_frac']:.2f}x the f16 cache, {best['pct']:+.2f}% PPL)")
+    else:
+        print("\n  nothing below 1% PPL cost -- keep the cache at f16 on this model.")
+    print("  NOTE: perplexity on short chunks is the LEAST sensitive way to see KV damage. "
+          "Confirm at your real context length before trusting a quantized cache.")
+
+
 def detect_loop(text, min_chars=80):
     """Pure heuristic loop detector. Returns (is_loop, metric, reason). Two stdlib signals:
       - zlib compression ratio: degenerate repetition (word- OR char-level: 'as big as the ...',
@@ -501,6 +570,12 @@ def main():
     ap.add_argument("--out", help="write a results.json (feeds pollard-scorecard)")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
     ap.add_argument("--llama-cli", default="llama-cli", help="generation binary for the coherence gate")
+    ap.add_argument("--kv-sweep", action="store_true",
+                    help="measure what each KV cache precision costs on this model. calc can "
+                         "already size a quantized cache; this says what it costs in quality.")
+    ap.add_argument("--kv-ctx", type=int, default=4096,
+                    help="context length for --kv-sweep. The cache is what fills memory at long "
+                         "context, so measure near where you will actually run.")
     ap.add_argument("--threads", type=int, default=_env_threads(),
                     help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--coherence", action="store_true",
@@ -523,6 +598,21 @@ def main():
     # measurement you asked for without saying so, so the verdict is held and the exit happens after
     # every requested measurement has run.
     gate_passed = None
+    # --- KV cache sweep (standalone: needs the perplexity binary and an eval corpus) ---
+    if a.kv_sweep:
+        if not (a.gguf and a.eval):
+            sys.exit("--kv-sweep needs --gguf and --eval (the corpus to measure on).")
+        ppl_bin = find_llama_bin(a.llama_perplexity)
+        if ppl_bin is None:
+            sys.exit(f"ERROR: {a.llama_perplexity} not found.")
+        rows = kv_sweep(ppl_bin, a.gguf, a.eval, a.ngl, a.chunks, a.kv_ctx)
+        print_kv_sweep(rows, a.kv_ctx)
+        if a.out:
+            json.dump({"kv_sweep": rows, "ctx": a.kv_ctx}, open(a.out, "w"), indent=2)
+            print(f"wrote {a.out}")
+        if not a.coherence:
+            return
+
     if a.coherence or a.quick:
         if not os.path.exists(a.gguf):
             sys.exit(f"file not found: {a.gguf}")
