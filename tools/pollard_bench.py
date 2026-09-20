@@ -433,7 +433,16 @@ def main():
         # the reference, so one file serves every rung. Naming it per-model wrote a full copy
         # each time -- 76GB apiece for a 152k vocab -- and filled the disk, after which the
         # remaining rungs silently reported "--".
-        base = os.path.splitext(a.ref)[0] + ".klbase.dat"
+        # ...and written into the WORKSPACE cache, not beside the reference. Every Pollard artifact
+        # belongs under POLLARD_HOME; dropping a 30GB intermediate next to whatever file happened to
+        # be passed as --ref scatters them across downloads/, source trees and working directories,
+        # so nobody can find them, account for the space, or clean them up.
+        try:
+            import pollard_workspace as _ws
+            base = os.path.join(_ws.cache_dir(create=True),
+                                os.path.splitext(os.path.basename(a.ref))[0] + ".klbase.dat")
+        except Exception:                                   # no workspace: keep the old behaviour
+            base = os.path.splitext(a.ref)[0] + ".klbase.dat"
         if os.path.exists(base) and os.path.getsize(base) > 0:
             print(f"[1] reusing KL base {os.path.basename(base)} "
                   f"({os.path.getsize(base)/1e9:.1f} GB)")
