@@ -20,7 +20,7 @@ is the base to stack rotation + Pollard allocation on top of.
 Usage:
   pollard-gptq --model hf_qwen05 --bits 4 --groupsize 128 --nsamples 128
 """
-import argparse, sys, time
+import argparse, json, os, sys, time
 import torch, torch.nn as nn
 
 
@@ -341,9 +341,21 @@ def linear_layers(module):
     return {n: m for n, m in module.named_modules() if isinstance(m, nn.Linear)}
 
 
+def _ckpt_fingerprint(bits, groupsize, act_order, qmode, recipe, n_calib, n_layers):
+    """What a checkpoint is only valid for.
+
+    Resuming a 4-bit run into a 2-bit one would silently produce a model that is half each, and
+    nothing downstream would notice -- the file loads, the perplexity is merely bad. So the
+    fingerprint covers everything that changes the arithmetic.
+    """
+    import hashlib
+    key = f"{bits}|{groupsize}|{act_order}|{qmode}|{bool(recipe)}|{n_calib}|{n_layers}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 @torch.no_grad()
 def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False, qmode="int",
-                    recipe=None, nlayers=None):
+                    recipe=None, nlayers=None, work_dir=None, resume=False):
     """The PROPER GPTQ: process transformer blocks in order, feeding each block's
     QUANTIZED outputs into the next block's Hessian -- so every layer compensates for
     the error earlier layers actually introduced. Recovers far more of RTN's loss
@@ -388,7 +400,33 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
         if dev == "mps": torch.mps.empty_cache()
         elif dev == "cuda": torch.cuda.empty_cache()
 
+    # --- resume -------------------------------------------------------------------------------
+    # The activations matter more than the weights here. `inps` is the calibration set propagated
+    # through every block quantized so far, so recomputing it means redoing the whole run; the
+    # weights alone would restore the model but not the place in the sequence.
+    start = 0
+    fp = _ckpt_fingerprint(bits, groupsize, act_order, qmode, recipe, len(calib), len(layers))
+    prog = os.path.join(work_dir, "progress.json") if work_dir else None
+    if work_dir:
+        os.makedirs(work_dir, exist_ok=True)
+    if resume and prog and os.path.exists(prog):
+        with open(prog, encoding="utf-8") as fh:
+            st = json.load(fh)
+        if st.get("fingerprint") != fp:
+            sys.exit(f"ERROR: the checkpoint in {work_dir} was written for a different run "
+                     f"(bits/groupsize/act-order/qmode/calibration size must match). Delete it "
+                     f"or point --work-dir somewhere else -- resuming across settings would "
+                     f"produce a model that is half one and half the other.")
+        start = int(st.get("next_block", 0))
+        for j in range(start):
+            layers[j].load_state_dict(torch.load(os.path.join(work_dir, f"blk{j}.pt"),
+                                                 map_location="cpu"))
+        inps = [t for t in torch.load(os.path.join(work_dir, "inps.pt"), map_location="cpu")]
+        print(f"   resuming at block {start}/{len(layers)} from {work_dir}")
+
     for i, layer in enumerate(layers):
+        if i < start:
+            continue
         if offload: layer.to(dev)                                     # one block on the GPU
         lins = {n: m for n, m in layer.named_modules() if isinstance(m, nn.Linear)}
         H = {n: torch.zeros(m.in_features, m.in_features, device=dev) for n, m in lins.items()}
@@ -419,6 +457,16 @@ def sequential_gptq(model, calib, dev, bits, groupsize, act_order, offload=False
             inps = [fwd(layer, inp.to(dev)).cpu() for inp in inps]
         if offload: layer.to("cpu")                                   # evict the block
         empty()
+        if work_dir:
+            # written AFTER the block is fully done and its outputs propagated, so a checkpoint
+            # never describes a half-quantized block
+            torch.save(layer.state_dict(), os.path.join(work_dir, f"blk{i}.pt"))
+            torch.save([t.half() for t in inps], os.path.join(work_dir, "inps.pt"))
+            tmp = prog + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"fingerprint": fp, "next_block": i + 1,
+                           "total_blocks": len(layers)}, fh)
+            os.replace(tmp, prog)        # atomic: a torn progress file would resume nowhere
     return model
 
 
@@ -442,6 +490,11 @@ def main():
                     help="protect-set ablation: drop ONE protect class to the body atom")
     ap.add_argument("--head-bits", type=int, default=0, help="quantize lm_head to N bits (0=leave fp16). Head/embed sweep.")
     ap.add_argument("--embed-bits", type=int, default=0, help="quantize token embeddings to N bits (0=leave fp16).")
+    ap.add_argument("--work-dir", help="checkpoint each finished block here, so a run that dies "
+                                      "at 90%% resumes instead of starting over")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from --work-dir. Refuses if the settings differ from the run "
+                         "that wrote it.")
     ap.add_argument("--threads", type=int, default=None,
                     help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--device", default="mps")
@@ -502,7 +555,8 @@ def main():
             rec = make_recipe("aggr" if a.recipe == "aggr" else "handmix", a.ablate) if a.recipe != "none" else None
             sequential_gptq(model, calib, dev, a.bits, a.groupsize,
                             act_order=method.endswith("-ao"), offload=a.offload, qmode=a.qmode,
-                            recipe=rec, nlayers=len(text_layers(model)))
+                            recipe=rec, nlayers=len(text_layers(model)),
+                            work_dir=a.work_dir, resume=a.resume)
         elif method in ("gptq", "gptq-ao"):
             Hs = collect_hessians(lins)                       # {n: (Hessian, token count)}
             ao = (method == "gptq-ao")
