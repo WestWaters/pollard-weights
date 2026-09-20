@@ -53,6 +53,23 @@ SAMPLING_CONFIGS = [
 ]
 
 
+THREADS = None          # set once from --threads in main(); the subprocess builders read it
+
+
+def _t():
+    """`-t N` for the llama.cpp binaries, or nothing when the user has not asked."""
+    return ["-t", str(THREADS)] if THREADS else []
+
+
+def _env_threads():
+    """POLLARD_THREADS, so a shared box can be configured once instead of per-command."""
+    try:
+        v = int(os.environ.get("POLLARD_THREADS", "") or 0)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
 def detect_loop(text, min_chars=80):
     """Pure heuristic loop detector. Returns (is_loop, metric, reason). Two stdlib signals:
       - zlib compression ratio: degenerate repetition (word- OR char-level: 'as big as the ...',
@@ -171,6 +188,7 @@ def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=220):
     # thinking block, so a short budget cuts it off mid-thought and the known-answer check
     # fails a build that was about to answer correctly.
     cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-c", "2048", "-n", str(n_predict), "-p", prompt]
+           + _t()
            + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else [])
            + sampling)
     # On Windows, put the child in its own process group so console control events (Ctrl+C /
@@ -327,7 +345,7 @@ def _size_gb(p):
 
 def _ppl_kl(ppl_bin, model, eval_f, base, ngl, chunks=0):
     """Run llama-perplexity and parse PPL (+ Mean/Median KLD + top-1 when a base is given)."""
-    cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", "2048", "-ngl", str(ngl)]
+    cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", "2048", "-ngl", str(ngl)] + _t()
     if chunks:
         cmd += ["--chunks", str(chunks)]
     if base:
@@ -392,7 +410,7 @@ def measure_speed(cli_bin, model, ngl, n_predict=128,
     loading ("Loading model... ^C") and silently produces nothing.
 
     Speed is hardware-specific, so whatever consumes this has to name the machine beside it."""
-    cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-n", str(n_predict),
+    cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-n", str(n_predict)] + _t() + [
             "--no-warmup", "-p", prompt]
            + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else []))
     kw = {}
@@ -483,6 +501,8 @@ def main():
     ap.add_argument("--out", help="write a results.json (feeds pollard-scorecard)")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
     ap.add_argument("--llama-cli", default="llama-cli", help="generation binary for the coherence gate")
+    ap.add_argument("--threads", type=int, default=_env_threads(),
+                    help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--coherence", action="store_true",
                     help="run the COHERENCE GATE: generate over fixed prompts, detect loops, sweep "
                          "sampling, and report PASS (+the sampling to ship) or BELOW-FLOOR (bump a tier). "
@@ -494,6 +514,8 @@ def main():
     ap.add_argument("--quick", action="store_true",
                     help="with --coherence: fast one-prompt / default-sampling sanity instead of the full sweep.")
     a = ap.parse_args()
+    global THREADS
+    THREADS = a.threads
 
     # --- coherence gate (can run standalone: no perplexity bin / eval corpus required) ---
     # The gate used to exit here as soon as it had a verdict, which silently swallowed --speed: ask

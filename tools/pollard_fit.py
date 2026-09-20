@@ -182,6 +182,15 @@ def _is_kquant(t: str) -> bool:
     return any(t.lower().startswith(p.lower()) for p in _KQUANT_PREFIXES)
 
 
+def _env_threads():
+    """POLLARD_THREADS, so a shared box can be configured once instead of per-command."""
+    try:
+        v = int(os.environ.get("POLLARD_THREADS", "") or 0)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
 def block_safe_type(t: str, row_len: int, fallback: str = "q8_0") -> str:
     """The requested type if this row length can hold it, else one that can.
 
@@ -373,6 +382,8 @@ def main():
                     help="GB reserved for activations/KV (default 3)")
     ap.add_argument("--llama-quantize", default="llama-quantize",
                     help="path to llama.cpp's llama-quantize binary")
+    ap.add_argument("--threads", type=int, default=_env_threads(),
+                    help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--plan-only", action="store_true",
                     help="print the allocation and the command, build nothing")
     ap.add_argument("--allow-grow", action="store_true",
@@ -558,6 +569,8 @@ def main():
     cmd += ["--token-embedding-type", emb_type, "--output-tensor-type", emb_type,
             "--tensor-type-file", tt_file,
             a.gguf, out, base_preset]   # base preset DERIVED from the plan
+    if a.threads:
+        cmd += [str(a.threads)]          # llama-quantize takes nthreads as a trailing positional
     print()
     if a.plan_only:
         print(f"plan only -- {len(ov_lines)} tensor overrides; command that would run:")

@@ -442,11 +442,15 @@ def main():
                     help="protect-set ablation: drop ONE protect class to the body atom")
     ap.add_argument("--head-bits", type=int, default=0, help="quantize lm_head to N bits (0=leave fp16). Head/embed sweep.")
     ap.add_argument("--embed-bits", type=int, default=0, help="quantize token embeddings to N bits (0=leave fp16).")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--offload", action="store_true",
                     help="keep the model on CPU and move ONE block to the GPU at a time -- "
                     "required to quantize a model bigger than VRAM (e.g. a 7B on 16 GB)")
     a = ap.parse_args()
+    if a.threads:
+        torch.set_num_threads(a.threads)   # otherwise torch takes every core
 
     from transformers import AutoTokenizer
     dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
