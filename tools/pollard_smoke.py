@@ -33,6 +33,27 @@ QK_K = 256                      # K-quant block: a row not divisible by this can
 # ---- synthetic shapes ---------------------------------------------------------------------------
 # Module trees, not checkpoints: the walking/allocation bugs are structural, so a stand-in exercises
 # the same code for a few bytes instead of a few gigabytes.
+def text_layers(model):
+    """This tool's OWN layer walk. A VL model keeps its text stack under `model.language_model`."""
+    for path in ("model.language_model", "language_model.model", "model"):
+        node = model
+        for part in path.split("."):
+            node = getattr(node, part, None)
+            if node is None:
+                break
+        layers = getattr(node, "layers", None) if node is not None else None
+        if layers is not None:
+            return layers
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        return layers
+    raise SystemExit(f"could not find the decoder layers on {type(model).__name__}; "
+                     "this tool's text_layers() needs a path for this architecture")
+
+
+_text_layers = text_layers    # this tool's local alias
+
+
 class _Node:
     """Stands in for an nn.Module for the tools that only walk attributes."""
     def __init__(self, **kw):
@@ -90,7 +111,6 @@ def check_layer_access(shape_name, model):
     # the converter check is its most useful mode and needs none. Module-qualified on purpose, so
     # the shared-loader guard keeps its exact meaning and needs no exception for this file.
     from pollard_probe import _linears
-    from pollard_load import text_layers as _text_layers
     layers = _text_layers(model)
     if not layers:
         return False, "text_layers() found no decoder layers"

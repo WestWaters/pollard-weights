@@ -148,7 +148,9 @@ def main():
     ap.add_argument("--ctx", type=int, default=512)
     a = ap.parse_args()
 
-    from pollard_load import load_backbone, text_layers
+    # An experiment borrows a tool's loader rather than owning one; pollard_probe is the tool this
+    # experiment is about. There is no shared loader module -- each tool carries its own.
+    from pollard_probe import load_backbone, text_layers
     from transformers import AutoTokenizer
     from datasets import load_dataset
 

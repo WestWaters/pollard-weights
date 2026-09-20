@@ -1434,10 +1434,12 @@ def test_backbone_loader_accepts_a_vision_language_model():
         print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
         return
     import pollard_flybrain as F
-    import pollard_load as L
 
-    assert hasattr(F, "load_backbone") and hasattr(L, "load_backbone")
-    src = pathlib.Path(L.__file__).read_text(encoding="utf-8")
+    # The brain lane's OWN loader. There is no shared loader module any more: it came out of the
+    # brain work, got threaded through eleven model tools, and that coupling is exactly what made
+    # every model-tool edit a question about the brains.
+    assert hasattr(F, "load_backbone")
+    src = pathlib.Path(F.__file__).read_text(encoding="utf-8")
     for cls in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
         assert cls in src, f"no fallback to {cls}: a VL model would be unreachable"
     assert "model.language_model" in src, "the VL text-stack path was dropped"

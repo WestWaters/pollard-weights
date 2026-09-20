@@ -36,6 +36,60 @@ if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == 
 import torch, torch.nn.functional as F
 
 
+def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
+    """This tool's OWN loader -- model tooling does not depend on a shared/brain-side one.
+
+    AutoModelForCausalLM refuses a vision-language config outright ("Unrecognized configuration
+    class Qwen2VLConfig for this kind of AutoModel"), so fall back to the vision-language auto
+    classes: a VL model's text stack quantizes like any other. Both failures are reported if
+    neither works, not just the last one.
+
+    Pass `device_map=` to shard across GPU+CPU+disk; accelerate owns placement after that, so
+    `device` is ignored in that case.
+    """
+    import torch as _t, transformers as _tf
+    from transformers import AutoModelForCausalLM
+    if dtype is None:
+        dtype = _t.float32
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
+    except ValueError as text_only_err:
+        model, errs = None, [f"AutoModelForCausalLM: {text_only_err}"]
+        for _n in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+            _c = getattr(_tf, _n, None)
+            if _c is None:
+                continue
+            try:
+                model = _c.from_pretrained(model_id, dtype=dtype, **kw)
+                break
+            except Exception as e:
+                errs.append(f"{_n}: {e}")
+        if model is None:
+            raise SystemExit(f"could not load {model_id!r} as a causal LM or a vision-language "
+                             "model:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
+    if kw.get("device_map") is None:            # accelerate already placed a dispatched model
+        model = model.to(device)
+    return model.eval() if eval_mode else model
+
+
+def text_layers(model):
+    """This tool's OWN layer walk. A VL model keeps its text stack under `model.language_model`."""
+    for path in ("model.language_model", "language_model.model", "model"):
+        node = model
+        for part in path.split("."):
+            node = getattr(node, part, None)
+            if node is None:
+                break
+        layers = getattr(node, "layers", None) if node is not None else None
+        if layers is not None:
+            return layers
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        return layers
+    raise SystemExit(f"could not find the decoder layers on {type(model).__name__}; "
+                     "this tool's text_layers() needs a path for this architecture")
+
+
 def _weights_bytes(model_id):
     """On-disk weight bytes, so we can tell BEFORE loading whether this fits. 0 = unknown (hub id)."""
     tot = 0
@@ -381,7 +435,6 @@ def _linears(model, layer, group):
     Taking those at face value put a None in the hook list and killed the probe with
     'NoneType has no attribute register_forward_hook' -- after loading 12B of weights. A layer with
     none of a group is legitimate; it simply contributes nothing to that group's cost."""
-    from pollard_load import load_backbone, text_layers
     parent, names = GROUP_ATTR[group]
     mod = getattr(text_layers(model)[layer], parent, None)
     if mod is None:
@@ -520,7 +573,6 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
 
 
 def main():
-    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     # Neither is needed by --from-imatrix (it reads the GGUF and the imatrix, nothing else), so

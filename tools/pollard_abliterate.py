@@ -39,6 +39,60 @@ _SMOKE_B = ["Describe a calm meadow at noon.", "Explain how a kite flies.",
             "Summarize the plot of a comedy.", "Write a limerick about the sun."]
 
 
+def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
+    """This tool's OWN loader -- model tooling does not depend on a shared/brain-side one.
+
+    AutoModelForCausalLM refuses a vision-language config outright ("Unrecognized configuration
+    class Qwen2VLConfig for this kind of AutoModel"), so fall back to the vision-language auto
+    classes: a VL model's text stack quantizes like any other. Both failures are reported if
+    neither works, not just the last one.
+
+    Pass `device_map=` to shard across GPU+CPU+disk; accelerate owns placement after that, so
+    `device` is ignored in that case.
+    """
+    import torch as _t, transformers as _tf
+    from transformers import AutoModelForCausalLM
+    if dtype is None:
+        dtype = _t.float32
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
+    except ValueError as text_only_err:
+        model, errs = None, [f"AutoModelForCausalLM: {text_only_err}"]
+        for _n in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+            _c = getattr(_tf, _n, None)
+            if _c is None:
+                continue
+            try:
+                model = _c.from_pretrained(model_id, dtype=dtype, **kw)
+                break
+            except Exception as e:
+                errs.append(f"{_n}: {e}")
+        if model is None:
+            raise SystemExit(f"could not load {model_id!r} as a causal LM or a vision-language "
+                             "model:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
+    if kw.get("device_map") is None:            # accelerate already placed a dispatched model
+        model = model.to(device)
+    return model.eval() if eval_mode else model
+
+
+def text_layers(model):
+    """This tool's OWN layer walk. A VL model keeps its text stack under `model.language_model`."""
+    for path in ("model.language_model", "language_model.model", "model"):
+        node = model
+        for part in path.split("."):
+            node = getattr(node, part, None)
+            if node is None:
+                break
+        layers = getattr(node, "layers", None) if node is not None else None
+        if layers is not None:
+            return layers
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        return layers
+    raise SystemExit(f"could not find the decoder layers on {type(model).__name__}; "
+                     "this tool's text_layers() needs a path for this architecture")
+
+
 def _load_lines(path):
     with open(path, encoding="utf-8") as f:
         return [ln.strip() for ln in f if ln.strip()]
@@ -109,7 +163,6 @@ def abliterate(model, r_hat, dev, strength=-1.0):
     o_proj/down_proj write columns into the stream (out-dim = D): W += a * r r^T W.
     embed_tokens rows ARE stream vectors (dim 1 = D):             W += a * (W r) r^T.
     """
-    from pollard_load import load_backbone, text_layers
     r = r_hat.to(dev).float()
     a = float(strength)
     edited = 0
@@ -126,7 +179,6 @@ def abliterate(model, r_hat, dev, strength=-1.0):
 
 
 def main():
-    from pollard_load import load_backbone, text_layers
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", required=True, help="HF model dir or id (FP16/BF16)")
