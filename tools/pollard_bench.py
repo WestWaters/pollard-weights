@@ -75,6 +75,59 @@ def detect_loop(text, min_chars=80):
     return False, round(comp, 3), "coherent"
 
 
+OPENERS = {"<think>": "</think>", "<reasoning>": "</reasoning>",
+           "<scratchpad>": "</scratchpad>", "<answer>": "</answer>"}
+ANSWER_RE = re.compile(r"(?:\\boxed\{|final answer|the answer is|therefore,?\s|answer:|"
+                       r"^\s*(?:so|thus)\b)", re.I | re.M)
+
+
+def detect_process_failures(text, budget=None, emitted=None):
+    """The ways a low-bit build fails that are NOT a phrase loop.
+
+    detect_loop above catches degenerate repetition. Below about three bits three more failures
+    show up, and each inflates token count while leaving the text locally coherent enough that
+    compression ratio and distinct-word ratio both look fine:
+
+      budget-exhaustion   generation never halts; it stops because it hit the cap
+      delayed-commitment  an answer exists, but only after most of the budget is spent
+      unclosed-segment    a reasoning block or code fence opened and never closed
+
+    They matter because the token saving from smaller weights is given straight back when a trace
+    balloons -- a 2-bit build that needs four times the tokens is not faster, whatever its
+    per-token cost. Returns a list of (name, detail); empty means none of these fired.
+    """
+    t = (text or "").strip()
+    out = []
+    if not t:
+        return out
+
+    words = re.findall(r"\S+", t)
+    # Hit the cap rather than choosing to stop. `emitted` is authoritative when the runtime
+    # reports it; the word count is a fallback and is deliberately conservative. Both the
+    # exhaustion check and the no-answer check below read the SAME number -- using the word count
+    # for one and the token count for the other reports a build that ran to the cap as having
+    # simply not answered yet.
+    used = emitted if emitted is not None else len(words)
+    exhausted = bool(budget and used >= budget * 0.98)
+    if exhausted:
+        out.append(("budget-exhaustion",
+                    f"stopped at the {budget}-token cap rather than finishing"))
+
+    unclosed = [tag for tag, close in OPENERS.items() if t.count(tag) > t.count(close)]
+    if t.count("```") % 2:
+        unclosed.append("```")
+    if unclosed:
+        out.append(("unclosed-segment", "never closed: " + ", ".join(unclosed)))
+
+    m = ANSWER_RE.search(t)
+    if m and len(t) > 200 and m.start() / len(t) > 0.85:
+        out.append(("delayed-commitment",
+                    f"first commits to an answer {m.start() / len(t):.0%} of the way through"))
+    elif not m and exhausted:
+        out.append(("no-answer", "ran to the cap without ever committing to an answer"))
+    return out
+
+
 # A distinct sentinel for "the model produced nothing". It must never be confused with a short but
 # valid generation: empty text reads as "too short to judge", which the gate treats as not-a-loop,
 # which would PASS a build that never spoke. A silent false pass is worse than a visible hang.
@@ -178,10 +231,17 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
             knows = any(e.lower() in gen.lower() for e in expect)
             if not is_loop and not knows:
                 reason = f"INCOHERENT (no {'/'.join(expect[:3])} in the continuation)"
+            # Loops are not the only way a low-bit build fails. A trace that never halts, commits
+            # only at the very end, or leaves a reasoning block open stays locally coherent --
+            # compression ratio and distinct-word ratio both look fine -- while the token count
+            # balloons and gives back the saving the smaller weights bought.
+            proc = detect_process_failures(gen, budget=budget)
+            if proc:
+                reason += "  [" + "; ".join(f"{n}: {d}" for n, d in proc) + "]"
             rows.append({"prompt": p.splitlines()[0][:48], "loop": is_loop or not knows,
-                         "reason": reason,
+                         "reason": reason, "process": [n for n, _ in proc],
                          "sample": gen.strip().replace("\n", " ")[:120]})
-            looped = looped or is_loop or not knows
+            looped = looped or is_loop or not knows or bool(proc)
         last = rows
         if not looped:
             return {"verdict": "PASS", "config": cfg_name, "sampling": sampling, "rows": rows}
