@@ -161,3 +161,46 @@ def test_mx_protect_globs_cannot_capture_a_vision_layer():
     vision = "vision_tower.encoder.layers.3.self_attn.out_proj"
     assert _matches(rec["protect"], vision), "precondition: the glob does reach it"
     assert _matches(rec["ignore"], vision), "so ignore must override it"
+
+
+# ── EXL3 lane ───────────────────────────────────────────────────────────────────────────────────
+def test_exl3_exposes_vision_bits():
+    """exllamav3 has -vb/--vision_bits. Pollard was not passing it, so the user had no say on the
+    one lane where the tower is handled by someone else's converter."""
+    src = (ROOT / "tools/pollard_exl3.py").read_text()
+    assert "--vision-bits" in src, "no way to steer the tower on this lane"
+    assert '"-vb"' in src, "the flag is declared but never reaches convert_model"
+
+
+def test_exl3_only_passes_vision_bits_when_asked():
+    """Passing nothing must leave exllamav3's own architecture default in place, not override it
+    with a guess of ours."""
+    src = (ROOT / "tools/pollard_exl3.py").read_text()
+    assert re.search(r"if a\.vision_bits is not None:\s*\n\s*cmd \+= \[\"-vb\"", src)
+
+
+def test_exl3_detects_a_vl_checkpoint_from_its_config():
+    src = (ROOT / "tools/pollard_exl3.py").read_text()
+    assert "def detect_vl" in src
+    assert "vision_config" in src, "detection should read the config, not the directory name"
+
+
+def test_every_lane_can_steer_the_vision_tower():
+    """The whole point: no lane is left where the tower is quantized with no way to intervene."""
+    flags = {
+        "mlx": ("tools/pollard_mlx.py", "--vision-bits"),
+        "mx": ("tools/pollard_mx.py", "--quantize-vision"),
+        "exl3": ("tools/pollard_exl3.py", "--vision-bits"),
+    }
+    for lane, (path, flag) in flags.items():
+        assert flag in (ROOT / path).read_text(), f"{lane} has no vision control"
+
+
+# ── dense models are first-class ────────────────────────────────────────────────────────────────
+def test_routecheck_does_not_treat_dense_as_a_failure():
+    """A dense model has no router. That is not a limitation on dense models, and it must not
+    exit non-zero or read like a refusal."""
+    src = (ROOT / "tools/pollard_routecheck.py").read_text()
+    assert "SystemExit(0)" in src, "dense should exit clean"
+    assert not re.search(r'sys\.exit\(\s*"no MoE routers', src), "dense must not be an error exit"
+    assert "not a limitation on dense models" in src

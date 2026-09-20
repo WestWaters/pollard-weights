@@ -105,6 +105,10 @@ def main():
                     "measured EXL3 sweet spot; more is NON-monotonic and can hurt)")
     ap.add_argument("--cal-cols", type=int, default=2048, help="tokens per row for --calib-text packing")
     ap.add_argument("--devices", default="0", help="CUDA device list for the convert, e.g. 0,1")
+    ap.add_argument("--vision-bits", type=int, default=None, metavar="N",
+                    help="bits for a vision/audio tower (1-8, or 16 to leave it unquantized). "
+                         "Default: exllamav3's architecture default -- 6 on towers it has "
+                         "validated, 16 otherwise. Measure any change with pollard-mmeval.")
     ap.add_argument("--plan-only", action="store_true", help="print the exllamav3 command, build nothing")
     a = ap.parse_args()
 
@@ -157,6 +161,13 @@ def main():
             cmd += ["-hq"]                                  # protect select (MoE) layers
     if a.cal_data:
         cmd += ["-cd", a.cal_data]
+    # Vision/audio tower. exllamav3 exposes -vb and defaults to 6 bpw on towers it has validated
+    # (16, i.e. unquantized, on anything else). Pollard was not passing it at all, so the lane was
+    # the only one where the user had no say. Default here is "leave exllamav3's architecture
+    # default alone"; --vision-bits 16 matches what Pollard does on GGUF, where the projector is
+    # never quantized at all.
+    if a.vision_bits is not None:
+        cmd += ["-vb", str(a.vision_bits)]
     cmd += ["-d", a.devices]
 
     if a.recipe:
@@ -172,10 +183,12 @@ def main():
     print("   NOTE: EXL3 trellis is the HEAVY lane (hours for a low-bit output) -- that's the format, "
           "not Pollard. Prefer GGUF/GPTQ/MLX unless you need the exllama runtime.")
     if is_vl:
-        print("   NOTE: this looks like a vision-language checkpoint. Module selection on THIS lane "
-              "belongs to exllamav3's convert_model, not to Pollard -- so Pollard is not protecting "
-              "the vision tower or the modality projector here the way it does on GGUF/MLX/MX. "
-              "Check the result with pollard-mmeval before shipping it.")
+        vb = a.vision_bits
+        print("   VISION: vision-language checkpoint. Tower at "
+              + (f"{vb} bpw (--vision-bits)" if vb is not None else
+                 "exllamav3's architecture default (6 bpw on validated towers, else 16)")
+              + ". Use --vision-bits 16 to leave it unquantized, as the GGUF lane does. "
+                "Confirm with pollard-mmeval either way.")
     print("   $ " + " ".join(cmd))
     if a.plan_only:
         return

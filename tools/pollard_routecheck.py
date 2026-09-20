@@ -23,6 +23,9 @@ What this measures, per layer:
 
 A swap rate near zero means the quantized model routes like the reference. A high one means the
 number on your card was measured on a different set of experts than the model will actually use.
+
+MoE-only by nature: a dense model has no router, so it exits 0 saying there is nothing to compare.
+That is not a limitation on dense models -- every other Pollard gate applies to them unchanged.
 """
 from __future__ import annotations
 
@@ -190,8 +193,12 @@ def main():
     elif a.ref and a.model and a.calib:
         ref_model = load_backbone(a.ref, a.device)
         if not routers(ref_model):
-            sys.exit("no MoE routers found -- this is a dense model, and routing consistency "
-                     "does not apply to it.")
+            # Not a refusal and not a failure. A dense model has no router, so there is no
+            # routing to preserve -- every other Pollard gate applies to it exactly as usual.
+            print("== pollard-routecheck :: dense model, no routers to compare.")
+            print("   Nothing to check here. Routing consistency is a MoE-only question;")
+            print("   run pollard-bench / pollard-eval / pollard-kl for this build as normal.")
+            raise SystemExit(0)
         top_k = a.top_k or int(getattr(ref_model.config, "num_experts_per_tok", 0) or 2)
         ids = _calib(a.ref, a.calib, a.nsamples, a.seqlen)
         ref = capture(ref_model, ids, a.device)
