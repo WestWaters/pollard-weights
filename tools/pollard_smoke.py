@@ -257,9 +257,12 @@ def check_arch_coverage(gguf=None, imatrix=None):
                       if _re.match(r"^blk\.\d+\..+\.weight$", n)
                       and _gguf_slot(n, ["ffn", "attn"]) is None})
     if unknown:
+        # Forward, do not just fail: an unrecognised architecture is what onboarding is FOR, and
+        # this check hands it the exact tensor kinds to write down.
         return False, (f"{len(unknown)} calibrated tensor kind(s) match no group rule, so their "
-                       f"layers would score 0.0 (= free to crush): {', '.join(unknown)}. "
-                       f"Add them to GROUP_GGUF in pollard_probe.py.")
+                       f"layers would score 0.0 (= free to crush): {', '.join(unknown)}\n"
+                       f"        -> pollard-onboard --model {gguf} --contribute   (then add them "
+                       f"to GROUP_GGUF in pollard_probe.py)")
     return True, "every calibrated matmul maps to a group"
 
 

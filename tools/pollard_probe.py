@@ -356,12 +356,19 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
     missed = sorted({re.sub(r"^blk\.\d+\.", "", n) for n in H
                      if re.match(r"^blk\.\d+\..+\.weight$", n) and n not in seen_covered})
     if missed:
+        # An unfamiliar architecture is an ONBOARDING case, not a dead end. Pollard's convention is
+        # to forward it so the next person's model of that family one-shots -- every onboarding
+        # feeds the tool. We are better placed than most to do that: we know the exact tensor kinds
+        # that matched nothing, which is the finding an onboarding contribution needs.
         raise SystemExit(
             f"\n  {len(missed)} calibrated tensor KIND(S) were not scored, so whole layers would "
             f"come back at cost 0.0\n  (= 'free to crush'). REFUSING to emit a profile this tool "
-            f"cannot account for.\n  unscored: " + ", ".join(missed) +
-            "\n  Add them to GROUP_GGUF in pollard_probe.py -- sequence mixers (attention or SSM) "
-            "go in\n  'attn', channel mixers in 'ffn'.")
+            f"cannot account for.\n\n  unscored: " + ", ".join(missed) +
+            f"\n\n  -> onboard this architecture, and paste the line above into the findings:\n"
+            f"       pollard-onboard --model {gguf_path} --contribute\n"
+            "     Then add these kinds to GROUP_GGUF in pollard_probe.py -- sequence mixers\n"
+            "     (attention OR a state-space operator) go in 'attn', channel mixers in 'ffn'.\n"
+            "     Qwen3.8-27B is how this check was born: 48 of its 65 blocks mix with an SSM.")
 
     # Drop any layer that scored nothing rather than emitting a zero for it.
     for g in groups:
