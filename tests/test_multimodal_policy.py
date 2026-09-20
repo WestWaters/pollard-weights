@@ -92,3 +92,72 @@ def test_gguf_lane_still_says_not_to_quantize_the_projector():
     """The GGUF policy is stronger than the other lanes and must stay that way."""
     src = (ROOT / "tools/pollard_fit.py").read_text()
     assert re.search(r"not\s+quantize\s+the\s+mmproj", src, re.I)
+
+
+# ── MX / compressed-tensors lane ────────────────────────────────────────────────────────────────
+def _mx():
+    """build_recipe and its globs, without importing llmcompressor."""
+    src = (ROOT / "tools/pollard_mx.py").read_text()
+    ns: dict = {"re": re}
+    for pat in (r"^VISION_GLOBS = .*?\n(?:\s+r\".*\n)*", r"^PROJECTOR_GLOBS = .*?\n(?:\s+r\".*\n)*",
+                r"^def build_recipe.*?(?=\n\ndef )"):
+        m = re.search(pat, src, re.M | re.S)
+        assert m, f"could not lift {pat!r} out of pollard_mx.py"
+        exec(m.group(0), ns)
+    return ns
+
+
+MX = _mx()
+
+
+def _matches(globs, name):
+    """compressed-tensors 're:' globs, evaluated the way it evaluates them."""
+    return any(re.fullmatch(g[3:], name) for g in globs if g.startswith("re:"))
+
+
+@pytest.mark.parametrize("name", [
+    "visual.blocks.0.attn.qkv",
+    "vision_tower.encoder.layers.2.self_attn.out_proj",
+    "model.vision_model.encoder.layers.5.mlp.fc1",
+    "audio_tower.layers.1.self_attn.k_proj",
+])
+def test_mx_ignores_the_vision_tower_by_default(name):
+    """targets='Linear' matches every Linear in the model, so the tower must be ignored by name."""
+    rec = MX["build_recipe"](["3"], "NVFP4", "FP8", False)
+    assert _matches(rec["ignore"], name), f"{name} would be quantized to FP4"
+
+
+@pytest.mark.parametrize("name", [
+    "multi_modal_projector.linear_1",
+    "visual.merger.mlp.0",
+    "model.mm_projector.2",
+])
+def test_mx_always_ignores_the_projector(name):
+    for quantize_vision in (False, True):
+        rec = MX["build_recipe"](["3"], "NVFP4", "FP8", False, quantize_vision)
+        assert _matches(rec["ignore"], name), "--quantize-vision must not reach the projector"
+
+
+def test_mx_quantize_vision_releases_the_tower_only():
+    rec = MX["build_recipe"](["3"], "NVFP4", "FP8", False, True)
+    assert not _matches(rec["ignore"], "visual.blocks.0.attn.qkv")
+    assert _matches(rec["ignore"], "visual.merger.mlp.0")
+
+
+def test_mx_language_modules_are_still_quantized():
+    rec = MX["build_recipe"](["3"], "NVFP4", "FP8", False)
+    for name in ("model.layers.0.self_attn.q_proj", "model.layers.7.mlp.down_proj"):
+        assert not _matches(rec["ignore"], name), f"{name} should still be quantized"
+
+
+def test_mx_lm_head_stays_ignored():
+    assert "lm_head" in MX["build_recipe"](["3"], "NVFP4", "FP8", False)["ignore"]
+
+
+def test_mx_protect_globs_cannot_capture_a_vision_layer():
+    """`.*layers\\.3\\..*proj` also matches vision_tower.encoder.layers.3.* — the ignore list,
+    applied to BOTH modifiers, is what stops a vision block inheriting a text layer's hotness."""
+    rec = MX["build_recipe"](["3"], "NVFP4", "FP8", False)
+    vision = "vision_tower.encoder.layers.3.self_attn.out_proj"
+    assert _matches(rec["protect"], vision), "precondition: the glob does reach it"
+    assert _matches(rec["ignore"], vision), "so ignore must override it"

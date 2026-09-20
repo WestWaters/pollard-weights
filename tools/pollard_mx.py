@@ -43,10 +43,25 @@ def allocate(sens, n_layers, hot_frac, focus=None):
     return hot
 
 
-def build_recipe(hot_layers, scheme, protect_scheme, protect_down):
+# A vision or audio tower lives inside the checkpoint on this lane. The body modifier is
+# targets="Linear", which matches EVERY nn.Linear in the model -- so on a vision-language
+# checkpoint the whole tower and the modality projector were going to FP4 alongside the language
+# stack. Worse, the per-layer protect globs below are `.*layers\.<n>\..*proj`, which also matches
+# `vision_tower.encoder.layers.<n>.self_attn.out_proj` -- so a vision block inherited whichever
+# TEXT layer happened to share its index.
+# Both go in `ignore`, which keeps them at the checkpoint's original precision. The projector is
+# never negotiable; the tower can be included deliberately with --quantize-vision.
+VISION_GLOBS = [r"re:.*(visual|vision_tower|vision_model|vision_encoder|image_encoder|patch_embed"
+                r"|audio_tower|audio_encoder|speech_encoder).*"]
+PROJECTOR_GLOBS = [r"re:.*(multi_modal_projector|mm_projector|mm_proj|merger|modality_project"
+                   r"|resampler|perceiver|connector).*"]
+
+
+def build_recipe(hot_layers, scheme, protect_scheme, protect_down, quantize_vision=False):
     """compressed-tensors config: body at FP4 `scheme`; hot layers (+ optionally all down_proj, the
-    residual writers) kept at `protect_scheme` (FP8); lm_head always ignored (kept high-precision)."""
-    ignore = ["lm_head"]
+    residual writers) kept at `protect_scheme` (FP8); lm_head always ignored (kept high-precision).
+    The modality projector is always ignored, and the vision/audio tower unless --quantize-vision."""
+    ignore = ["lm_head"] + PROJECTOR_GLOBS + ([] if quantize_vision else VISION_GLOBS)
     # per-module protection: hot layers' linears + (optionally) every down_proj -> FP8 group
     protect_globs = [f"re:.*layers\\.{L}\\..*proj" for L in sorted(hot_layers, key=lambda s: (len(s), s))]
     if protect_down:
@@ -77,6 +92,10 @@ def main():
     ap.add_argument("--out", help="output compressed-tensors dir (required unless --plan-only)")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (pollard-probe/-sensitivity)")
     ap.add_argument("--calib", help="calibration text (required for real emit; NVFP4 activations need it)")
+    ap.add_argument("--quantize-vision", action="store_true",
+                    help="also quantize a vision/audio tower inside the checkpoint (default: left "
+                         "at source precision). The modality projector is never quantized. "
+                         "Measure the cost with pollard-mmeval before trusting this.")
     ap.add_argument("--scheme", default="NVFP4", choices=["NVFP4", "MXFP4", "W4A16", "W8A16"],
                     help="body scheme: NVFP4 (Blackwell FP4, vLLM-validated default) / MXFP4 (OCP MX, "
                          "experimental) / W4A16 / W8A16 (INT weight-only compressed-tensors -- runs on any "
@@ -114,7 +133,7 @@ def main():
     if focus:
         print(f"   focus-layers: forcing layers {sorted(focus)} to FP8 (steered budget)")
     hot = allocate(sens, n_layers or 32, a.hot_frac, focus=focus)
-    rec = build_recipe(hot, a.scheme, a.protect_scheme, a.protect_down)
+    rec = build_recipe(hot, a.scheme, a.protect_scheme, a.protect_down, a.quantize_vision)
     ab = avg_bits(n_layers or 32, a.hot_frac, a.protect_down, a.scheme, a.protect_scheme)
     is_int = a.scheme in ("W4A16", "W8A16")
 
@@ -156,7 +175,10 @@ def main():
             print("   (GPTQModifier unavailable -- falling back to RTN QuantizationModifier for the body)")
     mods = [BodyMod(targets="Linear", scheme=a.scheme, ignore=rec["ignore"] + rec["protect"])]
     if rec["protect"]:
-        mods.append(QuantizationModifier(targets=rec["protect"], scheme=a.protect_scheme))
+        # same ignore on the protect modifier: otherwise a vision block whose index matches a hot
+        # TEXT layer is still captured here, at FP8 -- wrong, just more quietly
+        mods.append(QuantizationModifier(targets=rec["protect"], scheme=a.protect_scheme,
+                                         ignore=rec["ignore"]))
     cal = ([l for l in open(a.calib, encoding="utf-8", errors="ignore").read().splitlines() if l.strip()]
            if a.calib else None)
     print(f"   emitting via llm-compressor ({len(cal) if cal else 'no'} calib rows) -> {a.out}")

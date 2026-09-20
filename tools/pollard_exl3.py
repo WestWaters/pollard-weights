@@ -38,6 +38,23 @@ source build -- the pip wheel's prebuilt ext can fail with 'DLL load failed impo
 import argparse, os, subprocess, sys
 
 
+def detect_vl(model_id):
+    """Does this checkpoint carry a vision or audio tower? Read the config, never the name."""
+    import json as _json
+    for fn in ("config.json",):
+        p = os.path.join(model_id, fn)
+        if not os.path.exists(p):
+            continue
+        try:
+            cfg = _json.load(open(p, encoding="utf-8"))
+        except Exception:
+            return False
+        blob = _json.dumps(cfg).lower()
+        return any(k in blob for k in ("vision_config", "vision_tower", "audio_config",
+                                       "image_token", "visual"))
+    return False
+
+
 def detect_moe(model_id, layers_hint=0):
     try:
         from transformers import AutoConfig
@@ -149,10 +166,16 @@ def main():
           + (f"recipe {os.path.basename(a.recipe)}" if a.recipe
              else f"{a.bpw} bpw  |  head {a.head_bits}  |  mtp {a.mtp_bits}"
                   + ("  |  hq(MoE)" if hq else "")))
+    is_vl = detect_vl(a.model)
     print("   Pollard intent -> EXL3: crush the body to target bpw, protect head/MTP high"
           + (", bump select MoE layers (--hq)" if hq else "") + ".")
     print("   NOTE: EXL3 trellis is the HEAVY lane (hours for a low-bit output) -- that's the format, "
           "not Pollard. Prefer GGUF/GPTQ/MLX unless you need the exllama runtime.")
+    if is_vl:
+        print("   NOTE: this looks like a vision-language checkpoint. Module selection on THIS lane "
+              "belongs to exllamav3's convert_model, not to Pollard -- so Pollard is not protecting "
+              "the vision tower or the modality projector here the way it does on GGUF/MLX/MX. "
+              "Check the result with pollard-mmeval before shipping it.")
     print("   $ " + " ".join(cmd))
     if a.plan_only:
         return
