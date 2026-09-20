@@ -209,6 +209,50 @@ def _atom(name):
     return ALIASES.get(name.lower(), name.lower())
 
 
+
+def fragile_rules(path, protect, floor=3.0, cap=4):
+    """Turn a pollard-fragile scan into protect rules, so the fragile tensors are HANDLED.
+
+    Reporting fragility and leaving the build to crush it anyway is the wrong half of the job. A
+    heavy-tailed tensor is one an absmax scale cannot represent, and that is knowable from the
+    weights before anything is built -- so the allocator should act on it rather than print a
+    warning nobody reads.
+
+    This is why it matters in practice: on gemma-4-12B-it the scan puts token_embd at kurtosis 17.9
+    with a crest factor of 378, five times worse than anything else in the model. That is the tensor
+    whose lost resolution made the Gemma4 flagship loop on <|channel>thought and fail the coherence
+    gate TWICE before anyone found it by building. Consuming the scan turns two dead builds into a
+    rule emitted before the first one.
+
+    Reads a JSON file, the same way --imatrix reads a file: data between tools, not tools threaded
+    through each other. `floor` keeps ordinary tensors out (a mildly heavy tail is normal) and `cap`
+    stops a model whose every kind is peaky from protecting itself into no compression at all.
+    """
+    import json
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+    except Exception as e:
+        print(f"  (fragility scan unreadable: {e}) -- continuing without it")
+        return [], [], {}
+    kinds = [k for k in (d.get("kinds") or []) if k.get("kurtosis", 0) >= floor]
+    kinds.sort(key=lambda k: -k["kurtosis"])
+    rules, notes, lift = [], [], {}
+    for k in kinds[:cap]:
+        base = re.sub(r"\.weight$", "", k["kind"])
+        tag = f"{base} (kurtosis {k['kurtosis']:.1f}, crest {k['crest']:.0f})"
+        # token_embd and output are NOT custom-q territory: they have dedicated flags, and the
+        # protect atom is a LOW-bit trellis type -- emitting `token_embd=iq2_kt` would push the
+        # most fragile tensor in the model DOWN to 2.125 bpw, the exact opposite of protecting it.
+        # Raise their own flag instead, which is precisely the fix that rescued Gemma4's flagship.
+        if base in ("token_embd", "output"):
+            lift[base] = "Q8_0" if k["kurtosis"] >= 10 else "Q6_K"
+            notes.append(f"{tag} -> {lift[base]} via its own flag")
+        else:
+            rules.append(f"{re.escape(base)}={protect}")
+            notes.append(tag)
+    return rules, notes, lift
+
+
 def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     """Emit the Mix as (base_type, custom-q rules). base_type = the crush atom (fills
     everything not matched); every protected role is named explicitly via custom-q
@@ -278,7 +322,18 @@ def emit_bat(a, n_layers, is_moe, names):
     # in the imatrix-free path (K-quants don't consult an imatrix -> nothing to be uncovered).
     pins, ncov = ([], None) if kfree else uncovered_pins(names, a.imatrix)
     pin_cq = (",".join(pins) + ",") if pins else ""
-    cqs = pin_cq + ",".join(cq)                     # pins FIRST (custom-q is first-match-wins)
+    # Fragile kinds are protected ahead of the general role rules: custom-q is FIRST-MATCH-WINS, so
+    # a rule placed later would lose to the recipe's own entry for the same tensor.
+    frag_rules, frag_notes, frag_lift = (fragile_rules(a.fragile, protect)
+                                         if getattr(a, "fragile", None) else ([], [], {}))
+    # a fragile embedding/output raises ITS OWN flag rather than taking a custom-q rule
+    for _t, _ty in frag_lift.items():
+        _flag = "--token-embedding-type" if _t == "token_embd" else "--output-tensor-type"
+        flags = [f for f in flags if not f.startswith(_flag)] + [f"{_flag} {_ty}"]
+    frag_cq = (",".join(frag_rules) + ",") if frag_rules else ""
+    cqs = pin_cq + frag_cq + ",".join(cq)           # pins FIRST (custom-q is first-match-wins)
+    if frag_notes:
+        print("  fragile     : auto-protected -> " + ", ".join(frag_notes))
     im_flag = "" if kfree else "--imatrix %IM% "    # the whole point: no imatrix on the K-quant path
     # The eval corpus has to suit the MODEL, or the PPL lines describe the mismatch rather than the
     # build. Ask what this model is instead of defaulting everyone to raw Wikipedia.
@@ -365,6 +420,7 @@ def main():
     ap.add_argument("--log", default=os.environ.get("POLLARD_AUTOMAP_LOG", "automap.log"),
                     help="build/eval log path (default: ./automap.log; or $POLLARD_AUTOMAP_LOG)")
     ap.add_argument("--out", default="build_automap.bat")
+    ap.add_argument("--fragile", help="a pollard-fragile --out scan.json. The heaviest-tailed\n                        tensor kinds are PROTECTED automatically instead of merely reported.")
     ap.add_argument("--body", default=None, help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
     ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
     ap.add_argument("--no-imatrix", "--kquant", dest="no_imatrix", action="store_true",

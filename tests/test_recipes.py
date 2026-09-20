@@ -2433,3 +2433,35 @@ def test_smoke_preflight_catches_an_uncovered_imatrix_required_type():
     finally:
         for k, v in saved.items():
             setattr(calc, k, v)
+
+
+def test_fragile_embedding_is_raised_not_crushed():
+    """A fragile token_embd must RAISE its own flag, never take a custom-q protect rule.
+
+    The protect atom is a low-bit trellis type. Emitting `token_embd=iq2_kt` would push the most
+    fragile tensor in the model DOWN to 2.125 bpw -- the exact opposite of protecting it, and worse
+    than doing nothing. token_embd and output have dedicated flags for this reason.
+
+    It is not hypothetical: gemma-4-12B-it scores kurtosis 17.9 / crest 378 on token_embd, and that
+    tensor's lost resolution is what made its flagship loop on a control token and fail the
+    coherence gate twice. The fix that rescued it was raising --token-embedding-type."""
+    import importlib, json, sys, os, tempfile
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    A = importlib.import_module("pollard_automap")
+    scan = {"kinds": [
+        {"kind": "token_embd.weight", "kurtosis": 17.9, "crest": 378.0},
+        {"kind": "output.weight",     "kurtosis": 11.2, "crest": 190.0},
+        {"kind": "attn_v.weight",     "kurtosis": 3.6,  "crest": 28.0},
+        {"kind": "ffn_up.weight",     "kurtosis": 0.7,  "crest": 27.0},   # below floor: untouched
+    ]}
+    f = os.path.join(tempfile.mkdtemp(), "scan.json")
+    json.dump(scan, open(f, "w"))
+    rules, notes, lift = A.fragile_rules(f, "iq2_kt")
+
+    joined = ",".join(rules)
+    assert "token_embd" not in joined, f"token_embd must not take a custom-q rule: {joined}"
+    assert "output" not in joined, f"output must not take a custom-q rule: {joined}"
+    assert lift.get("token_embd") == "Q8_0", f"a kurtosis-17.9 embedding must be raised: {lift}"
+    assert lift.get("output") == "Q8_0", f"a kurtosis-11.2 output must be raised: {lift}"
+    assert any("attn_v" in r for r in rules), "an ordinary fragile kind should get a protect rule"
+    assert not any("ffn_up" in r for r in rules), "a low-kurtosis kind must be left alone"
