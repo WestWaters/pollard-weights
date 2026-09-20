@@ -53,10 +53,22 @@ def _probe_specs():
         specs.append((f"colour-{name}", ("solid", rgb),
                       "What color is the shape in this image? Answer with one word.",
                       (name,)))
-    for n in (2, 3, 5):
+    # SCORED counts stay inside the subitizing range. Counting past four is a documented failure of
+    # every VLM -- "VLMs fail when the quantity exceeds the immediate subitizing range (N > 4)" --
+    # so a miss at five measures the field's ceiling, not our quantization, and a probe that every
+    # model fails cannot tell a good build from a bad one. Measured here on gemma-4-12B-it at
+    # IQ2_XXS: n=4 -> 4, n=5 -> 4, n=6 -> 4, n=7 -> 8. A hard ceiling, not an off-by-one, and it
+    # survived every confound being removed (672px, large objects, jittered spacing, a 500-token
+    # budget, explicit chain-of-thought enumeration).
+    for n in (2, 3, 4):
         specs.append((f"count-{n}", ("count", n),
                       "How many squares are in this image? Answer with just the number.",
                       (str(n), _WORDS[n])))
+    # ...and one STRESS probe above the ceiling, reported but NOT scored. A healthy model is
+    # expected to miss it; what matters is whether a rung degrades differently from its reference.
+    specs.append(("count-6-stress", ("count", 6),
+                  "How many squares are in this image? Answer with just the number.",
+                  ("6", "six")))
     for shape in ("circle", "square", "triangle"):
         specs.append((f"shape-{shape}", ("shape", shape),
                       "What shape is in this image? Answer with one word: circle, square, or triangle.",
@@ -72,11 +84,16 @@ def _probe_specs():
     return specs
 
 
-_WORDS = {2: "two", 3: "three", 5: "five"}
+_WORDS = {2: "two", 3: "three", 4: "four", 6: "six"}
 
 
-def _draw(kind, arg, path, size=448):
-    """Render one probe. Big, high-contrast, centred -- a failure here is the pathway, not acuity."""
+def _draw(kind, arg, path, size=672):
+    """Render one probe. Big, high-contrast, centred -- a failure here is the pathway, not acuity.
+
+    672, not 448. Counting accuracy is measurably resolution-dependent and the literature settles on
+    672x672 for counting experiments; below that a miss confounds "cannot count" with "cannot
+    resolve". Going further (1344) buys nothing, so this is the knee, not a bigger-is-better guess.
+    """
     from PIL import Image, ImageDraw, ImageFont
     img = Image.new("RGB", (size, size), (255, 255, 255))
     d = ImageDraw.Draw(img)
@@ -84,11 +101,19 @@ def _draw(kind, arg, path, size=448):
     if kind == "solid":
         d.rectangle([m, m, size - m, size - m], fill=arg)
     elif kind == "count":
-        # a row of identical squares, generously spaced so counting is not a crowding test
-        w = size // (arg * 2 + 1)
+        # Squares BIG relative to the frame, and deliberately NOT on a uniform pitch.
+        # A perfectly regular row is the worst case for patch tokenization: when object boundaries
+        # land on the same phase of the patch grid every time they can vanish together, and the
+        # model goes blind in a structured, periodic way -- which reads as "cannot count" when it
+        # is really "cannot see the edges". Jitter breaks that phase lock, and larger objects keep
+        # small-object degradation out of the measurement.
+        w = int(size * 0.13)
+        gap = (size - 2 * w - arg * w) / max(arg - 1, 1)
+        jitter = [0, int(w * 0.28), -int(w * 0.18), int(w * 0.36), -int(w * 0.24)]
         for i in range(arg):
-            x = w + i * 2 * w
-            d.rectangle([x, size // 2 - w // 2, x + w, size // 2 + w // 2], fill=(30, 60, 220))
+            x = int(w + i * (w + gap))
+            y = size // 2 - w // 2 + jitter[i % len(jitter)]
+            d.rectangle([x, y, x + w, y + w], fill=(30, 60, 220))
     elif kind == "shape":
         if arg == "circle":
             d.ellipse([m, m, size - m, size - m], fill=(30, 60, 220))
@@ -125,6 +150,116 @@ def build_probes(outdir):
         p = os.path.join(outdir, f"{name}.png")
         _draw(kind, arg, p)
         out.append({"name": name, "image": p, "prompt": prompt, "answers": answers})
+    return out
+
+
+
+# ---- what does THIS projector actually carry? --------------------------------------------------
+def projector_facts(mmproj):
+    """Modalities and image geometry, read from the mmproj rather than assumed.
+
+    Nothing here is specific to one family. A projector states which encoders it has and the patch
+    geometry it was converted with, so probes can be sized to the model instead of to a number that
+    happened to suit whatever was tested first. That matters: llama.cpp derives the visual token
+    count from the IMAGE SIZE (tokens ~= (size/patch)^2, capped), so a fixed probe size silently
+    feeds one model its full budget and another a fraction of it. Measured on gemma-4-12B-it: a
+    672px probe yields 196 tokens against that model's own 280-token default.
+
+    Returns {"vision": bool, "audio": bool, "patch": int, "max_tokens": int|None}.
+    """
+    facts = {"vision": False, "audio": False, "patch": 0, "max_tokens": None}
+    try:
+        from gguf import GGUFReader
+        rd = GGUFReader(mmproj)
+        for f in rd.fields.values():
+            n, v = f.name, None
+            try:
+                v = f.parts[-1].tolist() if hasattr(f.parts[-1], "tolist") else f.parts[-1]
+            except Exception:
+                continue
+            first = v[0] if isinstance(v, list) and v else v
+            if n == "clip.has_vision_encoder":
+                facts["vision"] = bool(first)
+            elif n == "clip.has_audio_encoder":
+                facts["audio"] = bool(first)
+            elif n == "clip.vision.patch_size":
+                facts["patch"] = int(first)
+            elif n == "clip.vision.n_merge" or n.endswith("projector.scale_factor"):
+                facts["merge"] = int(first)
+            elif n == "clip.vision.image_size":
+                facts["image_size"] = int(first)
+    except Exception:
+        pass
+    return facts
+
+
+def probe_px(facts, floor=768, ceil=1024):
+    """How big to render a probe, for ANY model, without knowing its family.
+
+    The runtime already clamps an image to the model's own visual-token budget -- llama.cpp calls
+    set_limit_image_tokens(min, max) per projector and downscales to fit. So the only unrecoverable
+    mistake is feeding an image that is too SMALL: that silently spends less than the model's budget
+    and looks like a capability failure. Measured on gemma-4-12B-it, a 672px probe produces 196
+    visual tokens against that model's own 280-token default -- the probe was starving it.
+
+    So: render generously and let the runtime decide. No patch size, no merge factor, no per-family
+    table to keep in sync -- which is the point, because the same tool has to handle vision, audio,
+    video and whatever comes next. The ceiling is real too: an image large enough to produce ~1000
+    visual tokens overflows a default context on its own and the model returns nothing.
+    """
+    declared = facts.get("image_size") or 0
+    return max(floor, min(ceil, declared * 3 if declared else floor))
+
+
+
+# ---- audio probes ------------------------------------------------------------------------------
+# Generated the same way the images are: a signal whose answer is true by construction, so there is
+# no dataset, no licence, no network, and nothing that could have leaked into calibration. A model
+# shipped with an audio projector has an audio path nobody has ever checked -- gemma-4-12B-it went
+# out declaring clip.has_audio_encoder and every number on its card is text perplexity.
+def _tone(path, freq_hz, seconds=1.4, rate=16000, silence=False):
+    """A pure tone (or silence) as a 16-bit mono WAV. stdlib only -- no audio dependency."""
+    import math, struct, wave
+    n = int(rate * seconds)
+    with wave.open(path, "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = bytearray()
+        for i in range(n):
+            if silence:
+                v = 0
+            else:
+                # fade in/out so the clip does not start with a click, which is itself a sound
+                env = min(1.0, i / (rate * 0.05), (n - i) / (rate * 0.05))
+                v = int(22000 * env * math.sin(2 * math.pi * freq_hz * i / rate))
+            frames += struct.pack("<h", max(-32768, min(32767, v)))
+        w.writeframes(bytes(frames))
+    return path
+
+
+def _audio_probe_specs():
+    return [
+        ("audio-low",  ("tone", 180),
+         "Listen to this audio. Is the pitch low or high? Answer with one word: low or high.",
+         ("low",)),
+        ("audio-high", ("tone", 3200),
+         "Listen to this audio. Is the pitch low or high? Answer with one word: low or high.",
+         ("high",)),
+        ("audio-silence", ("tone", 0),
+         "Listen to this audio. Is there any sound, or is it silent? Answer: sound or silent.",
+         ("silent", "silence", "no sound")),
+    ]
+
+
+def build_audio_probes(outdir):
+    os.makedirs(outdir, exist_ok=True)
+    out = []
+    for name, (_kind, freq), prompt, answers in _audio_probe_specs():
+        f = os.path.join(outdir, f"{name}.wav")
+        _tone(f, freq, silence=(freq == 0))
+        out.append({"name": name, "media": f, "flag": "--audio",
+                    "prompt": prompt, "answers": answers})
     return out
 
 
@@ -197,17 +332,24 @@ def scored(reply, answers):
 
 # ---- report ------------------------------------------------------------------------------------
 def run_model(cli, model, mmproj, probes, ngl, label):
-    rows, hits = [], 0
+    """Score the probes. A `-stress` probe is RUN and REPORTED but never counted: it sits above a
+    limitation every VLM shares, so folding it into the score would mark a healthy build as damaged
+    and would make the number incomparable between models."""
+    rows, hits, n_scored = [], 0, 0
     print(f"\n== {label} ==", flush=True)
     for p in probes:
+        stress = p["name"].endswith("-stress")
         reply = ask(cli, model, mmproj, p["image"], p["prompt"], ngl)
         ok = scored(reply, p["answers"])
-        hits += ok
-        short = (reply or "<no output>").replace("\n", " ")[:56]
-        print(f"  {'OK ' if ok else 'MISS'}  {p['name']:16} -> {short}", flush=True)
-        rows.append({"probe": p["name"], "reply": reply, "pass": bool(ok)})
-    pct = 100.0 * hits / max(len(probes), 1)
-    print(f"  {hits}/{len(probes)} probes ({pct:.1f}%)", flush=True)
+        if not stress:
+            hits += ok
+            n_scored += 1
+        tag = ("ok  " if ok else "miss") if stress else ("OK  " if ok else "MISS")
+        short = (reply or "<no output>").replace("\n", " ")[:52]
+        print(f"  {tag}  {p['name']:16} {'(not scored) ' if stress else ''}-> {short}", flush=True)
+        rows.append({"probe": p["name"], "reply": reply, "pass": bool(ok), "scored": not stress})
+    pct = 100.0 * hits / max(n_scored, 1)
+    print(f"  {hits}/{n_scored} scored probes ({pct:.1f}%)", flush=True)
     return rows, pct
 
 
