@@ -354,6 +354,55 @@ def measure_speed(cli_bin, model, ngl, n_predict=128,
     return gen, pro
 
 
+
+def _eval_overlaps_calib(imatrix_path, eval_path):
+    """Is the eval text the same text that calibrated the build? Returns a reason, or None.
+
+    THIS tool's own check -- pollard-bench does not depend on another tool to know whether the
+    number it is about to print is a real measurement.
+
+    An imatrix records the dataset(s) it was built from, so the cheap answer is the recorded path.
+    When the names differ, compare content: a held-out split that shares most of its lines with the
+    calibration corpus is held out in name only. That is how gemma-4-12B-it came to publish
+    perplexity measured on its own calibration text -- 1366 of 1366 lines of `eval_heldout.txt`
+    are inside `gemma4_calib.txt`.
+    """
+    ds = []                                               # os/re are module-level; a local import
+    try:                                                  # of either would shadow them body-wide
+        blob = open(imatrix_path, "rb").read()
+        ds = [m.decode("utf-8", "ignore")
+              for m in re.findall(rb"[A-Za-z]:\\[^\x00]{3,200}?\.txt", blob)]
+    except Exception:
+        pass
+    try:
+        from gguf import GGUFReader                       # GGUF imatrix records it in the KV
+        for f in GGUFReader(imatrix_path).fields.values():
+            if "dataset" in f.name.lower():
+                ds += [str(f.parts[i].tobytes().decode("utf-8", "ignore")) for i in f.data]
+    except Exception:
+        pass
+    ev = os.path.abspath(eval_path)
+    for d in ds:
+        if os.path.abspath(d) == ev or os.path.basename(d) == os.path.basename(ev):
+            return f"the imatrix records this exact file as its calibration corpus: {d}"
+    try:
+        with open(ev, encoding="utf-8", errors="ignore") as fh:
+            ev_lines = {ln.strip() for ln in fh if len(ln.strip()) > 40}
+        for d in set(ds):
+            if not os.path.exists(d):
+                continue
+            with open(d, encoding="utf-8", errors="ignore") as fh:
+                cal = {ln.strip() for ln in fh if len(ln.strip()) > 40}
+            if ev_lines:
+                frac = len(ev_lines & cal) / len(ev_lines)
+                if frac > 0.10:
+                    return (f"{frac*100:.1f}% of the eval's lines are in the calibration corpus "
+                            f"{os.path.basename(d)}")
+    except Exception:
+        pass
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", required=True, help="the model to score (a Pollard build, or any GGUF)")
@@ -361,6 +410,11 @@ def main():
     ap.add_argument("--ref", help="KL reference GGUF (f16, or a near-lossless Q8_0/Q6_K host). "
                                   "Omit for PPL-only (no KLD/top-1).")
     ap.add_argument("--eval", default="wikitext2_test.txt", help="held-out eval text")
+    ap.add_argument("--imatrix", help="the imatrix the build used. Given, the eval is CHECKED "
+                                      "against the corpus that calibrated the model -- numbers "
+                                      "measured on the calibration text are not a quality result.")
+    ap.add_argument("--allow-eval-overlap", action="store_true",
+                    help="score anyway when the eval overlaps the calibration corpus (research)")
     ap.add_argument("--chunks", type=int, default=0,
                     help="cap the eval at N chunks. The KL base holds FULL logits, so a large "
                          "vocab over a long eval runs to tens of GB; 200 gives the same "
@@ -421,6 +475,19 @@ def main():
     ppl_bin = find_llama_bin(a.llama_perplexity)
     if not ppl_bin:
         sys.exit("llama-perplexity not found -- build llama.cpp/ik_llama.cpp or pass --llama-perplexity.")
+    # The corpus that BUILT the quant must not also MEASURE it. If the same text drives the imatrix
+    # and the eval, a bad allocation scores well because it is graded on the lines it was tuned on --
+    # and these numbers go on a public card. This is not hypothetical: gemma-4-12B-it shipped with
+    # PPL measured on `eval_heldout.txt`, every line of which is inside `gemma4_calib.txt`.
+    if a.imatrix and os.path.exists(a.imatrix) and os.path.exists(a.eval):
+        hit = _eval_overlaps_calib(a.imatrix, a.eval)
+        if hit and not a.allow_eval_overlap:
+            sys.exit(f"REFUSING to score on the calibration corpus.\n  {hit}\n"
+                     "  Perplexity measured on the text the imatrix was built from is flattered,\n"
+                     "  not held out. Build a disjoint eval (pollard-calib --out train.txt\n"
+                     "  --held-out eval.txt writes both from ONE run), or pass --allow-eval-overlap.")
+    elif not a.imatrix:
+        print("  (no --imatrix given: eval/calibration disjointness NOT verified)")
     if not os.path.exists(a.eval) or os.path.getsize(a.eval) == 0:
         sys.exit(f"eval corpus not found or empty: {a.eval}")
     for f in [a.gguf, a.rival, a.ref]:
