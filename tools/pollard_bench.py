@@ -306,16 +306,54 @@ def _server_bin():
     return find_llama_bin("llama-server") or "llama-server"
 
 
+_SERVER_FLAGS = {}
+
+
+def _server_supports(binary, flag):
+    """Does THIS build take that flag? Passing one it does not know is a hard startup failure,
+    and the forks disagree about which exist."""
+    key = (str(binary), flag)
+    if key not in _SERVER_FLAGS:
+        try:
+            h = subprocess.run([str(binary), "--help"], capture_output=True, text=True,
+                               errors="replace", timeout=60, stdin=subprocess.DEVNULL)
+            _SERVER_FLAGS[key] = flag in ((h.stdout or "") + (h.stderr or ""))
+        except Exception:
+            _SERVER_FLAGS[key] = False
+    return _SERVER_FLAGS[key]
+
+
 @contextlib.contextmanager
 def _served(model, ngl, ctx=4096, port=0):
     """llama-server for the duration, yielding its base url (or None if it will not start)."""
     if not port:
         s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-    cmd = [_server_bin(), "-m", model, "--host", "127.0.0.1", "--port", str(port),
-           "-ngl", str(ngl), "-c", str(ctx), "--jinja",
-           # thoughts land in reasoning_content, so a <think> block cannot be mistaken for the
-           # answer being incoherent
-           "--reasoning-format", "deepseek"] + _t()
+    binary = _server_bin()
+    cmd = [binary, "-m", model, "--host", "127.0.0.1", "--port", str(port),
+           "-ngl", str(ngl), "-c", str(ctx),
+           # -np 1 IS THE FIX for a server that dies mid-gate. Upstream's default is auto, which
+           # makes FOUR slots sharing one KV pool while telling each it owns the whole context;
+           # they exhaust it, llama_decode returns 1, and the resulting throw is uncaught on the
+           # main thread -- the process aborts and the client sees a reset socket, not an error.
+           # (ggml-org/llama.cpp#23652; the fix PR #23694 is still unmerged.) One slot also
+           # removes the batch-sharing that makes multi-slot output nondeterministic (#7052).
+           "-np", "1",
+           # ik defaults context-shift ON, upstream OFF. Left to ik's default an over-long prompt
+           # is silently truncated at the front instead of stopping, which scores a build on text
+           # it never saw.
+           "--no-context-shift",
+           "--no-cont-batching",
+           # apply the model's OWN template (default off on ik, on upstream)
+           "--jinja"] + _t()
+    # Without this the reply can land entirely in reasoning_content with content empty: llama.cpp
+    # passes enable_thinking=true even when the template's own default is false, so generation
+    # starts inside <think>, and a model that emits EOS without ever closing it has written
+    # nothing the parser calls an answer (#27134, #20265). A pure content parser keeps the text
+    # where it can be read; the gate strips the block itself.
+    if _server_supports(binary, "--skip-chat-parsing"):
+        cmd.append("--skip-chat-parsing")
+    else:
+        cmd += ["--reasoning-format", "deepseek"]
     proc, log = None, None
     try:
         # NOT DEVNULL: when the server dies mid-gate its own output is the only account of why,
@@ -356,22 +394,70 @@ def _served(model, ngl, ctx=4096, port=0):
             log.close()
 
 
-def _post(base, path, payload, timeout=900):
+def _post(base, path, payload, timeout=3600):
+    # Connection: close, deliberately. The server keeps an idle connection for 5 seconds
+    # (cpp-httplib's default) and closes it underneath a pooled client -- which surfaces as a
+    # reset socket while the server is perfectly healthy. Nine generations do not need pooling.
     req = urllib.request.Request(base + path, method="POST",
                                  data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "Connection": "close"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _get(base, path, timeout=10):
+    req = urllib.request.Request(base + path, headers={"Connection": "close"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _check_server(base, want_ctx):
+    """Assert the server is the one we asked for, before spending a run on it.
+
+    total_slots tells you whether -np landed: more than one slot is the configuration that
+    exhausts the KV pool and aborts the process partway through a gate. n_ctx tells you whether
+    the context was silently shrunk to fit the device, which changes what a PASS even means.
+    """
+    try:
+        props = _get(base, "/props")
+    except Exception:
+        return []                                     # not fatal: older builds vary
+    out = []
+    slots = props.get("total_slots")
+    if slots not in (None, 1):
+        out.append(f"the server came up with {slots} slots; a gate needs one (-np 1)")
+    got = ((props.get("default_generation_settings") or {}).get("n_ctx")
+           or props.get("n_ctx"))
+    if got and want_ctx and int(got) < int(want_ctx):
+        out.append(f"context is {got}, not the {want_ctx} asked for -- it was shrunk to fit")
+    return out
 
 
 def _chat(base, user, sampling, budget, proc=None):
     """One templated turn. Returns (content, reasoning, finish_reason)."""
     body = {"messages": [{"role": "user", "content": user}],
-            "max_tokens": budget, "stream": False}
+            "max_tokens": budget, "stream": False,
+            # the prompt cache reuses KV across requests, and the logits are not bit-identical
+            # across batch sizes -- documented as a source of nondeterministic results, and the
+            # path by which finished prompts accumulate until the pool is exhausted
+            "cache_prompt": False,
+            # a reply misfiled into reasoning_content reads as an empty answer; ask for it whole
+            "reasoning_format": "none"}
     body.update(_sampling_json(sampling))
     try:
         got = _post(base, "/v1/chat/completions", body)
     except Exception as e:
+        # one retry, and ONLY when the server is still alive: an idle connection closed by the
+        # server looks identical to a crash from the client side
+        if proc is None or proc.poll() is None:
+            time.sleep(1.0)
+            try:
+                got = _post(base, "/v1/chat/completions", body)
+            except Exception as e2:
+                e = e2
+            else:
+                return _read_chat(got)
         why = str(e)
         if proc is not None and proc.poll() is not None:
             tail = ""
@@ -383,10 +469,24 @@ def _chat(base, user, sampling, budget, proc=None):
             why = (f"the server exited (code {proc.returncode}) partway through the gate"
                    + (f": {tail}" if tail else f" -- see {_SERVER_LOG}"))
         return _NoOutput(why), "", "error"
+    return _read_chat(got)
+
+
+def _read_chat(got):
+    """(content, reasoning, finish_reason) -- reading the answer wherever it was filed.
+
+    With a pure content parser the reasoning stays inline in content, so the gate splits it out
+    itself; with a parsing server it arrives in reasoning_content. Either way an answer that
+    exists must not read as an empty one.
+    """
     ch = (got.get("choices") or [{}])[0]
     msg = ch.get("message") or {}
-    return (msg.get("content") or "", msg.get("reasoning_content") or "",
-            ch.get("finish_reason") or "")
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or ""
+    if not reasoning and "</think>" in content:
+        head, _, tail = content.rpartition("</think>")
+        reasoning, content = head.replace("<think>", "").strip(), tail.strip()
+    return content, reasoning, (ch.get("finish_reason") or "")
 
 
 #: the CLI sampling lists above, as the JSON the server takes
@@ -397,7 +497,9 @@ _SAMPLE_KEY = {"--temp": "temperature", "--top-k": "top_k", "--top-p": "top_p",
 
 
 def _sampling_json(sampling):
-    out, i = {}, 0
+    # seed pinned so a re-gate of the same build is comparable; on CPU llama.cpp's token path is
+    # bitwise deterministic once slots, batching and the prompt cache are pinned too.
+    out, i = {"seed": 0}, 0
     while i < len(sampling) - 1:
         k = _SAMPLE_KEY.get(sampling[i])
         if k:
@@ -471,6 +573,8 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
             print("  llama-server would not start; falling back to raw completion "
                   "(an instruct model scored this way can look like it loops)")
             return _gate_raw(cli_bin, model, ngl, prompts, configs, budget)
+        for why in _check_server(base, ctx):
+            print(f"  WARNING: {why}")
         return _gate_chat(base, prompts, configs, budget)
 
 

@@ -88,13 +88,15 @@ def test_the_served_gate_asks_for_jinja_and_separates_reasoning():
 def test_sampling_translates_to_the_server_payload():
     got = b._sampling_json(["--temp", "0.7", "--repeat-penalty", "1.15", "--top-k", "40",
                             "--repeat-last-n", "256", "--top-p", "0.9"])
-    assert got == {"temperature": 0.7, "repeat_penalty": 1.15, "top_k": 40,
+    assert got == {"seed": 0,                       # pinned so a re-gate is comparable
+                   "temperature": 0.7, "repeat_penalty": 1.15, "top_k": 40,
                    "repeat_last_n": 256, "top_p": 0.9}
 
 
 def test_unknown_sampling_flags_are_dropped_not_passed_through():
     """A flag the server does not take would be rejected for the whole request."""
-    assert b._sampling_json(["--mirostat", "2", "--temp", "0.5"]) == {"temperature": 0.5}
+    assert b._sampling_json(["--mirostat", "2", "--temp", "0.5"]) == {"seed": 0,
+                                                                      "temperature": 0.5}
 
 
 # -- taskeval: the suite that answers a competing release ----------------------------------------
@@ -190,3 +192,82 @@ def test_stopping_without_answering_is_not_called_a_loop():
     fn = src[src.index("def _gate_chat("):src.index("def _gate_raw(")]
     assert 'fin == "stop" and not body' in fn, "an empty answer is still handled generically"
     assert "INCONCLUSIVE" in fn and "EMPTY" in fn
+
+
+# -- the server is launched so it cannot take the gate down ---------------------------------------
+
+def _bench_src():
+    return open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "tools", "pollard_bench.py"), encoding="utf-8").read()
+
+
+def test_the_server_runs_on_one_slot():
+    """Upstream's default is auto, which makes FOUR slots sharing one KV pool while telling each
+    it owns the whole context. They exhaust it, llama_decode returns 1, and the throw is uncaught
+    on the main thread -- the process aborts and the client sees a reset socket."""
+    fn = _bench_src()
+    fn = fn[fn.index("def _served("):fn.index("def _server_supports") if "def _server_supports" in fn
+            else fn.index("def _post(")]
+    src = _bench_src()
+    blk = src[src.index("cmd = [binary,"):src.index("proc, log = None, None")]
+    assert '"-np", "1"' in blk, "the gate can be killed by slot KV exhaustion"
+    assert '"--no-context-shift"' in blk, "ik defaults context-shift ON and truncates the prompt"
+    assert '"--no-cont-batching"' in blk
+
+
+def test_an_unknown_flag_is_probed_not_assumed():
+    """Passing a flag a build does not know is a hard startup failure, and the forks disagree."""
+    src = _bench_src()
+    assert "def _server_supports" in src
+    assert "--skip-chat-parsing" in src
+
+
+def test_requests_disable_the_prompt_cache():
+    """Documented as a source of nondeterministic results, and the path by which finished prompts
+    accumulate until the KV pool is exhausted."""
+    src = _bench_src()
+    fn = src[src.index("def _chat("):src.index("def _read_chat(")]
+    assert '"cache_prompt": False' in fn
+    assert '"reasoning_format": "none"' in fn
+
+
+def test_the_seed_is_pinned():
+    import pollard_bench as B
+    assert B._sampling_json(["--temp", "0.7"])["seed"] == 0
+
+
+def test_a_socket_error_is_retried_only_while_the_server_lives():
+    """An idle connection closed by the server looks identical to a crash from the client side."""
+    src = _bench_src()
+    fn = src[src.index("def _chat("):src.index("def _read_chat(")]
+    assert "proc.poll() is None" in fn, "a dead server would be retried pointlessly"
+    assert "proc.poll() is not None" in fn, "a crash is not distinguished from a hiccup"
+
+
+def test_connections_are_not_pooled():
+    """The server closes an idle connection after 5 seconds; a pooled client races that close."""
+    src = _bench_src()
+    assert '"Connection": "close"' in src
+
+
+def test_the_server_is_checked_before_a_run_is_spent_on_it():
+    src = _bench_src()
+    assert "def _check_server" in src
+    assert "total_slots" in src and "n_ctx" in src
+
+
+def test_reasoning_is_split_out_even_when_the_server_does_not():
+    """With a pure content parser the thinking stays inline; an answer that exists must not read
+    as an empty one."""
+    import pollard_bench as B
+    got = B._read_chat({"choices": [{"message": {
+        "content": "<think>weighing it up</think>Jupiter."}, "finish_reason": "stop"}]})
+    assert got[0] == "Jupiter."
+    assert "weighing it up" in got[1]
+
+
+def test_a_server_that_files_reasoning_separately_still_works():
+    import pollard_bench as B
+    got = B._read_chat({"choices": [{"message": {
+        "content": "Jupiter.", "reasoning_content": "weighing it up"}, "finish_reason": "stop"}]})
+    assert got == ("Jupiter.", "weighing it up", "stop")
