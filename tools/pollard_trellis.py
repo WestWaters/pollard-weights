@@ -157,6 +157,57 @@ def decode(symbols, initial_state, L=12, K=2, scale=1.0):
     return codebook(states, scale)
 
 
+# --- storage ------------------------------------------------------------------------------------
+# A lane needs BYTES, not a list of ints. The packing below is deliberately plain: K-bit symbols
+# little-endian into a byte stream, with the header carrying everything a decoder needs. No lane
+# specific layout, because the point of this format is that every emitter can write it and every
+# runtime can read it with the same twenty lines.
+MAGIC = b"PTRL"          # Pollard TRelLis
+VERSION = 1
+
+
+def pack(symbols, initial_state, L, K, scale, shape=None):
+    """Symbols -> a self-describing byte string.
+
+    The header carries L, K, scale, the initial state and the tensor shape. A decoder that has
+    the bytes needs nothing else -- no sidecar, no per-lane convention to get wrong.
+    """
+    import struct
+    syms = np.asarray(symbols, dtype=np.uint64).ravel()
+    if K < 1 or K > 8:
+        raise ValueError(f"K must be 1..8 bits, got {K}")
+    if syms.size and int(syms.max()) >= (1 << K):
+        raise ValueError(f"a symbol exceeds {K} bits")
+    rows, cols = (shape or (1, syms.size))
+
+    bits = np.unpackbits(syms.astype(np.uint8)[:, None], axis=1)[:, 8 - K:]
+    buf = np.packbits(bits.reshape(-1))
+    head = struct.pack("<4sBBBQdII", MAGIC, VERSION, L, K, int(initial_state),
+                       float(scale), int(rows), int(cols))
+    return head + buf.tobytes()
+
+
+def unpack(blob):
+    """Bytes -> (weights, meta). The runtime path: header, bit unpack, shift, codebook."""
+    import struct
+    size = struct.calcsize("<4sBBBQdII")
+    magic, ver, L, K, state, scale, rows, cols = struct.unpack("<4sBBBQdII", blob[:size])
+    if magic != MAGIC:
+        raise ValueError("not a Pollard trellis blob")
+    if ver != VERSION:
+        raise ValueError(f"trellis version {ver}, this reader speaks {VERSION}")
+    n = rows * cols
+    bits = np.unpackbits(np.frombuffer(blob[size:], dtype=np.uint8))[:n * K]
+    syms = np.packbits(bits.reshape(n, K), axis=1, bitorder="big")[:, 0] >> (8 - K)
+    out = np.empty(n, dtype=np.float64)
+    at = 0
+    for _ in range(rows):
+        out[at:at + cols] = decode(syms[at:at + cols], state, L=L, K=K, scale=scale)
+        at += cols
+    return out.reshape(rows, cols), {"L": L, "K": K, "scale": scale, "state": state,
+                                     "rows": rows, "cols": cols}
+
+
 def bits_per_weight(n, L=12, K=2):
     """K bits per weight plus the initial state, amortised over the row."""
     return K + L / max(n, 1)

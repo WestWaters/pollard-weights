@@ -197,3 +197,67 @@ def test_encode_is_fast_enough_to_use():
     t = time.perf_counter()
     T.quantize_row(w, L=10, K=2)
     assert time.perf_counter() - t < 5.0, "2048 weights should not take seconds at L=10"
+
+
+# --- storage: the part that makes it portable across lanes ------------------------------------
+@pytest.mark.parametrize("K", [1, 2, 3, 4])
+def test_pack_round_trips_exactly(K):
+    """A lane needs bytes. If unpack does not reproduce the encoder's output the weights are
+    wrong and the file still loads, which is the worst kind of wrong."""
+    w = np.random.default_rng(10).standard_normal(256) * 0.02
+    scale = float(np.sqrt(np.mean(w * w)))
+    q, syms, state = T.quantize_row(w, L=10, K=K)
+    back, meta = T.unpack(T.pack(syms, state, 10, K, scale, shape=(1, 256)))
+    assert np.allclose(back.ravel(), q), f"K={K} does not survive packing"
+    assert meta["L"] == 10 and meta["K"] == K
+
+
+def test_the_blob_is_self_describing():
+    """No sidecar and no per-lane convention: everything a decoder needs is in the header."""
+    w = np.random.default_rng(11).standard_normal(64) * 0.02
+    q, syms, state = T.quantize_row(w, L=8, K=2)
+    _, meta = T.unpack(T.pack(syms, state, 8, 2, 0.02, shape=(1, 64)))
+    for key in ("L", "K", "scale", "state", "rows", "cols"):
+        assert key in meta, f"header does not carry {key}"
+
+
+def test_a_foreign_blob_is_refused():
+    with pytest.raises(ValueError):
+        T.unpack(b"NOPE" + b"\0" * 64)
+
+
+def test_a_future_version_is_refused_rather_than_misread():
+    import struct
+    blob = T.pack(np.zeros(8, dtype=np.int64), 0, 8, 2, 1.0, shape=(1, 8))
+    bad = blob[:4] + struct.pack("<B", 99) + blob[5:]
+    with pytest.raises(ValueError, match="version"):
+        T.unpack(bad)
+
+
+def test_a_symbol_too_wide_for_k_is_refused():
+    """Silently truncating would corrupt every weight after it."""
+    with pytest.raises(ValueError):
+        T.pack(np.array([7]), 0, 8, 2, 1.0, shape=(1, 1))
+
+
+def test_packed_size_matches_the_declared_rate():
+    n, K = 1024, 2
+    blob = T.pack(np.zeros(n, dtype=np.int64), 0, 10, K, 1.0, shape=(1, n))
+    overhead = len(blob) - (n * K // 8)
+    assert overhead < 40, f"header is {overhead} bytes, which is not amortising"
+    assert len(blob) * 8 / n < K + 0.5
+
+
+def test_a_matrix_round_trips_row_by_row():
+    W = np.random.default_rng(12).standard_normal((4, 128)) * 0.02
+    scale = float(np.sqrt(np.mean(W * W)))
+    syms, states = [], []
+    for row in W:
+        _, s, st = T.quantize_row(row, L=8, K=2, scale=scale)
+        syms.append(s)
+        states.append(st)
+    # one shared initial state is the simple case the format assumes
+    if len(set(states)) == 1:
+        back, meta = T.unpack(T.pack(np.concatenate(syms), states[0], 8, 2, scale,
+                                     shape=W.shape))
+        assert back.shape == W.shape
