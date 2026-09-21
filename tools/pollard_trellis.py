@@ -104,39 +104,57 @@ def quantize_row(w, L=12, K=2, hdiag=None, scale=None):
         raise ValueError(f"hdiag has {h.size} entries for {n} weights")
 
     all_states = np.arange(n_states, dtype=np.uint64)
-    # successor table: from every state, the K-bit shift gives 2^K next states
-    succ = np.empty((n_states, n_sym), dtype=np.int64)
-    for j in range(n_sym):
-        succ[:, j] = (((all_states << np.uint64(K)) | np.uint64(j)) & mask).astype(np.int64)
-    # every state's reconstruction value, computed once
+    # PREDECESSORS, not successors. Scattering into successors needs np.minimum.at, which is a
+    # serialised ufunc and dominates the runtime. Inverting the shift turns the same recurrence
+    # into a gather: a target state t was reached from ((t >> K) | (p << (L-K))) for each of the
+    # 2^K values p that were shifted out. That is a fixed-width table, so every timestep becomes
+    # one vectorised min over an (n_states, 2^K) array.
+    pred = np.empty((n_states, n_sym), dtype=np.int64)
+    hi_shift = np.uint64(L - K)
+    for pbits in range(n_sym):
+        pred[:, pbits] = (((all_states >> np.uint64(K))
+                           | (np.uint64(pbits) << hi_shift)) & mask).astype(np.int64)
     values = codebook(all_states, scale)
 
-    INF = np.float64(1e30)
     cost = np.zeros(n_states, dtype=np.float64)      # uniform start: any initial state allowed
     back = np.empty((n, n_states), dtype=np.uint16 if L <= 16 else np.uint32)
+    rows_ix = np.arange(n_states)
 
     for t in range(n):
         d = h[t] * (values - w[t]) ** 2              # cost of LANDING in each state at step t
-        nxt = np.full(n_states, INF, dtype=np.float64)
-        bk = np.zeros(n_states, dtype=back.dtype)
-        for j in range(n_sym):
-            tgt = succ[:, j]
-            cand = cost + d[tgt]
-            # keep the cheapest predecessor for each target state
-            np.minimum.at(nxt, tgt, cand)
-            better = cand <= nxt[tgt]
-            bk[tgt[better]] = np.arange(n_states, dtype=back.dtype)[better]
-        cost, back[t] = nxt, bk
+        cand = cost[pred] + d[:, None]               # (n_states, 2^K)
+        pick = np.argmin(cand, axis=1)
+        cost = cand[rows_ix, pick]
+        back[t] = pred[rows_ix, pick]
 
     state = int(np.argmin(cost))
     symbols = np.zeros(n, dtype=np.int64)
     path = np.zeros(n, dtype=np.int64)
     for t in range(n - 1, -1, -1):
         path[t] = state
-        prev = int(back[t][state])
-        symbols[t] = state & (n_sym - 1)
-        state = prev
-    return values[path], symbols, int(path[0])
+        symbols[t] = state & (n_sym - 1)             # the symbol IS the low K bits of the state
+        state = int(back[t][state])
+    # `state` is now the state BEFORE the first symbol was shifted in, which is what decode has to
+    # start from. Returning path[0] instead -- the state AFTER step 0 -- decodes every weight one
+    # position out of phase, and the file still loads, so nothing downstream would catch it.
+    return values[path], symbols, int(state)
+
+
+def decode(symbols, initial_state, L=12, K=2, scale=1.0):
+    """Symbols back to weights. This is the RUNTIME path, and it has no search in it.
+
+    Encoding pays for Viterbi once. Decoding just replays the shift and evaluates the computed
+    codebook, both of which vectorise -- which is the property that makes a trellis format
+    practical to serve rather than merely good on paper.
+    """
+    symbols = np.asarray(symbols, dtype=np.uint64).ravel()
+    mask = np.uint64((1 << L) - 1)
+    states = np.empty(symbols.size, dtype=np.uint64)
+    s = np.uint64(initial_state)
+    for i, sym in enumerate(symbols):                # the recurrence is inherently sequential
+        s = ((s << np.uint64(K)) | sym) & mask
+        states[i] = s
+    return codebook(states, scale)
 
 
 def bits_per_weight(n, L=12, K=2):

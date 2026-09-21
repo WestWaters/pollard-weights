@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import pathlib
 from pathlib import Path
 
 import pytest
@@ -132,3 +133,67 @@ def test_provenance_is_documented_in_the_file():
 
 def test_it_stays_ascii():
     assert all(ord(c) < 128 for c in (ROOT / "tools/pollard_trellis.py").read_text())
+
+
+# --- the round trip is the correctness property that matters --------------------------------
+@pytest.mark.parametrize("L,K", [(8, 2), (10, 2), (10, 3), (12, 2)])
+def test_decode_reproduces_encode_exactly(L, K):
+    """Encoding pays for Viterbi once; decoding just replays the shift. If they disagree by even
+    one position the file still loads and every weight is out of phase, which nothing downstream
+    would catch."""
+    w = np.random.default_rng(5).standard_normal(512) * 0.02
+    scale = float(np.sqrt(np.mean(w * w)))
+    q, syms, state = T.quantize_row(w, L=L, K=K)
+    d = T.decode(syms, state, L=L, K=K, scale=scale)
+    assert np.allclose(d, q), "decode is out of phase with encode"
+
+
+def test_the_returned_state_is_the_one_before_the_first_symbol():
+    """Returning the state AFTER step 0 decodes everything one position out."""
+    w = np.random.default_rng(6).standard_normal(64) * 0.02
+    q, syms, state = T.quantize_row(w, L=8, K=2)
+    mask = (1 << 8) - 1
+    first = ((state << 2) | int(syms[0])) & mask
+    assert T.codebook(np.array([first]), float(np.sqrt(np.mean(w * w))))[0] == pytest.approx(q[0])
+
+
+def _code_only(path):
+    """Source with comments and docstrings stripped, so a check about CODE is neither satisfied
+    nor broken by prose that happens to mention the thing."""
+    import ast
+    tree = ast.parse(pathlib.Path(path).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Module)):
+            if (node.body and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                node.body.pop(0)
+    return ast.unparse(tree)
+
+
+def test_encode_uses_a_gather_not_a_scatter():
+    """np.minimum.at is a serialised ufunc and dominated the runtime; inverting the shift turns
+    the recurrence into a fixed-width gather."""
+    code = _code_only(ROOT / "tools/pollard_trellis.py")
+    assert "np.minimum.at" not in code, "the scatter is still in the code path"
+    assert "pred" in code and "n_sym" in code
+
+
+def test_decode_has_no_search_in_it():
+    """The runtime path must not carry Viterbi. If it does, the format is not servable."""
+    code = _code_only(ROOT / "tools/pollard_trellis.py")
+    i = code.index("def decode")
+    body = code[i:]
+    nxt = body.find("\ndef ")
+    body = body[:nxt] if nxt > 0 else body
+    for banned in ("argmin", "minimum", "back["):
+        assert banned not in body, "decode should not contain " + repr(banned)
+
+
+def test_encode_is_fast_enough_to_use():
+    """A reference implementation nobody can run is not a reference implementation."""
+    import time
+    w = np.random.default_rng(7).standard_normal(2048) * 0.02
+    t = time.perf_counter()
+    T.quantize_row(w, L=10, K=2)
+    assert time.perf_counter() - t < 5.0, "2048 weights should not take seconds at L=10"
