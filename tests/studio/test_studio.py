@@ -153,16 +153,37 @@ def test_scan_is_shaped_right():
                 assert Path(b["path"]).is_dir()
 
 
-def test_every_lane_is_reachable_from_a_scan():
-    """Studio must not be able to see only GGUF -- that was the bug this closes."""
+def test_every_lane_is_reachable_from_a_scan(tmp_path, monkeypatch):
+    """Studio must not be able to see only GGUF -- that was the bug this closes.
+
+    Built from a fixture rather than whatever happens to be in the caller's workspace: read off
+    a real machine this passed for the wrong reason (there were GGUFs AND safetensors lying
+    around) and failed on a clean one for no reason at all (nothing lying around). Neither
+    outcome said anything about the scanner.
+    """
+    ws_root = tmp_path / "pollard"
+    m = ws_root / "models" / "some__model"
+    m.mkdir(parents=True)
+    (m / "some-model-Pollard-IQ4_XS.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+    st = ws_root / "models" / "some__model-mlx"
+    st.mkdir(parents=True)
+    (st / "model.safetensors").write_bytes(b"\0" * 64)
+    (st / "config.json").write_text('{"architectures": ["X"]}')
+    monkeypatch.setenv("POLLARD_HOME", str(ws_root))
+
     ws = workspace.scan(deep=False)
-    kinds = {b["kind"] for m in ws["models"] for b in m["builds"]}
-    assert kinds, "no builds found at all"
+    kinds = {b["kind"] for mm in ws["models"] for b in mm["builds"]}
+    assert kinds, "the scanner found nothing in a workspace that has two builds in it"
+    assert "safetensors" in kinds, "only GGUF is visible -- the bug this test exists for"
     assert kinds <= {"gguf", "safetensors"}
 
 
 def test_absent_measurements_stay_absent():
-    """A build with no recorded perplexity reports None -- never a stand-in number."""
+    """A build with no recorded perplexity reports None -- never a stand-in number.
+
+    Vacuous on a machine with an empty workspace, which is fine: it is a "never invents a
+    number" guard, and there is nothing to invent one from.
+    """
     ws = workspace.scan(deep=False)
     for m in ws["models"]:
         for b in m["builds"]:
