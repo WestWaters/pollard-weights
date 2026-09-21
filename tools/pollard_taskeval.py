@@ -104,6 +104,19 @@ def model_args(path: str) -> tuple[str, str]:
     return "hf", f"pretrained={path}"
 
 
+def chat_model(path: str) -> bool:
+    """Does this model have a chat template? Then it must be scored through a chat turn.
+
+    Pollard already reads this (pollard-modelkind says "instruct" from the same field); taskeval
+    simply never asked.
+    """
+    try:
+        from pollard_modelkind import _template_and_arch
+        return bool(_template_and_arch(path)[0])
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def served(gguf: str, ngl: str, port: int, ctx: int):
     """Host a GGUF on llama-server for the duration, and yield its base_url.
@@ -116,8 +129,16 @@ def served(gguf: str, ngl: str, port: int, ctx: int):
     import urllib.request
     from pollard_calc import find_llama_bin
     binsrv = find_llama_bin("llama-server") or "llama-server"
+    # --jinja: apply the model's OWN chat template. Without it an instruct model is scored as a
+    # base model -- it never reaches its end-of-turn token, runs past the answer, and the harness
+    # scrapes a stop string out of the overrun. Every generative task loses points to that, and
+    # the release being answered quoted numbers measured WITH their template, so the comparison
+    # was biased against us rather than merely noisy.
+    # --reasoning-format deepseek: a thinking model's <think> block lands in reasoning_content
+    # instead of being parsed as the answer.
     cmd = [binsrv, "-m", gguf, "--host", "127.0.0.1", "--port", str(port),
-           "-ngl", str(ngl), "-c", str(ctx)]
+           "-ngl", str(ngl), "-c", str(ctx), "--jinja",
+           "--reasoning-format", "deepseek"]
     print(f"   serving: {' '.join(os.path.basename(c) for c in cmd[:3])} ... -ngl {ngl}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = f"http://127.0.0.1:{port}"
@@ -167,7 +188,17 @@ def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_di
     # backend -- otherwise the number describes an fp32 copy of the build rather than the build.
     if serve and harness == "lm_eval" and path.endswith(".gguf"):
         with served(path, ngl, port, ctx) as base:
-            r = _invoke("gguf", f"base_url={base}")
+            if chat_model(path):
+                # lm-eval's `gguf` backend posts to /v1/completions -- the RAW endpoint, no
+                # template. local-chat-completions posts to /v1/chat/completions, where the
+                # server applies the model's own template and the model stops on its own
+                # end-of-turn token.
+                r = _invoke("local-chat-completions",
+                            f"base_url={base}/v1/chat/completions,"
+                            f"model=pollard,num_concurrent=1,tokenized_requests=False",
+                            ("--apply_chat_template",))
+            else:
+                r = _invoke("gguf", f"base_url={base}")
     else:
         r = _invoke(backend, margs, ("--device", device))
     if r.returncode != 0:
