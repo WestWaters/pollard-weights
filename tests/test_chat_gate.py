@@ -271,3 +271,53 @@ def test_a_server_that_files_reasoning_separately_still_works():
     got = B._read_chat({"choices": [{"message": {
         "content": "Jupiter.", "reasoning_content": "weighing it up"}, "finish_reason": "stop"}]})
     assert got == ("Jupiter.", "weighing it up", "stop")
+
+
+# -- a verdict from the wrong method is worse than no verdict -------------------------------------
+
+def test_an_instruct_model_without_a_server_is_ungated_not_failed(monkeypatch, tmp_path):
+    """This is the bug that cost a whole rebuild. llama-server could not be found, the gate
+    quietly fell back to raw completion, and an instruct model -- whose stop token only exists
+    inside a chat turn -- was reported BELOW FLOOR. The build was fine."""
+    monkeypatch.setattr(b, "has_chat_template", lambda m: "{{ messages }}")
+    monkeypatch.setattr(b, "_served", lambda *a, **k: __import__("contextlib").nullcontext(None))
+    res = b.coherence_gate("llama-cli", "m.gguf", 0)
+    assert res["verdict"] == "NO_SERVER", f"got {res['verdict']} -- a verdict it could not earn"
+    assert "llama-server" in res["rows"][0]["reason"]
+
+
+def test_a_base_model_without_a_server_still_uses_raw_completion(monkeypatch):
+    """Raw completion is CORRECT for a base model -- that is what it is."""
+    monkeypatch.setattr(b, "has_chat_template", lambda m: "")
+    called = {}
+    def _raw(*a, **k):
+        called["raw"] = True
+        return {"verdict": "PASS", "config": "x", "rows": []}
+    monkeypatch.setattr(b, "_gate_raw", _raw)
+    res = b.coherence_gate("llama-cli", "m.gguf", 0)
+    assert called.get("raw") and res["verdict"] == "PASS"
+
+
+def test_the_ungated_verdict_is_not_reported_as_a_pass():
+    res = {"verdict": "NO_SERVER", "config": None,
+           "rows": [{"prompt": "x", "loop": None, "reason": "no server", "sample": ""}]}
+    assert b.print_gate(res) is False
+
+
+def test_the_server_is_searched_for_not_guessed():
+    """find_llama_bin covers a llama.cpp checkout and PATH; the trellis atoms need ik_llama,
+    which people build wherever they like."""
+    src = _bench_src()
+    fn = src[src.index("def _server_bin("):src.index("@contextlib.contextmanager")]
+    assert "ik_llama.cpp/build/bin" in fn, "ik builds are not looked for"
+    assert "SERVER_BIN" in fn, "the caller cannot say where it is"
+
+
+def test_automap_tells_the_gate_where_the_server_is():
+    """automap already resolved the binaries; not passing the server is what made the gate fall
+    back to the wrong scoring method."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_automap.py"), encoding="utf-8").read()
+    seg = src[src.index('steps.append(("coherence gate"'):]
+    seg = seg[:seg.index("]))") + 3]
+    assert "--llama-server" in seg and "--llama-cli" in seg

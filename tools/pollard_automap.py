@@ -457,9 +457,13 @@ def emit_bat(a, n_layers, is_moe, names):
     # Auto coherence gate on the finished mix -- so a build also tells you whether it is USABLE.
     if getattr(a, "gate", True):
         gate_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pollard_bench.py")
+        # pass BOTH binaries: automap already resolved where they are, and a gate that cannot
+        # start a server falls back to scoring an instruct model as raw completion, which reads
+        # as a loop at any bit width
         steps.append(("coherence gate", [sys.executable, gate_py, "--gguf", mix_out,
                                          "--coherence", "--ngl", str(a.ngl),
-                                         "--llama-cli", os.path.join(a.bin, "llama-cli" + exe)]))
+                                         "--llama-cli", os.path.join(a.bin, "llama-cli" + exe),
+                                         "--llama-server", os.path.join(a.bin, "llama-server" + exe)]))
     return {"header": header, "steps": steps, "mix": mix_out, "log": a.log}
 
 
