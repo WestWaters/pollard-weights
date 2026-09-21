@@ -2401,6 +2401,10 @@ def test_no_dangling_pollard_imports_anywhere():
     root = os.path.join(os.path.dirname(__file__), "..")
     tools = os.path.join(root, "tools")
     have = {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(tools, "*.py"))}
+    # a PACKAGE is a directory with an __init__.py, not a .py file -- pollard_studio is one, and
+    # without this every import of it reads as dangling
+    have |= {os.path.basename(os.path.dirname(p))
+             for p in glob.glob(os.path.join(tools, "*", "__init__.py"))}
     pat = re.compile(r"^\s*(?:from|import)\s+(pollard_[A-Za-z0-9_]+)", re.M)
     dangling = []
     for d in ("tools", "tests", "experiments"):
@@ -2471,3 +2475,33 @@ def test_fragile_embedding_is_raised_not_crushed():
     assert lift.get("output") == "Q8_0", f"a kurtosis-11.2 output must be raised: {lift}"
     assert any("attn_v" in r for r in rules), "an ordinary fragile kind should get a protect rule"
     assert not any("ffn_up" in r for r in rules), "a low-kurtosis kind must be left alone"
+
+
+def test_every_entry_point_names_a_module_that_installs():
+    """`pollard-trellis` was declared in [project.scripts] and never added to py-modules, so pip
+    installed a command with no module behind it -- ModuleNotFoundError on first use, and only
+    for people who installed rather than working in a checkout."""
+    import tomllib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    d = tomllib.loads((root / "pyproject.toml").read_text())
+    st = d["tool"]["setuptools"]
+    shipped = set(st.get("py-modules") or []) | set(st.get("packages") or [])
+    missing = []
+    for cmd, target in d["project"]["scripts"].items():
+        mod = target.split(":")[0]
+        top = mod.split(".")[0]
+        if top not in shipped:
+            missing.append(f"{cmd} -> {mod}")
+    assert not missing, ("entry points whose module does not install:\n  "
+                         + "\n  ".join(sorted(missing)))
+
+
+def test_every_tool_in_the_tree_installs():
+    """A tool that exists but is not packaged is invisible to everyone who pip installs."""
+    import tomllib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    d = tomllib.loads((root / "pyproject.toml").read_text())
+    declared = set(d["tool"]["setuptools"].get("py-modules") or [])
+    on_disk = {p.stem for p in (root / "tools").glob("pollard_*.py")}
+    assert not (on_disk - declared), \
+        "in tools/ but never installed: " + ", ".join(sorted(on_disk - declared))

@@ -109,4 +109,7 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pol
     "pollard_serve_eval", "pollard_card", "pollard_onboard", "pollard_envmatch", "imatrix_fix_gate", "exl3_fix_mtp_ehproj",
     "pollard_archfp", "pollard_errtype", "pollard_errsrc", "pollard_recard",
     "pollard_ggufcompat", "pollard_reclaim", "pollard_exl3_band", "pollard_refcheck",
-    "pollard_runtime"]
+    "pollard_runtime",
+    # declared as entry points but never listed here, so `pollard-trellis` and friends installed
+    # as a command with no module behind it
+    "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis"]
