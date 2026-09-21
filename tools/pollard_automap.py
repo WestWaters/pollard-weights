@@ -21,7 +21,7 @@ Usage:
   pollard-automap --tensors tensors.txt --model model-f16.gguf --imatrix ik.imatrix \
       --out build_mix.bat --bin path/to/ik_llama.cpp/build/bin
 """
-import argparse, os, re, sys
+import argparse, os, re, subprocess, sys, tempfile
 
 
 def imatrix_covered(path):
@@ -122,6 +122,51 @@ def ensure_gate_coverage(imatrix_path):
     except Exception:
         return imatrix_path, 0          # couldn't write -> proceed with the original (pins will cover)
     return out, added
+
+
+def tensor_list(model, bin_dir=None, imatrix=None, out=None):
+    """Produce the tensor listing ourselves instead of demanding one.
+
+    --tensors was a required argument, which meant every caller had to know to run
+    `llama-quantize --dry-run` first and where to put the output. That is a step Pollard can do,
+    so it does it.
+
+    Choosing the listing type is the other half. A dry-run at IQ1_S is REFUSED outright when no
+    importance matrix is present -- llama-quantize prints the refusal instead of the tensor names,
+    and the caller sees an empty file rather than a reason. We only want names, so: use the
+    imatrix when one was given, and otherwise ask for a type that never needs one. Detect and
+    choose, rather than stop.
+    """
+    exe = os.path.join(bin_dir, "llama-quantize.exe" if os.name == "nt" else "llama-quantize") \
+        if bin_dir else ("llama-quantize.exe" if os.name == "nt" else "llama-quantize")
+    out = out or os.path.join(tempfile.gettempdir(), "pollard_tensors.txt")
+    sink = os.path.join(tempfile.gettempdir(), "pollard_dryrun.gguf")
+
+    # imatrix-free first: Q8_0 lists the same tensors and is never refused for want of one.
+    attempts = [["--dry-run", model, sink, "Q8_0"]]
+    if imatrix:
+        attempts.insert(0, ["--dry-run", "--imatrix", imatrix, model, sink, "IQ1_S"])
+
+    last = ""
+    for args in attempts:
+        try:
+            r = subprocess.run([exe] + args, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=900)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            last = str(e)
+            continue
+        blob = (r.stdout or "") + (r.stderr or "")
+        if re.search(r"blk\.\d+\.", blob):
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(blob)
+            return out
+        last = blob.strip().splitlines()[-1] if blob.strip() else "no output"
+    raise SystemExit(
+        f"ERROR: could not list the tensors of {model}.\n"
+        f"  Tried a dry-run with and without an importance matrix; the last thing it said was:\n"
+        f"    {last[:300]}\n"
+        f"  Pass --tensors with a `llama-quantize --dry-run` listing, or --bin with the directory "
+        f"holding llama-quantize.")
 
 
 def parse_tensors(path):
@@ -402,7 +447,10 @@ def emit_bat(a, n_layers, is_moe, names):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--tensors", required=True, help="llama-quantize --dry-run tensor list")
+    ap.add_argument("--tensors", help="llama-quantize --dry-run tensor list. Optional: without "
+                                      "it Pollard runs the dry-run itself, picking a listing "
+                                      "type that does not need an importance matrix if none "
+                                      "was supplied.")
     ap.add_argument("--model", required=True, help="source F16 gguf path (as seen on the box)")
     ap.add_argument("--imatrix", default="ik.imatrix")
     ap.add_argument("--eval", default="",
@@ -458,7 +506,9 @@ def main():
     else:
         a.body = a.body or "iq1_kt"
         a.protect = a.protect or "iq2_kt"
-    names, n_layers, is_moe, arch = parse_tensors(a.tensors)
+    # --tensors is optional now: if it was not given, make the listing rather than refusing.
+    tensors = a.tensors or tensor_list(a.model, bin_dir=a.bin, imatrix=a.imatrix)
+    names, n_layers, is_moe, arch = parse_tensors(tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found -- is this a dry-run tensor list?")
     # Dense runs. automap has carried a real dense recipe all along (crush ffn_gate/up, protect
