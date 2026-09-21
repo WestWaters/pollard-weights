@@ -221,8 +221,8 @@ class _Args:
 
 def test_build_vs_benchmark_split():
     names = _moe()
-    bat_full = A.emit_bat(_Args(), 4, True, names)
-    bat_fast = A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names)
+    bat_full = A.render_script(A.emit_bat(_Args(), 4, True, names), for_windows=True)
+    bat_fast = A.render_script(A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names), for_windows=True)
     assert bat_full.count("llama-quantize") == 3 and bat_full.count("llama-perplexity") == 3  # 3-bar benchmark
     assert bat_fast.count("llama-quantize") == 1 and bat_fast.count("llama-perplexity") == 0   # ONE model, no eval
 
@@ -230,10 +230,10 @@ def test_build_vs_benchmark_split():
 def test_gate_appended_to_oneshot_build():
     # the one-shot (mix-only) build auto-appends the coherence gate on the finished mix
     names = _moe()
-    bat = A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names)
+    bat = A.render_script(A.emit_bat(_Args(mix_only=True, no_eval=True), 4, True, names), for_windows=True)
     assert "--coherence" in bat and "pollard_bench.py" in bat, "one-shot build must append the gate"
     assert "deepseek" not in bat  # sanity: uses the emitted stem, not a stray path
-    bat_off = A.emit_bat(_Args(mix_only=True, no_eval=True, gate=False), 4, True, names)
+    bat_off = A.render_script(A.emit_bat(_Args(mix_only=True, no_eval=True, gate=False), 4, True, names), for_windows=True)
     assert "--coherence" not in bat_off, "--no-gate must omit the gate"
 
 
@@ -248,7 +248,9 @@ def test_dense_is_not_refused():
     out = os.path.join(tempfile.gettempdir(), "g.bat")
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "tools",
                         "pollard_automap.py"), "--tensors", tf, "--model", "d.gguf",
-                        "--out", out], capture_output=True, text=True)
+                        # --plan-only: the question here is whether dense is REFUSED, and
+                        # automap builds for real now -- there is no model behind d.gguf
+                        "--plan-only", "--out", out], capture_output=True, text=True)
     blob = r.stdout + r.stderr
     assert "REFUSED" not in blob, f"automap must NOT refuse a dense model:\n{blob}"
     assert r.returncode == 0, f"dense automap must succeed, got {r.returncode}:\n{blob}"
@@ -261,7 +263,10 @@ def test_allow_dense_still_accepted():
     tf = _tensorfile(_dense())
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "tools",
                         "pollard_automap.py"), "--tensors", tf, "--model", "d.gguf",
-                        "--allow-dense", "--out", os.path.join(tempfile.gettempdir(), "g2.bat")],
+                        # --plan-only for the same reason as above: the assertion is that the
+                        # FLAG still parses, not that a build of a nonexistent model succeeds
+                        "--allow-dense", "--plan-only",
+                        "--out", os.path.join(tempfile.gettempdir(), "g2.bat")],
                        capture_output=True, text=True)
     assert r.returncode == 0, f"--allow-dense must still be accepted:\n{r.stdout}{r.stderr}"
 
