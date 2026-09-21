@@ -17,7 +17,7 @@ quality for fewer GB, or more quality at the same GB), not as a single number.
 Reuses llama-perplexity; no rebuild. This is the opt-in benchmark -- a plain `pollard` build never
 runs it (that's the split that stopped a minutes-long shrink from taking hours).
 """
-import argparse, os, re, shutil, subprocess, sys, zlib
+import argparse, contextlib, json, os, re, shutil, subprocess, sys, time, zlib
 from collections import Counter
 
 from pollard_calc import find_llama_bin
@@ -282,21 +282,224 @@ def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=220):
     return out.split(prompt, 1)[-1] if prompt in out else out
 
 
-def coherence_gate(cli_bin, model, ngl, quick=False):
-    """Run the model over the gate prompts, sweeping sampling. A config PASSES only if EVERY
-    prompt is loop-free. Returns a verdict dict: PASS (+the winning sampling) or BELOW_FLOOR.
-    quick=True: one prompt, default sampling only (a fast post-build sanity, not the full gate)."""
+# -- chat-aware generation -----------------------------------------------------------------------
+# An instruct model's stop token lives INSIDE a chat turn: Qwen's EOS is <|im_end|>, which the
+# template emits and a raw prompt never can. Generate without the template and the model has no
+# reachable way to stop -- it runs to the token budget and repeats, every time, at any bit width.
+# That is a harness artifact, and scoring it as "below the coherence floor" condemns builds that
+# are fine and spends size bumping tiers to escape a bug.
+#
+# The portable fix is llama-server, not the CLI. The CLI flags disagree across builds (upstream
+# split llama-cli into llama-cli + llama-completion; ik_llama has no -st, no -no-cnv, and routes
+# -p to the SYSTEM role under -cnv, dropping it), whereas /v1/chat/completions and /apply-template
+# exist on upstream AND ik. It also hands back the one signal worth more than every heuristic
+# here: finish_reason == "stop" means the model emitted its own end-of-turn token.
+
+def _server_bin():
+    return find_llama_bin("llama-server") or "llama-server"
+
+
+@contextlib.contextmanager
+def _served(model, ngl, ctx=4096, port=0):
+    """llama-server for the duration, yielding its base url (or None if it will not start)."""
+    if not port:
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    cmd = [_server_bin(), "-m", model, "--host", "127.0.0.1", "--port", str(port),
+           "-ngl", str(ngl), "-c", str(ctx), "--jinja",
+           # thoughts land in reasoning_content, so a <think> block cannot be mistaken for the
+           # answer being incoherent
+           "--reasoning-format", "deepseek"] + _t()
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        yield None
+        return
+    base = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(900):                       # a big model on CPU takes a while to load
+            if proc.poll() is not None:
+                yield None
+                return
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                time.sleep(1)
+        else:
+            yield None
+            return
+        yield base
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                proc.kill()
+
+
+def _post(base, path, payload, timeout=900):
+    req = urllib.request.Request(base + path, method="POST",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _chat(base, user, sampling, budget):
+    """One templated turn. Returns (content, reasoning, finish_reason)."""
+    body = {"messages": [{"role": "user", "content": user}],
+            "max_tokens": budget, "stream": False}
+    body.update(_sampling_json(sampling))
+    try:
+        got = _post(base, "/v1/chat/completions", body)
+    except Exception as e:
+        return _NoOutput(str(e)), "", "error"
+    ch = (got.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    return (msg.get("content") or "", msg.get("reasoning_content") or "",
+            ch.get("finish_reason") or "")
+
+
+#: the CLI sampling lists above, as the JSON the server takes
+_SAMPLE_KEY = {"--temp": "temperature", "--top-k": "top_k", "--top-p": "top_p",
+               "--min-p": "min_p", "--repeat-penalty": "repeat_penalty",
+               "--repeat-last-n": "repeat_last_n", "--frequency-penalty": "frequency_penalty",
+               "--presence-penalty": "presence_penalty"}
+
+
+def _sampling_json(sampling):
+    out, i = {}, 0
+    while i < len(sampling) - 1:
+        k = _SAMPLE_KEY.get(sampling[i])
+        if k:
+            v = sampling[i + 1]
+            out[k] = float(v) if "." in str(v) else int(v)
+        i += 2
+    return out
+
+
+def tail_repeat(text, n=4, window=220):
+    """Repeated-n-gram rate over the TAIL of the output.
+
+    A loop is a tail phenomenon. Measuring over the whole output lets a long correct answer hide
+    a loop at the end, and -- worse -- flags legitimately repetitive bodies: code, tables and
+    numbered lists reuse tokens by construction. Splitting on whitespace also mis-scores CJK,
+    where one "word" can be a whole sentence, so this counts tokens crudely but not by spaces
+    alone."""
+    toks = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)[-window:]
+    if len(toks) < n * 4:
+        return 0.0
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    return round(1.0 - len(set(grams)) / len(grams), 3)
+
+
+def has_chat_template(model):
+    """The model's own chat template, or "" for a base model.
+
+    Pollard already reads this -- modelkind uses it to say "instruct" -- the gate just never
+    acted on it.
+    """
+    try:
+        from pollard_modelkind import _template_and_arch
+        return _template_and_arch(model)[0] or ""
+    except Exception:
+        return ""
+
+
+def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
+    """Run the model the way it is actually used, then judge whether it held together.
+
+    An INSTRUCT model is run through its own chat template on llama-server, because its stop
+    token only exists inside a chat turn. A BASE model is run as raw completion, because that is
+    what it is. Testing the first as the second is the bug this replaced: it condemned coherent
+    builds at every bit width and sent people off to spend size bumping tiers.
+
+    quick=True: one prompt, default sampling -- a fast post-build sanity, not the full gate."""
     prompts = GATE_PROMPTS[:1] if quick else GATE_PROMPTS
     configs = SAMPLING_CONFIGS[:1] if quick else SAMPLING_CONFIGS
     # A thinking model reasons before it answers, so a fixed budget cuts it off mid-thought
     # and the known-answer check fails a build that was about to be right. Ask what it is.
+    budget, kind = 220, None
     try:
         from pollard_modelkind import classify, describe
         kind = classify(model)
         budget = kind["gate_tokens"]
         print(f"  model kind: {describe(kind)}  (gate budget {budget} tokens)")
     except Exception:
-        budget = 220
+        pass
+    if gate_tokens:
+        budget = gate_tokens                     # an explicit budget always wins
+
+    tpl = has_chat_template(model)
+    if not tpl:
+        print("  no chat template -> base model, scored as raw completion")
+        return _gate_raw(cli_bin, model, ngl, prompts, configs, budget)
+    print("  chat template present -> served with --jinja, scored on the model's own turn")
+    with _served(model, ngl, ctx) as base:
+        if base is None:
+            print("  llama-server would not start; falling back to raw completion "
+                  "(an instruct model scored this way can look like it loops)")
+            return _gate_raw(cli_bin, model, ngl, prompts, configs, budget)
+        return _gate_chat(base, prompts, configs, budget)
+
+
+def _gate_chat(base, prompts, configs, budget):
+    """Score a templated turn. finish_reason is worth more than any heuristic here: "stop" means
+    the model emitted its own end-of-turn token, which a broken build cannot fake."""
+    last = []
+    for cfg_name, sampling in configs:
+        rows, bad = [], False
+        for p, expect in prompts:
+            content, reasoning, fin = _chat(base, p, sampling, budget)
+            if isinstance(content, _NoOutput):
+                rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
+                             "reason": f"NO OUTPUT ({content})", "sample": ""})
+                return {"verdict": "NO_OUTPUT", "config": cfg_name, "rows": rows}
+            body = (content or "").strip()
+            rep = tail_repeat(body)
+            knows = any(e.lower() in body.lower() for e in expect)
+            # A CONTROL token repeating (<|channel|>, <|im_start|>, <pad>) is not the body of the
+            # model collapsing -- it is the token embedding losing resolution, and the fix is to
+            # protect that tensor, not to spend size on every layer. True on a served turn too:
+            # the server strips the turn's own markers, so any that survive came from the weights.
+            ctrl = bool(re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", body))
+            verdict_row, reason = False, "coherent"
+            if fin == "stop" and body and knows:
+                reason = "coherent (stopped on its own end-of-turn token)"
+            elif fin == "stop" and body and not knows:
+                verdict_row = True
+                reason = f"INCOHERENT (stopped cleanly, but no {'/'.join(expect[:3])})"
+            elif fin == "length" and reasoning and not body:
+                # spent the whole budget thinking -- that is a budget problem, not a broken build
+                reason = "INCONCLUSIVE (budget went entirely to reasoning; raise --gate-tokens)"
+            elif fin == "length" and rep >= 0.5:
+                verdict_row = True
+                reason = f"LOOP (hit the budget with tail repeat {rep:.2f})"
+                if ctrl:
+                    reason += "  [control tokens repeating -> token-embedding precision]"
+            elif fin == "length":
+                reason = f"ran to the budget without looping (tail repeat {rep:.2f})"
+                verdict_row = not knows
+                if verdict_row:
+                    reason = f"INCOHERENT (no {'/'.join(expect[:3])}, tail repeat {rep:.2f})"
+            else:
+                verdict_row = True
+                reason = f"finish_reason={fin or 'unknown'}"
+            rows.append({"prompt": p.splitlines()[0][:48], "loop": verdict_row, "reason": reason,
+                         "finish": fin, "repeat": rep, "thought": bool(reasoning),
+                         "sample": body.replace("\n", " ")[:120]})
+            bad = bad or verdict_row
+        last = rows
+        if not bad:
+            return {"verdict": "PASS", "config": cfg_name, "sampling": sampling, "rows": rows}
+    return {"verdict": "BELOW_FLOOR", "config": None, "rows": last}
+
+
+def _gate_raw(cli_bin, model, ngl, prompts, configs, budget):
+    """The original raw-completion path. Correct for a BASE model, and only for a base model."""
     last = []
     for cfg_name, sampling in configs:
         rows, looped = [], False
@@ -313,15 +516,9 @@ def coherence_gate(cli_bin, model, ngl, quick=False):
             # protect that tensor, not to spend size on every layer.
             if is_loop and re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", gen):
                 reason += "  [control tokens repeating -> token-embedding precision]"
-            # Not looping is not the same as coherent. Check the model actually produced the
-            # known answer; salad passes a loop test and fails this.
             knows = any(e.lower() in gen.lower() for e in expect)
             if not is_loop and not knows:
                 reason = f"INCOHERENT (no {'/'.join(expect[:3])} in the continuation)"
-            # Loops are not the only way a low-bit build fails. A trace that never halts, commits
-            # only at the very end, or leaves a reasoning block open stays locally coherent --
-            # compression ratio and distinct-word ratio both look fine -- while the token count
-            # balloons and gives back the saving the smaller weights bought.
             proc = detect_process_failures(gen, budget=budget)
             if proc:
                 reason += "  [" + "; ".join(f"{n}: {d}" for n, d in proc) + "]"
@@ -586,6 +783,13 @@ def main():
                     help="also measure decode tok/s for --gguf (and --vs), on the same flags so the "
                          "two are comparable. Needs --llama-cli. tok/s is hardware-specific: state "
                          "the machine wherever you publish it.")
+    ap.add_argument("--gate-tokens", type=int, default=0,
+                    help="token budget per gate prompt. Default: read from the model kind, because "
+                         "a thinking model spends its first few hundred tokens reasoning and a "
+                         "fixed budget cuts it off mid-thought, which scores as incoherent.")
+    ap.add_argument("--gate-ctx", type=int, default=4096,
+                    help="context for the gate's server. A model whose template opens with a long "
+                         "system block needs room for the turn as well as the answer.")
     ap.add_argument("--quick", action="store_true",
                     help="with --coherence: fast one-prompt / default-sampling sanity instead of the full sweep.")
     a = ap.parse_args()
@@ -619,7 +823,8 @@ def main():
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
             sys.exit("llama-cli not found -- build llama.cpp/ik_llama.cpp or pass --llama-cli.")
-        res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick)
+        res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick,
+                             ctx=a.gate_ctx, gate_tokens=a.gate_tokens)
         gate_passed = print_gate(res)
         if not a.ref and not a.speed:      # nothing else was asked for -> exit on the verdict
             sys.exit(0 if gate_passed else 2)
@@ -750,7 +955,6 @@ def main():
         except Exception:
             out = None
     if out:
-        import json
         json.dump({"eval": a.eval, "ref": a.ref, "rows": rows}, open(out, "w"), indent=2)
         print(f"\nwrote {out}  (feed pollard-scorecard for the card)")
 

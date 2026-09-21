@@ -1874,7 +1874,10 @@ def test_gate_names_the_symptom_and_leads_with_the_cheap_lever():
     import pollard_bench as B
     src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
         encoding="utf-8")
-    seg = src.split("def coherence_gate", 1)[1].split("\ndef ", 1)[0]
+    # The gate is now a family: coherence_gate picks the path (chat for a model with a
+    # template, raw completion for a base model) and _gate_chat / _gate_raw score it.
+    # The invariant is about what the SCORING does, so read all three.
+    seg = src.split("def coherence_gate", 1)[1].split("\ndef print_gate", 1)[0]
     assert "control tokens repeating" in seg, "the gate does not distinguish this failure mode"
     # the pattern must actually catch what gemma-4 emitted
     assert re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", "<|channel>thought <|channel>thought")
@@ -1998,7 +2001,10 @@ def test_coherence_gate_rejects_fluent_garbage():
     assert "jupiter" in joined, "the solar-system probe has no known answer to check"
     src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
         encoding="utf-8")
-    seg = src.split("def coherence_gate", 1)[1].split("\ndef ", 1)[0]
+    # The gate is now a family: coherence_gate picks the path (chat for a model with a
+    # template, raw completion for a base model) and _gate_chat / _gate_raw score it.
+    # The invariant is about what the SCORING does, so read all three.
+    seg = src.split("def coherence_gate", 1)[1].split("\ndef print_gate", 1)[0]
     assert "knows" in seg and "not knows" in seg, (
         "the gate still passes on absence of looping alone")
     # salad must fail even though it never repeats
