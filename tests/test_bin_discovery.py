@@ -76,3 +76,83 @@ def test_nothing_found_returns_something_the_caller_can_report(tmp_path, monkeyp
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     got = A.find_ik_bin(None)
     assert isinstance(got, str)          # "" is fine; None would crash os.path.join downstream
+
+
+# ── automap BUILDS; it does not hand back homework ──────────────────────────────────────────────
+
+class _A:
+    """Just enough of the parsed args for the planner."""
+    def __init__(self, **kw):
+        self.model, self.imatrix, self.eval = "m-f16.gguf", "m.imatrix", "e.txt"
+        self.bin, self.log, self.ngl = "/opt/ik/bin", "automap.log", 0
+        self.mix_only, self.no_eval, self.rival, self.gate = True, True, None, False
+        self.body, self.protect, self.fragile = "iq1_s", "iq2_kt", None
+        self.no_imatrix = False
+        self.__dict__.update(kw)
+
+
+def _names(nl=2):
+    out = ["token_embd.weight", "output.weight", "output_norm.weight"]
+    for i in range(nl):
+        for t in ("attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"):
+            out.append(f"blk.{i}.{t}.weight")
+    return out
+
+
+def _plan(**kw):
+    return A.emit_bat(_A(**kw), 2, False, _names())
+
+
+def test_the_plan_is_argv_not_shell_text():
+    """It was assembled as Windows batch -- @echo off, %BIN%\\llama-quantize.exe, backslashes --
+    so automap on a Mac or Linux box wrote a file nothing could run."""
+    plan = _plan()
+    assert isinstance(plan, dict) and plan["steps"], "the plan is not a list of steps"
+    for label, argv in plan["steps"]:
+        assert isinstance(argv, list) and argv, f"{label} is not argv"
+        assert not any("%" in str(x) for x in argv), f"{label} still carries a batch variable"
+
+
+def test_it_renders_for_either_platform():
+    plan = _plan()
+    win, nix = A.render_script(plan, for_windows=True), A.render_script(plan, for_windows=False)
+    assert win.startswith("@echo off") and "1>>" in win
+    assert nix.startswith("#!/bin/sh") and ">>" in nix
+    assert "@echo off" not in nix
+
+
+def test_the_binary_name_matches_the_platform():
+    argv = _plan()["steps"][0][1]
+    exe = str(argv[0])
+    assert exe.endswith(".exe") == (sys.platform == "win32"), \
+        f"the quantizer name does not match this platform: {exe}"
+
+
+def test_building_is_the_default_and_plan_only_is_the_opt_out():
+    """automap exists to produce a model. Emitting a script and stopping left the user to re-run
+    the thing they had already asked for."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_automap.py"), encoding="utf-8").read()
+    assert "def run_plan(" in src, "automap cannot run what it plans"
+    main = src[src.index("def main("):]
+    assert "run_plan(plan)" in main, "main never runs the plan"
+    assert "--plan-only" in src, "there is no way to just look at the plan"
+    assert 'ap.add_argument("--out", default=""' in src, \
+        "--out still defaults to writing a script nobody asked for"
+
+
+def test_a_failed_step_stops_and_says_which(tmp_path, monkeypatch):
+    """A build that fails halfway must not report success, and must name the step."""
+    plan = {"header": "h", "log": str(tmp_path / "a.log"), "mix": "m.gguf",
+            "steps": [("first", [sys.executable, "-c", "raise SystemExit(3)"]),
+                      ("second", [sys.executable, "-c", "print('should not run')"])]}
+    assert A.run_plan(plan) == 3
+    blob = (tmp_path / "a.log").read_text()
+    assert "first" in blob and "should not run" not in blob
+
+
+def test_a_clean_run_reports_zero(tmp_path):
+    plan = {"header": "h", "log": str(tmp_path / "b.log"), "mix": "m.gguf",
+            "steps": [("only", [sys.executable, "-c", "print('ok')"])]}
+    assert A.run_plan(plan) == 0
+    assert "ok" in (tmp_path / "b.log").read_text()

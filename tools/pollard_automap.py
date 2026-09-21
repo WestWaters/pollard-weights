@@ -394,55 +394,111 @@ def emit_bat(a, n_layers, is_moe, names):
                        f"   #   pollard-calib --out train.txt --held-out {ev}")
         except Exception:
             pass
-    L = ["@echo off", f"set BIN={a.bin}", f"set IM={a.imatrix}", f"set SRC={base}",
-         f"set EV={ev}", f"set LOG={a.log}",
-         f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  imatrix={'no (K-quant)' if kfree else 'yes'}  "
-         f"body={body}({QUANT_BPW.get(body,'?')}) protect={protect}({QUANT_BPW.get(protect,'?')})"
-         f"=== 1> %LOG% 2>&1", ""]
-    def build(name, typ, extra=""):
-        return (f"%BIN%\\llama-quantize.exe {im_flag}{extra} %SRC% "
-                f"{stem}-{name}.gguf {typ} 1>> %LOG% 2>&1")
-    def ppl(name):
-        # PPL is offload-invariant (ngl changes speed, not the number) -- so a partial
-        # offload keeps every bar comparable AND stops a big bar OOMing the card.
-        return (f"%BIN%\\llama-perplexity.exe -m {stem}-{name}.gguf -f %EV% -c 2048 "
-                f"-ngl {a.ngl} 1>> %LOG% 2>&1")
-    pin_extra = f' --custom-q "{pin_cq[:-1]}"' if pins else ""   # uniform bars need the pins too
+    # ---- the plan, as ARGV rather than shell text ----------------------------------------------
+    # It used to be assembled as Windows batch -- "@echo off", %BIN%\\llama-quantize.exe,
+    # backslashes -- which meant automap on a Mac or a Linux box wrote a file nothing could run.
+    # Building argv instead makes the plan portable, and makes it RUNNABLE: the same list renders
+    # to a .bat or a .sh for anyone who wants the script, and executes directly for everyone who
+    # wanted the model.
+    exe = ".exe" if sys.platform == "win32" else ""
+    quantize = os.path.join(a.bin, "llama-quantize" + exe)
+    perplexity = os.path.join(a.bin, "llama-perplexity" + exe)
+    steps: list = []          # (label, argv)
+
+    header = (f"===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  "
+              f"imatrix={'no (K-quant)' if kfree else 'yes'}  "
+              f"body={body}({QUANT_BPW.get(body,'?')}) protect={protect}({QUANT_BPW.get(protect,'?')})===")
+
+    def build(name, typ, extra=()):
+        out = f"{stem}-{name}.gguf"
+        argv = [quantize]
+        if not kfree:
+            argv += ["--imatrix", a.imatrix]
+        argv += list(extra) + [base, out, typ]
+        return out, argv
+
+    def ppl(out):
+        # PPL is offload-invariant (ngl changes speed, not the number) -- so a partial offload
+        # keeps every bar comparable AND stops a big bar OOMing the card.
+        return [perplexity, "-m", out, "-f", ev, "-c", "2048", "-ngl", str(a.ngl)]
+
+    pin_extra = ["--custom-q", pin_cq[:-1]] if pins else []
     if pins:
-        L += [f"echo == pinned {len(pins)} imatrix-uncovered tensor(s) to q6_K "
-              f"(covered={ncov}) == 1>> %LOG% 2>&1"]
-    # --no-eval skips PPL (a plain user BUILD doesn't need the benchmark); the 3-bar
-    # comparison (uniform baseline + ceiling) is the BENCHMARK, emitted only when NOT --mix-only.
-    def maybe_ppl(name):
-        return [] if a.no_eval else [ppl(name)]
+        print(f"  pinned      : {len(pins)} imatrix-uncovered tensor(s) -> q6_K (covered={ncov})")
+
+    def maybe_ppl(out):
+        return [] if a.no_eval else [(f"ppl {os.path.basename(out)}", ppl(out))]
+
     if not a.mix_only:
-        # baseline (uniform at the crush tier) -- the bar the Mix must beat at ~same size
-        L += [f"echo ==uniform {body}== 1>> %LOG% 2>&1",
-              build(f"u-{body}", _bar_type(body), pin_extra), *maybe_ppl(f"u-{body}"), ""]
-        # ceiling (uniform at the protect tier)
-        L += [f"echo ==uniform {protect}== 1>> %LOG% 2>&1",
-              build(f"u-{protect}", _bar_type(protect), pin_extra), *maybe_ppl(f"u-{protect}"), ""]
-        # optional rival: a strong mixed/uniform low-bit to beat head-to-head (Grok's 4th bar)
+        out, argv = build(f"u-{body}", _bar_type(body), pin_extra)
+        steps += [(f"uniform {body}", argv), *maybe_ppl(out)]
+        out, argv = build(f"u-{protect}", _bar_type(protect), pin_extra)
+        steps += [(f"uniform {protect}", argv), *maybe_ppl(out)]
         if a.rival:
             rv = _atom(a.rival)
-            L += [f"echo ==rival uniform {rv}== 1>> %LOG% 2>&1",
-                  build(f"rival-{rv}", _bar_type(rv)), *maybe_ppl(f"rival-{rv}"), ""]
+            out, argv = build(f"rival-{rv}", _bar_type(rv))
+            steps += [(f"rival uniform {rv}", argv), *maybe_ppl(out)]
+
     # PollardMix: base fills with the body atom, custom-q protects the sensitive roles. This is
-    # the deliverable -- always emitted; with --mix-only it's the ONLY thing built (the fast path).
-    mix_extra = " ".join(flags) + f' --custom-q "{cqs}"'
-    L += ["echo ==PollardMix (automap)== 1>> %LOG% 2>&1",
-          build("mix", _bar_type(body), mix_extra), *maybe_ppl("mix"), ""]
-    # Auto coherence gate on the finished mix -- so a one-shot build also tells you if it's USABLE
-    # (coherent + which sampling to ship, or loops-under-every-sampling => bump a tier). Runs the
-    # quick loop-check + sampling sweep; resolved at emit time to this python + sibling pollard_bench.
+    # the deliverable -- always emitted; with --mix-only it's the ONLY thing built.
+    mix_extra = []
+    for f in flags:
+        mix_extra += f.split(" ", 1)
+    mix_extra += ["--custom-q", cqs]
+    mix_out, mix_argv = build("mix", _bar_type(body), mix_extra)
+    steps += [("PollardMix (automap)", mix_argv), *maybe_ppl(mix_out)]
+
+    # Auto coherence gate on the finished mix -- so a build also tells you whether it is USABLE.
     if getattr(a, "gate", True):
         gate_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pollard_bench.py")
-        cli = os.path.join(a.bin, "llama-cli.exe")
-        L += ["echo == coherence gate (loop check + sampling) == 1>> %LOG% 2>&1",
-              f'"{sys.executable}" "{gate_py}" --gguf {stem}-mix.gguf --coherence --ngl {a.ngl} '
-              f'--llama-cli "{cli}" 1>> %LOG% 2>&1', ""]
-    L += [f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> %LOG% 2>&1"]
-    return "\n".join(L)
+        steps.append(("coherence gate", [sys.executable, gate_py, "--gguf", mix_out,
+                                         "--coherence", "--ngl", str(a.ngl),
+                                         "--llama-cli", os.path.join(a.bin, "llama-cli" + exe)]))
+    return {"header": header, "steps": steps, "mix": mix_out, "log": a.log}
+
+
+def render_script(plan, for_windows=None):
+    """The plan as a script, for anyone who wants to read or edit it before running."""
+    win = sys.platform == "win32" if for_windows is None else for_windows
+    q = (lambda x: f'"{x}"' if " " in str(x) else str(x))
+    log = plan["log"]
+    if win:
+        out = ["@echo off", f'echo {plan["header"]} 1> {q(log)} 2>&1']
+        for label, argv in plan["steps"]:
+            out += [f'echo == {label} == 1>> {q(log)} 2>&1',
+                    " ".join(q(x) for x in argv) + f" 1>> {q(log)} 2>&1"]
+        out.append(f"echo AUTOMAP_DONE_EXIT_%ERRORLEVEL% 1>> {q(log)} 2>&1")
+    else:
+        out = ["#!/bin/sh", "set -e", f'echo {q(plan["header"])} > {q(log)} 2>&1']
+        for label, argv in plan["steps"]:
+            out += [f'echo "== {label} ==" >> {q(log)} 2>&1',
+                    " ".join(q(x) for x in argv) + f" >> {q(log)} 2>&1"]
+        out.append(f'echo "AUTOMAP_DONE_EXIT_$?" >> {q(log)} 2>&1')
+    return "\n".join(out)
+
+
+def run_plan(plan):
+    """Actually build it. Returns the exit code of the first step that failed, or 0.
+
+    This is what automap is for. Emitting a script and stopping left the user to re-run the
+    thing they had already asked for -- and on any machine that is not Windows, to re-run it by
+    hand because the script was batch.
+    """
+    print(f"  {plan['header']}")
+    with open(plan["log"], "w", encoding="utf-8", errors="replace") as log:
+        log.write(plan["header"] + "\n")
+        for label, argv in plan["steps"]:
+            print(f"  -> {label}", flush=True)
+            log.write(f"\n== {label} ==\n")
+            log.flush()
+            r = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT)
+            if r.returncode != 0:
+                msg = f"  FAILED at '{label}' (exit {r.returncode}) -- see {plan['log']}"
+                print(msg)
+                log.write(msg + "\n")
+                return r.returncode
+    print(f"  built {plan['mix']}")
+    return 0
 
 
 def find_ik_bin(explicit=None):
@@ -493,7 +549,13 @@ def main():
                          "$POLLARD_IK_BIN or point it at YOUR build")
     ap.add_argument("--log", default=os.environ.get("POLLARD_AUTOMAP_LOG", "automap.log"),
                     help="build/eval log path (default: ./automap.log; or $POLLARD_AUTOMAP_LOG)")
-    ap.add_argument("--out", default="build_automap.bat")
+    ap.add_argument("--out", default="",
+                    help="also write the plan as a script here (.bat on Windows, .sh elsewhere). "
+                         "Optional: automap BUILDS by default, so a script is only needed when "
+                         "you want to read or edit the plan first.")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="work out the mix and stop without building it. Pair with --out to get "
+                         "a script you can inspect.")
     ap.add_argument("--fragile", help="a pollard-fragile --out scan.json. The heaviest-tailed\n                        tensor kinds are PROTECTED automatically instead of merely reported.")
     ap.add_argument("--body", default=None, help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
     ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
@@ -586,8 +648,17 @@ def main():
                      if len(pins) > n_layers else ""))
         if not is_moe and pins:
             print("  (dense model with uncovered tensors -- unusual; check the imatrix.)")
-    open(a.out, "w").write(emit_bat(a, n_layers, is_moe, names))
-    print(f"wrote {a.out}")
+    plan = emit_bat(a, n_layers, is_moe, names)
+
+    # Write the script whenever one was asked for, so the plan stays readable and editable.
+    if a.out:
+        open(a.out, "w", encoding="utf-8").write(render_script(plan))
+        print(f"wrote {a.out}")
+
+    if a.plan_only:
+        print("  --plan-only: nothing was built. Run the script above, or drop --plan-only.")
+        return
+    raise SystemExit(run_plan(plan))
 
 
 if __name__ == "__main__":
