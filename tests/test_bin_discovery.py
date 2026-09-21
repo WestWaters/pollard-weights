@@ -156,3 +156,83 @@ def test_a_clean_run_reports_zero(tmp_path):
             "steps": [("only", [sys.executable, "-c", "print('ok')"])]}
     assert A.run_plan(plan) == 0
     assert "ok" in (tmp_path / "b.log").read_text()
+
+
+# ── an uncovered tensor is repaired, not reported ───────────────────────────────────────────────
+
+def test_the_mtp_head_is_known_to_need_an_imatrix():
+    """nextn.eh_proj is a real matmul and imatrix runs routinely skip it, so a low-bit build
+    reached it unpinned and llama-quantize bailed -- after an hour of quantizing. It is also the
+    tensor pollard-fragile ranks MOST heavy-tailed on this family."""
+    for n in ("blk.64.nextn.eh_proj.weight", "blk.64.nextn.shared_head_head.weight"):
+        assert A._NEEDS_IMATRIX.search(n), f"{n} would not be pinned"
+    assert not A._NEEDS_IMATRIX.search("blk.64.nextn.enorm.weight"), "a norm is not a matmul"
+
+
+FAKE_QUANTIZER = """import sys, pathlib
+# argv[-1], not argv[1]: the pin is inserted just after argv[0] and shifts everything along
+p = pathlib.Path(sys.argv[-1])
+p.write_text(str(int(p.read_text() or 0) + 1))
+if "--custom-q" in sys.argv and "eh_proj" in sys.argv[sys.argv.index("--custom-q") + 1]:
+    print("ok")
+    sys.exit(0)
+print("Missing importance matrix for tensor blk.64.nextn.eh_proj.weight in a very low-bit quantization")
+sys.exit(1)
+"""
+
+ALWAYS_FAILS = """import sys
+print("Missing importance matrix for tensor blk.1.ffn_up.weight in a very low-bit quantization")
+sys.exit(1)
+"""
+
+
+def _fake_quantizer(tmp_path, body, name="fake-quantize"):
+    """An executable stand-in for llama-quantize, so argv[0] is the BINARY the way it is in a
+    real run -- which is what makes the inserted pin land in the right position."""
+    f = tmp_path / name
+    f.write_text("#!" + sys.executable + "\n" + body)
+    f.chmod(0o755)
+    return f
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs an executable shebang")
+def test_a_missing_imatrix_tensor_is_pinned_and_the_build_retried(tmp_path):
+    """The pin list is built from a pattern, and a pattern is the tensors someone thought of.
+    llama-quantize names the tensor it wanted, which is enough to pin it and carry on."""
+    marker = tmp_path / "attempts"
+    marker.write_text("0")
+    q = _fake_quantizer(tmp_path, FAKE_QUANTIZER)
+    plan = {"header": "h", "log": str(tmp_path / "l.log"), "mix": "m.gguf",
+            "steps": [("build", [str(q), str(marker)])]}
+    assert A.run_plan(plan) == 0, "the repair did not take"
+    assert marker.read_text() == "2", "it should have run twice: once failing, once pinned"
+    assert "pinned blk.64.nextn.eh_proj.weight" in (tmp_path / "l.log").read_text()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs an executable shebang")
+def test_the_same_tensor_is_not_pinned_forever(tmp_path):
+    """If pinning does not help, stop -- do not loop."""
+    q = _fake_quantizer(tmp_path, ALWAYS_FAILS, name="always-fails")
+    plan = {"header": "h", "log": str(tmp_path / "l2.log"), "mix": "m.gguf",
+            "steps": [("build", [str(q)])]}
+    assert A.run_plan(plan) == 1
+
+
+def test_the_pin_goes_first_because_custom_q_is_first_match_wins():
+    got = A._pin_and_retry(["quantize", "--custom-q", "attn_q=iq2_kt", "src", "dst", "IQ1_S"],
+                           "blk.64.nextn.eh_proj.weight")
+    rules = got[got.index("--custom-q") + 1]
+    assert rules.startswith("blk\\.64\\.nextn\\.eh_proj\\.weight=q6_K,"), \
+        "a later rule would lose to the recipe's own entry for that tensor"
+    assert "attn_q=iq2_kt" in rules, "the existing rules must survive"
+
+
+def test_a_build_with_no_custom_q_still_gets_the_pin():
+    got = A._pin_and_retry(["quantize", "src", "dst", "IQ1_S"], "blk.1.ffn_up.weight")
+    assert "--custom-q" in got and got[-3:] == ["src", "dst", "IQ1_S"]
+
+
+def test_repair_can_be_turned_off():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_automap.py"), encoding="utf-8").read()
+    assert "def run_plan(plan, repair=True)" in src
