@@ -302,8 +302,32 @@ _SERVER_LOG = "gate-server.log"
 _SERVER_PROC = [None]
 
 
+SERVER_BIN = None          # set from --llama-server; the caller usually knows where it is
+
+
 def _server_bin():
-    return find_llama_bin("llama-server") or "llama-server"
+    """Where llama-server is. Told, found, or searched -- in that order.
+
+    find_llama_bin covers a llama.cpp checkout and PATH, but the trellis atoms need ik_llama,
+    which people build wherever they like. When it comes back empty the gate used to hand
+    Popen the bare name "llama-server", fail to start, and fall back to raw completion -- which
+    for an instruct model reads as a model that loops. Look properly instead.
+    """
+    if SERVER_BIN and os.path.isfile(SERVER_BIN):
+        return SERVER_BIN
+    got = find_llama_bin("llama-server")
+    if got:
+        return got
+    exe = ".exe" if os.name == "nt" else ""
+    home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for base in (os.getcwd(), home, os.path.dirname(home), here, os.path.expanduser("~")):
+        for sub in ("ik_llama.cpp/build/bin", "ik_llama/build/bin", "bin",
+                    "runtime/ik_llama.cpp/build/bin", "llama.cpp/build/bin"):
+            cand = os.path.join(base, *sub.split("/"), "llama-server" + exe)
+            if os.path.isfile(cand):
+                return cand
+    return "llama-server"
 
 
 _SERVER_FLAGS = {}
@@ -570,9 +594,16 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
     print("  chat template present -> served with --jinja, scored on the model's own turn")
     with _served(model, ngl, ctx) as base:
         if base is None:
-            print("  llama-server would not start; falling back to raw completion "
-                  "(an instruct model scored this way can look like it loops)")
-            return _gate_raw(cli_bin, model, ngl, prompts, configs, budget)
+            # NOT a fallback to raw completion. This model has a chat template, so its stop
+            # token lives inside a turn; scored as raw completion it cannot terminate and
+            # reads as a loop at any bit width. A verdict from the wrong method is worse than
+            # no verdict -- it condemns builds that are fine.
+            return {"verdict": "NO_SERVER", "config": None, "rows": [{
+                "prompt": "(not run)", "loop": None,
+                "reason": (f"llama-server would not start ({_server_bin()}), so this instruct "
+                           "model could not be scored on its own chat turn. Point "
+                           "--llama-server at your build; see " + _SERVER_LOG),
+                "sample": ""}]}
         for why in _check_server(base, ctx):
             print(f"  WARNING: {why}")
         return _gate_chat(base, prompts, configs, budget)
@@ -683,6 +714,13 @@ def print_gate(res):
         print(f"  [{mark}] {r['prompt']:<50} {r['reason']}")
         if r["loop"]:
             print(f"         -> {r['sample']}")
+    if res["verdict"] == "NO_SERVER":
+        print("\nVERDICT: UNGATED -- this model has a chat template, so its stop token only\n"
+              "  exists inside a chat turn. Without llama-server it cannot be scored the way it\n"
+              "  is actually used, and scoring it as raw completion would report a loop at ANY\n"
+              "  bit width. Nothing is wrong with the build; the gate could not run.\n"
+              "  Point --llama-server at your ik_llama/llama.cpp build and re-gate.")
+        return False
     if res["verdict"] == "NO_OUTPUT":
         print("\nVERDICT: NO OUTPUT -- the model produced nothing before the timeout, so this build\n"
               "  is UNGATED, not passed. Usually the run is simply slow (a big model with no GPU\n"
@@ -911,6 +949,10 @@ def main():
     ap.add_argument("--out", help="write a results.json (feeds pollard-scorecard)")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
     ap.add_argument("--llama-cli", default="llama-cli", help="generation binary for the coherence gate")
+    ap.add_argument("--llama-server", default="",
+                    help="server binary for the coherence gate. An instruct model is scored "
+                         "through its own chat template on llama-server; without one the gate "
+                         "cannot judge it at all.")
     ap.add_argument("--kv-sweep", action="store_true",
                     help="measure what each KV cache precision costs on this model. calc can "
                          "already size a quantized cache; this says what it costs in quality.")
@@ -964,6 +1006,7 @@ def main():
     if a.coherence or a.quick:
         if not os.path.exists(a.gguf):
             sys.exit(f"file not found: {a.gguf}")
+        globals()["SERVER_BIN"] = a.llama_server or None
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
             sys.exit("llama-cli not found -- build llama.cpp/ik_llama.cpp or pass --llama-cli.")
