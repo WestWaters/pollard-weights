@@ -296,6 +296,12 @@ def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=220):
 # exist on upstream AND ik. It also hands back the one signal worth more than every heuristic
 # here: finish_reason == "stop" means the model emitted its own end-of-turn token.
 
+#: where the gate's server writes, so a crash can be read back
+_SERVER_LOG = "gate-server.log"
+#: the running server, so a failed request can say whether it is still alive
+_SERVER_PROC = [None]
+
+
 def _server_bin():
     return find_llama_bin("llama-server") or "llama-server"
 
@@ -310,10 +316,16 @@ def _served(model, ngl, ctx=4096, port=0):
            # thoughts land in reasoning_content, so a <think> block cannot be mistaken for the
            # answer being incoherent
            "--reasoning-format", "deepseek"] + _t()
-    proc = None
+    proc, log = None, None
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # NOT DEVNULL: when the server dies mid-gate its own output is the only account of why,
+        # and discarding it leaves "connection forcibly closed" as the whole diagnosis.
+        log = open(_SERVER_LOG, "w", encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        _SERVER_PROC[0] = proc
     except OSError:
+        if log:
+            log.close()
         yield None
         return
     base = f"http://127.0.0.1:{port}"
@@ -339,6 +351,9 @@ def _served(model, ngl, ctx=4096, port=0):
                 proc.wait(timeout=30)
             except Exception:
                 proc.kill()
+        _SERVER_PROC[0] = None
+        if log:
+            log.close()
 
 
 def _post(base, path, payload, timeout=900):
@@ -349,7 +364,7 @@ def _post(base, path, payload, timeout=900):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
-def _chat(base, user, sampling, budget):
+def _chat(base, user, sampling, budget, proc=None):
     """One templated turn. Returns (content, reasoning, finish_reason)."""
     body = {"messages": [{"role": "user", "content": user}],
             "max_tokens": budget, "stream": False}
@@ -357,7 +372,17 @@ def _chat(base, user, sampling, budget):
     try:
         got = _post(base, "/v1/chat/completions", body)
     except Exception as e:
-        return _NoOutput(str(e)), "", "error"
+        why = str(e)
+        if proc is not None and proc.poll() is not None:
+            tail = ""
+            try:
+                with open(_SERVER_LOG, encoding="utf-8", errors="replace") as f:
+                    tail = " | ".join(f.read().strip().splitlines()[-3:])
+            except OSError:
+                pass
+            why = (f"the server exited (code {proc.returncode}) partway through the gate"
+                   + (f": {tail}" if tail else f" -- see {_SERVER_LOG}"))
+        return _NoOutput(why), "", "error"
     ch = (got.get("choices") or [{}])[0]
     msg = ch.get("message") or {}
     return (msg.get("content") or "", msg.get("reasoning_content") or "",
@@ -456,7 +481,7 @@ def _gate_chat(base, prompts, configs, budget):
     for cfg_name, sampling in configs:
         rows, bad = [], False
         for p, expect in prompts:
-            content, reasoning, fin = _chat(base, p, sampling, budget)
+            content, reasoning, fin = _chat(base, p, sampling, budget, _SERVER_PROC[0])
             if isinstance(content, _NoOutput):
                 rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
                              "reason": f"NO OUTPUT ({content})", "sample": ""})
@@ -470,6 +495,18 @@ def _gate_chat(base, prompts, configs, budget):
             # the server strips the turn's own markers, so any that survive came from the weights.
             ctrl = bool(re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", body))
             verdict_row, reason = False, "coherent"
+            if fin == "stop" and not body:
+                # it ended its turn without answering. With reasoning present that is a budget
+                # problem; without, the build really did produce nothing.
+                rows.append({"prompt": p.splitlines()[0][:48],
+                             "loop": not reasoning, "finish": fin, "repeat": rep,
+                             "thought": bool(reasoning),
+                             "reason": ("INCONCLUSIVE (ended the turn inside its reasoning; "
+                                        "raise --gate-tokens)" if reasoning else
+                                        "EMPTY (ended its turn having produced nothing)"),
+                             "sample": (reasoning or "").replace("\n", " ")[:120]})
+                bad = bad or not reasoning
+                continue
             if fin == "stop" and body and knows:
                 reason = "coherent (stopped on its own end-of-turn token)"
             elif fin == "stop" and body and not knows:

@@ -162,3 +162,31 @@ def test_an_explicit_gate_budget_is_the_one_reported():
     i_override = fn.index("budget = gate_tokens")
     i_print = fn.index("gate budget {budget}")
     assert i_override < i_print, "the budget is printed before the override is applied"
+
+
+def test_the_servers_own_output_is_kept_not_discarded():
+    """When the server dies mid-gate its output is the only account of why. Sent to DEVNULL, the
+    whole diagnosis was "connection forcibly closed by the remote host"."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_bench.py"), encoding="utf-8").read()
+    fn = src[src.index("def _served("):src.index("def _post(")]
+    assert "subprocess.DEVNULL" not in fn, "the server's output is still being thrown away"
+    assert "_SERVER_LOG" in fn
+
+
+def test_a_dead_server_is_reported_as_such():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_bench.py"), encoding="utf-8").read()
+    fn = src[src.index("def _chat("):src.index("#: the CLI sampling lists")]
+    assert "proc.poll() is not None" in fn, "a socket error cannot tell a crash from a hiccup"
+    assert "exited" in fn
+
+
+def test_stopping_without_answering_is_not_called_a_loop():
+    """finish_reason=stop with empty content fell through to a generic branch and was scored as a
+    failure. With reasoning present it is a budget problem; without, the build produced nothing."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_bench.py"), encoding="utf-8").read()
+    fn = src[src.index("def _gate_chat("):src.index("def _gate_raw(")]
+    assert 'fin == "stop" and not body' in fn, "an empty answer is still handled generically"
+    assert "INCONCLUSIVE" in fn and "EMPTY" in fn
