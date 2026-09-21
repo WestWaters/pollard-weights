@@ -142,3 +142,23 @@ def test_the_bonsai_suite_is_unchanged():
         "gsm8k", "minerva_math500", "aime25", "aime26",
         "humaneval_plus", "mbpp_plus",
         "ifeval"]
+
+
+def test_the_served_helper_has_every_module_it_uses():
+    """A NameError here only surfaces on a real box mid-gate, after the model has loaded. Call it
+    with a binary that cannot exist: it must fail by yielding None, not by raising."""
+    got = []
+    with b._served("/no/such/model.gguf", 0, ctx=256) as base:
+        got.append(base)
+    assert got == [None], "the server context manager should yield None when it cannot start"
+
+
+def test_an_explicit_gate_budget_is_the_one_reported():
+    """The printed budget used to be read before --gate-tokens was applied, so the log announced
+    a number the run did not use."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "pollard_bench.py"), encoding="utf-8").read()
+    fn = src[src.index("def coherence_gate("):src.index("def _gate_chat(")]
+    i_override = fn.index("budget = gate_tokens")
+    i_print = fn.index("gate budget {budget}")
+    assert i_override < i_print, "the budget is printed before the override is applied"

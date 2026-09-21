@@ -17,7 +17,8 @@ quality for fewer GB, or more quality at the same GB), not as a single number.
 Reuses llama-perplexity; no rebuild. This is the opt-in benchmark -- a plain `pollard` build never
 runs it (that's the split that stopped a minutes-long shrink from taking hours).
 """
-import argparse, contextlib, json, os, re, shutil, subprocess, sys, time, zlib
+import argparse, contextlib, json, os, re, shutil, socket, subprocess, sys, time, zlib
+import urllib.request
 from collections import Counter
 
 from pollard_calc import find_llama_bin
@@ -427,11 +428,13 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
         from pollard_modelkind import classify, describe
         kind = classify(model)
         budget = kind["gate_tokens"]
-        print(f"  model kind: {describe(kind)}  (gate budget {budget} tokens)")
     except Exception:
         pass
     if gate_tokens:
         budget = gate_tokens                     # an explicit budget always wins
+    if kind is not None:
+        from pollard_modelkind import describe
+        print(f"  model kind: {describe(kind)}  (gate budget {budget} tokens)")
 
     tpl = has_chat_template(model)
     if not tpl:
