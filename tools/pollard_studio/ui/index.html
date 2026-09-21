@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pollard Studio</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<svg style="display:none" aria-hidden="true">
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2=".3" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset=".5" stop-color="#f6f4ee"/>
+      <stop offset="1" stop-color="#cdc6b8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- the Pollard bear: upright polar bear, built from solids so it reads at 38px and at 300px -->
+  <symbol id="i-bear" viewBox="0 0 64 64">
+    <g fill="url(#fur)" stroke="#8d8577" stroke-width="1.15" stroke-linejoin="round">
+      <ellipse cx="26.5" cy="52.5" rx="5.4" ry="7.4"/>
+      <ellipse cx="37.5" cy="52.5" rx="5.4" ry="7.4"/>
+      <ellipse cx="24.8" cy="57.8" rx="6.2" ry="2.9"/>
+      <ellipse cx="39.2" cy="57.8" rx="6.2" ry="2.9"/>
+      <ellipse cx="32" cy="35.5" rx="11.6" ry="17"/>
+      <ellipse cx="20.8" cy="32" rx="3.7" ry="8.6" transform="rotate(-13 20.8 32)"/>
+      <ellipse cx="43.4" cy="29.5" rx="3.9" ry="8.8" transform="rotate(31 43.4 29.5)"/>
+      <circle cx="29.6" cy="7.6" r="3.3"/>
+      <circle cx="41.2" cy="7.8" r="3.0"/>
+      <ellipse cx="36" cy="14.2" rx="8.1" ry="7.1"/>
+      <ellipse cx="43.6" cy="16.8" rx="4.6" ry="3.3"/>
+    </g>
+    <g fill="#5d564b">
+      <circle cx="34.4" cy="12.4" r="1.25"/>
+      <ellipse cx="46.6" cy="16.2" rx="1.7" ry="1.3"/>
+    </g>
+  </symbol>
+
+  <symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2"/>
+    <circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h3l3 8 4-16 3 8h5"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5 9-5zM3 14l9 5 9-5M3 11l9 5 9-5"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8zM3 8l9 5 9-5M12 13v8"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M12 3l8 3v6c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V6l8-3z"/>
+    <path d="M9 12l2.2 2.2L15.5 10"/></symbol>
+  <symbol id="i-scale" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v16M7 20h10M4 8h16M4 8l-2 6h4l-2-6zM20 8l-2 6h4l-2-6z"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round"><path d="M2 12h3l2-7 3 14 3-11 2 6 2-3h5"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/>
+    <rect x="9.5" y="9.5" width="5" height="5" rx="1"/>
+    <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M6 3.5l14 8.5-14 8.5z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M4 4h12l4 4v12H4zM8 4v6h8V4M8 20v-6h8v6"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M3 6a1 1 0 011-1h5l2 2h9a1 1 0 011 1v11a1 1 0 01-1 1H4a1 1 0 01-1-1z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M14 3H6a1 1 0 00-1 1v16a1 1 0 001 1h12a1 1 0 001-1V8zM14 3v5h5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5.2 5.2L20 7"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M12 4l9 16H3zM12 10v4M12 17.4v.2"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8.2v.2"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linejoin="round"><path d="M12 5a3 3 0 00-5.8-1A3 3 0 004 8.5 3 3 0 005 14a3 3 0 004.5 2.6A2.5 2.5 0 0012 19zM12 5a3 3 0 015.8-1A3 3 0 0120 8.5 3 3 0 0119 14a3 3 0 01-4.5 2.6A2.5 2.5 0 0112 19z"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 8l5-5 5 5M4 20h16"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M8 5l7 7-7 7"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+    stroke-linecap="round"><path d="M4 18a9 9 0 1116 0"/><path d="M12 18l4.5-6"/></symbol>
+</svg>
+
+<div id="app">
+
+  <!-- ── top shell ──────────────────────────────────────────────────── -->
+  <div class="shell tight" id="top">
+    <div class="brand pywebview-drag-region">
+      <div class="bearmark"><svg><use href="#i-bear"/></svg></div>
+      <div>
+        <div class="nm">POLLARD WEIGHTS <span class="ver" id="ver">—</span></div>
+        <div class="sb">BUILD · VERIFY · PUBLISH</div>
+      </div>
+    </div>
+
+    <div class="leds">
+      <div class="led" id="led-imatrix"><i></i><b>IMATRIX</b></div>
+      <div class="led off" id="led-sens"><i></i><b>SENS</b></div>
+      <div class="led" id="led-gate"><i></i><b>GATE</b></div>
+    </div>
+
+    <div class="lcd sm pywebview-drag-region" id="topLcd" style="flex:1">loading…</div>
+
+    <div class="modelpick">
+      <label>MODEL</label>
+      <div class="selwrap"><select id="modelsel"></select>
+        <svg class="ic"><use href="#i-chev"/></svg></div>
+    </div>
+
+    <!-- the window is frameless, so these ARE the window controls -- no native set to double up -->
+    <div class="hwbtns">
+      <button class="hwb" onclick="win('minimize')" title="Minimize">
+        <svg viewBox="0 0 16 16"><rect x="3.5" y="7.2" width="9" height="1.6" rx=".8"/></svg></button>
+      <button class="hwb" onclick="win('toggle')" title="Full screen">
+        <svg viewBox="0 0 16 16"><path d="M3.4 3.4h4v1.5H4.9v2.5H3.4zM12.6 12.6h-4v-1.5h2.5V8.6h1.5z"/></svg></button>
+      <button class="hwb stop" onclick="win('close')" title="Close">
+        <svg viewBox="0 0 16 16"><path d="M4.6 3.5l3.4 3.4 3.4-3.4 1.1 1.1L9.1 8l3.4 3.4-1.1 1.1L8 9.1l-3.4 3.4-1.1-1.1L6.9 8 3.5 4.6z"/></svg></button>
+    </div>
+  </div>
+
+  <!-- ── body ───────────────────────────────────────────────────────── -->
+  <div id="body">
+    <div class="shell tight" id="wing"></div>
+    <div class="shell" id="stagewrap" style="overflow:hidden;display:grid">
+      <main id="stage"></main>
+    </div>
+  </div>
+
+  <!-- ── bottom deck ────────────────────────────────────────────────── -->
+  <div class="shell tight" id="deck">
+    <div class="deckbtns">
+      <button class="btn gold" style="width:78px" onclick="act('build')">BUILD</button>
+      <button class="btn" style="width:78px" onclick="act('gate')">GATE</button>
+    </div>
+
+    <div class="deckmid">
+      <div class="lcd sm" id="deckLcd">—</div>
+      <div class="spec" id="spectrum" title="bit allocation across the blocks"></div>
+    </div>
+
+    <div class="deckright">
+      <div class="c"><i>SIZE</i><b id="d-size">—</b></div>
+      <div class="c"><i>BPW</i><b class="gold" id="d-bpw">—</b></div>
+      <div class="c"><i>RUNTIME</i><b id="d-rt">—</b></div>
+      <div class="c"><i>STATE</i><b id="d-state">IDLE</b></div>
+    </div>
+  </div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

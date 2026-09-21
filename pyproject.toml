@@ -35,9 +35,17 @@ all = ["torch", "transformers", "safetensors", "exllamav3", "datasets", "gptqmod
        "mlx-lm", "llmcompressor", "huggingface-hub", "hf-transfer", "matplotlib"]
 # the connectome memory lane: attaches a fly brain to a frozen model (pollard-flybrain)
 flybrain = ["torch", "transformers", "pandas", "scipy"]
+# Pollard Studio: the desktop window over these tools. Behind an extra so a headless build box
+# never drags in a GUI toolkit just to run pollard-bench.
+studio = ["pywebview", "pillow"]
 
 [project.scripts]
 pollard = "pollard_auto:main"
+# the desktop app over everything below (pip install "pollard-weights[studio]")
+pollard-studio = "pollard_studio.app:main"
+# run this on every box in a cluster so Studio can total up its RAM, GPUs and disk -- ggml's RPC
+# protocol reports device memory and nothing else about the host
+pollard-node = "pollard_studio.node:main"
 pollard-calc = "pollard_calc:main"
 pollard-fit = "pollard_fit:main"
 pollard-run = "pollard_run:main"
@@ -104,6 +112,9 @@ pollard-envmatch = "pollard_envmatch:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
+# Studio is a package, not a flat module; it installs beside the tools it reads, which is how it
+# finds them without being configured.
+packages = ["pollard_studio"]
 py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit",
     "pollard_flybrain", "pollard_brainverify", "pollard_brainattach", "pollard_brainlanes", "pollard_brain_backends", "pollard_connectome", "pollard_experts", "pollard_route", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_taskeval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_probes", "pollard_convert", "pollard_smoke", "pollard_modelkind", "pollard_mmeval", "pollard_fragile", "pollard_stop", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_vllm", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
     "pollard_serve_eval", "pollard_card", "pollard_onboard", "pollard_envmatch", "imatrix_fix_gate", "exl3_fix_mtp_ehproj",
@@ -113,3 +124,7 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pol
     # declared as entry points but never listed here, so `pollard-trellis` and friends installed
     # as a command with no module behind it
     "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis"]
+
+# the window's own HTML/CSS/JS and the bear it puts in the dock
+[tool.setuptools.package-data]
+pollard_studio = ["ui/*.html", "ui/*.css", "ui/*.js", "ui/*.png"]
