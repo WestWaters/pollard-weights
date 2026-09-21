@@ -63,6 +63,12 @@ def imatrix_covered(path):
 _NEEDS_IMATRIX = re.compile(
     r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?"
     r"|ssm_(in|out|alpha|beta|x|dt)"
+    # the MTP head's projections. nextn.eh_proj is a real matmul and imatrix runs routinely skip
+    # it (it sits past the last ordinary block), so a low-bit build reached it unpinned and
+    # llama-quantize bailed with "Missing importance matrix ... the result will be garbage".
+    # Worth noting it is also the tensor pollard-fragile ranks MOST heavy-tailed on this family
+    # (kurtosis ~1044), so it is the last one you want crushed blind.
+    r"|nextn\.(eh_proj|shared_head_head)"
     r"|attn_(q|k|v|qkv|gate|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
 
 
@@ -477,26 +483,67 @@ def render_script(plan, for_windows=None):
     return "\n".join(out)
 
 
-def run_plan(plan):
+#: llama-quantize's own words when a very-low-bit build reaches a tensor the imatrix never saw
+_MISSING_IMATRIX = re.compile(
+    r"Missing importance matrix for tensor ([\w.]+) in a very low-bit quantization")
+
+
+def _pin_and_retry(argv, tensor, fallback="q6_K"):
+    """Add a --custom-q pin for one tensor and hand back the argv to run again.
+
+    custom-q is FIRST-MATCH-WINS, so the pin goes at the FRONT of the existing rules or the
+    recipe's own entry for that tensor would win and nothing would change.
+    """
+    out = list(argv)
+    rule = f"{re.escape(tensor)}={fallback}"
+    if "--custom-q" in out:
+        i = out.index("--custom-q") + 1
+        out[i] = rule + "," + out[i]
+    else:
+        out = out[:1] + ["--custom-q", rule] + out[1:]
+    return out
+
+
+def run_plan(plan, repair=True):
     """Actually build it. Returns the exit code of the first step that failed, or 0.
 
     This is what automap is for. Emitting a script and stopping left the user to re-run the
     thing they had already asked for -- and on any machine that is not Windows, to re-run it by
     hand because the script was batch.
+
+    A build that dies on an imatrix-uncovered tensor is REPAIRED rather than reported. The pin
+    list is built from a pattern of known matmul names, and a pattern is a list of the tensors
+    someone thought of: Qwen3.8's MTP head (nextn.eh_proj) was not on it, so an hour of
+    quantizing ended in "the result will be garbage, so bailing out". llama-quantize names the
+    tensor it wanted, which is all the information needed to pin it and carry on -- so the next
+    architecture with a matmul nobody listed costs a retry, not a run.
     """
     print(f"  {plan['header']}")
     with open(plan["log"], "w", encoding="utf-8", errors="replace") as log:
         log.write(plan["header"] + "\n")
         for label, argv in plan["steps"]:
             print(f"  -> {label}", flush=True)
-            log.write(f"\n== {label} ==\n")
-            log.flush()
-            r = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT)
-            if r.returncode != 0:
-                msg = f"  FAILED at '{label}' (exit {r.returncode}) -- see {plan['log']}"
-                print(msg)
-                log.write(msg + "\n")
-                return r.returncode
+            pinned: set = set()
+            while True:
+                log.write(f"\n== {label} ==\n")
+                log.flush()
+                r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, errors="replace")
+                log.write(r.stdout or "")
+                log.flush()
+                if r.returncode == 0:
+                    break
+                m = _MISSING_IMATRIX.search(r.stdout or "") if repair else None
+                if not m or m.group(1) in pinned:
+                    msg = f"  FAILED at '{label}' (exit {r.returncode}) -- see {plan['log']}"
+                    print(msg)
+                    log.write(msg + "\n")
+                    return r.returncode
+                tensor = m.group(1)
+                pinned.add(tensor)
+                print(f"     {tensor} has no imatrix entry -> pinning it to q6_K and retrying")
+                log.write(f"\n== repair: pinned {tensor} to q6_K ==\n")
+                argv = _pin_and_retry(argv, tensor)
     print(f"  built {plan['mix']}")
     return 0
 
