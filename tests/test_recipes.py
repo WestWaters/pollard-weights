@@ -10,6 +10,8 @@ Add a case whenever a recipe/guard changes — never fewer rows than the tools h
 """
 import json, os, pathlib, re, subprocess, sys, tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 import pollard_automap as A
 
@@ -2192,7 +2194,14 @@ def test_converter_is_matched_to_the_model_not_just_found():
     assert C.model_architectures(d) == ["TotallyMadeUpForCausalLM"]
     conv, why = C.find_converter(d)
     assert conv is None, "an architecture no converter registers was reported convertible"
-    assert "TotallyMadeUpForCausalLM" in why, f"the refusal does not name the architecture: {why}"
+    # Naming the ARCHITECTURE is only possible when a converter was found and asked about it. On a
+    # machine with no llama.cpp checkout the (correct) refusal is "no converter found" instead, so
+    # assert the specific wording only where it can apply.
+    if "no convert_hf_to_gguf.py found" in why:
+        assert "POLLARD_CONVERTER" in why, "the refusal must say how to supply one"
+    else:
+        assert "TotallyMadeUpForCausalLM" in why, \
+            f"the refusal does not name the architecture: {why}"
     # registrations live in conversion/*.py, not the ~16KB entry point -- scanning only the script
     # would call every modern converter incapable
     root = pathlib.Path(__file__).resolve().parents[1] / "tools"
@@ -2336,6 +2345,7 @@ def test_probe_groups_cover_ssm_sequence_mixers():
     whether they are attention or an SSM; the allocator's dense recipe protects the mixing path
     and crushes the FFN either way."""
     import importlib, sys, os
+    pytest.importorskip("torch", reason="pollard-probe is the torch lane; it lives in [convert]")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     P = importlib.import_module("pollard_probe")
     groups = ["ffn", "attn"]
