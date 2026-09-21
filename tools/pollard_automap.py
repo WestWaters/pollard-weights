@@ -445,6 +445,31 @@ def emit_bat(a, n_layers, is_moe, names):
     return "\n".join(L)
 
 
+def find_ik_bin(explicit=None):
+    """Where ik_llama.cpp's binaries are, without making the user say so.
+
+    The default used to be the RELATIVE path ik_llama.cpp\\build\\bin, which resolves against
+    whatever directory the run happens to start in -- so the same install worked from one folder
+    and failed from another, and the backslash made it Windows-only. A tool that cannot find a
+    binary sitting in an obvious place should look, not stop.
+    """
+    exe = ".exe" if sys.platform == "win32" else ""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+    roots = [explicit, os.environ.get("POLLARD_IK_BIN")]
+    for base in (os.getcwd(), home, here, os.path.dirname(home), os.path.expanduser("~")):
+        for sub in ("ik_llama.cpp/build/bin", "ik_llama/build/bin", "bin",
+                    "runtime/ik_llama.cpp/build/bin"):
+            roots.append(os.path.join(base, *sub.split("/")))
+    for r in roots:
+        if r and os.path.isfile(os.path.join(r, "llama-quantize" + exe)):
+            return r
+    # PATH, last: a distro build may be older than the trellis atoms this needs
+    from shutil import which
+    got = which("llama-quantize")
+    return os.path.dirname(got) if got else (explicit or "")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tensors", help="llama-quantize --dry-run tensor list. Optional: without "
@@ -462,9 +487,10 @@ def main():
     ap.add_argument("--ngl", type=int, default=99,
                     help="GPU layers for the PPL eval. Lower it for a big build that would OOM "
                          "the card (PPL is offload-invariant, so bars stay comparable).")
-    ap.add_argument("--bin", default=os.environ.get("POLLARD_IK_BIN", r"ik_llama.cpp\build\bin"),
-                    help="dir holding ik_llama.cpp binaries (llama-quantize/-perplexity/-cli); "
-                         "override with $POLLARD_IK_BIN or point it at YOUR build")
+    ap.add_argument("--bin", default=None,
+                    help="dir holding ik_llama.cpp binaries (llama-quantize/-perplexity/-cli). "
+                         "Found automatically when it is anywhere obvious; override with "
+                         "$POLLARD_IK_BIN or point it at YOUR build")
     ap.add_argument("--log", default=os.environ.get("POLLARD_AUTOMAP_LOG", "automap.log"),
                     help="build/eval log path (default: ./automap.log; or $POLLARD_AUTOMAP_LOG)")
     ap.add_argument("--out", default="build_automap.bat")
@@ -507,6 +533,7 @@ def main():
         a.body = a.body or "iq1_kt"
         a.protect = a.protect or "iq2_kt"
     # --tensors is optional now: if it was not given, make the listing rather than refusing.
+    a.bin = find_ik_bin(a.bin)
     tensors = a.tensors or tensor_list(a.model, bin_dir=a.bin, imatrix=a.imatrix)
     names, n_layers, is_moe, arch = parse_tensors(tensors)
     if not n_layers:
