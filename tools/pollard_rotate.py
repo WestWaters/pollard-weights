@@ -136,11 +136,28 @@ def main():
     layers = sorted({int(m.group(1)) for n in tensors
                      for m in [re.match(r"blk\.(\d+)\.", n)] if m})
 
-    # hidden size from the residual: attn_output OUTPUT rows == hidden
-    probe = tensors.get("blk.0.attn_output.weight")
-    if probe is None:
-        sys.exit("ERROR: no blk.0.attn_output.weight -- unsupported arch for rotation.")
-    hidden = to_logical(probe).shape[0]
+    # Hidden size from the residual stream. This used to read it off blk.0.attn_output.weight and
+    # refuse any model without that tensor -- which rules out every HYBRID: on Qwen3.8-27B blk.0 is
+    # a recurrent block carrying attn_qkv and ssm_out, no attn_output at all, so rotation (measured
+    # -9.7% at 2-bit, exactly the tier a flagship builds at) was unavailable on the models that need
+    # it most. The size is in the GGUF metadata for EVERY architecture; read it there, and fall back
+    # to whichever output projection this block actually has.
+    hidden = next((int(f.parts[-1][0]) for f in reader.fields.values()
+                   if f.name.endswith(".embedding_length")), 0)
+    if not hidden:
+        for cand in ("attn_output", "ssm_out", "attn_out", "ssm_in", "attn_qkv"):
+            probe = tensors.get(f"blk.0.{cand}.weight")
+            if probe is not None:
+                hidden = to_logical(probe).shape[0]
+                print(f"   (no embedding_length in metadata -- hidden from blk.0.{cand})")
+                break
+    if not hidden:
+        kinds = sorted({re.sub(r"^blk\.\d+\.", "", n) for n in tensors
+                        if re.match(r"^blk\.0\..+\.weight$", n)})
+        sys.exit("ERROR: cannot determine the hidden size for this architecture.\n"
+                 f"  blk.0 carries: {', '.join(kinds)}\n"
+                 f"  -> onboard it so the next person's model of this family one-shots:\n"
+                 f"       pollard-onboard --model {a.gguf} --contribute")
     print(f"== pollard-rotate :: {a.gguf}  [{arch}]  hidden={hidden}  layers={len(layers)}  kind={a.kind}")
 
     if a.kind == "hadamard":

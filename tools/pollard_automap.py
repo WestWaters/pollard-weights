@@ -21,7 +21,7 @@ Usage:
   pollard-automap --tensors tensors.txt --model model-f16.gguf --imatrix ik.imatrix \
       --out build_mix.bat --bin path/to/ik_llama.cpp/build/bin
 """
-import argparse, os, re, sys
+import argparse, os, re, subprocess, sys, tempfile
 
 
 def imatrix_covered(path):
@@ -55,9 +55,15 @@ def imatrix_covered(path):
 # and they can't be copy-covered (their input is the compressed KV latent, shared with nothing),
 # so when uncovered they MUST be pinned to a K-quant or the low-bit build hard-fails ("Missing
 # importance matrix ... bailing out"). Norms (attn_*_norm) are excluded -- they stay F32.
+# A HYBRID (Mamba/SSM) block mixes sequence information with a state-space operator instead of
+# attention, and its projections (ssm_in/out, the alpha/beta/x/dt projections) are ordinary
+# matmuls the imatrix covers exactly like q/k/v -- verified on Qwen3.8-27B, where all 240 of them
+# carry entries. Leaving them out of this pattern means a low-bit build never checks their
+# coverage, which is how "Missing importance matrix ... bailing out" arrives at build time.
 _NEEDS_IMATRIX = re.compile(
     r"blk\.\d+\.(ffn_(up|down|gate)(_exps|_shexp)?"
-    r"|attn_(q|k|v|qkv|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
+    r"|ssm_(in|out|alpha|beta|x|dt)"
+    r"|attn_(q|k|v|qkv|gate|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
 
 
 def uncovered_pins(all_names, imatrix, fallback="q6_K"):
@@ -82,7 +88,7 @@ def ensure_gate_coverage(imatrix_path):
     and return its path so the whole flow (pins + build) uses the covered imatrix with NO manual
     step. Returns (path_to_use, n_copied); the original path + 0 when nothing needed copying or the
     file can't be parsed (caller then proceeds unchanged)."""
-    import struct, os
+    import struct
     try:
         d = open(imatrix_path, "rb").read()
         n = struct.unpack_from("<i", d, 0)[0]; pos = 4
@@ -118,6 +124,51 @@ def ensure_gate_coverage(imatrix_path):
     return out, added
 
 
+def tensor_list(model, bin_dir=None, imatrix=None, out=None):
+    """Produce the tensor listing ourselves instead of demanding one.
+
+    --tensors was a required argument, which meant every caller had to know to run
+    `llama-quantize --dry-run` first and where to put the output. That is a step Pollard can do,
+    so it does it.
+
+    Choosing the listing type is the other half. A dry-run at IQ1_S is REFUSED outright when no
+    importance matrix is present -- llama-quantize prints the refusal instead of the tensor names,
+    and the caller sees an empty file rather than a reason. We only want names, so: use the
+    imatrix when one was given, and otherwise ask for a type that never needs one. Detect and
+    choose, rather than stop.
+    """
+    exe = os.path.join(bin_dir, "llama-quantize.exe" if os.name == "nt" else "llama-quantize") \
+        if bin_dir else ("llama-quantize.exe" if os.name == "nt" else "llama-quantize")
+    out = out or os.path.join(tempfile.gettempdir(), "pollard_tensors.txt")
+    sink = os.path.join(tempfile.gettempdir(), "pollard_dryrun.gguf")
+
+    # imatrix-free first: Q8_0 lists the same tensors and is never refused for want of one.
+    attempts = [["--dry-run", model, sink, "Q8_0"]]
+    if imatrix:
+        attempts.insert(0, ["--dry-run", "--imatrix", imatrix, model, sink, "IQ1_S"])
+
+    last = ""
+    for args in attempts:
+        try:
+            r = subprocess.run([exe] + args, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=900)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            last = str(e)
+            continue
+        blob = (r.stdout or "") + (r.stderr or "")
+        if re.search(r"blk\.\d+\.", blob):
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(blob)
+            return out
+        last = blob.strip().splitlines()[-1] if blob.strip() else "no output"
+    raise SystemExit(
+        f"ERROR: could not list the tensors of {model}.\n"
+        f"  Tried a dry-run with and without an importance matrix; the last thing it said was:\n"
+        f"    {last[:300]}\n"
+        f"  Pass --tensors with a `llama-quantize --dry-run` listing, or --bin with the directory "
+        f"holding llama-quantize.")
+
+
 def parse_tensors(path):
     """Return (names, n_layers, is_moe, arch). Detect the architecture CLASS generically and
     route by it -- dense -> dense recipe; ANY MoE -> THE MoE recipe (which covers both the
@@ -137,6 +188,14 @@ def parse_tensors(path):
     if any("attn_k_b" in n or "kv_a_mqa" in n or "attn_q_b" in n for n in names): feats.append("MLA")
     if any(".hc_" in n for n in names): feats.append("hyper-conn")
     if any(".indexer." in n for n in names): feats.append("DSA-indexer")
+    # HYBRID: most blocks mix with a state-space operator, only a minority carry real attention.
+    # Worth naming in the arch line -- on Qwen3.8-27B it is 48 SSM blocks to 17 attention ones,
+    # and a recipe written for "dense" silently crushes the mixing path of the other 48.
+    n_ssm = len({m.group(1) for n in names for m in [re.match(r"blk\.(\d+)\.ssm_", n)] if m})
+    if n_ssm:
+        n_attn = len({m.group(1) for n in names
+                      for m in [re.match(r"blk\.(\d+)\.attn_(q|qkv)\.weight", n)] if m})
+        feats.append(f"hybrid-SSM {n_ssm}ssm/{max(n_attn - n_ssm, 0)}attn")
     arch = ("MoE" if is_moe else "dense") + (f" +{'+'.join(feats)}" if feats else "")
     return names, n_layers, is_moe, arch
 
@@ -195,6 +254,50 @@ def _atom(name):
     return ALIASES.get(name.lower(), name.lower())
 
 
+
+def fragile_rules(path, protect, floor=3.0, cap=4):
+    """Turn a pollard-fragile scan into protect rules, so the fragile tensors are HANDLED.
+
+    Reporting fragility and leaving the build to crush it anyway is the wrong half of the job. A
+    heavy-tailed tensor is one an absmax scale cannot represent, and that is knowable from the
+    weights before anything is built -- so the allocator should act on it rather than print a
+    warning nobody reads.
+
+    This is why it matters in practice: on gemma-4-12B-it the scan puts token_embd at kurtosis 17.9
+    with a crest factor of 378, five times worse than anything else in the model. That is the tensor
+    whose lost resolution made the Gemma4 flagship loop on <|channel>thought and fail the coherence
+    gate TWICE before anyone found it by building. Consuming the scan turns two dead builds into a
+    rule emitted before the first one.
+
+    Reads a JSON file, the same way --imatrix reads a file: data between tools, not tools threaded
+    through each other. `floor` keeps ordinary tensors out (a mildly heavy tail is normal) and `cap`
+    stops a model whose every kind is peaky from protecting itself into no compression at all.
+    """
+    import json
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+    except Exception as e:
+        print(f"  (fragility scan unreadable: {e}) -- continuing without it")
+        return [], [], {}
+    kinds = [k for k in (d.get("kinds") or []) if k.get("kurtosis", 0) >= floor]
+    kinds.sort(key=lambda k: -k["kurtosis"])
+    rules, notes, lift = [], [], {}
+    for k in kinds[:cap]:
+        base = re.sub(r"\.weight$", "", k["kind"])
+        tag = f"{base} (kurtosis {k['kurtosis']:.1f}, crest {k['crest']:.0f})"
+        # token_embd and output are NOT custom-q territory: they have dedicated flags, and the
+        # protect atom is a LOW-bit trellis type -- emitting `token_embd=iq2_kt` would push the
+        # most fragile tensor in the model DOWN to 2.125 bpw, the exact opposite of protecting it.
+        # Raise their own flag instead, which is precisely the fix that rescued Gemma4's flagship.
+        if base in ("token_embd", "output"):
+            lift[base] = "Q8_0" if k["kurtosis"] >= 10 else "Q6_K"
+            notes.append(f"{tag} -> {lift[base]} via its own flag")
+        else:
+            rules.append(f"{re.escape(base)}={protect}")
+            notes.append(tag)
+    return rules, notes, lift
+
+
 def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     """Emit the Mix as (base_type, custom-q rules). base_type = the crush atom (fills
     everything not matched); every protected role is named explicitly via custom-q
@@ -239,6 +342,16 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     attn_kv = protect if (kfree or is_moe) else body
     cq += [f"attn_k={attn_kv}", f"attn_v={attn_kv}",
            f"attn_q={protect}", f"attn_output={protect}", f"ffn_down={protect}"]
+    # (4) HYBRID (Mamba/SSM) blocks mix the sequence with a state-space operator instead of
+    # attention, so the rules above -- which name attention tensors -- reach none of them and the
+    # whole mixing path falls through to the body crush atom. On Qwen3.8-27B that is 48 of 65
+    # blocks: ssm_out alone is ~1.5B parameters, the mixer's OUTPUT projection, crushed to ~1 bit.
+    # Apply the same policy attention gets: protect the writer (ssm_out, the analogue of
+    # attn_output) and the gate, and the alpha/beta projections, which are tiny (48 x n_embd) and
+    # cost nothing to keep. The fused attn_qkv is already caught by the attn_q rule above.
+    # No-ops on a model with no SSM blocks.
+    cq += [f"ssm_out={protect}", f"attn_gate={protect}",
+           f"ssm_alpha={protect}", f"ssm_beta={protect}", f"ssm_in={protect}"]
     return flags, cq
 
 
@@ -254,10 +367,35 @@ def emit_bat(a, n_layers, is_moe, names):
     # in the imatrix-free path (K-quants don't consult an imatrix -> nothing to be uncovered).
     pins, ncov = ([], None) if kfree else uncovered_pins(names, a.imatrix)
     pin_cq = (",".join(pins) + ",") if pins else ""
-    cqs = pin_cq + ",".join(cq)                     # pins FIRST (custom-q is first-match-wins)
+    # Fragile kinds are protected ahead of the general role rules: custom-q is FIRST-MATCH-WINS, so
+    # a rule placed later would lose to the recipe's own entry for the same tensor.
+    frag_rules, frag_notes, frag_lift = (fragile_rules(a.fragile, protect)
+                                         if getattr(a, "fragile", None) else ([], [], {}))
+    # a fragile embedding/output raises ITS OWN flag rather than taking a custom-q rule
+    for _t, _ty in frag_lift.items():
+        _flag = "--token-embedding-type" if _t == "token_embd" else "--output-tensor-type"
+        flags = [f for f in flags if not f.startswith(_flag)] + [f"{_flag} {_ty}"]
+    frag_cq = (",".join(frag_rules) + ",") if frag_rules else ""
+    cqs = pin_cq + frag_cq + ",".join(cq)           # pins FIRST (custom-q is first-match-wins)
+    if frag_notes:
+        print("  fragile     : auto-protected -> " + ", ".join(frag_notes))
     im_flag = "" if kfree else "--imatrix %IM% "    # the whole point: no imatrix on the K-quant path
+    # The eval corpus has to suit the MODEL, or the PPL lines describe the mismatch rather than the
+    # build. Ask what this model is instead of defaulting everyone to raw Wikipedia.
+    ev = a.eval
+    if not ev:
+        ev, why = "wikitext2_test.txt", ""
+        try:
+            from pollard_modelkind import classify, describe
+            k = classify(base)
+            if k["eval"] != "raw-text":
+                ev = "pollard_eval_heldout.txt"
+                why = (f"   # {describe(k)}: raw text would score the mismatch. Build this with\n"
+                       f"   #   pollard-calib --out train.txt --held-out {ev}")
+        except Exception:
+            pass
     L = ["@echo off", f"set BIN={a.bin}", f"set IM={a.imatrix}", f"set SRC={base}",
-         f"set EV={a.eval}", f"set LOG={a.log}",
+         f"set EV={ev}", f"set LOG={a.log}",
          f"echo ===AUTOMAP {stem}  layers={n_layers}  moe={is_moe}  imatrix={'no (K-quant)' if kfree else 'yes'}  "
          f"body={body}({QUANT_BPW.get(body,'?')}) protect={protect}({QUANT_BPW.get(protect,'?')})"
          f"=== 1> %LOG% 2>&1", ""]
@@ -307,21 +445,56 @@ def emit_bat(a, n_layers, is_moe, names):
     return "\n".join(L)
 
 
+def find_ik_bin(explicit=None):
+    """Where ik_llama.cpp's binaries are, without making the user say so.
+
+    The default used to be the RELATIVE path ik_llama.cpp\\build\\bin, which resolves against
+    whatever directory the run happens to start in -- so the same install worked from one folder
+    and failed from another, and the backslash made it Windows-only. A tool that cannot find a
+    binary sitting in an obvious place should look, not stop.
+    """
+    exe = ".exe" if sys.platform == "win32" else ""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+    roots = [explicit, os.environ.get("POLLARD_IK_BIN")]
+    for base in (os.getcwd(), home, here, os.path.dirname(home), os.path.expanduser("~")):
+        for sub in ("ik_llama.cpp/build/bin", "ik_llama/build/bin", "bin",
+                    "runtime/ik_llama.cpp/build/bin"):
+            roots.append(os.path.join(base, *sub.split("/")))
+    for r in roots:
+        if r and os.path.isfile(os.path.join(r, "llama-quantize" + exe)):
+            return r
+    # PATH, last: a distro build may be older than the trellis atoms this needs
+    from shutil import which
+    got = which("llama-quantize")
+    return os.path.dirname(got) if got else (explicit or "")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--tensors", required=True, help="llama-quantize --dry-run tensor list")
+    ap.add_argument("--tensors", help="llama-quantize --dry-run tensor list. Optional: without "
+                                      "it Pollard runs the dry-run itself, picking a listing "
+                                      "type that does not need an importance matrix if none "
+                                      "was supplied.")
     ap.add_argument("--model", required=True, help="source F16 gguf path (as seen on the box)")
     ap.add_argument("--imatrix", default="ik.imatrix")
-    ap.add_argument("--eval", default="wikitext2_test.txt")
+    ap.add_argument("--eval", default="",
+                    help="held-out eval corpus for the PPL lines. Left empty, Pollard picks one "
+                         "that suits the model: raw text for a base model, in-domain (Calib 3.0 "
+                         "held-out) for an instruct/reasoning model, because a model tuned away "
+                         "from raw-text modelling scores its own mismatch on WikiText -- "
+                         "gemma-4-12B-it reads ~664 there where a plain 7B reads 5.4.")
     ap.add_argument("--ngl", type=int, default=99,
                     help="GPU layers for the PPL eval. Lower it for a big build that would OOM "
                          "the card (PPL is offload-invariant, so bars stay comparable).")
-    ap.add_argument("--bin", default=os.environ.get("POLLARD_IK_BIN", r"ik_llama.cpp\build\bin"),
-                    help="dir holding ik_llama.cpp binaries (llama-quantize/-perplexity/-cli); "
-                         "override with $POLLARD_IK_BIN or point it at YOUR build")
+    ap.add_argument("--bin", default=None,
+                    help="dir holding ik_llama.cpp binaries (llama-quantize/-perplexity/-cli). "
+                         "Found automatically when it is anywhere obvious; override with "
+                         "$POLLARD_IK_BIN or point it at YOUR build")
     ap.add_argument("--log", default=os.environ.get("POLLARD_AUTOMAP_LOG", "automap.log"),
                     help="build/eval log path (default: ./automap.log; or $POLLARD_AUTOMAP_LOG)")
     ap.add_argument("--out", default="build_automap.bat")
+    ap.add_argument("--fragile", help="a pollard-fragile --out scan.json. The heaviest-tailed\n                        tensor kinds are PROTECTED automatically instead of merely reported.")
     ap.add_argument("--body", default=None, help=f"crush atom for the fat body/cold experts {BODY_CHOICES} (stq1_0->iq1_bn)")
     ap.add_argument("--protect", default=None, help=f"protect atom for attn-q/output/ffn_down/edge {PROTECT_CHOICES}")
     ap.add_argument("--no-imatrix", "--kquant", dest="no_imatrix", action="store_true",
@@ -338,7 +511,7 @@ def main():
                          "(Reproduce the gold-card numbers with the benchmark path instead.)")
     ap.add_argument("--rival", default="", help="optional 4th bar: a uniform tier to beat head-to-head, e.g. iq2_xxs")
     ap.add_argument("--allow-dense", action="store_true",
-                    help="permit a DENSE model (automap is the MoE path; dense uses imatrix "
+                    help="accepted and ignored -- dense is no longer refused. (was: MoE path; dense uses imatrix "
                          "K-quants). Only for the research 1-bit-mix case (the gold-card).")
     ap.add_argument("--no-gate", dest="gate", action="store_false",
                     help="skip the auto coherence gate appended after the mix build. By default the "
@@ -359,18 +532,16 @@ def main():
     else:
         a.body = a.body or "iq1_kt"
         a.protect = a.protect or "iq2_kt"
-    names, n_layers, is_moe, arch = parse_tensors(a.tensors)
+    # --tensors is optional now: if it was not given, make the listing rather than refusing.
+    a.bin = find_ik_bin(a.bin)
+    tensors = a.tensors or tensor_list(a.model, bin_dir=a.bin, imatrix=a.imatrix)
+    names, n_layers, is_moe, arch = parse_tensors(tensors)
     if not n_layers:
         sys.exit("no blk.N tensors found -- is this a dry-run tensor list?")
-    # GUARDRAIL: automap is the MoE path. A dense model has no experts to allocate -- its
-    # win is imatrix-guided K-quants, not this. Refuse dense (saves everyone the wrong-tool
-    # run) unless --allow-dense (the research 1-bit-mix / gold-card case). HYV4 IS a MoE.
-    if not is_moe and not a.allow_dense:
-        sys.exit("REFUSED: this is a DENSE model, and automap is the MoE path.\n"
-                 "  Dense models -> imatrix-guided K-quants (IQ3_S/IQ4_XS/Q6_K); the measured\n"
-                 "  expert-allocation here doesn't apply (no expert redundancy to reallocate).\n"
-                 "  Rule: imatrix = dense, automap = MoE. Pass --allow-dense only for the\n"
-                 "  research 1-bit-mix case (the gold-card).")
+    # Dense runs. automap has carried a real dense recipe all along (crush ffn_gate/up, protect
+    # attn+down+edges) -- refusing dense and then applying that recipe the moment someone passed
+    # --allow-dense was the tool arguing with itself. The shipped dense flagships all came out of
+    # the forced path, so the forced path IS the path.
     # Transparency: an aliased atom (e.g. Hy4's STQ1_0) is an APPROXIMATION, not the real format --
     # say so, so nobody thinks they built a true 1.31-bit STQ1_0 when they built 1.62-bit iq1_bn.
     for label, raw in [("--body", a.body), ("--protect", a.protect), ("--rival", a.rival)]:

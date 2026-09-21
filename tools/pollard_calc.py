@@ -139,12 +139,20 @@ def find_llama_bin(name, arch=None):
         p = os.path.expanduser(name)
         return p if os.path.exists(p) else None
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
     candidates = [
         os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),  # ours FIRST -- kept current
+        os.path.join(home, "bin", name),                    # the workspace's own bin/
+        os.path.join(home, "llama.cpp", "build", "bin", name),
         shutil.which(name),                                                # then PATH
         os.path.expanduser(f"~/llama.cpp/build/bin/{name}"),
         f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}",
     ]
+    # Windows names the file llama-quantize.exe, so every bare candidate above misses it -- including
+    # our own runtime path. Three of the fallbacks are Unix-only prefixes; without this the Windows
+    # build box resolves NOTHING and the caller is told to update a runtime it already has.
+    if sys.platform == "win32":
+        candidates = [c + ext for c in candidates if c for ext in ("", ".exe")]
     existing = [c for c in candidates if c and os.path.exists(c)]
     if not existing:
         return None
@@ -254,6 +262,33 @@ def read_gguf_meta(path):
     return meta
 
 
+def read_imatrix_legacy(path):
+    """Parse the LEGACY imatrix format -> {name: {"ncall": int, "values": [float]}}.
+
+    Layout: int32 n_entries, then per entry int32 name_len, name bytes, int32 ncall,
+    int32 n_values, float32[n_values]. `values` is the SUM of x_j^2 over ncall calls, so
+    the Hessian diagonal E[x_j^2] is values/ncall.
+
+    This format is not optional: ik_llama.cpp reads ONLY this (`--output-format dat`), while
+    llama.cpp now defaults to a GGUF imatrix. Anything that understands one and not the other
+    is half-blind on whichever toolchain it isn't looking at."""
+    out = {}
+    with open(path, "rb") as f:
+        d = f.read()
+    n = struct.unpack_from("<i", d, 0)[0]
+    if not 0 < n < 1_000_000:
+        raise ValueError(f"not a legacy imatrix (entry count {n})")
+    off = 4
+    for _ in range(n):
+        ln = struct.unpack_from("<i", d, off)[0]; off += 4
+        name = d[off:off + ln].decode("utf-8", "replace"); off += ln
+        ncall, nval = struct.unpack_from("<ii", d, off); off += 8
+        out[name] = {"ncall": ncall,
+                     "values": struct.unpack_from("<%df" % nval, d, off)}
+        off += 4 * nval
+    return out
+
+
 def imatrix_covered_tensors(path):
     """The set of weight tensors an imatrix ACTUALLY covers (base names, the
     `.in_sum2`/`.counts` stats suffixes stripped). Anything not in here can't take
@@ -262,8 +297,17 @@ def imatrix_covered_tensors(path):
     Returns the set, or None if the imatrix can't be read (callers fall back)."""
     try:
         names = read_gguf_tensor_names(path)               # a GGUF imatrix is a GGUF
+        if not names:
+            raise ValueError("no GGUF tensors")
     except Exception:
-        return None
+        # A LEGACY .dat is not a GGUF, so the reader above returns nothing and coverage came
+        # back None -- i.e. "unknown", and every caller fell back to pinning nothing. That is
+        # silent on llama.cpp (GGUF default) and WRONG on every ik_llama build, which must use
+        # .dat: llama-quantize would load 496 entries while Pollard believed it had zero.
+        try:
+            names = list(read_imatrix_legacy(path))
+        except Exception:
+            return None
     cov = set()
     for n in names:
         for suf in (".in_sum2", ".counts", ".sum2", ".activations"):
@@ -542,7 +586,7 @@ def detect_gpu_gb():
     A name table can only ever cover the cards someone thought to list. Detection covers the card
     the user actually owns -- including the ones we got wrong ourselves (this box is a 5070 Ti with
     16 GB, and was budgeted as a 32 GB 5090 for a whole week)."""
-    import subprocess
+    pass  # subprocess is imported at module scope
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=10).stdout

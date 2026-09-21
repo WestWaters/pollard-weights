@@ -213,8 +213,8 @@ def main():
                          "(len(groups)*layers full-model quantizes). Default refuses -- use the "
                          "automap trellis mix for a big MoE instead.")
     ap.add_argument("--allow-dense", action="store_true",
-                    help="force the sweep on a DENSE model (it's the MoE tool; dense doesn't "
-                         "benefit and this is a multi-hour sweep). Research only.")
+                    help="accepted and ignored -- dense is no longer refused. Kept so existing "
+                         "scripts keep working.")
     a = ap.parse_args()
 
     # The measurement must not be graded on the text it was tuned on. Checked, not just documented.
@@ -245,17 +245,16 @@ def main():
     meta = read_gguf_meta(a.gguf)
     arch = analyse(gguf_to_config(meta, a.gguf))
     layers = arch["layers"]
-    # GUARDRAIL: the measured-KL sensitivity sweep is the MoE tool -- it pays off where
-    # expert redundancy lets the knapsack reallocate. On a DENSE model it does NOT beat
-    # uniform (measured), and this sweep is ~2*layers of quantize+KL passes (HOURS). Refuse
-    # dense so nobody burns 3h for nothing (dense -> imatrix K-quants directly).
-    if str(arch.get("kind", "")).startswith("dense") and not getattr(a, "allow_dense", False):
-        sys.exit("REFUSED: this is a DENSE model -- the measured-KL sensitivity sweep is the\n"
-                 "  MoE tool and does NOT beat uniform on dense (no expert redundancy to\n"
-                 "  reallocate). It is ~2*layers quantize+KL passes (HOURS) that a dense model\n"
-                 "  can't use. Dense -> imatrix-guided K-quants directly (seconds), no sweep.\n"
-                 "  Rule: imatrix = dense, automap/sensitivity = MoE. Pass --allow-dense to\n"
-                 "  force the sweep anyway (research).")
+    # Dense runs. This sweep measures the model in front of it; it does not assume an answer
+    # from a different model. The one dense data point we have is small -- Qwen2.5-0.5B, where
+    # a measured profile lost to plain imatrix at matched size -- and a 0.5B is the weakest
+    # possible evidence about a 27B, so it is reported, not enforced. Cost is still guarded
+    # below (the feasibility check), because HOURS is a real cost whatever the arch.
+    if str(arch.get("kind", "")).startswith("dense"):
+        print("NOTE: dense model. Per-layer allocation has more headroom on MoE (experts give the\n"
+              "      knapsack somewhere to move bits). On dense it is an open question by size --\n"
+              "      measured on Qwen2.5-0.5B the profile lost to plain imatrix; larger dense\n"
+              "      models are untested. Bench both arms before shipping.", flush=True)
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
 
     # FEASIBILITY GUARD: the sweep is len(groups)*layers FULL-MODEL quantize+KL passes.

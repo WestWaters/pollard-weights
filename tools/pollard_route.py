@@ -36,7 +36,7 @@ try:
     import torch
 except ImportError as _e:
     raise SystemExit("pollard-route needs torch and transformers: "
-                     "pip install 'pollard-weights[flybrain]'") from None
+                     "pip install 'pollard-weights[convert]'") from None
 
 
 def find_routers(model, n_experts=None):

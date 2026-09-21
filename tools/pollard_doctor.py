@@ -27,8 +27,87 @@ you the noise floor needs a repeat run. Tells you whether to fix the mix, accept
 Lanes: exl3 health implemented; risk-scan + repair plan are lane-agnostic (they operate on the fp16
 source). Works on any CUDA GPU. Verify is the source of truth; a proxy metric is never consulted.
 """
-import argparse, os, subprocess, sys
-from pollard_load import load_backbone, text_layers
+import argparse, json, os, subprocess, sys
+
+
+def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
+    """This tool's OWN loader -- model tooling does not depend on a shared/brain-side one.
+
+    AutoModelForCausalLM refuses a vision-language config outright ("Unrecognized configuration
+    class Qwen2VLConfig for this kind of AutoModel"), so fall back to the vision-language auto
+    classes: a VL model's text stack quantizes like any other. Both failures are reported if
+    neither works, not just the last one.
+
+    Pass `device_map=` to shard across GPU+CPU+disk; accelerate owns placement after that, so
+    `device` is ignored in that case.
+    """
+    import torch as _t, transformers as _tf
+    from transformers import AutoModelForCausalLM
+    if dtype is None:
+        dtype = _t.float32
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
+    except ValueError as text_only_err:
+        model, errs = None, [f"AutoModelForCausalLM: {text_only_err}"]
+        for _n in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+            _c = getattr(_tf, _n, None)
+            if _c is None:
+                continue
+            try:
+                model = _c.from_pretrained(model_id, dtype=dtype, **kw)
+                break
+            except Exception as e:
+                errs.append(f"{_n}: {e}")
+        if model is None:
+            raise SystemExit(f"could not load {model_id!r} as a causal LM or a vision-language "
+                             "model:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
+    if kw.get("device_map") is None:            # accelerate already placed a dispatched model
+        model = model.to(device)
+    return model.eval() if eval_mode else model
+
+
+def text_layers(model):
+    """This tool's OWN layer walk. A VL model keeps its text stack under `model.language_model`."""
+    for path in ("model.language_model", "language_model.model", "model"):
+        node = model
+        for part in path.split("."):
+            node = getattr(node, part, None)
+            if node is None:
+                break
+        layers = getattr(node, "layers", None) if node is not None else None
+        if layers is not None:
+            return layers
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        return layers
+    raise SystemExit(f"could not find the decoder layers on {type(model).__name__}; "
+                     "this tool's text_layers() needs a path for this architecture")
+
+
+def _failmode(source, model, calib, device):
+    """Ask pollard-failmode whether this build's damage is the kind repair can fix.
+
+    Best-effort: if it cannot run (no calibration text, a lane whose weights this process cannot
+    load), repair proceeds as before rather than being blocked by a diagnostic.
+    """
+    if not calib:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    tool = os.path.join(here, "pollard_failmode.py")
+    if not os.path.exists(tool):
+        return None
+    out = os.path.join(here, "_failmode.json")
+    r = subprocess.run([sys.executable, tool, "--ref", source, "--model", model,
+                        "--calib", calib, "--device", device, "--out", out],
+                       capture_output=True, text=True)
+    try:
+        with open(out, encoding="utf-8") as fh:
+            return json.load(fh)["verdict"]
+    except Exception:
+        return None
+    finally:
+        if os.path.exists(out):
+            os.remove(out)
 
 
 def scan_outliers(source_dir, device, calib, rows, cols, thresh):
@@ -152,6 +231,9 @@ def main():
     ap.add_argument("--bpw", type=float, default=4.0, help="target bits for repair reconvert")
     ap.add_argument("--predict", action="store_true", help="scan the source and predict low-bit break risk")
     ap.add_argument("--repair", action="store_true", help="run smooth -> reconvert -> verify")
+    ap.add_argument("--force-repair", action="store_true",
+                    help="repair even when the damage is classified as computation collapse, "
+                         "which smoothing does not recover")
     ap.add_argument("--cal-response", dest="cal_response", action="store_true",
                     help="classify WHY two builds (from different calibrations) differ: allocator-shift vs "
                          "mix-dilution vs noise. Needs --model A and --compare B (both same lane/bpw).")
@@ -215,6 +297,22 @@ def main():
                     "gguf": f"pollard-smooth (imatrix path) then pollard-fit  # GGUF has its own smoothing"}[a.lane]
         print("   reconvert: " + lane_cmd)
         print(f"   verify:    pollard-verify --model {out}-{a.lane} --source {a.source} --end-to-end")
+        if a.repair and a.model:
+            # Repair recovers signal degradation. It does NOT recover a component that failed
+            # outright -- and spending a full reconvert to find that out is the expensive way to
+            # learn it. Classify first when there is a build to classify.
+            fm = _failmode(a.source, a.model, a.calib, a.device)
+            if fm and fm["repairable"] is False:
+                print(f"\n   !! {fm['mode'].upper()}: {fm['reason']}")
+                print("   Smoothing will not recover this, so repair is not run. What will:")
+                for line in fm["advice"]:
+                    print(f"     {line}")
+                print("   Override with --force-repair if you want to try it anyway.")
+                if not a.force_repair:
+                    sys.exit(1)
+            elif fm:
+                print(f"\n   {fm['mode']}: {fm['reason']}")
+
         if a.repair:
             print("\n   running repair (smoothing)...")
             rc = subprocess.run(smooth).returncode

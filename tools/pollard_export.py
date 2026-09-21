@@ -259,7 +259,7 @@ def main():
     # allocation-as-config: drop the exact bit plan beside the checkpoint. A/B'ing a different
     # allocation is then a re-pack against this record, not a full re-cook.
     try:
-        import os
+        pass  # os is imported at module scope
         cfg_path = os.path.join(a.out, "pollard-allocation.json")
         json.dump({"model": a.model, "kind": kind, "layers": n_layers, "group_size": a.group_size,
                    "low_bits": LOW, "high_bits": HIGH, "uniform": bool(a.uniform),

@@ -11,8 +11,8 @@ WINNING PATH -- the SAME for dense AND MoE (no losing fallback):
   (There is NO "imatrix-free mix": it loses to stock Q2_K, so it's deprecated, not a path here.)
 
 STOP LOSING / TRAP paths -- never the default, opt-in only:
-  - sensitivity SWEEP on DENSE = loses (no expert redundancy) -> pollard-sensitivity refuses dense.
-  - sensitivity SWEEP on a BIG MoE = ~2*layers full-model quantizes = many HOURS; opt-in R&D only.
+  - sensitivity SWEEP on a BIG model = ~2*layers full-model quantizes = many HOURS; opt-in R&D only
+    (dense is NOT refused -- it is a cost guard, not an arch guard; bench the two arms).
   - the 3-bar comparison + KL/PPL = the BENCHMARK, opt-in via --benchmark (see benchmarks/).
 
 Plans by default (prints the exact commands for THIS model); `--run` executes them.
@@ -31,7 +31,7 @@ EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix 
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
 pollard-probe, --no-measure to skip); EXL3 = smoothing + Calib 3.0 packed to -cd + EXL3's native allocator.
 """
-import argparse, os, subprocess, sys
+import argparse, contextlib, json, os, subprocess, sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse, find_llama_bin,
                           detect_gpu_gb, detect_available_ram_gb)
@@ -46,6 +46,33 @@ def _accel_gb():
     if sys.platform == "darwin":
         return detect_available_ram_gb() * 0.80
     return 0.0
+
+
+def _weights_gb(hf_dir):
+    """On-disk weight GB for an HF checkout. 0 = unknown."""
+    import glob
+    tot = 0
+    for pat in ("*.safetensors", "*.bin"):
+        tot += sum(os.path.getsize(f) for f in glob.glob(os.path.join(hf_dir, pat)))
+    return tot / (1 << 30)
+
+
+def _use_stream_probe(hf_dir, forced, need_gb=None):
+    """Which sensitivity estimator can actually finish on this box.
+
+    The default perturb+KL probe crushes one group and re-runs the eval, so it costs layers*groups
+    full forward passes -- ~100 for a 48-layer model. That is fine for a model that sits in memory
+    and hopeless for one streaming off disk, which is precisely when a measured allocation matters
+    most. The gold path would be 'available' and simply never finish. The one-pass Hessian-diagonal
+    estimator ranks the same groups for a single forward, so use it when the weights do not fit."""
+    if forced in ("stream", "kl"):
+        return forced == "stream"
+    # `need_gb` states the weight size rather than requiring a checkpoint on disk -- exercising the
+    # bigger-than-RAM path should not mean writing a 400GB file, which is free only on a filesystem
+    # with sparse files and writes real bytes on one without.
+    need = need_gb if need_gb is not None else _weights_gb(hf_dir)
+    ram = detect_available_ram_gb() or 0.0
+    return bool(need and ram and need * 1.15 > ram)
 
 
 def _fit_ngl(gguf, ngl):
@@ -229,14 +256,20 @@ def _automap_mix(a, is_moe):
     return out
 
 
-def _find_convert():
-    """Locate convert_hf_to_gguf.py (our runtime llama.cpp first, then PATH/common spots)."""
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for c in (os.path.join(repo, "runtime", "llama.cpp", "convert_hf_to_gguf.py"),
-              os.path.expanduser("~/llama.cpp/convert_hf_to_gguf.py")):
-        if os.path.exists(c):
-            return c
-    return "convert_hf_to_gguf.py"                          # assume on PATH / same dir
+def _find_convert(hf_dir=None):
+    """Locate a converter that can handle THIS model, not just any file with the right name.
+
+    This used to check two paths and then hand back the bare string "convert_hf_to_gguf.py",
+    trusting the shell. When the converter was absent or too old for the architecture, the failure
+    surfaced deep in the build as something about the model -- and the apparent fix was to move a
+    23.8GB GGUF across the network rather than copy a 3MB script."""
+    from pollard_convert import find_converter
+    conv, note = find_converter(hf_dir)
+    if conv is None:
+        raise SystemExit(f"\n   cannot convert on this machine: {note}")
+    if hf_dir:
+        print(f"   converter: {note}")
+    return str(conv)
 
 
 def _precondition_hf(a, hf_dir):
@@ -268,10 +301,40 @@ def _precondition_hf(a, hf_dir):
     return cur
 
 
+def _preflight(a, hf_dir):
+    """Can this machine finish the build, asked BEFORE it starts one.
+
+    Every capability this needs is knowable in seconds from the model's shape -- is there a
+    converter here that knows the architecture, will the weights fit anywhere sensible. Asking
+    afterwards is how a missing 3MB converter surfaces hours in, looking like a problem with the
+    model. A build that cannot finish should say so before it spends anything."""
+    if not getattr(a, "preflight", True):
+        return
+    try:
+        from pollard_convert import find_converter, model_architectures
+        from pollard_probe import plan_placement
+    except ImportError:
+        return                                          # no extra installed: nothing to check with
+    archs = model_architectures(hf_dir)
+    conv, note = find_converter(hf_dir)
+    print(f"   preflight: {', '.join(archs) or 'architecture unknown'}")
+    if conv is None:
+        raise SystemExit(f"   STOPPING before this build spends anything -- {note}\n"
+                         "   (--no-preflight to try anyway)")
+    print(f"      converter  {note}")
+    try:
+        _, _, where = plan_placement(hf_dir, "cpu", os.path.join(hf_dir, ".pollard-offload"))
+        if where:
+            print(f"      placement  {where}")
+    except Exception:
+        pass                                            # placement is advisory, never a blocker
+
+
 def _resolve_hf(a):
     """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
     Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
+        _preflight(a, a.hf)
         a._hf_dir = _precondition_hf(a, a.hf)
         return a._hf_dir
     import pollard_workspace as ws
@@ -279,6 +342,8 @@ def _resolve_hf(a):
     print(f"   fetch HF repo -> {local}  (workspace downloads/)")
     if a.run:
         local = ws.fetch_source(a.hf)                   # single copy, no ~/.cache dup
+    if os.path.isdir(local):
+        _preflight(a, local)
     a._hf_dir = _precondition_hf(a, local)
     return a._hf_dir
 
@@ -286,10 +351,11 @@ def _resolve_hf(a):
 def _hf_to_gguf(a):
     """HF weights -> f16 GGUF so the GGUF flagship pipeline can run one-shot from a repo/dir."""
     hf_dir = _resolve_hf(a)
-    conv = _find_convert()
+    conv = _find_convert(hf_dir)
     here = os.path.abspath(a.output) if a.output else os.path.dirname(os.path.abspath(hf_dir)) or "."
     out = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + "-f16.gguf")
     print(f"   convert HF -> f16 GGUF: python {os.path.basename(conv)} {hf_dir} --outtype f16 --outfile {out}")
+    _emit_mmproj(a, conv, hf_dir, out)
     if a.run:
         subprocess.run([sys.executable, conv, hf_dir, "--outtype", "f16", "--outfile", out])
     return out
@@ -320,7 +386,12 @@ def _ensure_sensitivity(a, hf_dir, calib, here):
     evalf = heldout if (heldout and (not a.run or os.path.exists(heldout))) else calib
     print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
     if a.run:
-        r = subprocess.run(["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof], cwd=here)
+        cmd = ["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof]
+        if _use_stream_probe(hf_dir, getattr(a, "probe_method", "auto")):
+            cmd.append("--stream")
+            print(f"      ({_weights_gb(hf_dir):.1f}GB of weights vs {detect_available_ram_gb() or 0:.1f}GB "
+                  "free -- one-pass estimator; perturb+KL would need ~layers*groups full passes)")
+        r = subprocess.run(cmd, cwd=here)
         # This used to fall back to uniform "rather than killing the whole build". But a uniform
         # allocation is not a lesser Pollard build -- it is the thing pollard-fit itself warns has
         # no quality win over a stock K-quant. Degrading to it silently spends hours producing a
@@ -398,7 +469,12 @@ def _ensure_imatrix(a):
     if a.run:
         if not a.calib and not os.path.exists(calib):
             _run(["pollard-calib", "--out", calib], True, cwd=here)
-        r = subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", ngl], cwd=here)
+        # --output-format dat, NOT the gguf default. Mainline llama.cpp reads both, but ik_llama --
+        # which builds the trellis flagship, the whole reason an imatrix is computed here -- reads
+        # only the legacy format and fails with "load_imatrix: failed reading number of values".
+        # The ladder still builds, so the loss is silent: the flagship is simply skipped.
+        r = subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", ngl,
+                            "--output-format", "dat"], cwd=here)
         # An unchecked imatrix is how a build gets all the way to llama-quantize before anyone finds
         # out there is no imatrix -- at which point it reports "failed to open" and quietly ships a
         # stock K-quant. Fail here, where the cause is still on screen.
@@ -414,54 +490,129 @@ def _ensure_imatrix(a):
     return imat
 
 
-def attach_brain(brain_path: str, out_dir: str, fmt: str) -> None:
-    """Ship a brain alongside a build, with a note saying exactly what it attaches to.
-
-    The brain is a separate 11 MB file, not weights to quantize, so it copies into the build
-    untouched whatever lane this is. What differs per lane is whether it can be USED there yet: the
-    GPTQ lane loads under transformers, so a brain attaches directly; GGUF, MLX and EXL3 run under
-    their own engines, which have no hook to inject memory tokens into the residual stream. The file
-    still travels with the build so the pair never gets separated, and the note says which case this
-    is instead of leaving someone to find out at run time.
-    """
-    import shutil
-    if not os.path.isfile(brain_path):
-        raise SystemExit(f"--brain: no such file {brain_path}")
-    dest_dir = out_dir if os.path.isdir(out_dir) else os.path.dirname(out_dir) or "."
-    name = os.path.basename(brain_path)
-    shutil.copy2(brain_path, os.path.join(dest_dir, name))
-
-    meta = {}
+def _pid_alive(pid):
     try:
-        import torch
-        meta = torch.load(brain_path, map_location="cpu", weights_only=False).get("meta", {})
+        if sys.platform == "win32":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True,
+                                 text=True, timeout=10).stdout
+            return str(pid) in out
+        os.kill(pid, 0)
+        return True
     except Exception:
-        pass
-    live = fmt in ("gptq",)
-    note = [f"# Brain: {name}", ""]
-    note.append(f"- slots x width : {meta.get('neurons','?')} x {meta.get('width','?')}"
-                f"  ({int(meta.get('neurons',0)) * int(meta.get('width',0)) * 4 / 1e6:.1f} MB live state)"
-                if meta.get("neurons") else "- (could not read brain metadata)")
-    if meta.get("hidden"):
-        note.append(f"- trained against a backbone with hidden size {meta['hidden']}")
-    note.append("")
-    if live:
-        note += ["Attach it at run time:", "",
-                 "```python", "from pollard_flybrain import FlyBrain, load_backbone",
-                 "brain = FlyBrain.load(\"" + name + "\").bind(model, tok)",
-                 "brain.feed(open(\"long_document.txt\").read())", "```", ""]
-    else:
-        note += [f"The {fmt.upper()} lane runs under its own engine, which has no hook to inject",
-                 "memory tokens into the residual stream, so the brain cannot attach to THIS build",
-                 "yet. It ships here so the pair stays together; use it with the transformers copy of",
-                 "the same backbone, or carry it to another model with:", "",
-                 "```", f"pollard-flybrain --train 900 --continue-from {name} --model <hf-id> ...", "```", ""]
-    note += ["Verify any brain with:", "",
-             "```", f"pollard-brainverify --brain {name} --model <hf-id> --filler corpus.txt", "```"]
-    with open(os.path.join(dest_dir, "BRAIN.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(note) + "\n")
-    print(f"   brain: {name} -> {dest_dir}"
-          + ("  (attaches at run time)" if live else f"  (ships with the build; {fmt} cannot host it yet)"))
+        return False
+
+
+class MachineLock:
+    """One heavy Pollard job on a machine at a time.
+
+    Quantizing, computing an imatrix and running perplexity all want the same GPU, the same disk and
+    most of the cores. Started together they do not go faster -- they thrash, and on a shared machine
+    the other person notices first. Nothing enforced this, so the only thing standing between a user
+    and an unusable desktop was remembering not to.
+
+    Advisory and self-healing: a lock whose process is gone is taken over, never a reason to be
+    stuck. --force ignores it outright."""
+
+    def __init__(self, what, force=False):
+        home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+        os.makedirs(home, exist_ok=True)
+        self.path, self.what, self.force, self.held = os.path.join(home, ".pollard.lock"), what, force, False
+
+    def __enter__(self):
+        if self.force:
+            return self
+        try:
+            if os.path.exists(self.path):
+                prev = json.loads(open(self.path, encoding="utf-8").read() or "{}")
+                pid = int(prev.get("pid", 0))
+                if pid and pid != os.getpid() and _pid_alive(pid):
+                    raise SystemExit(
+                        f"\n   another Pollard job is running on this machine (pid {pid}): "
+                        f"{prev.get('what', '?')}\n"
+                        "   Running two at once does not finish sooner -- they contend for the GPU,\n"
+                        "   the disk and the cores, and on a shared machine someone else feels it.\n"
+                        "   Wait for it, or pass --force if you know it is finished.")
+        except SystemExit:
+            raise
+        except Exception:
+            pass                                            # an unreadable lock never blocks a build
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "what": self.what}, f)
+            self.held = True
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        return False
+
+
+
+
+def _emit_mmproj(a, conv, hf_dir, gguf_out):
+    """Export the multimodal projector when the model has one, so the build can still see and hear.
+
+    A text GGUF is only the language half of a multimodal model. Ship it alone and the model loses
+    image and audio with nothing saying so -- the weights for them are right there in the source.
+
+    NOT --outtype f16. Gemma 4 is encoder-free: the 550M vision encoder is replaced by one large
+    matmul, so `v.patch_embd.weight` IS the vision pathway, and the reference build keeps it at F32
+    while the projections are BF16. Passing f16 downcast it and produced a 122MB projector where the
+    reference is 175MB. bf16 reproduces the reference byte for byte."""
+    try:
+        from pollard_modelkind import classify
+        k = classify(hf_dir)
+    except Exception:
+        return
+    mods = [m for m in k.get("modalities", []) if m != "speech_out"]
+    if not mods:
+        return
+    out = os.path.join(os.path.dirname(os.path.abspath(gguf_out)) or ".",
+                       "mmproj-" + os.path.basename(gguf_out).replace("-f16.gguf", "-BF16.gguf"))
+    print(f"   + multimodal projector ({'/'.join(mods)}): --mmproj --outtype bf16 -> "
+          f"{os.path.basename(out)}")
+    if not a.run:
+        return
+    r = subprocess.run([sys.executable, str(conv), str(hf_dir), "--mmproj",
+                        "--outtype", "bf16", "--outfile", out])
+    if r.returncode != 0 or not os.path.exists(out):
+        print("   (mmproj export failed -- the text build is unaffected, but this model's image/"
+              "audio will not work until one is produced)")
+        return
+    print(f"   wrote {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
+
+
+def _emit_card(a):
+    """Write the model card for what was just built.
+
+    A build is not finished when the files exist: without a card nobody knows what the rungs are,
+    which runtime each needs, or what was measured. That step lived in whatever script happened to
+    be driving the build, which means it existed for us and not for anyone else."""
+    src = a.gguf or getattr(a, "_hf_dir", None) or a.hf
+    if not src:
+        return
+    cmd = ["pollard-card", "--model", src]
+    results = getattr(a, "results", None)
+    if results and os.path.exists(results):
+        cmd += ["--results", results]
+    out = os.path.join(os.path.dirname(os.path.abspath(a.out or src)) or ".", "README.md")
+    cmd += ["--out", out]
+    print("\n   3) the card (what was built, which runtime each rung needs, what was measured):")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        print("   (card step failed -- the builds are fine; run pollard-card yourself to write it)")
+        return
+    print(f"   wrote {out}")
+    if not results:
+        print("   NOTE: no --results, so the card carries sizes but no measured numbers. Produce "
+              "them with\n         pollard-bench --gguf <rung> --ref <f16> --out results.json, "
+              "then re-run with --results.")
 
 
 def main():
@@ -474,11 +625,21 @@ def main():
                     " |  exl3 (exllamav3 -- the heavy trellis lane)  |  mx (Blackwell NVFP4 / any-GPU W4A16, "
                     "compressed-tensors)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
-    ap.add_argument("--brain", help="ship a trained brain (pollard-flybrain / human connectome) WITH this\n"
-                                    "build, so the pair travels as one artifact. The brain is not\n"
-                                    "quantized -- it is 11 MB of memory that attaches to the model at run\n"
-                                    "time and can be detached, moved to another backbone and carried on\n"
-                                    "with --continue-from.")
+    ap.add_argument("--results", help="measured numbers (pollard-bench --out) to put on the card")
+    ap.add_argument("--no-card", dest="card", action="store_false",
+                    help="skip writing the model card after a build")
+    ap.set_defaults(card=True)
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the machine lock and start even if another Pollard job is "
+                         "running here. They will contend for the GPU, disk and cores.")
+    ap.add_argument("--no-preflight", dest="preflight", action="store_false",
+                    help="skip the up-front capability check (converter knows this architecture, "
+                         "weights fit somewhere) and start the build regardless")
+    ap.set_defaults(preflight=True)
+    ap.add_argument("--probe-method", choices=("auto", "stream", "kl"), default="auto",
+                    help="sensitivity estimator: 'kl' = perturb+KL (layers*groups forward passes), "
+                         "'stream' = one-pass Hessian diagonal, 'auto' (default) picks stream when "
+                         "the weights do not fit memory")
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (gptq/mlx/mx allocation; else auto-measured)")
     ap.add_argument("--no-measure", dest="measure", action="store_false",
                     help="skip the auto sensitivity probe on the gptq/mlx/mx lanes (falls back to uniform "
@@ -529,6 +690,14 @@ def main():
                          "model is usable and which sampling to ship, without a manual step.")
     ap.set_defaults(gate=True)
     a = ap.parse_args()
+
+    # One heavy job per machine. Everything below contends for the same GPU, disk and cores.
+    with MachineLock(" ".join(sys.argv[1:])[:120], force=getattr(a, "force", False)) if a.run \
+            else contextlib.nullcontext():
+        _dispatch(a)
+
+
+def _dispatch(a):
     if not a.gguf and not a.hf:
         ap.error("pass --gguf <file> or --hf <repo-or-dir>")
 
@@ -573,8 +742,6 @@ def main():
             except Exception as e:
                 print(f"   [match-transformers] skipped ({e}); using the current env")
         _emit_nongguf(a)
-        if a.brain and a.run:
-            attach_brain(a.brain, a.output or ".", a.format)
         if not a.run:
             print("\n   plan only -- re-run with --run to execute.")
         return
@@ -634,8 +801,8 @@ def main():
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
-    if a.brain and a.run:
-        attach_brain(a.brain, a.out or os.path.dirname(a.gguf) or ".", "gguf")
+    if a.run and getattr(a, "card", True):
+        _emit_card(a)
     if not a.run:
         print("\n   plan only -- re-run with --run to execute.")
 

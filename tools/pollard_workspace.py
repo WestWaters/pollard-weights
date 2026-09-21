@@ -254,7 +254,7 @@ def resolve_trust_remote_code(model_id, mode="auto") -> bool:
     if mode == "off":
         return False
     try:
-        import json
+        pass  # json is imported at module scope
         if os.path.isdir(model_id):
             cfg = json.load(open(os.path.join(model_id, "config.json")))
         else:

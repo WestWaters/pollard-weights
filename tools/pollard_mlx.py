@@ -53,10 +53,31 @@ def layer_of(path):
     return int(m.group(1)) if m else None
 
 
-def bits_for(path, alloc, is_moe, gsize):
+# A vision or audio tower lives INSIDE the checkpoint on this lane -- unlike GGUF, where the
+# projector ships as a separate mmproj that Pollard never quantizes. Nothing below named them, so
+# they fell through: `visual.merger.mlp.0` (the PROJECTOR) matched no rule and took LOW, and
+# `vision_tower.encoder.layers.2.*` matched `.layers.2.` and took the LANGUAGE layer 2's
+# allocation -- a text-sensitivity profile applied to a vision block.
+# The encoder and the projector are what carry modality alignment; a model that cannot tell red
+# from blue has lost something no text perplexity will show. Held high by default, and
+# --vision-bits exists because compressing the tower is a legitimate choice, just not a silent one.
+VISION_RE = re.compile(r"(^|\.)(visual|vision_tower|vision_model|vision_encoder|image_encoder"
+                       r"|patch_embed|audio_tower|audio_encoder|speech_encoder)", re.I)
+PROJ_RE = re.compile(r"(multi_modal_projector|mm_projector|mm_proj|\bmerger\b"
+                     r"|modality_project|resampler|perceiver|connector)", re.I)
+
+
+def bits_for(path, alloc, is_moe, gsize, vision_bits=None):
     """Per-module bit-width for MLX (returns a {'bits','group_size'} dict, or False to skip).
     Mirrors the Pollard policy: attn follows the attn profile; the FFN/expert body follows ffn;
-    MoE router (`.gate`, not `gate_proj`) and shared experts are pinned HIGH; embeddings kept HIGH."""
+    MoE router (`.gate`, not `gate_proj`) and shared experts are pinned HIGH; embeddings kept HIGH.
+    The vision/audio tower and the modality projector are held at `vision_bits` (default HIGH) --
+    they are matched FIRST, because `vision_tower.encoder.layers.2.` also matches the language
+    layer pattern and would otherwise be given a text layer's allocation."""
+    if PROJ_RE.search(path):
+        return {"bits": HIGH, "group_size": gsize}      # modality alignment: never crushed
+    if VISION_RE.search(path):
+        return {"bits": vision_bits or HIGH, "group_size": gsize}
     if "embed" in path or path.endswith("lm_head"):    # embed_tokens (llama) OR embedding (Spark2_5, tied)
         return {"bits": HIGH, "group_size": gsize}      # vocab carriers: keep high
     if is_moe and (re.search(r"\.(mlp|block_sparse_moe)\.gate$", path)
@@ -85,6 +106,10 @@ def main():
     ap.add_argument("--focus-layers", help="force these layers to HIGH (8-bit) regardless of the profile, "
                     "e.g. '3,4,8' or '3-8,16' -- steer the budget to layers you care about")
     ap.add_argument("--group-size", type=int, default=64, help="MLX quant group size (default 64)")
+    ap.add_argument("--vision-bits", type=int, default=None,
+                    help="bits for a vision/audio tower inside the checkpoint (default: 8, same as "
+                         "embeddings). The modality PROJECTOR is always held high regardless. "
+                         "Lower it only if you have measured the cost with pollard-mmeval.")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map. "
                          "Note: MLX needs the arch supported in mlx_lm to convert a truly custom model.")
@@ -125,7 +150,8 @@ def main():
             if is_moe:
                 samples.append(f"model.layers.{i}.mlp.gate")
         for p in samples:
-            print(f"     {p:52s} -> {bits_for(p, alloc, is_moe, a.group_size)['bits']}-bit")
+            print(f"     {p:52s} -> "
+                  f"{bits_for(p, alloc, is_moe, a.group_size, a.vision_bits)['bits']}-bit")
         return
 
     if not a.out:                                          # no --out -> organized workspace path
@@ -141,7 +167,7 @@ def main():
         sys.exit("ERROR: mlx_lm not installed. On Apple Silicon: pip install mlx_lm ; then rerun.")
 
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
-        return bits_for(path, alloc, is_moe, a.group_size)
+        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits)
 
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)

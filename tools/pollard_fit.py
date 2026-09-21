@@ -43,6 +43,11 @@ QTYPES = [("q8_0", 8.5), ("q6_K", 6.6), ("q5_K", 5.5), ("iq4_xs", 4.25),
           ("iq3_s", 3.4), ("iq2_s", 2.5), ("iq2_xxs", 2.1),
           ("iq1_m", 1.75), ("iq1_s", 1.56)]      # 1-bit floor (opt-in, --allow-1bit)
 BPW = dict(QTYPES)
+# q2_K is deliberately NOT in QTYPES -- it is not a bulk-allocation candidate (iq2_s/iq2_xxs beat
+# it per byte when an imatrix is present). It is here only so its SIZE is known, because it is the
+# imatrix-free substitute NOIMATRIX_TYPE_SUB falls back to: embed/output are not covered by an
+# imatrix, so their ladder descends through this instead of into iq2_xxs.
+BPW["q2_K"] = 2.63
 # the whole-model PRESET that carries "everything unmatched" -- DERIVED from the
 # chosen bulk type, never hardcoded. (--tensor-type wants base types; the
 # positional base arg wants a preset name.) IQ presets need an --imatrix.
@@ -177,6 +182,15 @@ def _is_kquant(t: str) -> bool:
     return any(t.lower().startswith(p.lower()) for p in _KQUANT_PREFIXES)
 
 
+def _env_threads():
+    """POLLARD_THREADS, so a shared box can be configured once instead of per-command."""
+    try:
+        v = int(os.environ.get("POLLARD_THREADS", "") or 0)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
 def block_safe_type(t: str, row_len: int, fallback: str = "q8_0") -> str:
     """The requested type if this row length can hold it, else one that can.
 
@@ -189,7 +203,8 @@ def block_safe_type(t: str, row_len: int, fallback: str = "q8_0") -> str:
     return fallback
 
 
-def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False, tiers=None):
+def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False, tiers=None,
+                    emb_imatrix_ok=True):
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
@@ -296,7 +311,21 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
                 keep_meta.append((kind, pats))
         items, meta = keep_items, keep_meta
 
-    emb_type = tiers.get("emb", EMB_FLOOR)
+    # The embed/output ladder must not descend into an imatrix-REQUIRED type when the imatrix
+    # does not cover those tensors. llama-imatrix does not collect token_embd/output, so on a
+    # tight budget this walked output.weight down to iq2_xxs and llama-quantize died on
+    # GGML_ASSERT(imatrix != NULL) -- 866 tensors in, after the whole plan had printed. It bites
+    # hardest exactly where it is least expected: a big vocab makes embed+output a large share of
+    # the budget (Qwen3.8-27B: 248320 vocab = 2.54B params, ~2.1GB at q6_K of a 5.9GB budget), so
+    # the descent is forced. Substitute the non-imatrix equivalent instead of walking into a crash.
+    emb_ladder = LADDER if emb_imatrix_ok else [NOIMATRIX_TYPE_SUB.get(t, t) for t in LADDER]
+    dedup = []
+    for t in emb_ladder:
+        if not dedup or dedup[-1] != t:
+            dedup.append(t)
+    emb_ladder = dedup
+    emb_type = tiers.get("emb", emb_ladder[0])
+    ei = emb_ladder.index(emb_type) if emb_type in emb_ladder else 0
     while True:
         emb_gb = other * BPW[emb_type] / 8 / 1e9
         if not items:                       # everything pinned: nothing left to allocate
@@ -308,9 +337,9 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
         if tiers.get("emb"):
             sys.exit(f"ERROR: --tier emb={emb_type} does not fit in {budget:.1f}GB. Drop the tier "
                      f"or raise --ram.")
-        ei = LADDER.index(emb_type)
-        if ei + 1 < len(LADDER):
-            emb_type = LADDER[ei + 1]                    # embeddings never go 1-bit
+        if ei + 1 < len(emb_ladder):
+            ei += 1
+            emb_type = emb_ladder[ei]                    # embeddings never go 1-bit
         else:
             hint = ("" if allow_1bit else
                     " Or --allow-1bit to extend the floor to iq1 (heavy loss; for giant MoE).")
@@ -353,6 +382,8 @@ def main():
                     help="GB reserved for activations/KV (default 3)")
     ap.add_argument("--llama-quantize", default="llama-quantize",
                     help="path to llama.cpp's llama-quantize binary")
+    ap.add_argument("--threads", type=int, default=_env_threads(),
+                    help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--plan-only", action="store_true",
                     help="print the allocation and the command, build nothing")
     ap.add_argument("--allow-grow", action="store_true",
@@ -399,8 +430,14 @@ def main():
     cfg = gguf_to_config(meta, a.gguf)
     arch = analyse(cfg)
     sensitivity = json.load(open(a.sensitivity)) if a.sensitivity else None
+    # Read imatrix coverage BEFORE allocating: whether the imatrix covers token_embd/output
+    # decides which types the embed/output ladder is allowed to descend through. Unknown
+    # coverage (unparseable imatrix) counts as NOT covered -- the safe direction, since the
+    # cost is a slightly larger embedding and the alternative is a hard crash mid-build.
+    covered = imatrix_covered_tensors(a.imatrix) if a.imatrix else None
+    emb_imatrix_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
     overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
-        arch, a.ram, a.reserve, sensitivity, a.allow_1bit, tiers)
+        arch, a.ram, a.reserve, sensitivity, a.allow_1bit, tiers, emb_imatrix_ok)
     if a.out:
         out = a.out
     else:
@@ -448,7 +485,6 @@ def main():
     # that would take an imatrix-required type but isn't covered. Fall back to the
     # "matches no override" heuristic if the imatrix can't be parsed.
     base_pins = 0
-    covered = imatrix_covered_tensors(a.imatrix) if a.imatrix else None
     _REQ = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q2_k_s"}
     handled = ("token_embd.weight", "output.weight")
     if covered is not None:
@@ -477,6 +513,17 @@ def main():
     label = "expert+attn mix" if arch["kind"] == "moe" else "FFN+attn mix   "
     print(f"{label}     : {summary}  (base {base_preset})")
     print(f"sensitivity source  : {src}")
+
+    # NOTE -- scope the evidence honestly. The reallocation can cost more than it buys, and on
+    # Qwen2.5-0.5B at matched size it did (imatrix-only IQ3_S +7.48% over fp16 vs imatrix +
+    # measured allocation +14.17%). That is one 0.5B; it is not a verdict on every dense model,
+    # so this informs rather than blocks.
+    if a.sensitivity and arch["kind"] != "moe":
+        print("NOTE: measured profile on a DENSE model. Reallocation can cost more than it buys -- "
+              "on\n      Qwen2.5-0.5B at matched size imatrix-only was +7.48% over fp16 and "
+              "imatrix+profile\n      +14.17%. That is a single small model; larger dense models "
+              "are untested. Bench this\n      against a plain imatrix build at the same budget "
+              "before shipping.")
 
     # WARN -- no calibration signal at all means a UNIFORM build with no per-layer
     # benefit. Say it loudly; this is the difference between Pollard and llama-quantize.
@@ -522,6 +569,8 @@ def main():
     cmd += ["--token-embedding-type", emb_type, "--output-tensor-type", emb_type,
             "--tensor-type-file", tt_file,
             a.gguf, out, base_preset]   # base preset DERIVED from the plan
+    if a.threads:
+        cmd += [str(a.threads)]          # llama-quantize takes nthreads as a trailing positional
     print()
     if a.plan_only:
         print(f"plan only -- {len(ov_lines)} tensor overrides; command that would run:")

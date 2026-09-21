@@ -17,7 +17,8 @@ quality for fewer GB, or more quality at the same GB), not as a single number.
 Reuses llama-perplexity; no rebuild. This is the opt-in benchmark -- a plain `pollard` build never
 runs it (that's the split that stopped a minutes-long shrink from taking hours).
 """
-import argparse, os, re, subprocess, sys, zlib
+import argparse, contextlib, json, os, re, shutil, socket, subprocess, sys, time, zlib
+import urllib.request
 from collections import Counter
 
 from pollard_calc import find_llama_bin
@@ -29,10 +30,18 @@ from pollard_calc import find_llama_bin
 # bit tier is below the model's coherence floor -> it loops under EVERY sampling -> bump a tier.
 # This gate runs the model, detects loops, sweeps sampling, and returns which case it is.
 
+# (prompt, any-of expected in the CONTINUATION). The gate used to check only that output did not
+# LOOP, then call the result "coherent" -- so a build emitting fluent-looking token salad
+# ("isletedGESarz Svensri--st IC himself1 andict zichzelf") passed, because salad does not repeat.
+# A known answer is the cheapest real check: a model that cannot finish these is broken, whatever
+# its perplexity says.
 GATE_PROMPTS = [
-    "Paris is the capital of France. The largest planet in our solar system is",
-    "Here is a short explanation of how photosynthesis works:",
-    "# Python function to compute the nth Fibonacci number\ndef fib(n):",
+    ("Paris is the capital of France. The largest planet in our solar system is",
+     ("jupiter",)),
+    ("Here is a short explanation of how photosynthesis works:",
+     ("light", "sun", "water", "carbon", "energy", "plant", "chloroph")),
+    ("# Python function to compute the nth Fibonacci number\ndef fib(n):",
+     ("return", "fib", "n-1", "n - 1", "if n")),
 ]
 # tried in order; first config where ALL prompts are loop-free wins. Escalating anti-repetition.
 SAMPLING_CONFIGS = [
@@ -43,6 +52,92 @@ SAMPLING_CONFIGS = [
     ("temp0.5/rp1.20/pres0.5", ["--temp", "0.5", "--repeat-penalty", "1.2", "--repeat-last-n", "384",
                                 "--top-k", "30", "--min-p", "0.1", "--presence-penalty", "0.5"]),
 ]
+
+
+THREADS = None          # set once from --threads in main(); the subprocess builders read it
+
+
+def _t():
+    """`-t N` for the llama.cpp binaries, or nothing when the user has not asked."""
+    return ["-t", str(THREADS)] if THREADS else []
+
+
+def _env_threads():
+    """POLLARD_THREADS, so a shared box can be configured once instead of per-command."""
+    try:
+        v = int(os.environ.get("POLLARD_THREADS", "") or 0)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
+# Keys and values do not want the same precision. Their outlier structure differs -- published
+# work quantizes keys channel-wise and values token-wise for exactly this reason -- so the
+# asymmetric rows below are not filler: q8/q4 is usually the row that wins, and it is the one a
+# symmetric sweep never tries.
+KV_SWEEP = [
+    ("f16",   "f16",   "baseline -- what the ladder's numbers were measured at"),
+    ("q8_0",  "q8_0",  "halves the cache; the safe first step"),
+    ("q8_0",  "q4_0",  "keys high, values low -- values tolerate it better"),
+    ("q4_0",  "q4_0",  "quarter cache; check this one before trusting it"),
+    ("q4_0",  "q8_0",  "the inverse, included to show it is the worse half"),
+]
+
+
+def kv_sweep(ppl_bin, model, eval_f, ngl, chunks, ctx, rows=None):
+    """What each KV precision actually costs on THIS model.
+
+    pollard-calc can already tell you a quantized cache halves your memory. Nothing measured what
+    it costs in quality, and at long context the cache -- not the weights -- is what fills the
+    machine, so the trade is usually made blind. The damage also lands hardest where it is least
+    visible: extended-context retention and long-horizon agentic work, neither of which a short
+    perplexity run exercises.
+    """
+    out, base = [], None
+    for k, v, note in (rows or KV_SWEEP):
+        cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", str(ctx), "-ngl", str(ngl),
+               "-ctk", k, "-ctv", v] + _t()
+        if chunks:
+            cmd += ["--chunks", str(chunks)]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        blob = r.stdout + r.stderr
+        m = re.search(r"Final estimate: PPL = ([0-9.]+)", blob)
+        if not m:
+            out.append({"k": k, "v": v, "ppl": None, "note": note,
+                        "error": "no PPL in the output (unsupported cache type for this build?)"})
+            continue
+        ppl = float(m.group(1))
+        if base is None:
+            base = ppl
+        out.append({"k": k, "v": v, "ppl": ppl, "note": note,
+                    "delta": round(ppl - base, 4),
+                    "pct": round((ppl - base) / base * 100, 2) if base else 0.0,
+                    # bytes per element per KV entry, relative to f16
+                    "cache_frac": round({"f16": 1.0, "q8_0": 0.5, "q4_0": 0.28}.get(k, 1.0) / 2
+                                        + {"f16": 1.0, "q8_0": 0.5, "q4_0": 0.28}.get(v, 1.0) / 2, 3)})
+    return out
+
+
+def print_kv_sweep(rows, ctx):
+    print(f"\n=== KV cache sweep ===   context {ctx}")
+    print(f"{'K':>6} {'V':>6} {'PPL':>9} {'delta':>8} {'%':>7} {'cache':>7}   note")
+    for r in rows:
+        if r.get("ppl") is None:
+            print(f"{r['k']:>6} {r['v']:>6} {'--':>9} {'':>8} {'':>7} {'':>7}   {r['error']}")
+            continue
+        print(f"{r['k']:>6} {r['v']:>6} {r['ppl']:9.4f} {r.get('delta', 0):+8.4f} "
+              f"{r.get('pct', 0):+6.2f}% {r.get('cache_frac', 1):6.2f}x   {r['note']}")
+    ok = [r for r in rows if r.get("ppl") is not None and r.get("pct") is not None]
+    cheap = [r for r in ok if abs(r["pct"]) < 1.0 and r["cache_frac"] < 0.9]
+    if cheap:
+        best = min(cheap, key=lambda r: r["cache_frac"])
+        print(f"\n  cheapest cache under 1% PPL cost: -ctk {best['k']} -ctv {best['v']}  "
+              f"({best['cache_frac']:.2f}x the f16 cache, {best['pct']:+.2f}% PPL)")
+    else:
+        print("\n  nothing below 1% PPL cost -- keep the cache at f16 on this model.")
+    print("  NOTE: perplexity on short chunks is the LEAST sensitive way to see KV damage. "
+          "Confirm at your real context length before trusting a quantized cache.")
 
 
 def detect_loop(text, min_chars=80):
@@ -65,6 +160,59 @@ def detect_loop(text, min_chars=80):
         if distinct < 0.35:
             return True, round(distinct, 3), f"distinct-word ratio {distinct:.2f} < 0.35 (phrase loop)"
     return False, round(comp, 3), "coherent"
+
+
+OPENERS = {"<think>": "</think>", "<reasoning>": "</reasoning>",
+           "<scratchpad>": "</scratchpad>", "<answer>": "</answer>"}
+ANSWER_RE = re.compile(r"(?:\\boxed\{|final answer|the answer is|therefore,?\s|answer:|"
+                       r"^\s*(?:so|thus)\b)", re.I | re.M)
+
+
+def detect_process_failures(text, budget=None, emitted=None):
+    """The ways a low-bit build fails that are NOT a phrase loop.
+
+    detect_loop above catches degenerate repetition. Below about three bits three more failures
+    show up, and each inflates token count while leaving the text locally coherent enough that
+    compression ratio and distinct-word ratio both look fine:
+
+      budget-exhaustion   generation never halts; it stops because it hit the cap
+      delayed-commitment  an answer exists, but only after most of the budget is spent
+      unclosed-segment    a reasoning block or code fence opened and never closed
+
+    They matter because the token saving from smaller weights is given straight back when a trace
+    balloons -- a 2-bit build that needs four times the tokens is not faster, whatever its
+    per-token cost. Returns a list of (name, detail); empty means none of these fired.
+    """
+    t = (text or "").strip()
+    out = []
+    if not t:
+        return out
+
+    words = re.findall(r"\S+", t)
+    # Hit the cap rather than choosing to stop. `emitted` is authoritative when the runtime
+    # reports it; the word count is a fallback and is deliberately conservative. Both the
+    # exhaustion check and the no-answer check below read the SAME number -- using the word count
+    # for one and the token count for the other reports a build that ran to the cap as having
+    # simply not answered yet.
+    used = emitted if emitted is not None else len(words)
+    exhausted = bool(budget and used >= budget * 0.98)
+    if exhausted:
+        out.append(("budget-exhaustion",
+                    f"stopped at the {budget}-token cap rather than finishing"))
+
+    unclosed = [tag for tag, close in OPENERS.items() if t.count(tag) > t.count(close)]
+    if t.count("```") % 2:
+        unclosed.append("```")
+    if unclosed:
+        out.append(("unclosed-segment", "never closed: " + ", ".join(unclosed)))
+
+    m = ANSWER_RE.search(t)
+    if m and len(t) > 200 and m.start() / len(t) > 0.85:
+        out.append(("delayed-commitment",
+                    f"first commits to an answer {m.start() / len(t):.0%} of the way through"))
+    elif not m and exhausted:
+        out.append(("no-answer", "ran to the cap without ever committing to an answer"))
+    return out
 
 
 # A distinct sentinel for "the model produced nothing". It must never be confused with a short but
@@ -105,8 +253,12 @@ def _one_shot_flag(cli_bin):
     return _NO_CNV[cli_bin]
 
 
-def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80):
+def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=220):
+    # 220, not 80: a reasoning-tuned model spends its first hundred-odd tokens inside a
+    # thinking block, so a short budget cuts it off mid-thought and the known-answer check
+    # fails a build that was about to answer correctly.
     cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-c", "2048", "-n", str(n_predict), "-p", prompt]
+           + _t()
            + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else [])
            + sampling)
     # On Windows, put the child in its own process group so console control events (Ctrl+C /
@@ -131,26 +283,393 @@ def _generate(cli_bin, model, prompt, sampling, ngl, n_predict=80):
     return out.split(prompt, 1)[-1] if prompt in out else out
 
 
-def coherence_gate(cli_bin, model, ngl, quick=False):
-    """Run the model over the gate prompts, sweeping sampling. A config PASSES only if EVERY
-    prompt is loop-free. Returns a verdict dict: PASS (+the winning sampling) or BELOW_FLOOR.
-    quick=True: one prompt, default sampling only (a fast post-build sanity, not the full gate)."""
+# -- chat-aware generation -----------------------------------------------------------------------
+# An instruct model's stop token lives INSIDE a chat turn: Qwen's EOS is <|im_end|>, which the
+# template emits and a raw prompt never can. Generate without the template and the model has no
+# reachable way to stop -- it runs to the token budget and repeats, every time, at any bit width.
+# That is a harness artifact, and scoring it as "below the coherence floor" condemns builds that
+# are fine and spends size bumping tiers to escape a bug.
+#
+# The portable fix is llama-server, not the CLI. The CLI flags disagree across builds (upstream
+# split llama-cli into llama-cli + llama-completion; ik_llama has no -st, no -no-cnv, and routes
+# -p to the SYSTEM role under -cnv, dropping it), whereas /v1/chat/completions and /apply-template
+# exist on upstream AND ik. It also hands back the one signal worth more than every heuristic
+# here: finish_reason == "stop" means the model emitted its own end-of-turn token.
+
+#: where the gate's server writes, so a crash can be read back
+_SERVER_LOG = "gate-server.log"
+#: the running server, so a failed request can say whether it is still alive
+_SERVER_PROC = [None]
+
+
+def _server_bin():
+    return find_llama_bin("llama-server") or "llama-server"
+
+
+_SERVER_FLAGS = {}
+
+
+def _server_supports(binary, flag):
+    """Does THIS build take that flag? Passing one it does not know is a hard startup failure,
+    and the forks disagree about which exist."""
+    key = (str(binary), flag)
+    if key not in _SERVER_FLAGS:
+        try:
+            h = subprocess.run([str(binary), "--help"], capture_output=True, text=True,
+                               errors="replace", timeout=60, stdin=subprocess.DEVNULL)
+            _SERVER_FLAGS[key] = flag in ((h.stdout or "") + (h.stderr or ""))
+        except Exception:
+            _SERVER_FLAGS[key] = False
+    return _SERVER_FLAGS[key]
+
+
+@contextlib.contextmanager
+def _served(model, ngl, ctx=4096, port=0):
+    """llama-server for the duration, yielding its base url (or None if it will not start)."""
+    if not port:
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    binary = _server_bin()
+    cmd = [binary, "-m", model, "--host", "127.0.0.1", "--port", str(port),
+           "-ngl", str(ngl), "-c", str(ctx),
+           # -np 1 IS THE FIX for a server that dies mid-gate. Upstream's default is auto, which
+           # makes FOUR slots sharing one KV pool while telling each it owns the whole context;
+           # they exhaust it, llama_decode returns 1, and the resulting throw is uncaught on the
+           # main thread -- the process aborts and the client sees a reset socket, not an error.
+           # (ggml-org/llama.cpp#23652; the fix PR #23694 is still unmerged.) One slot also
+           # removes the batch-sharing that makes multi-slot output nondeterministic (#7052).
+           "-np", "1",
+           # ik defaults context-shift ON, upstream OFF. Left to ik's default an over-long prompt
+           # is silently truncated at the front instead of stopping, which scores a build on text
+           # it never saw.
+           "--no-context-shift",
+           "--no-cont-batching",
+           # apply the model's OWN template (default off on ik, on upstream)
+           "--jinja"] + _t()
+    # Without this the reply can land entirely in reasoning_content with content empty: llama.cpp
+    # passes enable_thinking=true even when the template's own default is false, so generation
+    # starts inside <think>, and a model that emits EOS without ever closing it has written
+    # nothing the parser calls an answer (#27134, #20265). A pure content parser keeps the text
+    # where it can be read; the gate strips the block itself.
+    if _server_supports(binary, "--skip-chat-parsing"):
+        cmd.append("--skip-chat-parsing")
+    else:
+        cmd += ["--reasoning-format", "deepseek"]
+    proc, log = None, None
+    try:
+        # NOT DEVNULL: when the server dies mid-gate its own output is the only account of why,
+        # and discarding it leaves "connection forcibly closed" as the whole diagnosis.
+        log = open(_SERVER_LOG, "w", encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        _SERVER_PROC[0] = proc
+    except OSError:
+        if log:
+            log.close()
+        yield None
+        return
+    base = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(900):                       # a big model on CPU takes a while to load
+            if proc.poll() is not None:
+                yield None
+                return
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                time.sleep(1)
+        else:
+            yield None
+            return
+        yield base
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                proc.kill()
+        _SERVER_PROC[0] = None
+        if log:
+            log.close()
+
+
+def _post(base, path, payload, timeout=3600):
+    # Connection: close, deliberately. The server keeps an idle connection for 5 seconds
+    # (cpp-httplib's default) and closes it underneath a pooled client -- which surfaces as a
+    # reset socket while the server is perfectly healthy. Nine generations do not need pooling.
+    req = urllib.request.Request(base + path, method="POST",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Connection": "close"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _get(base, path, timeout=10):
+    req = urllib.request.Request(base + path, headers={"Connection": "close"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _check_server(base, want_ctx):
+    """Assert the server is the one we asked for, before spending a run on it.
+
+    total_slots tells you whether -np landed: more than one slot is the configuration that
+    exhausts the KV pool and aborts the process partway through a gate. n_ctx tells you whether
+    the context was silently shrunk to fit the device, which changes what a PASS even means.
+    """
+    try:
+        props = _get(base, "/props")
+    except Exception:
+        return []                                     # not fatal: older builds vary
+    out = []
+    slots = props.get("total_slots")
+    if slots not in (None, 1):
+        out.append(f"the server came up with {slots} slots; a gate needs one (-np 1)")
+    got = ((props.get("default_generation_settings") or {}).get("n_ctx")
+           or props.get("n_ctx"))
+    if got and want_ctx and int(got) < int(want_ctx):
+        out.append(f"context is {got}, not the {want_ctx} asked for -- it was shrunk to fit")
+    return out
+
+
+def _chat(base, user, sampling, budget, proc=None):
+    """One templated turn. Returns (content, reasoning, finish_reason)."""
+    body = {"messages": [{"role": "user", "content": user}],
+            "max_tokens": budget, "stream": False,
+            # the prompt cache reuses KV across requests, and the logits are not bit-identical
+            # across batch sizes -- documented as a source of nondeterministic results, and the
+            # path by which finished prompts accumulate until the pool is exhausted
+            "cache_prompt": False,
+            # a reply misfiled into reasoning_content reads as an empty answer; ask for it whole
+            "reasoning_format": "none"}
+    body.update(_sampling_json(sampling))
+    try:
+        got = _post(base, "/v1/chat/completions", body)
+    except Exception as e:
+        # one retry, and ONLY when the server is still alive: an idle connection closed by the
+        # server looks identical to a crash from the client side
+        if proc is None or proc.poll() is None:
+            time.sleep(1.0)
+            try:
+                got = _post(base, "/v1/chat/completions", body)
+            except Exception as e2:
+                e = e2
+            else:
+                return _read_chat(got)
+        why = str(e)
+        if proc is not None and proc.poll() is not None:
+            tail = ""
+            try:
+                with open(_SERVER_LOG, encoding="utf-8", errors="replace") as f:
+                    tail = " | ".join(f.read().strip().splitlines()[-3:])
+            except OSError:
+                pass
+            why = (f"the server exited (code {proc.returncode}) partway through the gate"
+                   + (f": {tail}" if tail else f" -- see {_SERVER_LOG}"))
+        return _NoOutput(why), "", "error"
+    return _read_chat(got)
+
+
+def _read_chat(got):
+    """(content, reasoning, finish_reason) -- reading the answer wherever it was filed.
+
+    With a pure content parser the reasoning stays inline in content, so the gate splits it out
+    itself; with a parsing server it arrives in reasoning_content. Either way an answer that
+    exists must not read as an empty one.
+    """
+    ch = (got.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or ""
+    if not reasoning and "</think>" in content:
+        head, _, tail = content.rpartition("</think>")
+        reasoning, content = head.replace("<think>", "").strip(), tail.strip()
+    return content, reasoning, (ch.get("finish_reason") or "")
+
+
+#: the CLI sampling lists above, as the JSON the server takes
+_SAMPLE_KEY = {"--temp": "temperature", "--top-k": "top_k", "--top-p": "top_p",
+               "--min-p": "min_p", "--repeat-penalty": "repeat_penalty",
+               "--repeat-last-n": "repeat_last_n", "--frequency-penalty": "frequency_penalty",
+               "--presence-penalty": "presence_penalty"}
+
+
+def _sampling_json(sampling):
+    # seed pinned so a re-gate of the same build is comparable; on CPU llama.cpp's token path is
+    # bitwise deterministic once slots, batching and the prompt cache are pinned too.
+    out, i = {"seed": 0}, 0
+    while i < len(sampling) - 1:
+        k = _SAMPLE_KEY.get(sampling[i])
+        if k:
+            v = sampling[i + 1]
+            out[k] = float(v) if "." in str(v) else int(v)
+        i += 2
+    return out
+
+
+def tail_repeat(text, n=4, window=220):
+    """Repeated-n-gram rate over the TAIL of the output.
+
+    A loop is a tail phenomenon. Measuring over the whole output lets a long correct answer hide
+    a loop at the end, and -- worse -- flags legitimately repetitive bodies: code, tables and
+    numbered lists reuse tokens by construction. Splitting on whitespace also mis-scores CJK,
+    where one "word" can be a whole sentence, so this counts tokens crudely but not by spaces
+    alone."""
+    toks = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)[-window:]
+    if len(toks) < n * 4:
+        return 0.0
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    return round(1.0 - len(set(grams)) / len(grams), 3)
+
+
+def has_chat_template(model):
+    """The model's own chat template, or "" for a base model.
+
+    Pollard already reads this -- modelkind uses it to say "instruct" -- the gate just never
+    acted on it.
+    """
+    try:
+        from pollard_modelkind import _template_and_arch
+        return _template_and_arch(model)[0] or ""
+    except Exception:
+        return ""
+
+
+def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
+    """Run the model the way it is actually used, then judge whether it held together.
+
+    An INSTRUCT model is run through its own chat template on llama-server, because its stop
+    token only exists inside a chat turn. A BASE model is run as raw completion, because that is
+    what it is. Testing the first as the second is the bug this replaced: it condemned coherent
+    builds at every bit width and sent people off to spend size bumping tiers.
+
+    quick=True: one prompt, default sampling -- a fast post-build sanity, not the full gate."""
     prompts = GATE_PROMPTS[:1] if quick else GATE_PROMPTS
     configs = SAMPLING_CONFIGS[:1] if quick else SAMPLING_CONFIGS
+    # A thinking model reasons before it answers, so a fixed budget cuts it off mid-thought
+    # and the known-answer check fails a build that was about to be right. Ask what it is.
+    budget, kind = 220, None
+    try:
+        from pollard_modelkind import classify, describe
+        kind = classify(model)
+        budget = kind["gate_tokens"]
+    except Exception:
+        pass
+    if gate_tokens:
+        budget = gate_tokens                     # an explicit budget always wins
+    if kind is not None:
+        from pollard_modelkind import describe
+        print(f"  model kind: {describe(kind)}  (gate budget {budget} tokens)")
+
+    tpl = has_chat_template(model)
+    if not tpl:
+        print("  no chat template -> base model, scored as raw completion")
+        return _gate_raw(cli_bin, model, ngl, prompts, configs, budget)
+    print("  chat template present -> served with --jinja, scored on the model's own turn")
+    with _served(model, ngl, ctx) as base:
+        if base is None:
+            print("  llama-server would not start; falling back to raw completion "
+                  "(an instruct model scored this way can look like it loops)")
+            return _gate_raw(cli_bin, model, ngl, prompts, configs, budget)
+        for why in _check_server(base, ctx):
+            print(f"  WARNING: {why}")
+        return _gate_chat(base, prompts, configs, budget)
+
+
+def _gate_chat(base, prompts, configs, budget):
+    """Score a templated turn. finish_reason is worth more than any heuristic here: "stop" means
+    the model emitted its own end-of-turn token, which a broken build cannot fake."""
+    last = []
+    for cfg_name, sampling in configs:
+        rows, bad = [], False
+        for p, expect in prompts:
+            content, reasoning, fin = _chat(base, p, sampling, budget, _SERVER_PROC[0])
+            if isinstance(content, _NoOutput):
+                rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
+                             "reason": f"NO OUTPUT ({content})", "sample": ""})
+                return {"verdict": "NO_OUTPUT", "config": cfg_name, "rows": rows}
+            body = (content or "").strip()
+            rep = tail_repeat(body)
+            knows = any(e.lower() in body.lower() for e in expect)
+            # A CONTROL token repeating (<|channel|>, <|im_start|>, <pad>) is not the body of the
+            # model collapsing -- it is the token embedding losing resolution, and the fix is to
+            # protect that tensor, not to spend size on every layer. True on a served turn too:
+            # the server strips the turn's own markers, so any that survive came from the weights.
+            ctrl = bool(re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", body))
+            verdict_row, reason = False, "coherent"
+            if fin == "stop" and not body:
+                # it ended its turn without answering. With reasoning present that is a budget
+                # problem; without, the build really did produce nothing.
+                rows.append({"prompt": p.splitlines()[0][:48],
+                             "loop": not reasoning, "finish": fin, "repeat": rep,
+                             "thought": bool(reasoning),
+                             "reason": ("INCONCLUSIVE (ended the turn inside its reasoning; "
+                                        "raise --gate-tokens)" if reasoning else
+                                        "EMPTY (ended its turn having produced nothing)"),
+                             "sample": (reasoning or "").replace("\n", " ")[:120]})
+                bad = bad or not reasoning
+                continue
+            if fin == "stop" and body and knows:
+                reason = "coherent (stopped on its own end-of-turn token)"
+            elif fin == "stop" and body and not knows:
+                verdict_row = True
+                reason = f"INCOHERENT (stopped cleanly, but no {'/'.join(expect[:3])})"
+            elif fin == "length" and reasoning and not body:
+                # spent the whole budget thinking -- that is a budget problem, not a broken build
+                reason = "INCONCLUSIVE (budget went entirely to reasoning; raise --gate-tokens)"
+            elif fin == "length" and rep >= 0.5:
+                verdict_row = True
+                reason = f"LOOP (hit the budget with tail repeat {rep:.2f})"
+                if ctrl:
+                    reason += "  [control tokens repeating -> token-embedding precision]"
+            elif fin == "length":
+                reason = f"ran to the budget without looping (tail repeat {rep:.2f})"
+                verdict_row = not knows
+                if verdict_row:
+                    reason = f"INCOHERENT (no {'/'.join(expect[:3])}, tail repeat {rep:.2f})"
+            else:
+                verdict_row = True
+                reason = f"finish_reason={fin or 'unknown'}"
+            rows.append({"prompt": p.splitlines()[0][:48], "loop": verdict_row, "reason": reason,
+                         "finish": fin, "repeat": rep, "thought": bool(reasoning),
+                         "sample": body.replace("\n", " ")[:120]})
+            bad = bad or verdict_row
+        last = rows
+        if not bad:
+            return {"verdict": "PASS", "config": cfg_name, "sampling": sampling, "rows": rows}
+    return {"verdict": "BELOW_FLOOR", "config": None, "rows": last}
+
+
+def _gate_raw(cli_bin, model, ngl, prompts, configs, budget):
+    """The original raw-completion path. Correct for a BASE model, and only for a base model."""
     last = []
     for cfg_name, sampling in configs:
         rows, looped = [], False
-        for p in prompts:
-            gen = _generate(cli_bin, model, p, sampling, ngl)
+        for p, expect in prompts:
+            gen = _generate(cli_bin, model, p, sampling, ngl, budget)
             if isinstance(gen, _NoOutput) or not gen.strip():
                 rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
                              "reason": "NO OUTPUT (timeout or the run produced nothing)",
                              "sample": ""})
                 return {"verdict": "NO_OUTPUT", "config": cfg_name, "rows": rows}
             is_loop, metric, reason = detect_loop(gen)
-            rows.append({"prompt": p.splitlines()[0][:48], "loop": is_loop, "reason": reason,
+            # A CONTROL token repeating (<|channel|>, <|im_start|>, <pad>) is not the body of the
+            # model collapsing -- it is the token embedding losing resolution, and the fix is to
+            # protect that tensor, not to spend size on every layer.
+            if is_loop and re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", gen):
+                reason += "  [control tokens repeating -> token-embedding precision]"
+            knows = any(e.lower() in gen.lower() for e in expect)
+            if not is_loop and not knows:
+                reason = f"INCOHERENT (no {'/'.join(expect[:3])} in the continuation)"
+            proc = detect_process_failures(gen, budget=budget)
+            if proc:
+                reason += "  [" + "; ".join(f"{n}: {d}" for n, d in proc) + "]"
+            rows.append({"prompt": p.splitlines()[0][:48], "loop": is_loop or not knows,
+                         "reason": reason, "process": [n for n, _ in proc],
                          "sample": gen.strip().replace("\n", " ")[:120]})
-            looped = looped or is_loop
+            looped = looped or is_loop or not knows or bool(proc)
         last = rows
         if not looped:
             return {"verdict": "PASS", "config": cfg_name, "sampling": sampling, "rows": rows}
@@ -173,10 +692,57 @@ def print_gate(res):
         s = " ".join(res["sampling"])
         print(f"\nVERDICT: PASS -- coherent. Ship these sampling defaults on the card:\n  {s}")
     else:
-        print("\nVERDICT: BELOW FLOOR -- loops under EVERY sampling config. This is NOT a sampling\n"
-              "  problem; the bit tier is below the model's coherence floor. Bump the crush one\n"
-              "  tier and rebuild (e.g. --body iq1_kt -> iq2_kt), then re-gate. (Small/sparse\n"
-              "  models hit this; big models clear 1-bit fine -- it's a size property.)")
+        print("\nVERDICT: BELOW FLOOR -- every sampling config was tried and none held together, so\n"
+              "  this is not a sampling problem. It is also not the end of the road: a build lands\n"
+              "  here when the bits it was given cannot carry the model, and Pollard has a lever for\n"
+              "  every part of that. Work them in cost order -- each is cheaper than the one after:\n"
+              "\n"
+              "  -- protect what the failure points at ------------------------------------------\n"
+              "   1. TOKEN EMBEDDING + OUTPUT TENSOR. First when a control token repeats\n"
+              "      (<|channel|>, <|im_start|>): a big vocabulary at Q4_K loses the special tokens\n"
+              "      first, and the model cannot stop emitting them. A few hundred MB, not a tier.\n"
+              "        pollard-automap ... --output-tensor-type Q6_K --token-embedding-type Q6_K\n"
+              "\n"
+              "  -- measure before you spend --------------------------------------------------\n"
+              "   2. MEASURED ALLOCATION. Put the bits where this model actually needs them\n"
+              "      instead of crushing evenly. pollard-probe is the cheap any-box profile;\n"
+              "      pollard-sensitivity is the ground truth (heavier, GGUF sweep).\n"
+              "        pollard-probe --model <hf> --eval held.txt --out m.sensitivity.json\n"
+              "        pollard-fit --gguf <f16> --ram N --sensitivity m.sensitivity.json\n"
+              "\n"
+              "   3. CALIBRATION. A low-bit build leans on the imatrix harder than any other rung,\n"
+              "      and a short or single-domain corpus is the usual reason a tier looks\n"
+              "      impossible. Calib 3.0 is multi-domain on purpose -- do not trim it.\n"
+              "        pollard-calib --out calib.txt --held-out eval.txt\n"
+              "        llama-imatrix -m <f16> -f calib.txt -o m.dat --output-format dat\n"
+              "      (dat, not the gguf default: ik_llama builds the trellis flagship and reads\n"
+              "       only the legacy format.)\n"
+              "\n"
+              "  -- precondition the weights --------------------------------------------------\n"
+              "   4. Let Pollard pick the preconditioner for THIS model and bit-width -- the best\n"
+              "      one is bit-width dependent, and guessing wastes a build:\n"
+              "        pollard-precondition --model <hf>          # measures which lever wins\n"
+              "      or drive one directly:\n"
+              "        pollard-rotate     # incoherence (QuIP#/QuaRot) -- pays at IQ low bit\n"
+              "        pollard-smooth     # activation-aware, AWQ-style\n"
+              "        pollard-hf-smooth  # SmoothQuant, in place on the HF weights\n"
+              "\n"
+              "  -- change the alphabet, not the size ------------------------------------------\n"
+              "   5. BELOW 2 BITS, a different alphabet beats a smaller number of bits:\n"
+              "        pollard-palette    # measured mixed-ALPHABET allocation under the 2-bit floor\n"
+              "        pollard-lowbit     # extreme-low-bit R&D prototype\n"
+              "      MoE only: drop whole cold experts rather than crushing every one of them:\n"
+              "        pollard-prune      # REAP-style expert pruning\n"
+              "\n"
+              "  -- last, because it costs size -------------------------------------------------\n"
+              "   6. Widen protection (--protect iq3_kt), then bump the body tier\n"
+              "      (--body iq1_kt -> iq2_kt) and re-gate. Last because the levers above often\n"
+              "      make it unnecessary.\n"
+              "\n"
+              "  Re-gate after each: `pollard-bench --gguf <build> --coherence`. Sampling is already\n"
+              "  swept here, so a PASS reports the defaults to ship on the card.\n"
+              "  (Small/sparse models hit the floor sooner; big models clear 1-bit fine -- a size\n"
+              "   property, not a defect in the build.)")
     return res["verdict"] == "PASS"
 
 
@@ -187,21 +753,30 @@ def _size_gb(p):
         return None
 
 
-def _ppl_kl(ppl_bin, model, eval_f, base, ngl):
+def _ppl_kl(ppl_bin, model, eval_f, base, ngl, chunks=0):
     """Run llama-perplexity and parse PPL (+ Mean/Median KLD + top-1 when a base is given)."""
-    cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", "2048", "-ngl", str(ngl)]
+    cmd = [ppl_bin, "-m", model, "-f", eval_f, "-c", "2048", "-ngl", str(ngl)] + _t()
+    if chunks:
+        cmd += ["--chunks", str(chunks)]
     if base:
         cmd += ["--kl-divergence", "--kl-divergence-base", base]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     out = r.stdout + r.stderr
     def g(pat):
-        m = re.search(pat, out)
+        m = re.search(pat, out, re.M)
         return float(m.group(1)) if m else None
+    # llama-perplexity prints a different report under --kl-divergence: no "Final estimate", but
+    # BOTH perplexities, which is what the card wants anyway. Every pattern is anchored to its own
+    # line: a negated-colon class matches NEWLINES too, so the old top-1 pattern latched onto the
+    # table header ("... Same top p") and ran on to the next colon anywhere below, reporting a
+    # number that was not a percentage and looked like a result.
     return {
-        "ppl":    g(r"Final estimate:\s*PPL[^=]*=\s*([0-9.]+)"),
-        "mean_kld":   g(r"Mean\s+KLD:\s*([0-9.]+)"),
-        "median_kld": g(r"Median\s+KLD:\s*([0-9.]+)"),
-        "top1":   g(r"Same top[^:]*:\s*([0-9.]+)"),      # top-1 agreement %
+        "ppl":    g(r"^Mean PPL\(Q\)\s*:\s*([0-9.]+)")
+                  or g(r"Final estimate:\s*PPL[^=\n]*=\s*([0-9.]+)"),
+        "ref_ppl":    g(r"^Mean PPL\(base\)\s*:\s*([0-9.]+)"),
+        "mean_kld":   g(r"^Mean\s+KLD:\s*([0-9.]+)"),
+        "median_kld": g(r"^Median\s+KLD:\s*([0-9.]+)"),
+        "top1":   g(r"^Same top p:\s*([0-9.]+)"),        # top-1 agreement %
     }
 
 
@@ -245,7 +820,7 @@ def measure_speed(cli_bin, model, ngl, n_predict=128,
     loading ("Loading model... ^C") and silently produces nothing.
 
     Speed is hardware-specific, so whatever consumes this has to name the machine beside it."""
-    cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-n", str(n_predict),
+    cmd = ([cli_bin, "-m", model, "-ngl", str(ngl), "-n", str(n_predict)] + _t() + [
             "--no-warmup", "-p", prompt]
            + ([_one_shot_flag(cli_bin)] if _one_shot_flag(cli_bin) else []))
     kw = {}
@@ -267,6 +842,55 @@ def measure_speed(cli_bin, model, ngl, n_predict=128,
     return gen, pro
 
 
+
+def _eval_overlaps_calib(imatrix_path, eval_path):
+    """Is the eval text the same text that calibrated the build? Returns a reason, or None.
+
+    THIS tool's own check -- pollard-bench does not depend on another tool to know whether the
+    number it is about to print is a real measurement.
+
+    An imatrix records the dataset(s) it was built from, so the cheap answer is the recorded path.
+    When the names differ, compare content: a held-out split that shares most of its lines with the
+    calibration corpus is held out in name only. That is how gemma-4-12B-it came to publish
+    perplexity measured on its own calibration text -- 1366 of 1366 lines of `eval_heldout.txt`
+    are inside `gemma4_calib.txt`.
+    """
+    ds = []                                               # os/re are module-level; a local import
+    try:                                                  # of either would shadow them body-wide
+        blob = open(imatrix_path, "rb").read()
+        ds = [m.decode("utf-8", "ignore")
+              for m in re.findall(rb"[A-Za-z]:\\[^\x00]{3,200}?\.txt", blob)]
+    except Exception:
+        pass
+    try:
+        from gguf import GGUFReader                       # GGUF imatrix records it in the KV
+        for f in GGUFReader(imatrix_path).fields.values():
+            if "dataset" in f.name.lower():
+                ds += [str(f.parts[i].tobytes().decode("utf-8", "ignore")) for i in f.data]
+    except Exception:
+        pass
+    ev = os.path.abspath(eval_path)
+    for d in ds:
+        if os.path.abspath(d) == ev or os.path.basename(d) == os.path.basename(ev):
+            return f"the imatrix records this exact file as its calibration corpus: {d}"
+    try:
+        with open(ev, encoding="utf-8", errors="ignore") as fh:
+            ev_lines = {ln.strip() for ln in fh if len(ln.strip()) > 40}
+        for d in set(ds):
+            if not os.path.exists(d):
+                continue
+            with open(d, encoding="utf-8", errors="ignore") as fh:
+                cal = {ln.strip() for ln in fh if len(ln.strip()) > 40}
+            if ev_lines:
+                frac = len(ev_lines & cal) / len(ev_lines)
+                if frac > 0.10:
+                    return (f"{frac*100:.1f}% of the eval's lines are in the calibration corpus "
+                            f"{os.path.basename(d)}")
+    except Exception:
+        pass
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", required=True, help="the model to score (a Pollard build, or any GGUF)")
@@ -274,10 +898,27 @@ def main():
     ap.add_argument("--ref", help="KL reference GGUF (f16, or a near-lossless Q8_0/Q6_K host). "
                                   "Omit for PPL-only (no KLD/top-1).")
     ap.add_argument("--eval", default="wikitext2_test.txt", help="held-out eval text")
+    ap.add_argument("--imatrix", help="the imatrix the build used. Given, the eval is CHECKED "
+                                      "against the corpus that calibrated the model -- numbers "
+                                      "measured on the calibration text are not a quality result.")
+    ap.add_argument("--allow-eval-overlap", action="store_true",
+                    help="score anyway when the eval overlaps the calibration corpus (research)")
+    ap.add_argument("--chunks", type=int, default=0,
+                    help="cap the eval at N chunks. The KL base holds FULL logits, so a large "
+                         "vocab over a long eval runs to tens of GB; 200 gives the same "
+                         "comparison at a fraction of the size. 0 = whole file.")
     ap.add_argument("--ngl", type=int, default=99, help="GPU layers (lower for a model bigger than the GPU)")
     ap.add_argument("--out", help="write a results.json (feeds pollard-scorecard)")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
     ap.add_argument("--llama-cli", default="llama-cli", help="generation binary for the coherence gate")
+    ap.add_argument("--kv-sweep", action="store_true",
+                    help="measure what each KV cache precision costs on this model. calc can "
+                         "already size a quantized cache; this says what it costs in quality.")
+    ap.add_argument("--kv-ctx", type=int, default=4096,
+                    help="context length for --kv-sweep. The cache is what fills memory at long "
+                         "context, so measure near where you will actually run.")
+    ap.add_argument("--threads", type=int, default=_env_threads(),
+                    help="number of threads for the heavy step. Default: the tool's own choice, which is usually every core. Set it lower to leave the machine usable -- a quantize that takes the whole box is a quantize you cannot run while anything else matters. POLLARD_THREADS sets it for every tool.")
     ap.add_argument("--coherence", action="store_true",
                     help="run the COHERENCE GATE: generate over fixed prompts, detect loops, sweep "
                          "sampling, and report PASS (+the sampling to ship) or BELOW-FLOOR (bump a tier). "
@@ -286,9 +927,18 @@ def main():
                     help="also measure decode tok/s for --gguf (and --vs), on the same flags so the "
                          "two are comparable. Needs --llama-cli. tok/s is hardware-specific: state "
                          "the machine wherever you publish it.")
+    ap.add_argument("--gate-tokens", type=int, default=0,
+                    help="token budget per gate prompt. Default: read from the model kind, because "
+                         "a thinking model spends its first few hundred tokens reasoning and a "
+                         "fixed budget cuts it off mid-thought, which scores as incoherent.")
+    ap.add_argument("--gate-ctx", type=int, default=4096,
+                    help="context for the gate's server. A model whose template opens with a long "
+                         "system block needs room for the turn as well as the answer.")
     ap.add_argument("--quick", action="store_true",
                     help="with --coherence: fast one-prompt / default-sampling sanity instead of the full sweep.")
     a = ap.parse_args()
+    global THREADS
+    THREADS = a.threads
 
     # --- coherence gate (can run standalone: no perplexity bin / eval corpus required) ---
     # The gate used to exit here as soon as it had a verdict, which silently swallowed --speed: ask
@@ -296,13 +946,29 @@ def main():
     # measurement you asked for without saying so, so the verdict is held and the exit happens after
     # every requested measurement has run.
     gate_passed = None
+    # --- KV cache sweep (standalone: needs the perplexity binary and an eval corpus) ---
+    if a.kv_sweep:
+        if not (a.gguf and a.eval):
+            sys.exit("--kv-sweep needs --gguf and --eval (the corpus to measure on).")
+        ppl_bin = find_llama_bin(a.llama_perplexity)
+        if ppl_bin is None:
+            sys.exit(f"ERROR: {a.llama_perplexity} not found.")
+        rows = kv_sweep(ppl_bin, a.gguf, a.eval, a.ngl, a.chunks, a.kv_ctx)
+        print_kv_sweep(rows, a.kv_ctx)
+        if a.out:
+            json.dump({"kv_sweep": rows, "ctx": a.kv_ctx}, open(a.out, "w"), indent=2)
+            print(f"wrote {a.out}")
+        if not a.coherence:
+            return
+
     if a.coherence or a.quick:
         if not os.path.exists(a.gguf):
             sys.exit(f"file not found: {a.gguf}")
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
             sys.exit("llama-cli not found -- build llama.cpp/ik_llama.cpp or pass --llama-cli.")
-        res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick)
+        res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick,
+                             ctx=a.gate_ctx, gate_tokens=a.gate_tokens)
         gate_passed = print_gate(res)
         if not a.ref and not a.speed:      # nothing else was asked for -> exit on the verdict
             sys.exit(0 if gate_passed else 2)
@@ -330,6 +996,19 @@ def main():
     ppl_bin = find_llama_bin(a.llama_perplexity)
     if not ppl_bin:
         sys.exit("llama-perplexity not found -- build llama.cpp/ik_llama.cpp or pass --llama-perplexity.")
+    # The corpus that BUILT the quant must not also MEASURE it. If the same text drives the imatrix
+    # and the eval, a bad allocation scores well because it is graded on the lines it was tuned on --
+    # and these numbers go on a public card. This is not hypothetical: gemma-4-12B-it shipped with
+    # PPL measured on `eval_heldout.txt`, every line of which is inside `gemma4_calib.txt`.
+    if a.imatrix and os.path.exists(a.imatrix) and os.path.exists(a.eval):
+        hit = _eval_overlaps_calib(a.imatrix, a.eval)
+        if hit and not a.allow_eval_overlap:
+            sys.exit(f"REFUSING to score on the calibration corpus.\n  {hit}\n"
+                     "  Perplexity measured on the text the imatrix was built from is flattered,\n"
+                     "  not held out. Build a disjoint eval (pollard-calib --out train.txt\n"
+                     "  --held-out eval.txt writes both from ONE run), or pass --allow-eval-overlap.")
+    elif not a.imatrix:
+        print("  (no --imatrix given: eval/calibration disjointness NOT verified)")
     if not os.path.exists(a.eval) or os.path.getsize(a.eval) == 0:
         sys.exit(f"eval corpus not found or empty: {a.eval}")
     for f in [a.gguf, a.rival, a.ref]:
@@ -338,22 +1017,54 @@ def main():
 
     base = None
     if a.ref:
-        base = os.path.splitext(a.gguf)[0] + ".klbase.dat"
-        print(f"[1] KL base logits from {os.path.basename(a.ref)} (ngl {a.ngl}) ...")
-        r = subprocess.run([ppl_bin, "-m", a.ref, "-f", a.eval, "-c", "2048",
-                            "-ngl", str(a.ngl), "--kl-divergence-base", base],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if not os.path.exists(base) or os.path.getsize(base) == 0:
-            sys.exit("could not build KL base logits (ref too big for the GPU? lower --ngl, or use "
-                     "a smaller near-lossless --ref like Q6_K).")
+        # Named from the REFERENCE, not the model being scored: the base logits depend only on
+        # the reference, so one file serves every rung. Naming it per-model wrote a full copy
+        # each time -- 76GB apiece for a 152k vocab -- and filled the disk, after which the
+        # remaining rungs silently reported "--".
+        # ...and written into the WORKSPACE cache, not beside the reference. Every Pollard artifact
+        # belongs under POLLARD_HOME; dropping a 30GB intermediate next to whatever file happened to
+        # be passed as --ref scatters them across downloads/, source trees and working directories,
+        # so nobody can find them, account for the space, or clean them up.
+        try:
+            import pollard_workspace as _ws
+            base = os.path.join(_ws.cache_dir(create=True),
+                                os.path.splitext(os.path.basename(a.ref))[0] + ".klbase.dat")
+        except Exception:                                   # no workspace: keep the old behaviour
+            base = os.path.splitext(a.ref)[0] + ".klbase.dat"
+        if os.path.exists(base) and os.path.getsize(base) > 0:
+            print(f"[1] reusing KL base {os.path.basename(base)} "
+                  f"({os.path.getsize(base)/1e9:.1f} GB)")
+        else:
+            print(f"[1] KL base logits from {os.path.basename(a.ref)} (ngl {a.ngl}) ...")
+            cmd = [ppl_bin, "-m", a.ref, "-f", a.eval, "-c", "2048",
+                   "-ngl", str(a.ngl), "--kl-divergence-base", base]
+            if a.chunks:
+                cmd += ["--chunks", str(a.chunks)]
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
+            if not os.path.exists(base) or os.path.getsize(base) == 0:
+                sys.exit(f"could not build KL base logits ({free/1e9:.1f} GB free). The base holds "
+                         "FULL logits -- tokens x vocab x 4 bytes -- so a large vocab over a long "
+                         "eval runs to tens of GB. Cap it with --chunks, lower --ngl, or use a "
+                         "smaller near-lossless --ref like Q6_K.")
     else:
         print("[1] no --ref -> PPL only (pass --ref f16/Q8/Q6 for Mean/Median KLD + top-1).")
 
+    try:
+        from pollard_modelkind import classify, describe
+        k = classify(a.gguf)
+        if k["eval"] == "in-domain":
+            print(f"  NOTE: this is a {describe(k)} model. Perplexity on RAW text measures the")
+            print("        mismatch, not the build -- gemma-4-12B-it reads ~664 on WikiText where a")
+            print("        plain 7B reads 5.4 on the same corpus and binary. Score it on text it was")
+            print("        tuned for:  pollard-calib --out train.txt --held-out eval.txt")
+    except Exception:
+        pass
     targets = [("model", a.gguf)] + ([("rival", a.rival)] if a.rival else [])
     rows = []
     for i, (tag, m) in enumerate(targets, 2):
         print(f"[{i}] scoring {os.path.basename(m)} ...")
-        r = _ppl_kl(ppl_bin, m, a.eval, base, a.ngl)
+        r = _ppl_kl(ppl_bin, m, a.eval, base, a.ngl, a.chunks)
         r.update({"tag": tag, "name": os.path.basename(m), "gb": _size_gb(m)})
         rows.append(r)
 
@@ -388,7 +1099,6 @@ def main():
         except Exception:
             out = None
     if out:
-        import json
         json.dump({"eval": a.eval, "ref": a.ref, "rows": rows}, open(out, "w"), indent=2)
         print(f"\nwrote {out}  (feed pollard-scorecard for the card)")
 

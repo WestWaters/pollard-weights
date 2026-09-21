@@ -25,7 +25,7 @@ Data-driven from the workspace manifest + the base model's config -- never hand-
 `--results` (optional) supplies per-file PPL / Mean-KLD / eval string so the files table carries real
 numbers; without it those columns show "--". `--builds-from` reads builds recorded under a different
 manifest key (e.g. the f16 GGUF path). Sizes/bpw come from the manifest."""
-import argparse
+import argparse, glob
 import json
 import os
 import re
@@ -260,6 +260,106 @@ def human_gb(nbytes):
     return f"{nbytes/1e9:.2f} GB" if nbytes else "--"
 
 
+
+
+
+def _fmt_num(v, nd=4):
+    """Numbers a reader can scan: 56.8803, not 56.880311."""
+    return f"{float(v):.{nd}f}".rstrip("0").rstrip(".") if isinstance(v, (int, float)) else "--"
+
+
+def auto_note(idx, n, ppl, f16_ppl, tag):
+    """The one-line verdict a reader wants per rung: what it costs against f16, and which to take.
+
+    Said in PERCENT, not raw PPL, and earned rather than assigned by position. "near-lossless"
+    meant +0.08 on a 11.28 baseline for one model and would have meant +3.57 on 23.04 for the next
+    -- 15% worse, printed as near-lossless, on a published card."""
+    if not (ppl and f16_ppl):
+        return {0: "smallest"}.get(idx, "recommended default" if idx < n - 1 else "largest")
+    pct = (float(ppl) - float(f16_ppl)) / float(f16_ppl) * 100.0
+    if pct <= 1.0:
+        cost = "near-lossless"
+    elif pct <= 5.0:
+        cost = f"+{pct:.1f}% vs f16"
+    else:
+        cost = f"+{pct:.0f}% vs f16"
+    if idx == 0:
+        return f"smallest -- {cost}"
+    if idx == n - 1:
+        return f"highest fidelity here -- {cost}"
+    return f"recommended default -- {cost}"
+
+
+def detect_card_facts(model_id, builds_dir, cfg, builds=()):
+    """Input support, imatrix and parameter count -- read off what was actually built.
+
+    These were flags a person had to remember. Forgetting one puts a wrong fact on a published
+    card: gemma-4-12B-it went out reading "Input support: text" while its 175MB projector sat in
+    the same folder, and "imatrix: no" for a build an imatrix produced. What shipped is knowable
+    from the model and the build directory, so read it."""
+    facts = {"input": None, "imatrix": None, "params_b": None}
+    # classify needs something on disk. A repo id reads nothing, so fall back to a built GGUF
+    # (which carries the chat template) or the pulled source in the workspace.
+    probe = model_id if os.path.isdir(str(model_id)) else None
+    if not probe:
+        probe = next((b["path"] for b in builds
+                      if isinstance(b, dict) and str(b.get("path", "")).endswith(".gguf")
+                      and os.path.isfile(b["path"])), None)
+    if not probe:
+        home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+        cand = os.path.join(home, "downloads", str(model_id).replace("/", "__"))
+        probe = cand if os.path.isdir(cand) else model_id
+    try:
+        from pollard_modelkind import classify
+        k = classify(probe)
+        mods = [m for m in k.get("modalities", []) if m != "speech_out"]
+        # A modality only ships if the projector that carries it ships too.
+        # The text GGUF carries no modality signals by construction -- the projector does, and it
+        # says so itself (clip.has_vision_encoder / clip.has_audio_encoder). Ask the file that
+        # actually ships the capability rather than the one that cannot.
+        mm = glob.glob(os.path.join(builds_dir, "*mmproj*.gguf")) if builds_dir else []
+        shipped = []
+        if mm:
+            try:
+                from pollard_calc import read_gguf_meta
+                meta = read_gguf_meta(mm[0])
+                if meta.get("clip.has_vision_encoder"):
+                    shipped.append("image")
+                if meta.get("clip.has_audio_encoder"):
+                    shipped.append("audio")
+            except Exception:
+                shipped = mods
+        facts["input"] = ", ".join(["text"] + shipped)
+        if mods and not shipped:
+            facts["input"] += ("   (the source also does " + "/".join(mods) +
+                               " -- build the projector with --mmproj to ship it)")
+    except Exception:
+        pass
+    # Parameter count: the config may be unreachable for a gated/renamed repo, but a built GGUF
+    # records what it holds, so a card need never print "--" for a model we actually built.
+    try:
+        from pollard_calc import read_gguf_meta, gguf_to_config, analyse
+        g = next((b["path"] for b in builds
+                  if isinstance(b, dict) and str(b.get("path", "")).endswith(".gguf")
+                  and os.path.isfile(b["path"])), None)
+        if g:
+            tot = read_gguf_meta(g).get("_tensor_param_sum")
+            if tot:
+                facts["params_b"] = float(tot) / 1e9
+    except Exception:
+        pass
+    if builds_dir:
+        home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+        # the imatrix is written beside the SOURCE gguf, which is a sibling tree of the builds
+        im = []
+        for d in (builds_dir, os.path.dirname(builds_dir.rstrip("/\\")),
+                  os.path.join(home, "downloads")):
+            for pat in ("*.imatrix", "*.dat"):
+                im += glob.glob(os.path.join(d, pat))
+        facts["imatrix"] = im[0] if im else None
+    return facts
+
+
 def parse_params_b(params, cfg):
     if params:
         s = str(params).upper().replace("B", "").strip()
@@ -382,7 +482,13 @@ def main():
     NONSTOCK = ("ik_llama", "fork", "newer", "unknown")
     ik_builds = [b for b in builds if runtimes.get(b.get("path")) in NONSTOCK]
 
-    pb = parse_params_b(a.params, cfg)
+    # Detect first: the parameter count drives f16_gb, which drives the shrink block. Detecting
+    # afterwards left a card with no "Pollard shrank this model" hero at all whenever the config
+    # was unreachable -- the single most useful line on the page, silently absent.
+    bdir = next((os.path.dirname(b["path"]) for b in builds
+                 if isinstance(b, dict) and b.get("path") and os.path.dirname(b["path"])), None)
+    facts = detect_card_facts(a.model, bdir, cfg, builds)
+    pb = parse_params_b(a.params, cfg) or facts.get("params_b") or 0.0
     f16_gb = pb * 2.0
     builds_sorted = sorted(builds, key=lambda b: -(b.get("bytes") or 0))
     smallest = builds_sorted[-1] if builds_sorted else {}
@@ -452,10 +558,17 @@ def main():
     # ---- Model details: the at-a-glance table every good Pollard card opens with
     arch = a.arch or mtype or "--"
     out += ["## Model details", "", "| | |", "|---|---|"]
+    # Detected from the model and the build directory; an explicit flag still wins.
+    # the directory the builds actually live in, from the manifest entries themselves
+    bdir = next((os.path.dirname(b["path"]) for b in builds
+                 if isinstance(b, dict) and b.get("path") and os.path.dirname(b["path"])), None)
+    facts = detect_card_facts(a.model, bdir, cfg, builds)
+    inp = a.input_support if a.input_support and a.input_support != "text" else (facts["input"] or a.input_support)
+    imat = a.imatrix_file or facts["imatrix"]
     out.append(f"| Parameter count | ~{pb:.1f}B |" if pb else "| Parameter count | -- |")
     out.append(f"| Architecture | `{arch}` |")
-    out.append(f"| Input support | {a.input_support} |")
-    out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if a.imatrix_file else 'no'} |")
+    out.append(f"| Input support | {inp} |")
+    out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if imat else 'no'} |")
     out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
     out.append("")
 
@@ -501,15 +614,18 @@ def main():
     rt_s = "---|" if mixed else ""
     out += [f"| file | PPL | size |{tps_h} Mean KLD |{rt_h} notes |",
             f"|---|---:|---:|{tps_s}---:|{rt_s}---|"]
-    for b in sorted(builds, key=lambda x: (x.get("bytes") or 0)):
+    for _i, b in enumerate(sorted(builds, key=lambda x: (x.get("bytes") or 0))):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','--')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
         rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain,
                   "unknown": "unverified", "stock": "any llama.cpp"}.get(rt, "--")
         rt_c = (" " + rt_lbl + " |") if mixed else ""
-        out.append(f"| `{b.get('name','-')}` | {r.get('ppl','--')} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{r.get('kld','--')} |{rt_c} {r.get('note', b.get('tag',''))} |")
+        _ppl, _kld = r.get("ppl"), r.get("kld")
+        note = r.get("note") or auto_note(_i, len(builds), _ppl, results.get("_f16_ppl"),
+                                          b.get("tag", ""))
+        out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
+                   f"{_fmt_num(_kld)} |{rt_c} {note} |")
     if has_tps:
         hw = results.get("_hw")
         out.append("")

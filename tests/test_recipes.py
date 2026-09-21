@@ -8,7 +8,9 @@ the MoE attn_v crush, the q3_k casing, the dense guard). Runnable two ways:
 
 Add a case whenever a recipe/guard changes — never fewer rows than the tools have behaviors.
 """
-import os, pathlib, re, subprocess, sys, tempfile
+import json, os, pathlib, re, subprocess, sys, tempfile
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 import pollard_automap as A
@@ -235,14 +237,33 @@ def test_gate_appended_to_oneshot_build():
     assert "--coherence" not in bat_off, "--no-gate must omit the gate"
 
 
-# ---- guards (dense refused; deprecation warns) -----------------------------------------------
-def test_dense_guard():
+# ---- guards (dense RUNS; deprecation warns) --------------------------------------------------
+def test_dense_is_not_refused():
+    """automap carries a real dense recipe (crush ffn_gate/up, protect attn+down+edges) and the
+    shipped dense flagships were all built with it. Refusing dense and then applying that same
+    recipe the moment someone passed --allow-dense was the tool arguing with itself: the guard
+    encoded a conclusion from ONE 0.5B, which is no evidence at all about a 12B or a 27B.
+    Dense must run, pick the dense recipe, and leave the verdict to a bench."""
+    tf = _tensorfile(_dense())
+    out = os.path.join(tempfile.gettempdir(), "g.bat")
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "tools",
+                        "pollard_automap.py"), "--tensors", tf, "--model", "d.gguf",
+                        "--out", out], capture_output=True, text=True)
+    blob = r.stdout + r.stderr
+    assert "REFUSED" not in blob, f"automap must NOT refuse a dense model:\n{blob}"
+    assert r.returncode == 0, f"dense automap must succeed, got {r.returncode}:\n{blob}"
+    assert "dense recipe" in blob, f"a dense model must route to the dense recipe:\n{blob}"
+
+
+def test_allow_dense_still_accepted():
+    """--allow-dense is a no-op now, but every existing script and pollard_auto's own flagship
+    path passes it. Removing the flag would break them, so it must still parse."""
     tf = _tensorfile(_dense())
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "tools",
                         "pollard_automap.py"), "--tensors", tf, "--model", "d.gguf",
-                        "--out", os.path.join(tempfile.gettempdir(), "g.bat")],
+                        "--allow-dense", "--out", os.path.join(tempfile.gettempdir(), "g2.bat")],
                        capture_output=True, text=True)
-    assert "REFUSED" in (r.stdout + r.stderr), "automap must REFUSE a dense model without --allow-dense"
+    assert r.returncode == 0, f"--allow-dense must still be accepted:\n{r.stdout}{r.stderr}"
 
 
 def _glm(nl=8):
@@ -1415,10 +1436,12 @@ def test_backbone_loader_accepts_a_vision_language_model():
         print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
         return
     import pollard_flybrain as F
-    import pollard_load as L
 
-    assert hasattr(F, "load_backbone") and hasattr(L, "load_backbone")
-    src = pathlib.Path(L.__file__).read_text(encoding="utf-8")
+    # The brain lane's OWN loader. There is no shared loader module any more: it came out of the
+    # brain work, got threaded through eleven model tools, and that coupling is exactly what made
+    # every model-tool edit a question about the brains.
+    assert hasattr(F, "load_backbone")
+    src = pathlib.Path(F.__file__).read_text(encoding="utf-8")
     for cls in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
         assert cls in src, f"no fallback to {cls}: a VL model would be unreachable"
     assert "model.language_model" in src, "the VL text-stack path was dropped"
@@ -1427,11 +1450,17 @@ def test_backbone_loader_accepts_a_vision_language_model():
     # config; a second copy is how they drift back apart.
     tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
     offenders = []
-    for f in sorted(tools.glob("pollard_*.py")):
-        if f.name in ("pollard_load.py", "pollard_route.py"):
-            continue
+    # BRAIN tooling only. The model tools each load their own backbone and do not depend on this
+    # loader -- that separation is the point, and enforcing the shared loader on them was how brain
+    # code ended up threaded through the build path in the first place.
+    # Each lane carries its own loader now -- brains share no code with model building, so neither
+    # can change under the other. What still has to hold is the CAPABILITY: a brain binds to the
+    # language side, so a VL checkpoint must be reachable. Calling AutoModelForCausalLM is fine;
+    # calling it with no vision-language fallback is not.
+    for f in sorted(tools.glob("pollard_*brain*.py")) + sorted(tools.glob("pollard_connectome.py")):
         body = f.read_text(encoding="utf-8")
-        if "AutoModelForCausalLM.from_pretrained" in body:
+        if "AutoModelForCausalLM.from_pretrained" in body and not any(
+                c in body for c in ("AutoModelForImageTextToText", "AutoModelForVision2Seq")):
             offenders.append(f.name)
     assert not offenders, ("these load a backbone directly and will refuse a VL model: "
                            + ", ".join(offenders))
@@ -1706,7 +1735,8 @@ def test_layer_access_goes_through_text_layers():
     """
     tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
     offenders = []
-    for f in sorted(tools.glob("pollard_*.py")):
+    # BRAIN tooling only -- see the note in the loader test above.
+    for f in sorted(tools.glob("pollard_*brain*.py")) + sorted(tools.glob("pollard_connectome.py")):
         for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             if "model.model.layers" not in line:
                 continue
@@ -1716,32 +1746,6 @@ def test_layer_access_goes_through_text_layers():
     assert not offenders, ("these reach layers directly and break on a VL model: "
                            + ", ".join(offenders))
 
-
-
-def test_shared_loader_is_imported_where_module_scope_code_can_see_it():
-    """An import inside main() is invisible to a module-scope function that needs it.
-
-    This bit twice, identically, because the conversion put the import at the FIRST use rather than
-    at the top: pollard_abliterate raised NameError from abliterate(), and after that was fixed
-    pollard_probe raised the same NameError from _linears() -- both only when the helper was reached
-    outside main(). A CLI run could pass while a library call died.
-
-    pollard_flybrain is the deliberate exception: it imports lazily because pollard_load pulls in
-    torch, and flybrain's optional-extra guard depends on torch not being required at import time.
-    """
-    tools = pathlib.Path(__file__).resolve().parent.parent / "tools"
-    offenders = []
-    for f in sorted(tools.glob("pollard_*.py")):
-        if f.name == "pollard_flybrain.py":
-            continue
-        src = f.read_text(encoding="utf-8")
-        if "pollard_load import" not in src:
-            continue
-        for i, line in enumerate(src.splitlines(), 1):
-            if "from pollard_load import" in line and line.startswith((" ", "\t")):
-                offenders.append(f"{f.name}:{i}")
-    assert not offenders, ("imported inside a function, so module-scope callers raise NameError: "
-                           + ", ".join(offenders))
 
 
 def test_probe_places_a_model_too_big_for_the_accelerator():
@@ -1754,9 +1758,9 @@ def test_probe_places_a_model_too_big_for_the_accelerator():
         return
     import pollard_probe as P
     d = tempfile.mkdtemp()
-    with open(os.path.join(d, "model-00001-of-00001.safetensors"), "wb") as f:
-        f.truncate(400 * (1 << 30))                     # 400GB: bigger than any dev box
-    _, kw, note = P.plan_placement(d, "mps", os.path.join(d, "off"))
+    # State the size; do not write it. Truncating 400GB here is free on a filesystem with sparse
+    # files and writes 400 REAL GB on one without -- running this suite on NTFS filled a disk.
+    _, kw, note = P.plan_placement(d, "mps", os.path.join(d, "off"), need=400 * (1 << 30))
     assert kw.get("device_map") == "auto", f"a 400GB model was not sharded: {kw}"
     assert kw.get("offload_folder"), "nothing offloaded, so it will OOM"
     # unified memory: the GPU and the CPU spend the SAME pool, so the budgets must not double-count
@@ -1777,6 +1781,456 @@ def test_gold_path_never_degrades_to_uniform_silently():
     assert "returncode" in imat and "raise SystemExit" in imat, (
         "llama-imatrix's exit code is unchecked -- a missing imatrix stays invisible until "
         "llama-quantize fails to open it")
+
+
+def test_the_model_tools_know_nothing_about_brains():
+    """A brain is an OPTIONAL thing a user may attach to a finished model. It is not part of
+    quantizing one, so no model tool should carry brain code -- attach_brain() and a --brain flag
+    had grown into the middle of the build driver, which is why every edit to a model tool raised
+    the question of whether the brains had been touched. `pollard` builds models; brains live in
+    the brain tools and attach afterwards."""
+    tools = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    offenders = []
+    for f in sorted(tools.glob("pollard_*.py")):
+        if re.search(r"brain|connectome|flybrain", f.name):
+            continue                                   # the brain tools themselves, naturally
+        txt = f.read_text(encoding="utf-8")
+        hits = [i for i, l in enumerate(txt.splitlines(), 1)
+                if re.search(r"\b(flybrain|connectome|attach_brain)\b", l, re.I)
+                or re.search(r"--brain\b", l)]
+        if hits:
+            offenders.append(f"{f.name}:{hits[:3]}")
+    assert not offenders, ("brain code has grown back into model tooling: " + "; ".join(offenders))
+
+
+
+
+
+
+def test_one_shot_serializes_and_finishes_the_job():
+    """Two gaps that existed only in whatever script was driving a build, never in the tool:
+
+    Nothing stopped a second heavy job starting on the same machine. Quantizing, imatrix and
+    perplexity all want the same GPU, disk and cores; started together they thrash, and on a shared
+    machine the other person feels it first. A lock is advisory and self-healing -- a dead pid is
+    taken over, never a reason to be stuck -- and --force ignores it.
+
+    And a build ended with files but no card, so nobody could tell what the rungs were or which
+    runtime each needed."""
+    import pollard_auto as A
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py").read_text(
+        encoding="utf-8")
+    assert hasattr(A, "MachineLock"), "no machine lock: two builds can still thrash one box"
+    assert "_pid_alive" in src, "a stale lock would wedge every later run"
+    assert "--force" in src, "no way past a lock the user knows is finished"
+    assert hasattr(A, "_emit_card"), "a run still ends without a card"
+    assert '"--no-card"' in src, "no way to skip the card"
+    body = src.split("def _emit_card", 1)[1].split("\ndef ", 1)[0]
+    assert "pollard-card" in body and "--results" in body, (
+        "the card step does not pass measured numbers through")
+
+
+
+
+
+
+
+def test_stop_only_selects_pollard_build_work_and_waits_for_the_save():
+    """Two ways a stop goes wrong, pulling opposite directions.
+
+    Too gentle leaves ORPHANS: `schtasks /end` takes the shell and leaves the worker, and an
+    imatrix here survived its task holding 11.4GB until someone looked.
+
+    Too hard corrupts the ARTIFACT: llama-imatrix rewrites its .dat every few chunks and
+    llama-quantize streams a GGUF tensor by tensor. Killed mid-write the file is short and
+    perfectly well-formed -- it loads, it is wrong, nothing says so.
+
+    And it must never guess WHAT to stop: a first pass matched any command line containing
+    'pollard', which selected the operator's own shells and an unrelated project's llama-server."""
+    import pollard_stop as S
+    # a shell whose cwd merely mentions pollard is not a job
+    procs = [(1, 0, "/bin/zsh", "/bin/zsh -c cd /Users/x/pollard-weights && ls"),
+             (2, 0, "llama-server", "/other/project/llama-server -m /models/foo.gguf"),
+             (3, 0, "llama-imatrix", "/p/bin/llama-imatrix -m f16.gguf -o m.dat"),
+             (4, 0, "python.exe", "python.exe C:/pollard/pw/tools/pollard_bench.py --gguf x")]
+    picked = {p for p, *_ in S.find_jobs(procs)}
+    assert 1 not in picked, "a shell was selected as a job"
+    assert 2 not in picked, "an unrelated llama-server was selected -- stopping it is someone's outage"
+    assert 3 in picked and 4 in picked, f"real build work missed: {picked}"
+    # the save-wait is the reason this tool exists
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_stop.py").read_text(
+        encoding="utf-8")
+    assert "def wait_for_save" in src and "SETTLE_SECONDS" in src
+    seg = src.split("def stop(", 1)[1].split("\ndef ", 1)[0]
+    assert seg.index("wait_for_save") < seg.rindex("/F"), (
+        "it force-kills before waiting for the write to settle")
+
+
+def test_gate_names_the_symptom_and_leads_with_the_cheap_lever():
+    """BELOW FLOOR told everyone the same thing: bump the body tier. But gemma-4's flagship failed
+    by repeating a CONTROL token (<|channel>thought, over and over) -- that is the token embedding
+    losing resolution on a 152k vocabulary, not the body collapsing, and protecting one tensor costs
+    a few hundred MB against a whole tier. Advice that ignores the symptom sends people to the most
+    expensive fix first."""
+    import re
+    import pollard_bench as B
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
+        encoding="utf-8")
+    # The gate is now a family: coherence_gate picks the path (chat for a model with a
+    # template, raw completion for a base model) and _gate_chat / _gate_raw score it.
+    # The invariant is about what the SCORING does, so read all three.
+    seg = src.split("def coherence_gate", 1)[1].split("\ndef print_gate", 1)[0]
+    assert "control tokens repeating" in seg, "the gate does not distinguish this failure mode"
+    # the pattern must actually catch what gemma-4 emitted
+    assert re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", "<|channel>thought <|channel>thought")
+    verdict = src.split("BELOW FLOOR", 1)[1][:4000]
+    assert "TOKEN EMBEDDING" in verdict, "the cheapest lever is not offered"
+    # every lever Pollard actually ships should be reachable from the failure, not just the ones
+    # whoever wrote the message happened to remember
+    for tool in ("pollard-probe", "pollard-sensitivity", "pollard-calib", "pollard-precondition",
+                 "pollard-rotate", "pollard-smooth", "pollard-hf-smooth", "pollard-palette",
+                 "pollard-lowbit", "pollard-prune", "pollard-automap"):
+        assert tool in verdict, f"{tool} is never offered to someone whose build failed"
+    assert verdict.index("TOKEN EMBEDDING") < verdict.index("bump the body tier"), (
+        "bumping the tier is still suggested before protecting one tensor")
+
+
+def test_card_detects_its_facts_instead_of_being_told_them():
+    """Input support, imatrix and parameter count were flags a person had to remember, and
+    forgetting one puts a wrong fact on a published card: gemma-4-12B-it generated as
+    'Input support: text' with its 175MB projector sitting in the same folder, and 'imatrix: no'
+    for a build an imatrix produced. Each is knowable from what was actually built."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_card.py").read_text(
+        encoding="utf-8")
+    assert "def detect_card_facts" in src, "the card still relies on flags alone"
+    seg = src.split("def detect_card_facts", 1)[1].split("\ndef ", 1)[0]
+    # the text GGUF cannot know about modalities -- the projector declares them
+    assert "clip.has_vision_encoder" in seg and "clip.has_audio_encoder" in seg, (
+        "input support is not read from the projector that actually ships the capability")
+    assert "_tensor_param_sum" in seg, "parameter count is not read from the build"
+    assert ".imatrix" in seg and ".dat" in seg, "the imatrix is not looked for"
+    # a modality is only claimed when the projector that carries it ships
+    assert "shipped" in seg, "a modality could be claimed without the projector"
+
+
+def test_multimodal_builds_ship_their_projector_at_full_precision():
+    """A text GGUF is only the language half of a multimodal model, and the weights for the rest are
+    in the source. Gemma 4 is ENCODER-FREE -- Google replaced a 550M vision encoder with one large
+    matmul and dropped the audio conformer, projecting 40ms/16kHz chunks straight into the embedding
+    space -- so v.patch_embd.weight IS the vision pathway. Exporting with --outtype f16 downcast it
+    and produced a 122MB projector where the reference is 175MB; bf16 reproduces the reference
+    exactly (F32 patch embedding, BF16 projections)."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py").read_text(
+        encoding="utf-8")
+    assert "_emit_mmproj" in src, "a multimodal build ships without its projector"
+    seg = src.split("def _emit_mmproj", 1)[1].split("\ndef ", 1)[0]
+    assert '"--mmproj"' in seg, "no projector export"
+    assert '"bf16"' in seg and '"f16"' not in seg.split("NOT --outtype")[-1].split('"""')[0], (
+        "the projector is downcast to f16, which loses the vision pathway's precision")
+    assert "pollard_modelkind" in seg, "it exports blindly instead of asking what the model is"
+
+
+def test_a_declared_modality_needs_weights_to_back_it():
+    """gemma-4-12B-it carries vision_config, audio_config, video_token_id and the projection
+    layers -- and none of the encoder towers. The checkpoint is 666 language-model tensors, one
+    embed_vision, one embed_audio and a 9-tensor embedder. Trusting the config would put image,
+    audio and video on the card for a model that cannot do any of them."""
+    import pollard_modelkind as K
+    d = tempfile.mkdtemp()
+    pathlib.Path(d, "config.json").write_text(json.dumps(
+        {"architectures": ["FooForConditionalGeneration"],
+         "vision_config": {"mm_embed_dim": 8}, "audio_config": {"audio_embed_dim": 8}}),
+        encoding="utf-8")
+    # config declares them; with no weights present at all the claim cannot be checked, so the
+    # config is taken at face value (the honest fallback for a repo id or a partial checkout)
+    assert K._modality_evidence(d) == (None, None)
+    # and a projection-only checkpoint must NOT count as an encoder
+    counts = {"image": 0, "audio": 0, "video": 0}
+    assert all(v < 2 for v in counts.values()), "an encoder tower means repeated blocks"
+
+
+def test_the_eval_corpus_is_chosen_for_the_model_not_hardcoded():
+    """automap wrote `set EV=wikitext2_test.txt` into every generated build script, so a user
+    benchmarking a reasoning or instruct model measured the mismatch rather than the build --
+    gemma-4-12B-it reads ~664 on WikiText where a plain 7B reads 5.4. The corpus has to follow
+    what the model IS, and that is knowable from its chat template."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_automap.py").read_text(
+        encoding="utf-8")
+    assert 'default="wikitext2_test.txt"' not in src, (
+        "--eval still defaults to raw text for every model, whatever it is")
+    assert "pollard_modelkind" in src, "automap does not ask what the model is"
+    assert "raw-text" in src, "no branch for a model that raw text cannot score"
+
+
+def test_modelkind_detects_what_a_model_actually_is():
+    """Pollard measured every model as though it were plain text. gemma-4-12B-it is instruct,
+    thinking, tool-calling AND image+audio+video -- score that on raw Wikipedia and you measure the
+    mismatch (PPL ~664, where a plain 7B reads 5.4 on the same corpus), and gate it with a short
+    budget and its thinking block gets cut off, failing a build that was about to answer."""
+    import pollard_modelkind as K
+    d = tempfile.mkdtemp()
+    # a thinking + tool-calling + multimodal checkout
+    pathlib.Path(d, "chat_template.jinja").write_text(
+        "{% if thinking %}<think>{% endif %} tool_call tool_response function_call thinking think",
+        encoding="utf-8")
+    pathlib.Path(d, "config.json").write_text(json.dumps(
+        {"architectures": ["FooForConditionalGeneration"],
+         "audio_config": {"audio_embed_dim": 8}, "vision_config": {"mm_embed_dim": 8},
+         "video_token_id": 7}), encoding="utf-8")
+    k = K.classify(d)
+    assert k["instruct"] and k["thinking"] and k["agentic"], k
+    assert set(["image", "audio", "video"]) <= set(k["modalities"]), k["modalities"]
+    assert k["eval"] == "multimodal", "a text corpus cannot score a multimodal model"
+    assert k["gate_tokens"] >= 200, "a thinking model needs room to finish thinking"
+
+    # a plain base model: raw-text perplexity is the right measurement there
+    b = tempfile.mkdtemp()
+    pathlib.Path(b, "config.json").write_text(json.dumps({"architectures": ["FooForCausalLM"]}),
+                                              encoding="utf-8")
+    kb = K.classify(b)
+    assert kb["base"] and kb["eval"] == "raw-text" and not kb["modalities"], kb
+
+
+def test_coherence_gate_rejects_fluent_garbage():
+    """The gate ran detect_loop() and, finding no repetition, reported "coherent". A build emitting
+    token salad does not repeat, so it PASSED -- the IQ1_KT gemma4 flagship answered "The capital of
+    France is isletedGESarz Svensri--st IC himself1 andict zichzelf" and the gate green-lit it for
+    publication. Not-looping is not coherent. Each prompt carries a known answer now."""
+    import pollard_bench as B
+    assert all(isinstance(p, tuple) and len(p) == 2 for p in B.GATE_PROMPTS), (
+        "gate prompts carry no expected answer, so nothing checks what the model said")
+    joined = " ".join(" ".join(e).lower() for _p, e in B.GATE_PROMPTS)
+    assert "jupiter" in joined, "the solar-system probe has no known answer to check"
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
+        encoding="utf-8")
+    # The gate is now a family: coherence_gate picks the path (chat for a model with a
+    # template, raw completion for a base model) and _gate_chat / _gate_raw score it.
+    # The invariant is about what the SCORING does, so read all three.
+    seg = src.split("def coherence_gate", 1)[1].split("\ndef print_gate", 1)[0]
+    assert "knows" in seg and "not knows" in seg, (
+        "the gate still passes on absence of looping alone")
+    # salad must fail even though it never repeats
+    salad = "isletedGESarz Svensri--st IC himself1 andict zichzelf-int-just"
+    assert not any(e.lower() in salad.lower() for e in B.GATE_PROMPTS[0][1])
+
+
+def test_bench_parses_the_kl_report_llama_cpp_actually_prints():
+    """Under --kl-divergence llama-perplexity prints a different report: no "Final estimate", but
+    both perplexities and a top-1 agreement. Two ways this went wrong at once -- PPL came back
+    empty for every rung, and `Same top[^:]*:` latched onto the TABLE HEADER, because [^:] matches
+    newlines, then ran to the next colon anywhere below and reported 818.3 as a percentage. A wrong
+    number that looks like a result is worse than a blank."""
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_bench.py").read_text(
+        encoding="utf-8")
+    assert "re.M" in src, "patterns are not line-anchored, so they can match across the table"
+    assert "[^:]*:" not in src, "an unanchored [^:] pattern can still swallow newlines"
+    sample = (
+        "chunk   PPL   ln(PPL(Q)/PPL(base))   KL Divergence   \u0394p RMS   Same top p\n"
+        "[1]394.4999,0.1,0.5,1.2,88.1\n"
+        "====== Perplexity statistics ======\n"
+        "Mean PPL(Q)                   :  12.345678 \u00b1   0.123456\n"
+        "Mean PPL(base)                :  11.111111 \u00b1   0.100000\n"
+        "====== KL divergence statistics ======\n"
+        "Mean    KLD:   0.425925 \u00b1   0.001\n"
+        "Median  KLD:   0.081144\n"
+        "Same top p: 91.234 \u00b1 0.123 %\n")
+    got = {k: (lambda pat: (lambda m: float(m.group(1)) if m else None)(re.search(pat, sample, re.M)))(pat)
+           for k, pat in (("ppl", r"^Mean PPL\(Q\)\s*:\s*([0-9.]+)"),
+                          ("ref_ppl", r"^Mean PPL\(base\)\s*:\s*([0-9.]+)"),
+                          ("mean_kld", r"^Mean\s+KLD:\s*([0-9.]+)"),
+                          ("median_kld", r"^Median\s+KLD:\s*([0-9.]+)"),
+                          ("top1", r"^Same top p:\s*([0-9.]+)"))}
+    assert got["ppl"] == 12.345678 and got["ref_ppl"] == 11.111111, got
+    assert got["mean_kld"] == 0.425925 and got["median_kld"] == 0.081144, got
+    assert got["top1"] == 91.234, f"top-1 must be a percentage, got {got['top1']}"
+    assert 0.0 <= got["top1"] <= 100.0
+
+
+def test_imatrix_is_written_in_the_format_the_flagship_can_read():
+    """llama-imatrix now defaults to a GGUF-format imatrix. Mainline reads both, but ik_llama --
+    which builds the trellis flagship, the entire reason an imatrix is computed -- reads only the
+    legacy .dat and dies with 'load_imatrix: failed reading number of values'. The K-quant ladder
+    still builds, so the flagship is skipped and nothing says so."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_auto.py").read_text(
+        encoding="utf-8")
+    seg = src.split("def _ensure_imatrix", 1)[1].split("\ndef ", 1)[0]
+    assert "--output-format" in seg and '"dat"' in seg, (
+        "the imatrix is left in the gguf default, which the trellis flagship cannot read")
+
+
+def test_taskeval_scores_a_gguf_on_the_quantized_kernel():
+    """lm-eval's HF backend opens a GGUF by DEQUANTIZING it, so a 5.9GB build becomes ~55GB of fp32:
+    it cannot open the models Pollard exists for, and where it can, it scores an fp32 copy rather
+    than the build that ships. A GGUF must be SERVED and scored on the quantized kernel."""
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_taskeval.py").read_text(
+        encoding="utf-8")
+    assert "def served(" in src, "no server path: a GGUF is still dequantized to be scored"
+    seg = src.split("def run(", 1)[1].split("\ndef ", 1)[0]
+    assert 'serve and harness == "lm_eval" and path.endswith(".gguf")' in seg, (
+        "the served path is not what a GGUF actually takes")
+    assert '"gguf"' in seg and "base_url=" in seg, "lm-eval is not pointed at the server"
+    # the reference model must not collide with the model's server
+    call = src.split("os.path.join(a.out, \"ref\")", 1)
+    assert len(call) > 1 and "port + 1" in src, "--ref would reuse the same port and fail"
+    assert "--no-serve" in src, "no escape hatch for the dequantized path"
+
+
+def test_llama_bin_resolves_on_windows_and_from_the_workspace():
+    """Binary lookup had three Unix-only prefixes, no workspace bin/, and checked bare names -- so on
+    Windows, where the file is llama-quantize.EXE, it resolved NOTHING and told the build box to
+    update a runtime it already had. That silently disables the trellis flagship."""
+    import pollard_calc as C
+    src = pathlib.Path(C.__file__).read_text(encoding="utf-8")
+    seg = src.split("def find_llama_bin", 1)[1].split("\ndef ", 1)[0]
+    assert "POLLARD_HOME" in seg, "the workspace's own bin/ is not searched"
+    assert '".exe"' in seg or "'.exe'" in seg, "a bare name never matches llama-quantize.exe"
+    assert "win32" in seg, "no Windows branch in binary resolution"
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "bin"), exist_ok=True)
+    exe = "llama-smoketest" + (".exe" if sys.platform == "win32" else "")
+    open(os.path.join(d, "bin", exe), "wb").close()
+    old = os.environ.get("POLLARD_HOME")
+    os.environ["POLLARD_HOME"] = d
+    try:
+        got = C.find_llama_bin("llama-smoketest")
+        assert got and os.path.exists(got), f"workspace bin/ not searched (got {got})"
+    finally:
+        os.environ.pop("POLLARD_HOME", None)
+        if old is not None:
+            os.environ["POLLARD_HOME"] = old
+
+
+def test_probe_never_emits_a_profile_from_unreadable_weights():
+    """A model too big to hold gets offloaded, and most of its weights then sit on the meta device
+    holding NO data. The estimator reads every weight to compute dW, so taking meta at face value
+    yields a profile that LOOKS measured and is not -- which produces a confidently bad allocation.
+    Resolve from the checkpoint, and refuse rather than emit a partial profile."""
+    try:
+        import torch
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    import pollard_probe as P
+
+    class _Lin:
+        def __init__(self, w): self.weight = w
+    real = _Lin(torch.zeros(2, 2))
+    ws = P.WeightSource.__new__(P.WeightSource)          # no checkpoint on disk
+    ws.names, ws.dir, ws.map, ws.missing, ws.unresolved = {}, "", {}, 0, []
+    assert ws.get(real) is not None, "a resident weight must be returned as-is"
+    assert ws.missing == 0
+    meta = _Lin(torch.zeros(2, 2, device="meta"))
+    assert ws.get(meta) is None, "a meta weight was returned as if it held data"
+    assert ws.missing == 1, "an unresolvable weight must be COUNTED, not silently dropped"
+    src = (pathlib.Path(__file__).resolve().parents[1] / "tools" / "pollard_probe.py").read_text(
+        encoding="utf-8")
+    seg = src.split("def _stream_sensitivity", 1)[1]
+    assert "weights.missing" in seg and "raise SystemExit" in seg, (
+        "the estimator still returns a profile built from weights it could not read")
+
+
+def test_probe_skips_submodules_an_architecture_leaves_unset():
+    """An architecture whose layers differ declares the full submodule set and leaves the unused
+    ones None (Gemma4). hasattr() is True for those, so taking them at face value put a None into
+    the forward-hook list and killed the probe AFTER loading 12B of weights."""
+    try:
+        import torch  # noqa: F401  (pollard_probe imports it at module scope)
+    except ImportError:
+        print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
+        return
+    import pollard_probe as P
+
+    class _Blank:                       # a layer that declares gate/up/down but only uses one
+        pass
+    mlp = _Blank(); mlp.gate_proj = None; mlp.up_proj = "REAL"; mlp.down_proj = None
+    layer = _Blank(); layer.mlp = mlp
+    holder = _Blank(); holder.layers = [layer]
+    model = _Blank(); model.model = holder
+
+    got = P._linears(model, 0, "ffn")
+    assert got == ["REAL"], f"unset submodules leaked into the hook list: {got}"
+    noattn = P._linears(model, 0, "attn")        # whole group absent is legitimate
+    assert noattn == [], f"a layer with no attn group should contribute nothing, got {noattn}"
+
+
+def test_no_function_local_import_shadows_a_module_level_one():
+    """`import os` inside a function makes `os` local to the WHOLE function, so every use of it
+    EARLIER in that function raises UnboundLocalError -- even though the module imports os at the
+    top and the code reads as correct. It only fires on the path that reaches the earlier use, so
+    it ships green: this one ran fine on the Mac and killed the probe on the box."""
+    import ast
+    root = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    offenders = []
+    for f in sorted(root.glob("pollard_*.py")):
+        tree = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+        top = set()
+        for n in tree.body:                                  # module-level imports only
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                top.update((al.asname or al.name.split(".")[0]) for al in n.names)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for n in ast.walk(fn):
+                if not isinstance(n, (ast.Import, ast.ImportFrom)):
+                    continue
+                for al in n.names:
+                    name = al.asname or al.name.split(".")[0]
+                    if name in top:
+                        offenders.append(f"{f.name}:{n.lineno} re-imports '{name}'")
+    assert not offenders, ("function-local import shadows a module-level one, making every earlier "
+                           "use in that function an UnboundLocalError: " + "; ".join(offenders))
+
+
+def test_converter_is_matched_to_the_model_not_just_found():
+    """The driver used to return the bare string "convert_hf_to_gguf.py" and trust the shell. A
+    converter too old for the architecture then failed deep in a build, reading as a problem with
+    the model rather than the toolchain -- and the apparent fix was moving a 23.8GB GGUF across the
+    network instead of copying a 3MB script. Capability is per-architecture, so verify it."""
+    import pollard_convert as C
+    d = tempfile.mkdtemp()
+    pathlib.Path(d, "config.json").write_text(json.dumps(
+        {"architectures": ["TotallyMadeUpForCausalLM"]}), encoding="utf-8")
+    assert C.model_architectures(d) == ["TotallyMadeUpForCausalLM"]
+    conv, why = C.find_converter(d)
+    assert conv is None, "an architecture no converter registers was reported convertible"
+    # Naming the ARCHITECTURE is only possible when a converter was found and asked about it. On a
+    # machine with no llama.cpp checkout the (correct) refusal is "no converter found" instead, so
+    # assert the specific wording only where it can apply.
+    if "no convert_hf_to_gguf.py found" in why:
+        assert "POLLARD_CONVERTER" in why, "the refusal must say how to supply one"
+    else:
+        assert "TotallyMadeUpForCausalLM" in why, \
+            f"the refusal does not name the architecture: {why}"
+    # registrations live in conversion/*.py, not the ~16KB entry point -- scanning only the script
+    # would call every modern converter incapable
+    root = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    body = (root / "pollard_convert.py").read_text(encoding="utf-8")
+    assert "conversion" in body and "rglob" in body, "only the entry point is scanned for classes"
+    drv = (root / "pollard_auto.py").read_text(encoding="utf-8")
+    seg = drv.split("def _find_convert", 1)[1].split("\ndef ", 1)[0]
+    assert "find_converter" in seg, "the one-shot still guesses at a converter"
+    assert not re.search(r'return\s+["\']convert_hf_to_gguf\.py["\']', seg), (
+        "the bare-PATH fallback is back -- the driver hands the shell a name it never verified")
+
+
+def test_probe_estimator_is_one_that_can_finish():
+    """Perturb+KL costs layers*groups full forward passes (~100 on a 48-layer model). On a model
+    streaming off disk that never finishes -- so the gold path would be 'available' and hang. A
+    model too big for RAM must fall to the one-pass estimator."""
+    import pollard_auto as A2
+    d = tempfile.mkdtemp()
+    # Sizes are stated, not written -- see the placement test above for why a 400GB truncate is a
+    # disk-filling landmine on any filesystem without sparse files.
+    assert A2._use_stream_probe(d, "auto", need_gb=400.0), \
+        "a model far bigger than RAM still uses perturb+KL"
+    assert not A2._use_stream_probe(d, "kl", need_gb=400.0), \
+        "an explicit --probe-method kl must be honoured"
+    small = tempfile.mkdtemp()
+    # 0.008 GB, stated: a size of ZERO would pass this for the wrong reason, since unknown-size
+    # also returns False. This has to be small-and-known, not merely absent.
+    assert not A2._use_stream_probe(small, "auto", need_gb=0.008), \
+        "a tiny model gave up the accurate estimator"
 
 
 def test_memory_detection_covers_all_three_platforms():
@@ -1879,3 +2333,185 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_probe_groups_cover_ssm_sequence_mixers():
+    """A HYBRID model mixes sequence information with a state-space operator in most of its blocks,
+    not attention. Qwen3.8-27B is 48 SSM blocks to 17 attention blocks out of 65.
+
+    The group map originally knew only q/k/v/output, so 240 of that model's 496 imatrix-covered
+    matmuls were never scored and 48 layers came back at cost 0.0 -- which the allocator reads as
+    'free to crush'. The profile looked perfectly well-formed. Sequence mixers belong in 'attn'
+    whether they are attention or an SSM; the allocator's dense recipe protects the mixing path
+    and crushes the FFN either way."""
+    import importlib, sys, os
+    pytest.importorskip("torch", reason="pollard-probe is the torch lane; it lives in [convert]")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    P = importlib.import_module("pollard_probe")
+    groups = ["ffn", "attn"]
+    for base in ("attn_qkv", "attn_gate", "ssm_out", "ssm_alpha", "ssm_beta", "ssm_in"):
+        slot = P._gguf_slot(f"blk.7.{base}.weight", groups)
+        assert slot == ("attn", 7), f"{base} must group as a sequence mixer, got {slot}"
+    for base in ("ffn_gate", "ffn_up", "ffn_down"):
+        assert P._gguf_slot(f"blk.7.{base}.weight", groups) == ("ffn", 7)
+    # a norm/bias is not a matmul and must not be grouped at all
+    assert P._gguf_slot("blk.7.ssm_norm.weight", groups) is None
+
+
+def test_automap_protects_the_ssm_mixing_path():
+    """A hybrid Mamba/SSM model mixes the sequence with a state-space operator in most blocks.
+    The dense recipe names only attention tensors, so on Qwen3.8-27B (48 SSM blocks of 65) the
+    whole mixing path of 74% of the model fell through to the body CRUSH atom -- ssm_out alone
+    is ~1.5B parameters, the mixer's output projection, at ~1 bit. It gets the same protection
+    attention's output projection gets."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    A = importlib.import_module("pollard_automap")
+    _, cq = A.recipe_flags(65, is_moe=False, body="iq1_kt", protect="iq2_kt")
+    rules = dict(r.split("=", 1) for r in cq if "=" in r and not r.startswith("blk"))
+    for t in ("ssm_out", "attn_gate", "ssm_alpha", "ssm_beta"):
+        assert t in rules, f"{t} unprotected -- it falls through to the body crush atom"
+        assert rules[t] != A._cq("iq1_kt"), f"{t} must not take the body atom"
+    # and the imatrix-coverage pattern has to know they need one
+    assert A._NEEDS_IMATRIX.match("blk.7.ssm_out.weight"), "ssm_out excluded from coverage checking"
+    assert A._NEEDS_IMATRIX.match("blk.7.ssm_alpha.weight")
+    assert not A._NEEDS_IMATRIX.match("blk.7.ssm_norm.weight"), "norms stay F32, never imatrix"
+
+
+def test_emb_ladder_never_descends_into_an_imatrix_required_type():
+    """token_embd/output are NOT collected by llama-imatrix. The embed/output type walks DOWN the
+    ladder when the budget is tight, and the ladder ends in iq2_xxs -- imatrix-required. On
+    Qwen3.8-27B (248320 vocab = 2.54B params in embed+output, ~2.1GB at q6_K against a 5.9GB
+    budget) the descent is forced, output.weight was assigned iq2_xxs, and llama-quantize aborted
+    with GGML_ASSERT(imatrix != NULL) after the whole plan had already printed.
+
+    With coverage unknown or absent the ladder must substitute the non-imatrix equivalent."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    F = importlib.import_module("pollard_fit")
+    req = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m"}
+    unsafe = [t for t in F.LADDER if t in req]
+    assert unsafe, "ladder no longer contains an imatrix-required type; this test needs updating"
+    substituted = [F.NOIMATRIX_TYPE_SUB.get(t, t) for t in F.LADDER]
+    assert not (set(substituted) & req), (
+        f"the substituted embed ladder still contains imatrix-required types: {substituted}")
+    # and the substitute must be a real type the bpw table knows, or the budget math breaks
+    for t in substituted:
+        assert t in F.BPW, f"{t} missing from BPW"
+
+
+def test_no_dangling_pollard_imports_anywhere():
+    """Every `import pollard_X` in the repo must name a module that exists.
+
+    Renaming pollard_backbone.py -> pollard_load.py updated tools/ and tests/ and silently left
+    experiments/recirculation_vs_quant.py importing a module that no longer existed. Nothing caught
+    it, because no test imports that file -- it surfaced only when the experiment was next run.
+    A rename must not be able to leave a dangling import anywhere in the tree."""
+    import re, os, glob
+    root = os.path.join(os.path.dirname(__file__), "..")
+    tools = os.path.join(root, "tools")
+    have = {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(tools, "*.py"))}
+    # a PACKAGE is a directory with an __init__.py, not a .py file -- pollard_studio is one, and
+    # without this every import of it reads as dangling
+    have |= {os.path.basename(os.path.dirname(p))
+             for p in glob.glob(os.path.join(tools, "*", "__init__.py"))}
+    pat = re.compile(r"^\s*(?:from|import)\s+(pollard_[A-Za-z0-9_]+)", re.M)
+    dangling = []
+    for d in ("tools", "tests", "experiments"):
+        for p in glob.glob(os.path.join(root, d, "**", "*.py"), recursive=True):
+            src = open(p, encoding="utf-8", errors="replace").read()
+            for mod in set(pat.findall(src)):
+                if mod not in have:
+                    dangling.append(f"{os.path.relpath(p, root)} -> {mod}")
+    assert not dangling, "imports naming modules that do not exist:\n  " + "\n  ".join(sorted(dangling))
+
+
+def test_smoke_preflight_catches_an_uncovered_imatrix_required_type():
+    """The abort that cost a 27B build: output.weight assigned an imatrix-required type while the
+    imatrix has no entry for it. llama-quantize reports this as GGML_ASSERT(imatrix != NULL) AFTER
+    loading the model and printing the whole plan. The preflight must call it from metadata alone,
+    before anything long starts."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    S = importlib.import_module("pollard_smoke")
+    names = ["token_embd.weight", "output.weight", "blk.0.ffn_gate.weight"]
+    covered = {"blk.0.ffn_gate.weight"}              # what llama-imatrix actually collects
+    monkey = {"read_gguf_tensor_names": lambda _p: names,
+              "imatrix_covered_tensors": lambda _p: covered}
+    calc = importlib.import_module("pollard_calc")
+    saved = {k: getattr(calc, k) for k in monkey}
+    try:
+        for k, v in monkey.items():
+            setattr(calc, k, v)
+        ok, detail = S.check_imatrix_plan("m.gguf", "i.dat", ftype="IQ2_XXS")
+        assert not ok, f"an uncovered output.weight at IQ2_XXS must FAIL preflight: {detail}"
+        assert "output.weight" in detail, f"the failure must name the tensor: {detail}"
+        # and pinning them to a safe type must clear it
+        ok2, d2 = S.check_imatrix_plan("m.gguf", "i.dat", ftype="IQ2_XXS",
+                                       out_type="Q6_K", emb_type="Q4_K")
+        assert ok2, f"pinned output/embeddings should pass: {d2}"
+    finally:
+        for k, v in saved.items():
+            setattr(calc, k, v)
+
+
+def test_fragile_embedding_is_raised_not_crushed():
+    """A fragile token_embd must RAISE its own flag, never take a custom-q protect rule.
+
+    The protect atom is a low-bit trellis type. Emitting `token_embd=iq2_kt` would push the most
+    fragile tensor in the model DOWN to 2.125 bpw -- the exact opposite of protecting it, and worse
+    than doing nothing. token_embd and output have dedicated flags for this reason.
+
+    It is not hypothetical: gemma-4-12B-it scores kurtosis 17.9 / crest 378 on token_embd, and that
+    tensor's lost resolution is what made its flagship loop on a control token and fail the
+    coherence gate twice. The fix that rescued it was raising --token-embedding-type."""
+    import importlib, json, sys, os, tempfile
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    A = importlib.import_module("pollard_automap")
+    scan = {"kinds": [
+        {"kind": "token_embd.weight", "kurtosis": 17.9, "crest": 378.0},
+        {"kind": "output.weight",     "kurtosis": 11.2, "crest": 190.0},
+        {"kind": "attn_v.weight",     "kurtosis": 3.6,  "crest": 28.0},
+        {"kind": "ffn_up.weight",     "kurtosis": 0.7,  "crest": 27.0},   # below floor: untouched
+    ]}
+    f = os.path.join(tempfile.mkdtemp(), "scan.json")
+    json.dump(scan, open(f, "w"))
+    rules, notes, lift = A.fragile_rules(f, "iq2_kt")
+
+    joined = ",".join(rules)
+    assert "token_embd" not in joined, f"token_embd must not take a custom-q rule: {joined}"
+    assert "output" not in joined, f"output must not take a custom-q rule: {joined}"
+    assert lift.get("token_embd") == "Q8_0", f"a kurtosis-17.9 embedding must be raised: {lift}"
+    assert lift.get("output") == "Q8_0", f"a kurtosis-11.2 output must be raised: {lift}"
+    assert any("attn_v" in r for r in rules), "an ordinary fragile kind should get a protect rule"
+    assert not any("ffn_up" in r for r in rules), "a low-kurtosis kind must be left alone"
+
+
+def test_every_entry_point_names_a_module_that_installs():
+    """`pollard-trellis` was declared in [project.scripts] and never added to py-modules, so pip
+    installed a command with no module behind it -- ModuleNotFoundError on first use, and only
+    for people who installed rather than working in a checkout."""
+    import tomllib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    d = tomllib.loads((root / "pyproject.toml").read_text())
+    st = d["tool"]["setuptools"]
+    shipped = set(st.get("py-modules") or []) | set(st.get("packages") or [])
+    missing = []
+    for cmd, target in d["project"]["scripts"].items():
+        mod = target.split(":")[0]
+        top = mod.split(".")[0]
+        if top not in shipped:
+            missing.append(f"{cmd} -> {mod}")
+    assert not missing, ("entry points whose module does not install:\n  "
+                         + "\n  ".join(sorted(missing)))
+
+
+def test_every_tool_in_the_tree_installs():
+    """A tool that exists but is not packaged is invisible to everyone who pip installs."""
+    import tomllib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    d = tomllib.loads((root / "pyproject.toml").read_text())
+    declared = set(d["tool"]["setuptools"].get("py-modules") or [])
+    on_disk = {p.stem for p in (root / "tools").glob("pollard_*.py")}
+    assert not (on_disk - declared), \
+        "in tools/ but never installed: " + ", ".join(sorted(on_disk - declared))
