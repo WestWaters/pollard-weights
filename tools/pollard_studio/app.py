@@ -409,6 +409,33 @@ class Api:
         kind = "gguf" if str(path).endswith(".gguf") else "safetensors"
         return runtimes.for_build(kind, lane)
 
+    def _runtime_for_build(self, gguf: str) -> str | None:
+        """Switch to a runtime that can actually OPEN this file, before trying to load it.
+
+        Pollard already knows the answer -- pollard-ggufcheck reads it off the tensor types -- but
+        Studio defaulted to stock llama.cpp and never asked. Chatting with a trellis build then
+        launched the one runtime that cannot load it, and the refusal surfaced as the app giving
+        up with no reason. Returns the runtime it moved to, or None if it stayed put.
+        """
+        if not str(gguf).endswith(".gguf"):
+            return None
+        try:
+            sys.path.insert(0, str(runner.tools_dir()))
+            from pollard_ggufcompat import runtime_of
+            verdict, _ = runtime_of(gguf, offline=True)
+        except Exception:
+            return None                      # never block a chat on a header read
+        want = "ik_llama" if verdict in ("ik_llama", "fork") else None
+        if not want or self.server.name == want:
+            return None
+        try:
+            probe = runtimes.Runtime(want, ngl=self.server.ngl, ctx=self.server.ctx)
+        except ValueError:
+            return None
+        self.server.stop()
+        self.server = probe
+        return want
+
     def chat(self, gguf: str, prompt: str, max_tokens: int = 256,
              temperature: float = 0.7) -> dict:
         """Generate once, and check the result for the failures metrics cannot see.
@@ -416,13 +443,15 @@ class Api:
         A build can hold its perplexity and still loop forever, never halt, or open a reasoning
         block it never closes. That only shows up when you make it generate.
         """
+        switched = self._runtime_for_build(gguf)
         up = self.server.ensure(gguf)
         if not up["ok"]:
-            return {"ok": False, "error": up["error"]}
+            return {"ok": False, "error": up["error"], "runtime": self.server.name}
         r = self.server.complete(prompt, max_tokens, temperature)
         if not r["ok"]:
             return r
         return {"ok": True, "text": r["text"], "tokens": r["tokens"],
+                "runtime": self.server.name, "switched": switched,
                 "coherence": coherence.analyse(r["text"], int(max_tokens), r["stop_reason"])}
 
     def server_status(self) -> dict:
@@ -440,6 +469,7 @@ class Api:
             "What is 17 * 24? Show your working, then give the answer.",
             "List three uses for a paperclip.",
         ]
+        self._runtime_for_build(gguf)
         up = self.server.ensure(gguf)
         if not up["ok"]:
             return {"pass": False, "reason": up["error"]}

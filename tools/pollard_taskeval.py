@@ -44,6 +44,19 @@ import subprocess
 import sys
 import time
 
+#: lm-eval marks these UNSAFE_CODE: scoring them means EXECUTING code the model wrote. It
+#: refuses to run them without an explicit opt-in, and it aborts the WHOLE invocation rather than
+#: skipping them -- so one code task in a nine-task suite costs all nine. `bonsai` and `core` both
+#: contain two, which is why --allow-code-exec exists rather than the flag being buried.
+UNSAFE_CODE_TASKS = {"humaneval", "humaneval_plus", "mbpp", "mbpp_plus"}
+
+#: lm-eval grades those two with a pass@k metric that forks and uses POSIX signals for its
+#: execution timeout, so on Windows it raises `NotImplementedError: This metric is currently not
+#: supported on Windows` -- after generation, which is the expensive half. Nothing we pass fixes
+#: it; the tasks have to be scored on a POSIX box.
+CODE_METRIC_POSIX_ONLY = sys.platform == "win32"
+
+
 SUITES = {
     # minutes, for checking a rung is sane before spending hours on it
     "quick": ["gsm8k", "ifeval"],
@@ -117,8 +130,25 @@ def chat_model(path: str) -> bool:
         return False
 
 
+#: the served model's own stdout+stderr. Written next to wherever taskeval was run.
+_SERVER_LOG = "taskeval-server.log"
+
+
+def _server_tail(n: int = 12) -> str:
+    """The last few lines the server managed to say, for an error message that can be acted on."""
+    try:
+        with open(_SERVER_LOG, encoding="utf-8", errors="replace") as f:
+            lines = [l.rstrip() for l in f if l.strip()]
+    except OSError:
+        return f"  (no {_SERVER_LOG})"
+    if not lines:
+        return f"  ({_SERVER_LOG} is empty)"
+    return f"  last {min(n, len(lines))} line(s) of {_SERVER_LOG}:\n" + \
+           "\n".join("    " + l for l in lines[-n:])
+
+
 @contextlib.contextmanager
-def served(gguf: str, ngl: str, port: int, ctx: int):
+def served(gguf: str, ngl: str, port: int, ctx: int, server: str | None = None):
     """Host a GGUF on llama-server for the duration, and yield its base_url.
 
     lm-eval's HF backend loads a GGUF by DEQUANTIZING it, so a 5.9GB build becomes ~55GB of fp32 in
@@ -128,7 +158,11 @@ def served(gguf: str, ngl: str, port: int, ctx: int):
     talks to it over HTTP."""
     import urllib.request
     from pollard_calc import find_llama_bin
-    binsrv = find_llama_bin("llama-server") or "llama-server"
+    # An explicit --llama-server wins outright. It has to: find_llama_bin prefers
+    # $POLLARD_HOME/bin over PATH, so on a box that keeps a stock llama.cpp there, a trellis
+    # build (IQ*_KT is ggml type >= 43, which stock caps out below) can never be scored -- the
+    # stock server refuses the file and no ordering of PATH changes which binary is chosen.
+    binsrv = server or find_llama_bin("llama-server") or "llama-server"
     # --jinja: apply the model's OWN chat template. Without it an instruct model is scored as a
     # base model -- it never reaches its end-of-turn token, runs past the answer, and the harness
     # scrapes a stop string out of the overrun. Every generative task loses points to that, and
@@ -139,13 +173,18 @@ def served(gguf: str, ngl: str, port: int, ctx: int):
     cmd = [binsrv, "-m", gguf, "--host", "127.0.0.1", "--port", str(port),
            "-ngl", str(ngl), "-c", str(ctx), "--jinja",
            "--reasoning-format", "deepseek"]
-    print(f"   serving: {' '.join(os.path.basename(c) for c in cmd[:3])} ... -ngl {ngl}", flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"   serving: {binsrv} ... -ngl {ngl}", flush=True)
+    # NOT DEVNULL. A server that dies on load says exactly why ("invalid ggml type 153",
+    # "failed to allocate", a missing DLL); discarding it leaves only "exited (1)" and turns a
+    # one-line diagnosis into an afternoon.
+    log = open(_SERVER_LOG, "w", encoding="utf-8", errors="replace")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     base = f"http://127.0.0.1:{port}"
     try:
         for _ in range(600):                                   # a big model takes a while to load
             if proc.poll() is not None:
-                raise SystemExit(f"llama-server exited ({proc.returncode}) before serving {gguf}")
+                raise SystemExit(f"llama-server exited ({proc.returncode}) before serving "
+                                 f"{gguf}\n{_server_tail()}")
             try:
                 with urllib.request.urlopen(base + "/health", timeout=2) as r:
                     if r.status == 200:
@@ -153,9 +192,10 @@ def served(gguf: str, ngl: str, port: int, ctx: int):
             except Exception:
                 time.sleep(1)
         else:
-            raise SystemExit(f"llama-server never became ready for {gguf}")
+            raise SystemExit(f"llama-server never became ready for {gguf}\n{_server_tail()}")
         yield base
     finally:
+        log.close()
         proc.terminate()
         try:
             proc.wait(timeout=30)
@@ -165,7 +205,7 @@ def served(gguf: str, ngl: str, port: int, ctx: int):
 
 def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_dir: str,
         harness: str = "lm_eval", serve: bool = True, ngl: str = "99", port: int = 8080,
-        ctx: int = 4096) -> dict:
+        ctx: int = 4096, server: str | None = None, allow_code: bool = False) -> dict:
     """Run one harness over one model. lmms-eval takes the same shape of arguments as lm-eval,
     which is why a single runner covers both: the difference is the module and the model wrapper."""
     backend, margs = model_args(path)
@@ -173,35 +213,74 @@ def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_di
         # lmms-eval drives a vision-language model, so the wrapper differs from lm-eval's plain hf
         backend = "hf-multimodal" if not path.endswith(".gguf") else "hf-multimodal"
 
-    def _invoke(backend, margs, extra=()):
+    # lm-eval evaluates a --tasks list in ONE process and aborts the lot if any single task will
+    # not run -- an unsafe-code gate, a POSIX-only metric, a missing extra. A nine-task suite then
+    # reports nothing because of one task. So the coding tasks are invoked SEPARATELY from the
+    # rest: whatever happens to one group, the other still produces its numbers.
+    code_tasks = [x for x in tasks if x in UNSAFE_CODE_TASKS]
+    other_tasks = [x for x in tasks if x not in UNSAFE_CODE_TASKS]
+    skipped: list[str] = []
+    if code_tasks and not allow_code:
+        skipped = code_tasks
+        print(f"   (!) skipping {', '.join(code_tasks)}: they EXECUTE code the model wrote. "
+              f"Pass --allow-code-exec to score them.", file=sys.stderr, flush=True)
+    elif code_tasks and CODE_METRIC_POSIX_ONLY:
+        skipped = code_tasks
+        print(f"   (!) skipping {', '.join(code_tasks)}: lm-eval's pass@k grader is POSIX-only "
+              f"and raises NotImplementedError on Windows, after generation. Score these on a "
+              f"Linux or macOS box.", file=sys.stderr, flush=True)
+    if skipped:
+        code_tasks = []
+
+    groups = [g for g in (other_tasks, code_tasks) if g]
+
+    def _invoke(backend, margs, extra=(), subset=None):
+        subset = subset or tasks
+        is_code = bool(UNSAFE_CODE_TASKS.intersection(subset))
         cmd = [sys.executable, "-m", harness, "--model", backend, "--model_args", margs,
-               "--tasks", ",".join(tasks), "--batch_size", batch, "--output_path", out_dir]
+               "--tasks", ",".join(subset), "--batch_size", batch, "--output_path", out_dir]
         if harness == "lm_eval" and os.path.isdir(TASK_DIR):
             cmd += ["--include_path", TASK_DIR]      # Pollard's own tasks (e.g. aime26)
+        if is_code and allow_code and harness == "lm_eval":
+            cmd += ["--confirm_run_unsafe_code"]
         cmd += list(extra)
         if limit:
             cmd += ["--limit", str(limit)]
         print(f"   $ {' '.join(cmd[2:])}", flush=True)
-        return subprocess.run(cmd, capture_output=True, text=True)
+        env = dict(os.environ)
+        if is_code and allow_code:
+            # the CLI flag gets the task past lm-eval's gate; the grader itself checks this
+            env["HF_ALLOW_CODE_EVAL"] = "1"
+        return subprocess.run(cmd, capture_output=True, text=True, env=env)
 
     # A GGUF is scored ON the quantized kernel, served, not dequantized into RAM through the HF
     # backend -- otherwise the number describes an fp32 copy of the build rather than the build.
+    results = []                                 # (subset, CompletedProcess) per group
     if serve and harness == "lm_eval" and path.endswith(".gguf"):
-        with served(path, ngl, port, ctx) as base:
-            if chat_model(path):
-                # lm-eval's `gguf` backend posts to /v1/completions -- the RAW endpoint, no
-                # template. local-chat-completions posts to /v1/chat/completions, where the
-                # server applies the model's own template and the model stops on its own
-                # end-of-turn token.
-                r = _invoke("local-chat-completions",
-                            f"base_url={base}/v1/chat/completions,"
-                            f"model=pollard,num_concurrent=1,tokenized_requests=False",
-                            ("--apply_chat_template",))
-            else:
-                r = _invoke("gguf", f"base_url={base}")
+        with served(path, ngl, port, ctx, server) as base:
+            for subset in groups:
+                if chat_model(path):
+                    # lm-eval's `gguf` backend posts to /v1/completions -- the RAW endpoint, no
+                    # template. local-chat-completions posts to /v1/chat/completions, where the
+                    # server applies the model's own template and the model stops on its own
+                    # end-of-turn token.
+                    results.append((subset, _invoke(
+                        "local-chat-completions",
+                        f"base_url={base}/v1/chat/completions,"
+                        f"model=pollard,num_concurrent=1,tokenized_requests=False",
+                        ("--apply_chat_template",), subset)))
+                else:
+                    results.append((subset, _invoke("gguf", f"base_url={base}", (), subset)))
     else:
-        r = _invoke(backend, margs, ("--device", device))
-    if r.returncode != 0:
+        for subset in groups:
+            results.append((subset, _invoke(backend, margs, ("--device", device), subset)))
+
+    for subset, r in results:
+        if r.returncode == 0:
+            continue
+        # A group that failed is reported and survived -- unless it is the only group, in which
+        # case there is nothing to report and the old hard exit is still the right answer.
+        fatal = len(results) == 1
         # The last N lines of a harness that logs progress are all INFO, so the real cause scrolls
         # past. Pull the lines that look like a failure first, and only fall back to the tail.
         blob = ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines()
@@ -209,8 +288,12 @@ def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_di
                 "No module", "out of memory", "Killed")
         hits = [l for l in blob if any(k in l for k in keys)][-10:]
         detail = "\n".join(hits or blob[-10:]) or "(no output at all -- likely killed by the OS)"
-        raise SystemExit(f"{harness} failed on {os.path.basename(path)} (exit {r.returncode}):\n"
-                         f"{detail}")
+        msg = (f"{harness} failed on {os.path.basename(path)} for "
+               f"{', '.join(subset)} (exit {r.returncode}):\n{detail}")
+        if fatal:
+            raise SystemExit(msg)
+        print(f"   (!) {msg}\n       the other task group(s) still ran; their numbers stand.",
+              file=sys.stderr, flush=True)
     return collect(out_dir)
 
 
@@ -261,6 +344,16 @@ def main() -> None:
     ap.set_defaults(serve=True)
     ap.add_argument("--ngl", default="99", help="GPU layers for the served GGUF (default all)")
     ap.add_argument("--port", type=int, default=8080, help="llama-server port (--ref uses port+1)")
+    ap.add_argument("--allow-code-exec", dest="allow_code", action="store_true",
+                    help="run the coding tasks (humaneval*/mbpp*), which EXECUTE code the model "
+                         "wrote, on this machine. Off by default. Without it lm-eval refuses the "
+                         "entire invocation -- not just those tasks -- so a suite containing one "
+                         "reports nothing at all.")
+    ap.add_argument("--llama-server", dest="llama_server", default=None,
+                    help="llama-server binary to host the GGUF with. Point this at an ik_llama "
+                         "build to score a trellis (IQ*_KT) build: those types are outside stock "
+                         "llama.cpp's range, and a stock server on $POLLARD_HOME/bin would "
+                         "otherwise be picked and refuse the file.")
     ap.add_argument("--ctx", type=int, default=4096, help="server context size")
     ap.add_argument("--out", default="taskeval", help="directory for lm-eval's raw output")
     a = ap.parse_args()
@@ -287,10 +380,12 @@ def main() -> None:
     print(f"\n== pollard-taskeval :: {len(tasks)} task(s), limit={a.limit or 'full'}\n")
 
     got = run(a.model, tasks, a.limit, a.device, a.batch_size,
-              os.path.join(a.out, "model"), harness, a.serve, a.ngl, a.port, a.ctx)
+              os.path.join(a.out, "model"), harness, a.serve, a.ngl, a.port, a.ctx,
+              a.llama_server, a.allow_code)
     # a second server would collide on the port, so the reference gets its own
     ref = run(a.ref, tasks, a.limit, a.device, a.batch_size,
-              os.path.join(a.out, "ref"), harness, a.serve, a.ngl, a.port + 1, a.ctx) if a.ref else {}
+              os.path.join(a.out, "ref"), harness, a.serve, a.ngl, a.port + 1, a.ctx,
+              a.llama_server, a.allow_code) if a.ref else {}
 
     print(f"\n  {'task':30s} {'score':>8s}" + (f" {'ref':>8s} {'retention':>10s}" if ref else ""))
     cats: dict[str, list[float]] = {}
