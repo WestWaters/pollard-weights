@@ -120,7 +120,7 @@ def test_an_instruct_model_is_scored_through_a_chat_turn():
 def test_a_base_model_still_uses_the_raw_endpoint():
     """A base model has no template; forcing one on it would be the same bug in reverse."""
     src = _taskeval_src()
-    seg = src[src.index("if serve and harness"):src.index("    if r.returncode != 0:")]
+    seg = src[src.index("if serve and harness"):src.index("    for subset, r in results:")]
     assert "chat_model(path)" in seg, "the backend is not chosen from the model"
     assert '_invoke("gguf"' in seg, "the raw path must remain for base models"
 

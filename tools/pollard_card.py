@@ -268,14 +268,20 @@ def _fmt_num(v, nd=4):
     return f"{float(v):.{nd}f}".rstrip("0").rstrip(".") if isinstance(v, (int, float)) else "--"
 
 
-def auto_note(idx, n, ppl, f16_ppl, tag):
+def auto_note(idx, n, ppl, f16_ppl, tag, rec_idx=None):
     """The one-line verdict a reader wants per rung: what it costs against f16, and which to take.
 
     Said in PERCENT, not raw PPL, and earned rather than assigned by position. "near-lossless"
     meant +0.08 on a 11.28 baseline for one model and would have meant +3.57 on 23.04 for the next
-    -- 15% worse, printed as near-lossless, on a published card."""
+    -- 15% worse, printed as near-lossless, on a published card.
+
+    `rec_idx` is the ONE rung that earned "recommended default" (see pick_recommended). Every
+    middle rung used to claim it, so a six-rung ladder shipped four recommended defaults and the
+    word stopped meaning anything.
+    """
     if not (ppl and f16_ppl):
-        return {0: "smallest"}.get(idx, "recommended default" if idx < n - 1 else "largest")
+        base = {0: "smallest"}.get(idx, "largest" if idx == n - 1 else "")
+        return ("recommended default" if idx == rec_idx else base)
     pct = (float(ppl) - float(f16_ppl)) / float(f16_ppl) * 100.0
     if pct <= 1.0:
         cost = "near-lossless"
@@ -283,11 +289,26 @@ def auto_note(idx, n, ppl, f16_ppl, tag):
         cost = f"+{pct:.1f}% vs f16"
     else:
         cost = f"+{pct:.0f}% vs f16"
+    if idx == rec_idx:
+        return f"recommended default -- {cost}"
     if idx == 0:
         return f"smallest -- {cost}"
     if idx == n - 1:
         return f"highest fidelity here -- {cost}"
-    return f"recommended default -- {cost}"
+    return cost
+
+
+def pick_recommended(rows):
+    """Which single rung is THE recommendation, earned from the measurement.
+
+    `rows` is [(idx, ppl_or_None)] smallest-first. The pick is the best measured PPL; a rung with
+    no measurement cannot be recommended, because the recommendation would then be a guess about
+    the one thing this card exists to state. If nothing is measured, nothing is recommended.
+    """
+    scored = [(i, float(p)) for i, p in rows if p]
+    if not scored:
+        return None
+    return min(scored, key=lambda x: x[1])[0]
 
 
 def detect_card_facts(model_id, builds_dir, cfg, builds=()):
@@ -500,6 +521,14 @@ def main():
     lane_word = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
                  "mx": " for Blackwell/vLLM", "exl3": " for exllamav3"}.get(primary, "")
     # ---- frontmatter + hero
+    # Both of these name a file that sits at the ROOT of the published repo, so only the basename
+    # can ever be correct on the card. Accepting a path and printing it verbatim put
+    # "C:\pollard\phome\mmproj-....gguf" in front of every reader and told them to pass it to
+    # --mmproj, which works on exactly one machine on earth.
+    if a.mmproj:
+        a.mmproj = os.path.basename(a.mmproj.rstrip("/\\"))
+    if a.imatrix_file:
+        a.imatrix_file = os.path.basename(a.imatrix_file.rstrip("/\\"))
     ptag = detect_pipeline_tag(base_model, cfg, a.pipeline_tag, a.mmproj, a.input_support)
     out = [frontmatter(base_model, lic, lanes, mtype, account, ptag), "",
            f"# {name} -- Pollard", ""]
@@ -509,9 +538,14 @@ def main():
                 "> The smallest rung here; larger, higher-fidelity rungs are listed below."]
         if primary == "gguf":          # the format size table is GGUF-specific
             out += [">", "> | format | this model's size |", "> |---|---:|", f"> | f16 | {f16_gb:.2f} GB |"]
+            # If the repo SHIPS this format, quote the real file. An estimated "~22.40 GB" three
+            # lines above the shipped 22.43 GB reads as two different files.
+            shipped = {str(x.get("tag", "")).upper(): (x.get("bytes") or 0) / 1e9 for x in builds}
             for fmt, mult in FMT_BPP.items():
                 if fmt in ("Q8_0", "Q6_K", "Q4_K_M"):
-                    out.append(f"> | {fmt} | ~{pb*mult:.2f} GB |")
+                    real = shipped.get(fmt.upper())
+                    out.append(f"> | {fmt} | {real:.2f} GB |" if real
+                               else f"> | {fmt} | ~{pb*mult:.2f} GB |")
             out.append(f"> | **PollardMix (this repo's {smallest.get('tag','best')})** | **{small_gb:.2f} GB** |")
         out.append("")
     out += [f"Pollard builds of [{base_model}](https://huggingface.co/{base_model}) made with "
@@ -585,7 +619,10 @@ def main():
             rec = "" if (is_rec and note) else (" **Recommended.**" if is_rec else "")
             if is_rec and note:
                 note = f"**{note}**"
-            head = f"- **~{gb + 2:.0f} GB RAM / VRAM** -> **`{b.get('tag','')}`** ({gb:.2f} GB)."
+            # One decimal, not :.0f. Rounding to whole GB printed 6.53, 7.25 and 7.36 GB as the
+            # same "~9 GB" budget, and told a 9 GB machine it could hold a 7.36 GB build -- the
+            # 2 GB of context headroom this line exists to add, rounded away.
+            head = f"- **~{gb + 2:.1f} GB RAM / VRAM** -> **`{b.get('tag','')}`** ({gb:.2f} GB)."
             # This list is where people actually pick a file, so a rung that stock llama.cpp cannot
             # open has to say so here too -- not only in the table further down.
             rtb = runtimes.get(b.get("path"))
@@ -607,14 +644,26 @@ def main():
                   for b in builds)
     tps_h = " tok/s |" if has_tps else ""
     tps_s = "---:|" if has_tps else ""
+    # Top-1 agreement: of the tokens the f16 would have picked, how many does this rung still pick.
+    # llama-perplexity reports it as "Same top p" on every --kl-divergence run, so it is measured
+    # anywhere a KLD is -- it was simply never carried onto the card. It is the figure a reader
+    # understands without knowing what a nat of divergence is, which is why people keep asking for it.
+    has_top1 = any((results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("top1")
+                   for b in builds)
+    t1_h = " Top-1 agree |" if has_top1 else ""
+    t1_s = "---:|" if has_top1 else ""
     # "runs in" appears only when the ladder is actually mixed -- a uniform ladder says it once
     # in the line above the table instead of repeating itself on every row.
     mixed = bool(ik_builds) and len(ik_builds) != len(runtimes)
     rt_h = " runs in |" if mixed else ""
     rt_s = "---|" if mixed else ""
-    out += [f"| file | PPL | size |{tps_h} Mean KLD |{rt_h} notes |",
-            f"|---|---:|---:|{tps_s}---:|{rt_s}---|"]
-    for _i, b in enumerate(sorted(builds, key=lambda x: (x.get("bytes") or 0))):
+    out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h} notes |",
+            f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}---|"]
+    _ordered = sorted(builds, key=lambda x: (x.get("bytes") or 0))
+    _rec = pick_recommended(
+        [(i, results.get(b.get("name", ""), results.get(b.get("tag", ""), {})).get("ppl"))
+         for i, b in enumerate(_ordered)])
+    for _i, b in enumerate(_ordered):
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','--')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
@@ -623,9 +672,15 @@ def main():
         rt_c = (" " + rt_lbl + " |") if mixed else ""
         _ppl, _kld = r.get("ppl"), r.get("kld")
         note = r.get("note") or auto_note(_i, len(builds), _ppl, results.get("_f16_ppl"),
-                                          b.get("tag", ""))
+                                          b.get("tag", ""), _rec)
+        t1 = r.get("top1")
+        t1_c = (f" {float(t1):.2f}% |" if t1 else " -- |") if has_top1 else ""
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{_fmt_num(_kld)} |{rt_c} {note} |")
+                   f"{_fmt_num(_kld)} |{t1_c}{rt_c} {note} |")
+    if has_top1:
+        out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
+                "one the f16 would have picked (llama-perplexity's `Same top p`). Higher is closer "
+                "to the original model._"]
     if has_tps:
         hw = results.get("_hw")
         out.append("")
