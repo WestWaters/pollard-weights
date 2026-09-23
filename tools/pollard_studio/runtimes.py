@@ -26,6 +26,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -46,6 +47,7 @@ SPECS: dict[str, dict] = {
     },
     "ik_llama": {
         "kind": LOCAL, "exe": "llama-server", "env_exe": "IK_LLAMA_SERVER", "accepts": ["gguf"],
+        "path_marker": "ik_llama",
         "note": "ik_llama fork — required for IQ*_KT trellis atoms",
         "args": lambda m, port, ngl, ctx: ["-m", m, "--port", str(port), "--host", "127.0.0.1",
                                            "-c", str(ctx), "-ngl", str(ngl), "--log-disable"],
@@ -85,7 +87,15 @@ def _exe(spec: dict) -> str | None:
         p = os.environ.get(var)
         if p and Path(p).exists():
             return p
-    return shutil.which(spec["exe"]) if spec.get("exe") else None
+    found = shutil.which(spec["exe"]) if spec.get("exe") else None
+    # A fork whose binary has the SAME NAME as the stock one cannot be resolved off PATH: the
+    # stock llama-server answers to `which llama-server` and then refuses every trellis atom,
+    # which reads as "the build is broken" rather than "wrong runtime". Only accept a path that
+    # actually names the fork; otherwise say it is missing so the caller can set the env var.
+    marker = spec.get("path_marker")
+    if found and marker and marker not in Path(found).as_posix().lower():
+        return None
+    return found
 
 
 def _env_first(names) -> str | None:
@@ -130,14 +140,20 @@ def for_build(kind: str, lane: str | None = None) -> list[str]:
     want = "gguf" if kind == "gguf" else "safetensors"
     local = [n for n, s in SPECS.items()
              if s["kind"] == LOCAL and want in s.get("accepts", [])]
-    if want == "gguf" and lane and "KT" in str(lane).upper():
+    trellis = want == "gguf" and lane and "KT" in str(lane).upper()
+    if trellis:
         local.sort(key=lambda n: n != "ik_llama")          # trellis: the fork first
     remote = [n for n, s in SPECS.items() if s["kind"] == REMOTE]
     # Rank, do not filter. Hiding a runtime the user has not installed yet hides the fact that
     # it is an option at all -- the UI marks what is missing and how to get it.
     ready = {r["name"] for r in available() if r["ready"]}
     cands = local + remote
-    return sorted(cands, key=lambda n: (n not in ready, cands.index(n)))
+    # REQUIRED outranks READY. For a trellis build stock llama.cpp is not a fallback -- it cannot
+    # open the file at all -- so ranking it above a not-yet-installed ik_llama points the user at
+    # the runtime guaranteed to fail and hides the one that works.
+    def rank(n):
+        return (not (trellis and n == "ik_llama"), n not in ready, cands.index(n))
+    return sorted(cands, key=rank)
 
 
 def _free_port() -> int:
@@ -194,15 +210,22 @@ class Runtime:
 
         self.port = _free_port()
         argv = [exe] + self.spec["args"](model, self.port, self.ngl, self.ctx)
-        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        # NOT DEVNULL. A server that dies on load says exactly why -- "invalid ggml type 153",
+        # "failed to allocate", a missing dylib -- and discarding it leaves the UI showing
+        # "exited while loading" with no cause, which looks like the BUILD is broken.
+        self._log = Path(tempfile.gettempdir()) / f"pollard-studio-{self.name}.log"
+        logf = open(self._log, "w", encoding="utf-8", errors="replace")
+        self.proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, start_new_session=True)
+        logf.close()
         self.model = model
 
         health = self.spec.get("health", "/health")
         deadline = time.time() + (timeout or self.spec.get("boot", 300))
         while time.time() < deadline:
             if not self.running:
-                return {"ok": False, "error": f"{self.name} exited while loading"}
+                return {"ok": False,
+                        "error": f"{self.name} exited while loading. {self._why()}"}
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{self.port}{health}", timeout=2) as r:
@@ -212,6 +235,24 @@ class Runtime:
                 time.sleep(0.4)
         self.stop()
         return {"ok": False, "error": f"{self.name} did not come up in time"}
+
+    def _why(self, n: int = 6) -> str:
+        """The server's own last words, with the one we can name called out.
+
+        A trellis atom in a stock runtime is the common case and it has a specific fix, so it is
+        translated rather than handed over as a raw ggml error.
+        """
+        try:
+            lines = [l.rstrip() for l in open(self._log, encoding="utf-8",
+                                              errors="replace") if l.strip()]
+        except (OSError, AttributeError):
+            return "(no server log)"
+        blob = "\n".join(lines)
+        if "invalid ggml type" in blob or "should be in [0, 43)" in blob:
+            return ("This build carries ik_llama-only atoms (IQ*_KT) and stock llama.cpp caps "
+                    "ggml types at 42. Switch the runtime to ik_llama, or set IK_LLAMA_SERVER "
+                    "to an ik_llama llama-server.")
+        return "Last lines: " + " | ".join(lines[-n:]) if lines else "(server log empty)"
 
     def stop(self) -> None:
         if self.proc is None:
