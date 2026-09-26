@@ -79,11 +79,71 @@
     catch (e) { S.cooks = [{ name: "Mario · WestWaters", role: "Founder · Pollard", lanes: LANES, hardware: "Apple Silicon · RTX Blackwell", status: "cooking", blurb: "The method, the shelf, every lane." }]; }
   }
 
+
+  /* ── the water: the same shader pollard.app runs, behind the shell ─────── */
+  const VS = `attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}`;
+  const FS = `precision highp float;uniform vec2 u_res;uniform float u_time;uniform vec3 u_cy,u_vi,u_mg,u_am;
+vec3 pal(float u){u=fract(u);vec3 c=mix(u_cy,u_vi,smoothstep(0.,.3,u));c=mix(c,u_mg,smoothstep(.3,.6,u));
+c=mix(c,u_am,smoothstep(.6,.85,u));return mix(c,u_cy,smoothstep(.88,1.,u));}float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);}
+float fbm(vec2 p){float v=0.,a=.5;mat2 m=mat2(1.6,1.2,-1.2,1.6);for(int i=0;i<5;i++){v+=a*noise(p);p=m*p;a*=.5;}return v;}
+float water(vec2 p,float t){float h=fbm(p*1.3+vec2(t*.04,-t*.025));h+=.22*fbm(p*2.8-vec2(t*.06,t*.03));
+ vec2 c1=vec2(.35,-.25),c2=vec2(-.45,-.4);
+ h+=.06*sin(length(p-c1)*38.-t*1.6)*exp(-length(p-c1)*1.6);
+ h+=.05*sin(length(p-c2)*30.-t*1.3)*exp(-length(p-c2)*1.4);return h;}
+float yc(float x,float t){return .18*sin(x*2.4+t*.35)+.28*sin(x*1.1-t*.2);}
+vec2 ribbon(vec2 p,float t){float x=p.x;float y0=yc(x,t);float w=.13+.09*sin(x*1.9+t*.3+1.7);
+ float v=(p.y-y0)/w;float body=1.-smoothstep(.85,1.05,abs(v));
+ float k=v*5.5+.4*sin(x*6.+t*.8)+.25*sin(x*13.-t*.5);float lines=pow(abs(sin(k*3.14159)),10.);
+ lines*=.55+.9*noise(vec2(x*7.+t*.3,v*4.));
+ float g=body*(.35+1.2*lines);g*=smoothstep(-1.35,-.7,x)*(1.-smoothstep(.9,1.4,x));
+ float y2=-.05+.22*sin(x*1.6-t*.25+2.);float w2=.06+.03*sin(x*3.+t*.4);float v2=(p.y-y2)/w2;
+ float b2=1.-smoothstep(.8,1.05,abs(v2));float l2=pow(abs(sin((v2*6.+.4*sin(x*5.-t))*3.14159)),12.);
+ return vec2(g,v*.5+.5+x*.2);}
+void main(){vec2 uv=gl_FragCoord.xy/u_res;vec2 p=(gl_FragCoord.xy-.5*u_res)/u_res.y;float t=u_time;
+ float e=.004;vec2 wp=p*vec2(1.,2.2);float h=water(wp,t);
+ float hx=water(wp+vec2(e,0.),t)-h,hy=water(wp+vec2(0.,e),t)-h;vec3 n=normalize(vec3(-hx,-hy,e*3.));
+ vec3 vd=vec3(0.,0.,1.);vec3 col=mix(vec3(.004,.007,.016),vec3(.010,.022,.048),smoothstep(.3,-.6,p.y));
+ vec3 L1=normalize(vec3(.5,.8,.6)),L2=normalize(vec3(-.6,.3,.7));
+ float s1=pow(max(dot(reflect(-L1,n),vd),0.),34.),s2=pow(max(dot(reflect(-L2,n),vd),0.),22.);
+ float wm=mix(.05,1.,smoothstep(.35,-.4,p.y));s1*=wm;s2*=wm;
+ col+=vec3(.70,.92,1.)*s1*.42+vec3(.30,.55,1.)*s2*.22;
+ col+=.035*vec3(.3,.6,1.)*pow(max(dot(n,L2),0.),2.)*wm;
+ col*=1.-.9*dot(uv-.5,uv-.5);gl_FragColor=vec4(col,1.);}`;
+  let water = null;
+  function startWater(cv) {
+    if (water || !cv) return;
+    const gl = cv.getContext("webgl", { antialias: false, alpha: false }); if (!gl) return;
+    const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o);
+      if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) { console.warn(gl.getShaderInfoLog(o)); return null; } return o; };
+    const v = sh(gl.VERTEX_SHADER, VS), f = sh(gl.FRAGMENT_SHADER, FS); if (!v || !f) return;
+    const pr = gl.createProgram(); gl.attachShader(pr, v); gl.attachShader(pr, f); gl.linkProgram(pr); gl.useProgram(pr);
+    const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const a = gl.getAttribLocation(pr, "a"); gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+    const U = n => gl.getUniformLocation(pr, n);
+    const u = { res: U("u_res"), time: U("u_time"), cy: U("u_cy"), vi: U("u_vi"), mg: U("u_mg"), am: U("u_am") };
+    gl.uniform3f(u.cy, .24, .88, 1); gl.uniform3f(u.vi, .55, .36, .96); gl.uniform3f(u.mg, 1, .48, .88); gl.uniform3f(u.am, .88, .54, .16);
+    const size = () => { const d = .6; cv.width = (cv.clientWidth * d) | 0; cv.height = (cv.clientHeight * d) | 0; gl.viewport(0, 0, cv.width, cv.height); };
+    size(); window.addEventListener("resize", size);
+    const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const t0 = performance.now(); let n = 0;
+    water = { stop: false };
+    (function loop() {
+      if (water.stop) return;
+      if (!(n++ & 1) && !document.getElementById("simple").hidden) {        // 30 fps, and only while Simple is showing
+        gl.uniform2f(u.res, cv.width, cv.height); gl.uniform1f(u.time, (performance.now() - t0) / 1000); gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
+      if (!still) requestAnimationFrame(loop);
+    })();
+  }
+
   /* ── shell ───────────────────────────────────────────────────────────── */
   function frame() {
     const rail = [["fit", "Fit"], ["shelf", "Shelf"], ["request", "Request"], ["cooks", "Cooks"], ["docs", "Docs"]]
       .map(([k, l]) => `<button data-screen="${k}" aria-current="${k === S.screen}"><svg viewBox="0 0 24 24">${ICON[k]}</svg><span>${l}</span></button>`).join("");
     return `
+    <canvas class="s-water" id="s-water"></canvas>
     <div class="s-top">
       <div class="s-mark">POLLARD<small>STUDIO</small></div>
       <div class="s-right">
@@ -194,7 +254,7 @@ llama-cli -m Qwen3-8B-Pollard.gguf</div></div>
   /* ── render ──────────────────────────────────────────────────────────── */
   function render() {
     const root = $("#simple"); if (!root) return;
-    if (!root.dataset.built) { root.innerHTML = frame(); root.dataset.built = "1"; wire(); }
+    if (!root.dataset.built) { root.innerHTML = frame(); root.dataset.built = "1"; wire(); startWater($("#s-water")); }
     root.querySelectorAll(".s-rail button").forEach(b => b.setAttribute("aria-current", b.dataset.screen === S.screen));
     root.querySelectorAll(".screen").forEach(s => s.classList.toggle("on", s.id === "scr-" + S.screen));
     renderFit(); renderShelf(); renderCooks();
