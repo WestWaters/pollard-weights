@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import webview
@@ -655,6 +656,39 @@ class Api:
                 pass
             self._dl.update(active=False, error=str(e))
             self.run._emit(f"download {filename}: FAILED {e}")
+
+    _NET_OK = ("https://pollard.app/", "https://www.pollard.app/", "https://huggingface.co/")
+
+    def fetch_json(self, url: str) -> dict:
+        """GET JSON from pollard.app or the Hub for the Simple screens (cooks, quotes) -- the webview's
+        file:// origin cannot fetch cross-site itself, so it goes through here. Allow-listed hosts only."""
+        if not url.startswith(self._NET_OK):
+            return {"ok": False, "error": "host not allowed"}
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "pollard-studio", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return {"ok": True, "data": json.load(r)}
+        except Exception as e:                               # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    def post_json(self, url: str, data: dict) -> dict:
+        """POST JSON to pollard.app (the build-request form). Same allow-list."""
+        if not url.startswith(self._NET_OK):
+            return {"ok": False, "error": "host not allowed"}
+        try:
+            body = json.dumps(data).encode()
+            req = urllib.request.Request(url, data=body, method="POST",
+                                         headers={"User-Agent": "pollard-studio", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                txt = r.read().decode("utf-8", "replace")
+                try:
+                    return {"ok": True, "status": r.status, "data": json.loads(txt)}
+                except ValueError:
+                    return {"ok": True, "status": r.status, "data": txt}
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "status": e.code, "error": e.read().decode("utf-8", "replace")[:300]}
+        except Exception as e:                               # noqa: BLE001
+            return {"ok": False, "error": str(e)}
 
     def open_url(self, url: str) -> dict:
         """Links out of the panel (the site's request form) open in the user's browser, not the webview."""
