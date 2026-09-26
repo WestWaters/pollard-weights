@@ -913,3 +913,7 @@ td .mono, .kv .k.mono { font-family: var(--mono); font-size: 10px; }
 .faders { flex-wrap: wrap; row-gap: 14px; }
 .fader.dev .fl { max-width: 62px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                  text-align: center; }
+
+/* the Simple/Advanced switch lives with the window buttons */
+.hwb.mode { width: auto; padding: 0 10px; font: 600 10px var(--ui); letter-spacing: .14em; color: var(--ink-md); }
+.hwb.mode[aria-pressed="true"] { color: var(--gold-lo); }

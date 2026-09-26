@@ -2575,3 +2575,6 @@ if (window.pywebview) boot();
 else window.addEventListener("pywebviewready", boot);
 window.addEventListener("load", () => setTimeout(() => {
   if (!$("#wing").children.length) boot(); }, 300));
+
+// Simple mode (simple.js) reaches the instrument through these; script-scope const/let are not globals.
+window.S = S; window.R = R;

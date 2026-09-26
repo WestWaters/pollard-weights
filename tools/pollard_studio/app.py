@@ -20,8 +20,12 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
+import threading
+import time
+import urllib.request
 
 import webview
 
@@ -57,6 +61,113 @@ def load_manifest() -> list:
         return []
 
 
+_SHELF_CACHE = pathlib.Path.home() / ".cache/pollard-studio/shelf.json"
+_SHELF_TTL = 6 * 3600
+
+
+def _avail_gb() -> float | None:
+    """Memory that is free RIGHT NOW. Nameplate RAM lies once the OS and everything else take their cut."""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            pages = {}
+            for line in out.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    v = v.strip().rstrip(".")
+                    if v.isdigit():
+                        pages[k.strip()] = int(v)
+            free = pages.get("Pages free", 0) + pages.get("Pages inactive", 0) + pages.get("Pages speculative", 0)
+            return round(free * 16384 / 1e9, 1)
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return round(int(line.split()[1]) * 1024 / 1e9, 1)
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = _MS()
+            st.dwLength = ctypes.sizeof(_MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return round(st.ullAvailPhys / 1e9, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _shape_repo(repo_id: str, downloads: int, files: list[dict]) -> dict:
+    """One repo as the slabs want it -- the same shape pollard.app uses."""
+    short = repo_id.split("/")[1]
+    out = {"id": repo_id, "name": short.replace("-Pollard", ""), "dl": downloads, "vision": False, "lane": "gguf",
+           "moe": "MoE" if re.search(r"A\d+B|Ling", short, re.I) else "", "files": []}
+    for f in files:
+        name = f["name"]
+        if name.startswith("mmproj"):
+            out["vision"] = True
+            continue
+        if name.endswith(".safetensors"):
+            out["lane"] = "mlx"
+            out["files"].append({"q": "4bit", "gb": round(f["bytes"] / 1e9, 2), "ik": False, "file": name})
+            continue
+        if not name.endswith(".gguf"):
+            continue
+        q = name[:-5].split("-")[-1]
+        out["files"].append({"q": q, "gb": round(f["bytes"] / 1e9, 2), "ik": q.endswith("_KT"), "file": name})
+    out["files"].sort(key=lambda x: x["gb"])
+    return out
+
+
+def _shelf() -> list[dict]:
+    """The PollardWeights org from the Hub, cached. Offline -> whatever was cached, else empty."""
+    try:
+        if _SHELF_CACHE.exists() and time.time() - _SHELF_CACHE.stat().st_mtime < _SHELF_TTL:
+            return json.loads(_SHELF_CACHE.read_text())
+    except Exception:
+        pass
+    shelf: list[dict] = []
+    try:
+        def get(url: str):
+            req = urllib.request.Request(url, headers={"User-Agent": "pollard-studio"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.load(r)
+        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100"):
+            try:
+                tree = get(f"https://huggingface.co/api/models/{m['id']}/tree/main")
+            except Exception:
+                tree = []
+            files = [{"name": t["path"], "bytes": (t.get("lfs") or {}).get("size") or t.get("size") or 0} for t in tree]
+            shaped = _shape_repo(m["id"], m.get("downloads", 0), files)
+            if shaped["files"]:
+                shelf.append(shaped)
+        shelf.sort(key=lambda r: -r["dl"])
+        _SHELF_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _SHELF_CACHE.write_text(json.dumps(shelf))
+    except Exception:
+        try:
+            return json.loads(_SHELF_CACHE.read_text())
+        except Exception:
+            return []
+    return shelf
+
+
+def _local_index(ws: dict) -> dict:
+    """repo/file -> path for every shelf rung already in the workspace, so INSTALL can say INSTALLED."""
+    out = {}
+    for m in ws.get("models", []):
+        for b in m.get("builds", []):
+            p = pathlib.Path(b.get("path", ""))
+            if p.suffix in (".gguf", ".safetensors"):
+                out[f"PollardWeights/{p.parent.name}/{p.name}"] = str(p)
+    return out
+
+
 class Api:
     """The JS side calls these. Deliberately thin: this is a front end over the CLI."""
 
@@ -69,6 +180,7 @@ class Api:
         self._ws: dict | None = None
         self._remote: dict = {}          # path -> the box that holds it
         self.selected: str | None = None
+        self._dl: dict | None = None     # the one Simple-mode download in flight
 
     # -- data ------------------------------------------------------------------------------------
     def state(self, rescan: bool = False) -> dict:
@@ -303,7 +415,8 @@ class Api:
             free = round(shutil.disk_usage(self._ws["home"] if self._ws else ".").free / 1e9, 1)
         except Exception:
             pass
-        return {"ram_gb": gb, "cpus": os.cpu_count(),
+        avail = _avail_gb()
+        return {"ram_gb": gb, "cpus": os.cpu_count(), "avail_gb": avail,
                 # a sane place to start: most of the machine, leaving the OS room
                 "suggest_target_gb": max(2, int(gb * 0.75)) if gb else 16,
                 "suggest_reserve_gb": max(1, round(gb * 0.12)) if gb else 3,
@@ -487,6 +600,68 @@ class Api:
 
     def abort(self) -> dict:
         return self.run.abort()
+
+    # -- simple mode: the shelf and one-click install ---------------------------------------------
+    def shelf(self) -> dict:
+        """Every published PollardWeights rung with its real size, plus which of them are already on
+        this machine. Cached for six hours so the slabs open instantly; the Hub is the source."""
+        return {"shelf": _shelf(), "local": _local_index(self._ws or workspace.scan(deep=False))}
+
+    def download(self, repo: str, filename: str) -> dict:
+        """Pull one rung into the workspace, in the background. Poll download_status()."""
+        if self._dl and self._dl.get("active"):
+            return {"ok": False, "error": "a download is already running"}
+        if not re.fullmatch(r"PollardWeights/[A-Za-z0-9._-]+", repo) or not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
+            return {"ok": False, "error": "not a PollardWeights file"}
+        dest = workspace.home() / "models" / repo.split("/")[1] / filename   # where workspace.scan() looks
+        self._dl = {"active": True, "pct": 0, "bytes": 0, "total": 0, "file": filename, "path": None, "error": None}
+        threading.Thread(target=self._pull, args=(repo, filename, dest), daemon=True).start()
+        return {"ok": True, "path": str(dest)}
+
+    def download_status(self) -> dict:
+        return dict(self._dl or {"active": False})
+
+    def _pull(self, repo: str, filename: str, dest: pathlib.Path) -> None:
+        url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "pollard-studio"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                self._dl.update(total=total)
+                got, last = 0, 0.0
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    now = time.time()
+                    if now - last > 0.3:
+                        last = now
+                        self._dl.update(bytes=got, pct=int(got * 100 / total) if total else 0)
+                        self.run._emit(f"download {filename}: {got/1e9:.2f} / {total/1e9:.2f} GB")
+            if dest.exists():
+                dest.unlink()
+            tmp.rename(dest)
+            self._dl.update(active=False, pct=100, bytes=got, path=str(dest))
+            self.run._emit(f"download {filename}: done -> {dest}")
+            self._ws = None                                  # the workspace has a new build in it
+        except Exception as e:                               # noqa: BLE001 - surfaced to the UI as-is
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            self._dl.update(active=False, error=str(e))
+            self.run._emit(f"download {filename}: FAILED {e}")
+
+    def open_url(self, url: str) -> dict:
+        """Links out of the panel (the site's request form) open in the user's browser, not the webview."""
+        import webbrowser
+        if not url.startswith("https://"):
+            return {"ok": False}
+        return {"ok": webbrowser.open(url)}
 
     # -- window ----------------------------------------------------------------------------------
     def win(self, what: str) -> None:

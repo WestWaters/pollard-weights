@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>Pollard Studio</title>
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="simple.css">
 </head>
 <body>
 
@@ -113,6 +114,8 @@
         <svg class="ic"><use href="#i-chev"/></svg></div>
     </div>
 
+    <button class="hwb mode" id="modebtn" aria-pressed="true" title="Simple mode: device → model → install" onclick="setMode('simple')">SIMPLE</button>
+
     <!-- the window is frameless, so these ARE the window controls -- no native set to double up -->
     <div class="hwbtns">
       <button class="hwb" onclick="win('minimize')" title="Minimize">
@@ -154,6 +157,10 @@
 
 </div>
 
+<!-- SIMPLE mode: the same three slabs as pollard.app; Advanced (#app) is the instrument -->
+<div id="simple" class="simple" hidden></div>
+
 <script src="app.js"></script>
+<script src="simple.js"></script>
 </body>
 </html>
