@@ -74,7 +74,12 @@
     if (api() && api().fetch_json) { const r = await api().fetch_json(url); if (r && r.ok) return r.data; throw new Error(r && r.error || "fetch failed"); }
     return fetch(url).then(r => r.json());
   }
+  const TIERS = [[1e6, "Executive"], [1e5, "Chef"], [1e4, "Sous"], [1e3, "Line"], [0, "Prep"]];
+  const tierOf = d => TIERS.find(([m]) => d >= m)[1];
+  const fmt = n => n == null ? "—" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k" : String(n);
   async function readCooks() {
+    // live reputation (HF downloads / models / followers + builds delivered through Pollard), falling back to the plain roster
+    try { const c = await getJson(SITE + "/api/cooks"); S.cooks = c.cooks || []; return; } catch (e) {}
     try { const c = await getJson(SITE + "/cooks.json?ts=" + Date.now()); S.cooks = c.cooks || []; }
     catch (e) { S.cooks = [{ name: "Mario · WestWaters", role: "Founder · Pollard", lanes: LANES, hardware: "Apple Silicon · RTX Blackwell", status: "cooking", blurb: "The method, the shelf, every lane." }]; }
   }
@@ -321,11 +326,13 @@ llama-cli -m Qwen3-8B-Pollard.gguf</div></div>
   }
   function renderCooks() {
     const g = $("#s-cooks"); if (!g) return;
-    g.innerHTML = S.cooks ? S.cooks.map(k => `<div class="pane card cook">
-      <div class="who"><div><h4>${esc(k.name)}</h4><small>${esc(k.role || "")}</small></div><span class="st ${esc(k.status || "")}">${esc(k.status || "")}</span></div>
-      <div class="meta">${(k.lanes || []).map(l => `<span class="tg">${esc(l)}</span>`).join("")}</div>
+    g.innerHTML = S.cooks ? S.cooks.map(k => { const st = k.stats || {}, tier = k.tier || tierOf(st.downloads || 0); return `<div class="pane card cook">
+      <div class="who"><div><h4>${esc(k.name)}${k.verified ? '<span class="vcheck" title="Stripe-onboarded, gated builds delivered">✓</span>' : ""}</h4><small>${esc(k.role || "")}</small></div>
+        <span class="tier t-${tier.toLowerCase()}" title="by total Hugging Face downloads">${tier}</span></div>
+      <div class="stats"><span><b>${fmt(st.downloads)}</b> downloads</span><span><b>${fmt(st.models)}</b> models</span><span><b>${fmt(st.followers)}</b> followers</span><span><b>${k.delivered || 0}</b> cooks delivered</span></div>
+      <div class="meta">${(k.lanes || []).map(l => `<span class="tg">${esc(l)}</span>`).join("")}<span class="st ${esc(k.status || "")}" style="margin-left:auto">${esc(k.status || "")}</span></div>
       <p>${esc(k.blurb || "")}</p><div class="hw">Hardware · <b>${esc(k.hardware || "—")}</b></div>
-      <div class="cfoot">${k.hf ? `<button data-url="${esc(k.hf)}">Hugging Face</button>` : ""}${k.gh ? `<button data-url="${esc(k.gh)}">GitHub</button>` : ""}</div></div>`).join("") : `<p class="chosen">Loading…</p>`;
+      <div class="cfoot">${k.hf ? `<button data-url="${esc(k.hf)}">Hugging Face</button>` : ""}${k.gh ? `<button data-url="${esc(k.gh)}">GitHub</button>` : ""}</div></div>`; }).join("") : `<p class="chosen">Loading…</p>`;
   }
 
   /* ── events (one delegated listener; the DOM is re-rendered often) ───── */
