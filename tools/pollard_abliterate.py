@@ -18,7 +18,17 @@ as one OPT-IN pass, OFF by default and clearly labelled:
 Honest scope: this is a behaviour-changing transform the USER opts into on THEIR
 model; it can cost some coherence, and stacking it on an extreme low-bit crush can
 compound that -- so measure the PPL/KL delta vs the un-ablated build (pollard-kl)
-before trusting it, same as everything else. The contrast prompt SETS are supplied
+before trusting it, same as everything else.
+
+The embedding edit is where "abliterated model repeats itself" comes from (the failure
+huihui reported, 2026-09): token_embd rows are the model's vocabulary, and bending every
+row against one direction shifts control tokens too, which is exactly the CONTROL TOKENS
+/ REPEATED verdict the coherence gate gives a crushed embedding. So after surgery this
+tool runs that gate on a few benign prompts (same bar as pollard-bench: half the tail
+n-grams repeating = loop). `--embed auto` (default) edits the embedding, and if the gate
+trips, restores it and gates again -- the residual writers alone usually carry the
+ablation. `--embed off` (`--skip-embed`) never touches it; `--embed on` keeps the classic
+recipe regardless. The verdict is written next to the model as abliterate_gate.json. The contrast prompt SETS are supplied
 by the user (one prompt per line); this tool ships only a tiny benign smoke-test
 default so `--selftest` runs -- it is NOT a real refusal set.
 
@@ -141,7 +151,7 @@ def _pick_layer(diff, layer):
 
 
 @torch.no_grad()
-def abliterate(model, r_hat, dev, strength=-1.0):
+def abliterate(model, r_hat, dev, strength=-1.0, skip_embed=False):
     """Scale the r_hat component of every residual-WRITING weight by (1 + strength).
 
     The published technique removes a direction: W -= r r^T W. That is this function at
@@ -172,10 +182,77 @@ def abliterate(model, r_hat, dev, strength=-1.0):
             W = lin.weight.data.float()                   # [D, in]
             lin.weight.data = (W + a * torch.outer(r, r @ W)).to(lin.weight.dtype)
             edited += 1
+    if skip_embed:
+        return edited
     emb = model.model.embed_tokens.weight.data.float()    # [vocab, D]
     model.model.embed_tokens.weight.data = (emb + a * torch.outer(emb @ r, r)).to(model.model.embed_tokens.weight.dtype)
     edited += 1
     return edited
+
+
+# the same control-token shape pollard-bench's gate looks for: <|im_start|>, <|channel|>, <pad>, <unk>
+_CTRL = r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>"
+# (prompt, words a real answer contains) -- fluent word salad neither loops nor leaks control tokens,
+# so "does it know the answer" is the third check, as in pollard-bench
+_GATE_PROMPTS = [("In one sentence, why is the sky blue?", ["scatter", "blue", "light", "wavelength"]),
+                 ("Name three fruits and one thing they have in common.", ["apple", "banana", "orange", "fruit", "sweet", "seed"]),
+                 ("Write two short sentences about a bicycle.", ["bicycle", "bike", "wheel", "pedal", "ride"])]
+_RANK = {"PASS": 2, "WEAK": 1, "FAIL": 0}
+
+
+def judge_sample(text: str, expect=()) -> dict:
+    """Score one post-surgery generation the way pollard-bench's coherence gate scores a chat turn.
+
+    CONTROL TOKENS first (the embedding was bent -- the fix is to restore it, not to soften the
+    strength), then a tail loop (half the tail n-grams repeating, or a handful of words over and
+    over), then empty, then -- if `expect` is given -- whether any expected word is in the answer
+    (salad reads as WEAK). Pure function: unit-tested on strings, no model needed.
+    Returns {"verdict": PASS|WEAK|FAIL, "ok", "reason", "repeat"}."""
+    import re
+    from pollard_bench import tail_repeat
+    body = (text or "").strip()
+    if not body:
+        return {"verdict": "FAIL", "ok": False, "reason": "NO OUTPUT", "repeat": 0.0}
+    rep = tail_repeat(body)
+    words = body.split()
+    loop = rep >= 0.5 or (len(set(words)) <= 2 and len(words) > 8)
+    if re.search(_CTRL, body):
+        return {"verdict": "FAIL", "ok": False, "repeat": rep,
+                "reason": "CONTROL TOKENS in the output (embedding bent -- restore it)"}
+    if loop:
+        return {"verdict": "FAIL", "ok": False, "reason": "REPEATED output (loop)", "repeat": rep}
+    if expect and not any(e.lower() in body.lower() for e in expect):
+        return {"verdict": "WEAK", "ok": False, "reason": "no known answer in the output", "repeat": rep}
+    return {"verdict": "PASS", "ok": True, "reason": "coherent", "repeat": rep}
+
+
+@torch.no_grad()
+def coherence_gate(model, tok, dev, prompts=None, max_new_tokens=60) -> dict:
+    """Greedy-decode a few benign prompts through the model's own chat template and judge each.
+    Special tokens are kept in the decode so a leaked <|im_start|> is seen, not hidden."""
+    rows = []
+    for p, expect in (prompts or _GATE_PROMPTS):
+        try:
+            txt = tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False,
+                                          add_generation_prompt=True)
+        except Exception:                                  # base model: no template
+            txt = p + "\n"
+        enc = tok([txt], return_tensors="pt").to(dev)
+        gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                             pad_token_id=tok.pad_token_id)
+        out = tok.decode(gen[0][enc["input_ids"].shape[1]:], skip_special_tokens=False)
+        # the model's own end-of-turn is not a leak: cut there, drop padding; anything else in
+        # <|...|> form left in the body is a bent embedding talking
+        for t in ("<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>", tok.eos_token):
+            if t and t in out:
+                out = out.split(t)[0]
+        if tok.pad_token:
+            out = out.replace(tok.pad_token, "")
+        j = judge_sample(out, expect)
+        j.update({"prompt": p, "sample": out.strip()[:200]})
+        rows.append(j)
+    verdict = min((r["verdict"] for r in rows), key=_RANK.get)
+    return {"verdict": verdict, "rows": rows}
 
 
 def main():
@@ -196,6 +273,12 @@ def main():
     ap.add_argument("--device", default="mps")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map")
+    ap.add_argument("--embed", default="auto", choices=["auto", "on", "off"],
+                    help="edit the embedding too: 'auto' (default) edits it and backs the edit out if the "
+                         "coherence gate trips; 'off' never touches it; 'on' = classic recipe, no back-out")
+    ap.add_argument("--skip-embed", dest="embed", action="store_const", const="off",
+                    help="alias for --embed off")
+    ap.add_argument("--no-gate", action="store_true", help="skip the post-surgery coherence gate")
     ap.add_argument("--selftest", action="store_true",
                     help="mechanism canary on the benign smoke sets -- writes nothing")
     a = ap.parse_args()
@@ -239,13 +322,31 @@ def main():
     sj = min(max(j - 1, 0), len(text_layers(model)) - 1)
     o0 = text_layers(model)[sj].self_attn.o_proj.weight.data.float()
     before = (r_hat.to(dev).float() @ o0).norm().item()
-    edited = abliterate(model, r_hat, dev, a.strength)
+    emb_saved = model.model.embed_tokens.weight.data.clone() if a.embed == "auto" else None
+    edited = abliterate(model, r_hat, dev, a.strength, skip_embed=(a.embed == "off"))
     o1 = text_layers(model)[sj].self_attn.o_proj.weight.data.float()
     after = (r_hat.to(dev).float() @ o1).norm().item()
     want = "collapse to ~0" if a.strength <= -0.999 else f"scale by {1 + a.strength:.2f}x"
     verb = "orthogonalized" if a.strength < 0 else "amplified"
-    print(f"  {verb} {edited} residual-writers at strength {a.strength:+.2f}; "
+    print(f"  {verb} {edited} residual-writers at strength {a.strength:+.2f} (embedding: {a.embed}); "
           f"proj(o_proj@blk{sj}) {before:.3f} -> {after:.3f} (should {want})", flush=True)
+
+    gate = None
+    if not a.no_gate:
+        gate = coherence_gate(model, tok, dev)
+        gate["embed"] = "edited" if a.embed != "off" else "untouched"
+        print(f"  gate: {gate['verdict']}  " + "; ".join(r["reason"] for r in gate["rows"]), flush=True)
+        if gate["verdict"] != "PASS" and emb_saved is not None:
+            # the embedding edit is the usual culprit (huihui's repetition): put it back, judge again
+            model.model.embed_tokens.weight.data = emb_saved
+            gate2 = coherence_gate(model, tok, dev)
+            gate2["embed"] = "restored (gate tripped with it edited)"; gate2["first_attempt"] = gate
+            gate = gate2
+            print(f"  gate after restoring the embedding: {gate['verdict']}  "
+                  + "; ".join(r["reason"] for r in gate["rows"]), flush=True)
+        for r in gate["rows"]:
+            print(f"    {r['verdict']:4s} {r['prompt'][:40]:40s} {r['sample'][:90]!r}", flush=True)
+    del emb_saved
     if a.strength > 0:
         print("  NOTE: steering TOWARD a direction can degrade everything else and the failure "
               "reads as fluent nonsense.\n        Measure against the unedited build with "
@@ -259,13 +360,22 @@ def main():
         gen = model.generate(**enc, max_new_tokens=40, do_sample=False)
         txt = tok.decode(gen[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
         print(f"  post-surgery sample: {txt!r}", flush=True)
-        ok = after < before * 0.05 and len(txt.strip()) > 0
-        print(f"SELFTEST {'PASS' if ok else 'CHECK'} -- direction collapsed & model still generates.", flush=True)
+        ok = after < before * 0.05 and len(txt.strip()) > 0 and (gate is None or gate["verdict"] == "PASS")
+        print(f"SELFTEST {'PASS' if ok else 'CHECK'} -- direction collapsed & model still generates"
+              f"{'' if gate is None else ' & gate ' + gate['verdict']}.", flush=True)
         return
 
     os.makedirs(a.out, exist_ok=True)
     model.save_pretrained(a.out)
     tok.save_pretrained(a.out)
+    if gate is not None:
+        import json
+        gate.update({"model": a.model, "strength": a.strength, "layer": int(j)})
+        with open(os.path.join(a.out, "abliterate_gate.json"), "w") as f:
+            json.dump(gate, f, indent=1)
+        if gate["verdict"] != "PASS":
+            print(f"  GATE FAIL -- written anyway so you can inspect it, but do not build from this "
+                  f"without fixing it (try --strength -0.5).", flush=True)
     print(f"wrote abliterated FP16 -> {a.out}\n"
           f"  next: convert to GGUF and run a Pollard build; compare PPL/KL vs the "
           f"un-ablated build (pollard-kl) to see the quality cost you're opting into.", flush=True)
