@@ -171,13 +171,23 @@ def test_nothing_else_is_outbound():
 
 def test_every_spec_is_complete():
     for name, spec in runtimes.SPECS.items():
-        assert spec["kind"] in (runtimes.LOCAL, runtimes.REMOTE), name
+        assert spec["kind"] in (runtimes.LOCAL, runtimes.REMOTE, runtimes.CLI), name
         assert spec.get("note"), f"{name} has no note for the user"
         if spec["kind"] == runtimes.LOCAL:
             assert spec.get("exe") and spec.get("args"), name
+        elif spec["kind"] == runtimes.CLI:
+            # a per-generation binary: no port, no health, but it must still say what it runs
+            assert spec.get("exe") and spec.get("accepts"), name
         else:
             assert spec.get("key_env"), name
             assert spec.get("base") or spec.get("base_env"), name
+
+
+def test_diffusion_builds_prefer_the_cli_runtime():
+    """A diffusion LLM (Dream / LLaDA / RND1) cannot be served: llama-server does not decode it."""
+    order = runtimes.for_build("gguf", "diffusion")
+    assert order[0] == "llama-diffusion"
+    assert runtimes.for_build("gguf", "Q6_K")[0] != "llama-diffusion"
 
 
 def test_available_reports_every_runtime_with_a_reason():

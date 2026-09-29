@@ -703,6 +703,11 @@ const ADV_SECTIONS = [
        + "chooses per tensor on top of GPTQ reconstruction; trellis spends fractional bits on "
        + "shape instead of integer bits on magnitude.",
     tools: ["pollard_palette", "pollard_lowbit", "pollard_trellis"] },
+  { title: "DIFFUSION LLMs", icon: "wave",
+    why: "Dream, LLaDA and RND1 decode by unmasking a canvas, not left to right. They quantize "
+       + "like the Qwen bodies they are, but llama-server cannot run them: chat and the gate go "
+       + "through llama-diffusion-cli, and a score is the canvas, not a perplexity.",
+    tools: ["pollard_diffusion"] },
   { title: "SOLVER", icon: "wave",
     why: "Full-Hessian error feedback. Pollard trains as well as compresses, and these are the "
        + "solver's own knobs.",
