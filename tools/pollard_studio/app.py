@@ -138,14 +138,15 @@ def _shelf() -> list[dict]:
             req = urllib.request.Request(url, headers={"User-Agent": "pollard-studio"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 return json.load(r)
-        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100&expand[]=gguf&expand[]=downloads"):
+        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100&expand[]=gguf&expand[]=config&expand[]=downloads"):
             try:
                 tree = get(f"https://huggingface.co/api/models/{m['id']}/tree/main")
             except Exception:
                 tree = []
             files = [{"name": t["path"], "bytes": (t.get("lfs") or {}).get("size") or t.get("size") or 0} for t in tree]
             shaped = _shape_repo(m["id"], m.get("downloads", 0), files)
-            shaped["arch"] = str((m.get("gguf") or {}).get("architecture") or "").lower()
+            shaped["arch"] = str((m.get("gguf") or {}).get("architecture")
+                                 or (m.get("config") or {}).get("model_type") or "").lower()   # any lane, not just GGUF
             shaped["diffusion"] = shaped["arch"].replace("_", "-") in ("dream", "llada", "llada-moe", "rnd1", "diffusion-gemma")
             if shaped["files"]:
                 shelf.append(shaped)
