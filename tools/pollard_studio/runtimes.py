@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-LOCAL, REMOTE = "local", "remote"
+LOCAL, REMOTE, CLI = "local", "remote", "cli"
 
 
 # ── the table: adding a runtime is an entry here ────────────────────────────────────────────────
@@ -52,6 +52,14 @@ SPECS: dict[str, dict] = {
         "args": lambda m, port, ngl, ctx: ["-m", m, "--port", str(port), "--host", "127.0.0.1",
                                            "-c", str(ctx), "-ngl", str(ngl), "--log-disable"],
         "api": "llama",
+    },
+    "llama-diffusion": {
+        # Diffusion LLMs (Dream / LLaDA / RND1 / DiffusionGemma) decode by unmasking a canvas; llama-server
+        # cannot run them at all. This runtime is llama-diffusion-cli, one process per generation.
+        "kind": CLI, "exe": "llama-diffusion-cli", "accepts": ["gguf"],
+        "note": "llama-diffusion-cli — required for diffusion LLMs (Dream, LLaDA, RND1); not a server",
+        "args": lambda m, port, ngl, ctx: [],
+        "api": "cli",
     },
     "vllm": {
         "kind": LOCAL, "exe": "vllm", "accepts": ["safetensors"],
@@ -87,7 +95,20 @@ def _exe(spec: dict) -> str | None:
         p = os.environ.get(var)
         if p and Path(p).exists():
             return p
-    found = shutil.which(spec["exe"]) if spec.get("exe") else None
+    # The runtime build install.sh makes (and the workspace's bin/) come BEFORE PATH -- the same order
+    # pollard-calc's find_llama_bin uses. A Homebrew llama.cpp a few weeks behind answers to `which`
+    # and then lacks the architecture (or the diffusion CLI's flags) the fresh build has.
+    found = None
+    if spec.get("exe") and not spec.get("path_marker"):
+        repo = Path(__file__).resolve().parents[2]
+        home = Path(os.environ.get("POLLARD_HOME") or Path.home() / "pollard")
+        exe = spec["exe"] + (".exe" if os.name == "nt" else "")
+        for cand in (repo / "runtime" / "llama.cpp" / "build" / "bin" / exe, home / "bin" / exe):
+            if cand.is_file():
+                found = str(cand)
+                break
+    if not found:
+        found = shutil.which(spec["exe"]) if spec.get("exe") else None
     # A fork whose binary has the SAME NAME as the stock one cannot be resolved off PATH: the
     # stock llama-server answers to `which llama-server` and then refuses every trellis atom,
     # which reads as "the build is broken" rather than "wrong runtime". Only accept a path that
@@ -112,10 +133,11 @@ def available() -> list[dict]:
     for name, spec in SPECS.items():
         row = {"name": name, "kind": spec["kind"], "note": spec["note"],
                "accepts": spec.get("accepts", []), "ready": False, "why": ""}
-        if spec["kind"] == LOCAL:
+        if spec["kind"] in (LOCAL, CLI):
             path = _exe(spec)
             row["ready"] = bool(path)
-            row["why"] = path or f"{spec['exe']} not on PATH"
+            row["why"] = path or (f"{spec['exe']} not on PATH" + (
+                " — rebuild the runtime: ./install.sh" if spec["kind"] == CLI else ""))
             if name == "ik_llama" and path and not os.environ.get("IK_LLAMA_SERVER"):
                 row["why"] = f"{path} — set IK_LLAMA_SERVER if the fork lives elsewhere"
         else:
@@ -139,10 +161,13 @@ def for_build(kind: str, lane: str | None = None) -> list[str]:
     """
     want = "gguf" if kind == "gguf" else "safetensors"
     local = [n for n, s in SPECS.items()
-             if s["kind"] == LOCAL and want in s.get("accepts", [])]
+             if s["kind"] in (LOCAL, CLI) and want in s.get("accepts", [])]
     trellis = want == "gguf" and lane and "KT" in str(lane).upper()
+    diffusion = want == "gguf" and lane and "DIFFUSION" in str(lane).upper()
     if trellis:
         local.sort(key=lambda n: n != "ik_llama")          # trellis: the fork first
+    if diffusion:
+        local.sort(key=lambda n: n != "llama-diffusion")   # diffusion: the only one that decodes it
     remote = [n for n, s in SPECS.items() if s["kind"] == REMOTE]
     # Rank, do not filter. Hiding a runtime the user has not installed yet hides the fact that
     # it is an option at all -- the UI marks what is missing and how to get it.
@@ -152,7 +177,8 @@ def for_build(kind: str, lane: str | None = None) -> list[str]:
     # open the file at all -- so ranking it above a not-yet-installed ik_llama points the user at
     # the runtime guaranteed to fail and hides the one that works.
     def rank(n):
-        return (not (trellis and n == "ik_llama"), n not in ready, cands.index(n))
+        required = (trellis and n == "ik_llama") or (diffusion and n == "llama-diffusion")
+        return (not required, n not in ready, cands.index(n))
     return sorted(cands, key=rank)
 
 
@@ -186,6 +212,8 @@ class Runtime:
     def running(self) -> bool:
         if self.spec["kind"] == REMOTE:
             return bool(_env_first(self.spec.get("key_env")))
+        if self.spec["kind"] == CLI:
+            return self.model is not None and bool(_exe(self.spec))
         return self.proc is not None and self.proc.poll() is None
 
     def ensure(self, model: str, timeout: float | None = None) -> dict:
@@ -197,6 +225,16 @@ class Runtime:
                         + "set " + " or ".join(self.spec.get("key_env", []))}
             self.model = model
             return {"ok": True, "remote": True, "base": base}
+
+        if self.spec["kind"] == CLI:
+            # nothing to boot: the binary is invoked per generation and loads the model each time
+            exe = _exe(self.spec)
+            if not exe:
+                return {"ok": False, "error": f"{self.spec['exe']} not found — rebuild the runtime (./install.sh)"}
+            if not Path(model).exists():
+                return {"ok": False, "error": f"no such build: {model}"}
+            self.model = model
+            return {"ok": True, "cli": exe, "reused": False}
 
         if self.running and self.model == model:
             return {"ok": True, "port": self.port, "reused": True}
@@ -285,6 +323,16 @@ class Runtime:
                                     self.spec.get("base") or _env_first(self.spec.get("base_env")),
                                     {"Authorization": f"Bearer {_env_first(self.spec['key_env'])}"},
                                     self.model)
+            if self.spec["kind"] == CLI:
+                import sys as _sys
+                from . import runner as _runner
+                _sys.path.insert(0, str(_runner.tools_dir()))
+                from pollard_diffusion import generate
+                r = generate(self.model, prompt, n_predict, ngl=self.ngl, ctx=self.ctx,
+                             temperature=temperature, binary=_exe(self.spec), timeout=timeout)
+                if not r["ok"]:
+                    return {"ok": False, "error": f"{self.name}: {r['error']}"}
+                return {"ok": True, "text": r["text"], "stop_reason": r["stop_reason"], "tokens": r["tokens"]}
             if not self.running:
                 return {"ok": False, "error": "runtime not running"}
             base = f"http://127.0.0.1:{self.port}"

@@ -28,6 +28,7 @@ from pathlib import Path
 # name -> (label, what a user is actually verifying)
 MODALITIES = {
     "text":      ("Text", "does it still answer coherently, without looping"),
+    "diffusion": ("Diffusion", "does the unmasked canvas read as an answer, not noise"),
     "vision_in": ("Vision in", "can it still resolve colour, count, shape and position"),
     "audio_in":  ("Audio in", "can it still transcribe and follow spoken input"),
     "video_in":  ("Video in", "does it still track content across frames"),
@@ -104,8 +105,12 @@ def _detect_gguf(p: Path, got: dict, notes: list) -> dict:
             got["vision_in"] = True
         if "has_audio_encoder" in kl and v:
             got["audio_in"] = True
-    if meta.get("general.architecture", "").lower() in ("clip", "mmproj"):
+    arch = str(meta.get("general.architecture", "")).lower()
+    if arch in ("clip", "mmproj"):
         notes.append("this file IS a projector, not a language model")
+    if arch.replace("_", "-") in ("dream", "llada", "llada-moe", "rnd1", "diffusion-gemma"):
+        got["diffusion"] = True                     # decoded by unmasking, not left-to-right
+        notes.append(f"diffusion LLM ({arch}) -> llama-diffusion-cli, not llama-server")
     return {"modalities": got, "notes": notes, "kind": "gguf"}
 
 

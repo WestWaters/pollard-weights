@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import argparse, json, os, re
 
+# GGUF general.architecture / HF model_type values that llama.cpp decodes by diffusion (llama_model_is_diffusion).
+# Normalised with "_" -> "-" so "diffusion_gemma" (HF) and "diffusion-gemma" (GGUF) both match.
+DIFFUSION_ARCHS = frozenset({"dream", "llada", "llada-moe", "rnd1", "diffusion-gemma"})
+
 # How many tokens the coherence gate must allow. A thinking model spends its first hundred-odd
 # tokens reasoning, so a short budget reads as incoherence.
 TOKENS_PLAIN, TOKENS_THINKING = 96, 220
@@ -162,6 +166,15 @@ def classify(model) -> dict:
     vision = "image" in modalities
     for m in modalities:
         why.append(f"{m} signals in the template/config/architecture")
+    # A diffusion LLM (Dream / LLaDA / RND1 / DiffusionGemma) is not decoded left-to-right: it
+    # unmasks a canvas over N steps. Perplexity and next-token KL are computed against an objective
+    # it was never trained on, and llama-server cannot decode it at all -- generation, and so the
+    # coherence gate and chat, go through llama-diffusion-cli. The architecture string says so.
+    diffusion = any(str(x).lower().replace("_", "-") in DIFFUSION_ARCHS for x in archs) or \
+        str((conf or {}).get("model_type", "")).lower().replace("_", "-") in DIFFUSION_ARCHS
+    if diffusion:
+        why.append("diffusion architecture -> masked-denoising decoder; AR perplexity/KL are not "
+                   "its objective; generate with llama-diffusion-cli, not llama-server")
     if not instruct:
         why.append("no chat template -> base model; raw-text perplexity is meaningful here")
 
@@ -170,10 +183,12 @@ def classify(model) -> dict:
     multimodal = [m for m in modalities if m != "speech_out"]
     return {
         "instruct": instruct, "thinking": thinking, "agentic": agentic, "vision": vision,
+        "diffusion": diffusion, "runtime": "llama-diffusion-cli" if diffusion else "llama-server",
         "modalities": modalities, "base": not instruct,
         # A model tuned away from raw text must be scored on text it was tuned FOR, or the number
         # describes the mismatch rather than the build.
-        "eval": ("multimodal" if multimodal else
+        "eval": ("diffusion" if diffusion else
+                 "multimodal" if multimodal else
                  "raw-text" if not instruct else "in-domain"),
         "gate_tokens": TOKENS_THINKING if thinking else TOKENS_PLAIN,
         "why": why,
@@ -181,7 +196,7 @@ def classify(model) -> dict:
 
 
 def describe(k: dict) -> str:
-    tags = [n for n in ("base", "instruct", "thinking", "agentic") if k.get(n)]
+    tags = [n for n in ("base", "instruct", "thinking", "agentic", "diffusion") if k.get(n)]
     tags += k.get("modalities", [])
     return "+".join(tags) or "unknown"
 

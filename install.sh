@@ -56,11 +56,13 @@ else
   # NOTE: the RPC server target is `ggml-rpc-server` in current llama.cpp
   # (was `rpc-server` before it moved to tools/rpc/). Using the wrong name
   # silently builds nothing — verified against llama.cpp master.
+  # llama-diffusion-cli = decode diffusion LLMs (Dream / LLaDA / RND1) -- llama-server cannot.
   # llama-mtmd-cli = run vision/audio models with their mmproj; llama-speculative =
   # draft-model speculative decoding (faster tok/s); llama-bench = measure it.
   cmake --build "$LLAMA_DIR/build" -j \
     --target llama-quantize llama-cli llama-server llama-imatrix llama-perplexity \
-             llama-mtmd-cli llama-speculative llama-bench ggml-rpc-server
+             llama-mtmd-cli llama-speculative llama-bench ggml-rpc-server \
+             llama-diffusion-cli
   echo "runtime built at $LLAMA_DIR/build/bin ${GPU_FLAGS:+($GPU_FLAGS)}"
   echo "add to PATH:  export PATH=\"$LLAMA_DIR/build/bin:\$PATH\""
 fi
