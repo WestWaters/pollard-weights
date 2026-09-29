@@ -179,7 +179,7 @@ def main() -> None:
         print(json.dumps(r, indent=2))
     elif r["ok"]:
         print(r["text"])
-        print(f"\n[{arch} · {r['tokens']} tokens · {r['seconds']}s]", file=sys.stderr)
+        print(f"\n[{arch} - {r['tokens']} tokens - {r['seconds']}s]", file=sys.stderr)   # ASCII: cp1252 consoles
     else:
         print(f"error: {r['error']}", file=sys.stderr)
     sys.exit(0 if r["ok"] else 1)
