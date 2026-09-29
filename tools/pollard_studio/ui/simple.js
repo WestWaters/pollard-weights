@@ -27,8 +27,8 @@
     srv: { l: "Server · Cluster", d: { "srv-128": ["128 GB", 120], "srv-256": ["256 GB", 240], "srv-512": ["512 GB", 490], "srv-1t": ["1 TB", 980], "srv-2t": ["2 TB", 1960] }, svg: '<rect x="4" y="4" width="22" height="6" rx="1.4"/><rect x="4" y="12" width="22" height="6" rx="1.4"/><rect x="4" y="20" width="22" height="6" rx="1.4"/><path d="M8 7h.01M8 15h.01M8 23h.01"/>' }
   };
   const DEVLIST = Object.entries(CATS).flatMap(([k, c]) => Object.entries(c.d).map(([id, [l, b]]) => ({ k, id, l: c.l + " · " + l, b })));
-  const MODS = [["all", "All"], ["chat", "Chat"], ["code", "Code"], ["vision", "Vision"], ["moe", "MoE"], ["connectome", "Connectome"]];
-  const modality = r => /flybrain|humanbrain/i.test(r.id) ? "connectome" : /coder/i.test(r.name) ? "code" : r.vision ? "vision" : "chat";
+  const MODS = [["all", "All"], ["chat", "Chat"], ["code", "Code"], ["vision", "Vision"], ["diffusion", "Diffusion"], ["moe", "MoE"], ["connectome", "Connectome"]];
+  const modality = r => r.diffusion ? "diffusion" : /flybrain|humanbrain/i.test(r.id) ? "connectome" : /coder/i.test(r.name) ? "code" : r.vision ? "vision" : "chat";
 
   const S = { screen: "fit", hw: null, cat: "detected", dev: null, lane: "GGUF", shelf: [], local: {}, repo: null, file: null, q: "",
               dl: null, page: 1, mod: "all", onlyFits: false, cooks: null };

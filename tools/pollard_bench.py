@@ -587,6 +587,14 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
         from pollard_modelkind import describe
         print(f"  model kind: {describe(kind)}  (gate budget {budget} tokens)")
 
+    # A diffusion LLM is neither served nor completed left-to-right: it unmasks a canvas. llama-server
+    # cannot load it and llama-cli would run it as the wrong kind of model, so it generates through
+    # llama-diffusion-cli and is judged on the canvas it produced. finish_reason does not exist for
+    # it (the canvas is always filled), so the verdict rests on the text checks alone.
+    if kind is not None and kind.get("diffusion"):
+        print("  diffusion architecture -> decoded with llama-diffusion-cli, scored on the canvas")
+        return _gate_diffusion(model, ngl, prompts, budget)
+
     tpl = has_chat_template(model)
     if not tpl:
         print("  no chat template -> base model, scored as raw completion")
@@ -607,6 +615,44 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
         for why in _check_server(base, ctx):
             print(f"  WARNING: {why}")
         return _gate_chat(base, prompts, configs, budget)
+
+
+def _gate_diffusion(model, ngl, prompts, budget):
+    """Score diffusion generations. One config: the decoder's own defaults (entropy/confidence order,
+    128 steps) -- sampling temperature is not the lever that separates a broken canvas from a good one."""
+    from pollard_diffusion import generate
+    rows = []
+    for p, expect in prompts:
+        r = generate(model, p, budget, ngl=ngl)
+        if not r["ok"]:
+            rows.append({"prompt": p.splitlines()[0][:48], "loop": None,
+                         "reason": f"NO OUTPUT ({r['error']})", "sample": ""})
+            return {"verdict": "NO_OUTPUT", "config": "diffusion", "rows": rows}
+        body = (r["text"] or "").strip()
+        rep = tail_repeat(body)
+        knows = any(e.lower() in body.lower() for e in expect)
+        # The MASK token is not a control token: a canvas still full of <mask> / [MASK] never converged,
+        # which is the diffusion shape of "below the floor", so it is counted as repetition, not as the
+        # embedding failing.
+        masks = len(re.findall(r"<\|?mask\|?>|\[MASK\]", body, re.I))
+        body_nomask = re.sub(r"<\|?mask\|?>|\[MASK\]", " ", body, flags=re.I)
+        ctrl = bool(re.search(r"<\|[^|>]{1,32}\|?>|<[a-z_]{2,16}>", body_nomask))
+        if masks and masks >= max(4, len(body.split()) // 3):
+            rep = 1.0                                   # a canvas still masked never converged
+        # Control tokens are judged FIRST: a canvas of <|im_start|> is also "repeated", but the fix is
+        # different -- protect the embedding / output tensors, not bump the tier. Only then does a canvas
+        # that never converged (mask tokens / one token repeated) read as below the floor.
+        # same bar as the chat gate: half the tail n-grams repeating is a loop; code and lists sit well below it
+        loop = rep >= 0.5 or (len(set(body.split())) <= 2 and len(body.split()) > 8)
+        reason = ("CONTROL TOKENS in the canvas (protect the embedding / output tensors)" if ctrl else
+                  "REPEATED CANVAS (below the floor at this tier)" if loop else
+                  "coherent" if knows else
+                  "no known answer in the canvas")
+        rows.append({"prompt": p.splitlines()[0][:48], "loop": bool(loop), "finish": "canvas",
+                     "repeat": rep, "knows": knows, "reason": reason, "sample": body[:240]})
+    bad = [r for r in rows if "CONTROL" in r["reason"] or ("REPEATED" in r["reason"])]
+    verdict = "PASS" if not bad and all(r["knows"] for r in rows) else ("FAIL" if bad else "WEAK")
+    return {"verdict": verdict, "config": "diffusion", "rows": rows}
 
 
 def _gate_chat(base, prompts, configs, budget):

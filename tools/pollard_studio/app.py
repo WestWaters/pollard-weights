@@ -138,13 +138,15 @@ def _shelf() -> list[dict]:
             req = urllib.request.Request(url, headers={"User-Agent": "pollard-studio"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 return json.load(r)
-        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100"):
+        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100&expand[]=gguf&expand[]=downloads"):
             try:
                 tree = get(f"https://huggingface.co/api/models/{m['id']}/tree/main")
             except Exception:
                 tree = []
             files = [{"name": t["path"], "bytes": (t.get("lfs") or {}).get("size") or t.get("size") or 0} for t in tree]
             shaped = _shape_repo(m["id"], m.get("downloads", 0), files)
+            shaped["arch"] = str((m.get("gguf") or {}).get("architecture") or "").lower()
+            shaped["diffusion"] = shaped["arch"].replace("_", "-") in ("dream", "llada", "llada-moe", "rnd1", "diffusion-gemma")
             if shaped["files"]:
                 shelf.append(shaped)
         shelf.sort(key=lambda r: -r["dl"])
@@ -521,6 +523,14 @@ class Api:
 
     def runtimes_for(self, path: str, lane: str | None = None) -> list:
         kind = "gguf" if str(path).endswith(".gguf") else "safetensors"
+        if kind == "gguf" and path:
+            try:
+                sys.path.insert(0, str(runner.tools_dir()))
+                from pollard_diffusion import is_diffusion
+                if is_diffusion(path):
+                    lane = "diffusion"
+            except Exception:
+                pass
         return runtimes.for_build(kind, lane)
 
     def _runtime_for_build(self, gguf: str) -> str | None:
@@ -533,13 +543,19 @@ class Api:
         """
         if not str(gguf).endswith(".gguf"):
             return None
+        want = None
         try:
             sys.path.insert(0, str(runner.tools_dir()))
-            from pollard_ggufcompat import runtime_of
-            verdict, _ = runtime_of(gguf, offline=True)
+            # A diffusion LLM is decided first: no server decodes it, whatever its atoms are.
+            from pollard_diffusion import is_diffusion
+            if is_diffusion(gguf):
+                want = "llama-diffusion"
+            else:
+                from pollard_ggufcompat import runtime_of
+                verdict, _ = runtime_of(gguf, offline=True)
+                want = "ik_llama" if verdict in ("ik_llama", "fork") else None
         except Exception:
             return None                      # never block a chat on a header read
-        want = "ik_llama" if verdict in ("ik_llama", "fork") else None
         if not want or self.server.name == want:
             return None
         try:
