@@ -1347,6 +1347,15 @@ def test_steering_strength_generalises_ablation_without_changing_its_default():
     mp = toy(); abliterate(mp, r, "cpu", 0.5)
     amp = mp.model.layers[0].self_attn.o_proj.weight.data
     assert torch.allclose(amp[3], base[3] * 1.5, atol=1e-5), "positive strength must amplify"
+    # skip_embed leaves the vocabulary alone -- the huihui repetition fix -- and still edits the writers
+    ms = toy(); emb0 = ms.model.embed_tokens.weight.data.clone()
+    n = abliterate(ms, r, "cpu", -1.0, skip_embed=True)
+    assert torch.equal(ms.model.embed_tokens.weight.data, emb0), "skip_embed must not touch the embedding"
+    assert torch.allclose(ms.model.layers[0].self_attn.o_proj.weight.data[3], torch.zeros(5), atol=1e-6)
+    assert n == 2, "two writers edited, embedding skipped"
+    me = toy(); abliterate(me, r, "cpu", -1.0)
+    assert not torch.equal(me.model.embed_tokens.weight.data, emb0), "default still edits the embedding"
+
     # and it must touch ONLY that direction
     assert torch.allclose(amp[4], base[4], atol=1e-6), "steering leaked into other directions"
 
@@ -2520,3 +2529,29 @@ def test_every_tool_in_the_tree_installs():
     on_disk = {p.stem for p in (root / "tools").glob("pollard_*.py")}
     assert not (on_disk - declared), \
         "in tools/ but never installed: " + ", ".join(sorted(on_disk - declared))
+
+
+def test_abliterate_gate_judges_like_the_bench_gate():
+    """The post-surgery gate must call the two failures huihui saw -- control tokens leaking and a
+    tail loop -- and pass ordinary prose. Control tokens win over repetition: the fix differs."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        print("    (skipped: torch not installed)")
+        return
+    from pollard_abliterate import judge_sample
+    assert judge_sample("The sky is blue because air scatters short wavelengths more than long ones.")["ok"]
+    loop = judge_sample("the sky the sky the sky the sky the sky the sky the sky the sky the sky the sky the sky the sky")
+    assert not loop["ok"] and "REPEATED" in loop["reason"]
+    ctrl = judge_sample("<|im_start|>assistant<|im_start|>assistant<|im_start|>assistant<|im_start|>assistant<|im_start|>")
+    assert not ctrl["ok"] and "CONTROL" in ctrl["reason"]
+    assert not judge_sample("")["ok"]
+    salad = judge_sample("able thequelle-like arma the okus theuxtap kart utherland ynam", ["scatter", "blue"])
+    assert salad["verdict"] == "WEAK", "fluent word salad must not pass when it knows nothing"
+    assert judge_sample("The sky is blue because of Rayleigh scattering.", ["scatter"])["verdict"] == "PASS"
+    import inspect
+    from pollard_abliterate import abliterate
+    assert inspect.signature(abliterate).parameters["skip_embed"].default is False, \
+        "the classic recipe stays the default; --embed auto backs it out only when the gate trips"
+
