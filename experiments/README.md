@@ -13,6 +13,7 @@ Raw captures/logs from our runs stay out of git — the scripts regenerate them.
 | `e3_predictability.py` | Can layer L's experts be known **before** L's router runs (lookahead for prefetch)? | a routing trace |
 | `e5_cache_sim.py` | Replay the trace against a bounded hot-expert cache: hit rate and bytes-from-flash per token at each cache size — the residency curve `pollard-calc`'s verdict points at | a routing trace |
 | `pollard_mattr.py` | Can ONE training run (Matryoshka Attribution, arXiv 2609.25518: sigmoid top-k mask at a random k every step) learn the whole bit-allocation ordering that `pollard-probe` finds by crushing 2×layers groups one at a time? Interpolates every weight row between f16 and its RTN-2 crush, KL-to-f16 loss; evaluates the learned order vs the probe's vs random at equal budgets on held-out text. | transformers + torch (MPS ok), small model, a `pollard-probe` sensitivity.json |
+| `pollard_recovery.py` | Does a LIFT-style recovery vector (arXiv 2609.31140: mean hidden-state difference, strong minus degraded, injected at one layer) buy back quality on a low rung? Here strong = f16, degraded = the RTN crush of the same model, so the vector is a constant — a bias the GGUF can carry for free. | transformers + torch (MPS ok), small model |
 
 Typical flow on a new MoE model:
 
@@ -44,3 +45,24 @@ the group sweep at every budget; row-level halves it again (an upper bound — G
 The learned tensor ranking recovers the allocator's rule of thumb from data: protect `attn_v` > `ffn_down` > `attn_k`,
 crush `attn_q` > `ffn_gate` > `ffn_up` first. Spearman vs probe at tensor level ≈ 0 — the two orderings genuinely differ.
 Next: same run on a 3B, then feed `protect_first` into `pollard-automap` and measure a real rung's KLD against the probe-built one.
+
+### Recovery vectors (`pollard_recovery.py`) — first number, Qwen2.5-0.5B-Instruct, 2026-09-29
+
+RTN-3 g64 on all 168 decoder linears · 12×512 calib chunks · 6 held-out wikitext-2 chunks · M4 MPS · 96 s.
+Vector r_L = mean over calib tokens of (f16 hidden_states[L] − crushed hidden_states[L]), carried as the `down_proj` bias of block L−1.
+
+| what | KL to f16 | Δ | top-1 |
+|---|---|---|---|
+| crushed baseline | 1.035 | — | 51.7 % |
+| r @ layer 22 (μ=1) | 0.923 | −10.8 % | 54.5 % |
+| r @ layer 4 | 0.924 | −10.7 % | 53.8 % |
+| **r @ 22 + r @ 4 jointly** | **0.815** | **−21.2 %** | **56.8 %** |
+| r @ 22 + 4 + 20 | 0.861 | −16.8 % | 56.8 % |
+| every block 0..22, sequential | 0.989 | −4.5 % | 52.5 % |
+| every block 0..23 (incl. final) | 1.259 | +21.7 % | 48.8 % |
+
+Reading: two constant vectors (2 × 896 floats, zero runtime cost) recover a fifth of a 3-bit crush's KL. μ=1 is the right scale
+(0.5 and 1.5 both worse). The final hidden state (norm 47 vs 2–12 elsewhere) must be left alone — its vector alone is +83 %.
+More vectors is not better: the mean shift is a lever for a couple of layers, not a per-block correction.
+Next: same on a 3B and at 2-bit; then bake — llama.cpp's Qwen2 graph already passes `wo_b`, the loader just never creates it
+(one `TENSOR_NOT_REQUIRED` line), and gguf-py `add_tensor` writes the extra `blk.N.ffn_down.bias`; measure the real rung's KLD.
