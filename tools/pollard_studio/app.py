@@ -138,7 +138,7 @@ def _shelf() -> list[dict]:
             req = urllib.request.Request(url, headers={"User-Agent": "pollard-studio"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 return json.load(r)
-        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100&expand[]=gguf&expand[]=config&expand[]=downloads"):
+        for m in get("https://huggingface.co/api/models?author=PollardWeights&limit=100&expand[]=gguf&expand[]=config&expand[]=downloads&expand[]=tags"):
             try:
                 tree = get(f"https://huggingface.co/api/models/{m['id']}/tree/main")
             except Exception:
@@ -148,6 +148,9 @@ def _shelf() -> list[dict]:
             shaped["arch"] = str((m.get("gguf") or {}).get("architecture")
                                  or (m.get("config") or {}).get("model_type") or "").lower()   # any lane, not just GGUF
             shaped["diffusion"] = shaped["arch"].replace("_", "-") in ("dream", "llada", "llada-moe", "rnd1", "diffusion-gemma")
+            # a decision model (Jev / OpenJev style) is a stock body with a card tag: the tag is the signal
+            shaped["decision"] = any(str(t).lower() in ("decision-model", "calibrated-probabilities")
+                                     for t in (m.get("tags") or []))
             if shaped["files"]:
                 shelf.append(shaped)
         shelf.sort(key=lambda r: -r["dl"])

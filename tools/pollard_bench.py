@@ -561,7 +561,7 @@ def has_chat_template(model):
         return ""
 
 
-def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
+def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0, ref=None):
     """Run the model the way it is actually used, then judge whether it held together.
 
     An INSTRUCT model is run through its own chat template on llama-server, because its stop
@@ -594,6 +594,13 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0):
     if kind is not None and kind.get("diffusion"):
         print("  diffusion architecture -> decoded with llama-diffusion-cli, scored on the canvas")
         return _gate_diffusion(model, ngl, prompts, budget)
+    # A decision model's answer is the probability on each lettered option at position one. Prose
+    # checks do not apply; fidelity to the reference does. Served the same way, judged by pollard-decision.
+    if kind is not None and kind.get("decision"):
+        print("  decision model -> typed set, first-position letter probabilities"
+              + (" vs the reference" if ref else " (add --ref for agreement + option KL)"))
+        from pollard_decision import gate as _decision_gate
+        return _decision_gate(model, ngl, ctx, ref)
 
     tpl = has_chat_template(model)
     if not tpl:
@@ -772,6 +779,13 @@ def print_gate(res):
               "  is UNGATED, not passed. Usually the run is simply slow (a big model with no GPU\n"
               "  offload): re-run with more time, or with -ngl set, before reading anything into it.")
         return False
+    if res.get("config") == "decision":
+        b = res.get("board", {})
+        line = f"accuracy {b.get('accuracy', 0):.0%}  letter mass {b.get('letter_mass', 0):.0%}"
+        if "agreement" in b:
+            line += f"  agreement {b['agreement']:.0%}  option KL {b['option_kl']:.4f}  drift {b['mean_abs_drift']:.3f}"
+        print(f"\nVERDICT: {res['verdict']} -- decision model: {line}\n  {res.get('reason', '')}")
+        return res["verdict"] == "PASS"
     if res["verdict"] == "PASS":
         s = " ".join(res["sampling"])
         print(f"\nVERDICT: PASS -- coherent. Ship these sampling defaults on the card:\n  {s}")
@@ -1056,7 +1070,7 @@ def main():
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
             sys.exit("llama-cli not found -- build llama.cpp/ik_llama.cpp or pass --llama-cli.")
-        res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick,
+        res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick, ref=a.ref,
                              ctx=a.gate_ctx, gate_tokens=a.gate_tokens)
         gate_passed = print_gate(res)
         if not a.ref and not a.speed:      # nothing else was asked for -> exit on the verdict
