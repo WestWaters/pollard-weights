@@ -2670,4 +2670,15 @@ def test_runtime_capture_includes_new_source_files(tmp_path):
     assert "+++ b/new-sampler.cpp" in patch and "+int b = 3;" in patch, patch
     assert "+++ b/old.cpp" in patch and "weights.gguf" not in patch
     assert sorted(meta["files"]) == ["new-sampler.cpp", "old.cpp"]
+    # two trees with the SAME basename: verify must find the one the patch lives in, not the last scanned
+    from pollard_runtime import verify_captured
+    other = tmp_path / "elsewhere" / "rt"; other.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(other), "init", "-q"], check=True)
+    (other / "old.cpp").write_text("int a = 1;\n")
+    subprocess.run(["git", "-C", str(other), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "b"], check=True)
+    rows = verify_captured([str(other), str(tree)], out_dir=str(tmp_path / "patches"))
+    assert rows and rows[0]["state"] == "APPLIED" and os.path.abspath(rows[0]["tree"]) == os.path.abspath(str(tree)), rows
+    rows = verify_captured([str(tree), str(other)], out_dir=str(tmp_path / "patches"))
+    assert rows[0]["state"] == "APPLIED", rows
 
