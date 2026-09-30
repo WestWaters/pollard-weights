@@ -1,0 +1,580 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 1506bf647..7bed6cf5e 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -102,6 +102,8 @@ add_library(${TARGET}
+     reasoning-budget.cpp
+     reasoning-budget.h
+     sampling.cpp
++    composed-sampler.cpp
++    composed-sampler.h
+     sampling.h
+     speculative.cpp
+     speculative.h
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 43052d58d..05e997801 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -9,6 +9,7 @@
+ #include "llama.h"
+ #include "log.h"
+ #include "sampling.h"
++#include "composed-sampler.h"
+ #include "speculative.h"
+ #include "preset.h"
+ 
+@@ -2041,6 +2042,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
+         }
+     ).set_sampling());
++    add_opt(common_arg(
++        {"--composed"}, "SPEC",
++        "composed decoding on the simplex (arXiv 2609.34992): regularizers as type[:alpha[:key=val]] joined by ','\n"
++        "types kl | js | entropy | coverage | diversity; globals lambda= base_temp= steps= lr= tol=\n"
++        "e.g. \"kl:0.5,coverage:0.5:K=4\" (the paper's Best-of-K). Runs after temperature; default: off",
++        [](common_params & params, const std::string & value) {
++            std::string err;
++            if (!common_composed_parse(value, params.sampling.composed, err)) {
++                throw std::invalid_argument("--composed: " + err);
++            }
++        }
++    ).set_sampling());
+     add_opt(common_arg(
+         {"--top-nsigma", "--top-n-sigma"}, "N",
+         string_format("top-n-sigma sampling (default: %.2f, -1.0 = disabled)", params.sampling.top_n_sigma),
+diff --git a/common/common.h b/common/common.h
+index 63d0badd0..2a70d1fb0 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -126,6 +126,7 @@ enum common_sampler_type {
+     COMMON_SAMPLER_TYPE_PENALTIES   = 10,
+     COMMON_SAMPLER_TYPE_TOP_N_SIGMA = 11,
+     COMMON_SAMPLER_TYPE_ADAPTIVE_P  = 12,
++    COMMON_SAMPLER_TYPE_COMPOSED    = 13,  // composed decoding on the simplex (Pollard)
+ };
+ 
+ // dimensionality reduction methods, used by cvector-generator
+@@ -220,6 +221,26 @@ inline bool common_grammar_needs_prefill(const common_grammar & g) {
+         || g.type == COMMON_GRAMMAR_TYPE_TOOL_CALLS;
+ }
+ 
++// composed decoding on the probability simplex (arXiv 2609.34992) -- see common/composed-sampler.h
++struct common_composed_regularizer {
++    std::string type;                     // kl_to_base | js_to_base | entropy | coverage | diversity_gap
++    float       alpha       = 1.0f;
++    int32_t     K           = 16;         // coverage / diversity: samples the objective is written for
++    int32_t     top_m       = 8;          // coverage: how many reference tokens count
++    std::string weight_mode = "topm_uniform";
++    float       gap_tau     = 1.0f;       // diversity_gap
++};
++
++struct common_composed_params {
++    float   lambda    = 1.0f;
++    float   base_temp = 1.0f;             // base distribution p = softmax(logits / base_temp)
++    int32_t steps     = 10;               // mirror ascent
++    float   lr        = 0.1f;
++    float   tol       = 0.0f;
++    std::vector<common_composed_regularizer> regularizers;
++    bool enabled() const { return !regularizers.empty(); }
++};
++
+ // sampling parameters
+ struct common_params_sampling {
+     uint32_t seed = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampler
+@@ -230,6 +251,7 @@ struct common_params_sampling {
+     int32_t top_k              = 40;     // <= 0 to use vocab size
+     float   top_p              = 0.95f;  // 1.0 = disabled
+     float   min_p              = 0.05f;  // 0.0 = disabled
++    common_composed_params composed;     // empty = disabled; appended after temperature when set
+     float   xtc_probability    = 0.00f;  // 0.0 = disabled
+     float   xtc_threshold      = 0.10f;  // > 0.5 disables XTC
+     float   typ_p              = 1.00f;  // typical_p, 1.0 = disabled
+diff --git a/common/composed-sampler.cpp b/common/composed-sampler.cpp
+new file mode 100644
+index 000000000..03abda020
+--- /dev/null
++++ b/common/composed-sampler.cpp
+@@ -0,0 +1,308 @@
++#include "composed-sampler.h"
++
++#include "llama.h"
++#include "log.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <numeric>
++#include <sstream>
++#include <vector>
++
++// ---------------------------------------------------------------- spec parsing
++
++static bool parse_kv(const std::string & tok, std::string & k, std::string & v) {
++    const auto eq = tok.find('=');
++    if (eq == std::string::npos) {
++        return false;
++    }
++    k = tok.substr(0, eq);
++    v = tok.substr(eq + 1);
++    return true;
++}
++
++bool common_composed_parse(const std::string & spec, common_composed_params & out, std::string & err) {
++    out = common_composed_params{};
++    std::stringstream ss(spec);
++    std::string item;
++    while (std::getline(ss, item, ',')) {
++        if (item.empty()) {
++            continue;
++        }
++        std::string k, v;
++        if (parse_kv(item, k, v) && item.find(':') == std::string::npos) {
++            try {
++                if      (k == "lambda")    out.lambda    = std::stof(v);
++                else if (k == "base_temp") out.base_temp = std::stof(v);
++                else if (k == "steps")     out.steps     = std::stoi(v);
++                else if (k == "lr")        out.lr        = std::stof(v);
++                else if (k == "tol")       out.tol       = std::stof(v);
++                else { err = "unknown composed key: " + k; return false; }
++            } catch (...) {
++                err = "bad value for " + k + ": " + v; return false;
++            }
++            continue;
++        }
++        // type[:alpha[:key=val...]]
++        std::stringstream ps(item);
++        std::string part;
++        common_composed_regularizer r;
++        int idx = 0;
++        while (std::getline(ps, part, ':')) {
++            if (idx == 0) {
++                if      (part == "kl" || part == "kl_to_base")   r.type = "kl_to_base";
++                else if (part == "js" || part == "js_to_base")   r.type = "js_to_base";
++                else if (part == "entropy")                       r.type = "entropy";
++                else if (part == "coverage" || part == "cov")     r.type = "coverage";
++                else if (part == "diversity" || part == "div" || part == "diversity_gap") r.type = "diversity_gap";
++                else { err = "unknown regularizer: " + part; return false; }
++            } else if (idx == 1 && part.find('=') == std::string::npos) {
++                try { r.alpha = std::stof(part); } catch (...) { err = "bad alpha: " + part; return false; }
++            } else {
++                if (!parse_kv(part, k, v)) { err = "expected key=value in " + item; return false; }
++                try {
++                    if      (k == "alpha")       r.alpha       = std::stof(v);
++                    else if (k == "K")           r.K           = std::stoi(v);
++                    else if (k == "top_m")       r.top_m       = std::stoi(v);
++                    else if (k == "weight_mode") r.weight_mode = v;
++                    else if (k == "gap_tau")     r.gap_tau     = std::stof(v);
++                    else { err = "unknown regularizer key: " + k; return false; }
++                } catch (...) {
++                    err = "bad value for " + k + ": " + v; return false;
++                }
++            }
++            idx++;
++        }
++        out.regularizers.push_back(r);
++    }
++    if (out.regularizers.empty()) {
++        err = "composed spec names no regularizer";
++        return false;
++    }
++    return true;
++}
++
++std::string common_composed_to_string(const common_composed_params & p) {
++    std::ostringstream o;
++    for (size_t i = 0; i < p.regularizers.size(); ++i) {
++        const auto & r = p.regularizers[i];
++        if (i) o << ",";
++        o << r.type << ":" << r.alpha;
++        if (r.type == "coverage")      o << ":K=" << r.K << ":top_m=" << r.top_m << ":weight_mode=" << r.weight_mode;
++        if (r.type == "diversity_gap") o << ":K=" << r.K << ":gap_tau=" << r.gap_tau;
++    }
++    o << ",lambda=" << p.lambda << ",base_temp=" << p.base_temp << ",steps=" << p.steps << ",lr=" << p.lr << ",tol=" << p.tol;
++    return o.str();
++}
++
++// ---------------------------------------------------------------- the math (mirrors composimplex exactly)
++
++static const float EPS = 1e-8f;
++
++static void softmax_inplace(std::vector<float> & v) {
++    float mx = -INFINITY;
++    for (float x : v) mx = std::max(mx, x);
++    double sum = 0.0;
++    for (float & x : v) { x = expf(x - mx); sum += x; }
++    if (!(sum > 0.0) || !std::isfinite(sum)) {
++        std::fill(v.begin(), v.end(), 1.0f / (float) v.size());
++        return;
++    }
++    for (float & x : v) x = (float) (x / sum);
++}
++
++static std::vector<size_t> topm_indices(const std::vector<float> & ref, size_t m) {
++    std::vector<size_t> idx(ref.size());
++    std::iota(idx.begin(), idx.end(), 0);
++    m = std::min(m, ref.size());
++    std::partial_sort(idx.begin(), idx.begin() + m, idx.end(), [&](size_t a, size_t b) { return ref[a] > ref[b]; });
++    idx.resize(m);
++    return idx;
++}
++
++struct composed_ctx {
++    common_composed_params params;
++    float temp;
++    // scratch
++    std::vector<float> s, p, q, g, raw, w;
++};
++
++// gradient of  <q,s> - lambda * sum alpha_i Omega_i(q)   at q
++static void objective_grad(composed_ctx & c) {
++    const size_t n = c.q.size();
++    for (size_t i = 0; i < n; ++i) c.g[i] = c.s[i];
++    for (const auto & r : c.params.regularizers) {
++        const float coef = c.params.lambda * r.alpha;
++        if (r.type == "kl_to_base") {
++            for (size_t i = 0; i < n; ++i) {
++                const float qs = std::min(std::max(c.q[i], EPS), 1.0f), ps = std::min(std::max(c.p[i], EPS), 1.0f);
++                c.g[i] -= coef * (logf(qs / ps) + 1.0f);
++            }
++        } else if (r.type == "js_to_base") {
++            for (size_t i = 0; i < n; ++i) {
++                const float qs = std::min(std::max(c.q[i], EPS), 1.0f), ps = std::min(std::max(c.p[i], EPS), 1.0f);
++                const float m = std::min(std::max(0.5f * (ps + qs), EPS), 1.0f);
++                c.g[i] -= coef * (0.5f * logf(qs / m));
++            }
++        } else if (r.type == "entropy") {
++            for (size_t i = 0; i < n; ++i) {
++                const float qs = std::min(std::max(c.q[i], EPS), 1.0f);
++                c.g[i] -= coef * (logf(qs) + 1.0f);
++            }
++        } else if (r.type == "coverage" || r.type == "diversity_gap") {
++            // weights
++            std::fill(c.w.begin(), c.w.end(), 0.0f);
++            if (r.type == "coverage") {
++                const size_t m = std::min((size_t) std::max(r.top_m, 1), n);
++                if (r.weight_mode == "reference") {
++                    c.w = c.p;
++                } else {
++                    const auto idx = topm_indices(c.p, m);
++                    float val = 1.0f;
++                    if (r.weight_mode == "topm_l2") {
++                        val = 1.0f / sqrtf((float) m);
++                    } else if (r.weight_mode == "topm") {
++                        val = 1.0f;
++                    } else { // topm_uniform (default): uniform-distribution coverage of one
++                        const float max_hit = 1.0f - powf(1.0f - 1.0f / (float) m, (float) r.K);
++                        val = 1.0f / ((float) m * max_hit);
++                    }
++                    for (size_t i : idx) c.w[i] = val;
++                }
++            } else {
++                float mx = -INFINITY;
++                for (float x : c.raw) mx = std::max(mx, x);
++                const float tau = std::max(r.gap_tau, EPS);
++                double total = 0.0;
++                for (size_t i = 0; i < n; ++i) {
++                    const float gap = mx - c.raw[i];
++                    c.w[i] = gap * expf(-gap / tau);
++                    total += c.w[i];
++                }
++                if (std::isfinite(total) && total > 0.0) {
++                    for (size_t i = 0; i < n; ++i) c.w[i] = (float) (c.w[i] / total);
++                }
++            }
++            const float K = (float) r.K;
++            for (size_t i = 0; i < n; ++i) {
++                const float qc = (r.type == "coverage") ? std::min(std::max(c.q[i], EPS), 1.0f) : c.q[i];
++                const float one_minus = std::min(std::max(1.0f - qc, 0.0f), 1.0f);
++                const float cov_grad = K * powf(one_minus, K - 1.0f);
++                // Omega = -coverage  ->  grad Omega = -(w * cov_grad);  g -= coef * gradOmega  ->  g += coef*w*cov_grad
++                c.g[i] += coef * c.w[i] * cov_grad;
++            }
++        }
++    }
++}
++
++static void solve(composed_ctx & c) {
++    const size_t n = c.s.size();
++    const auto & P = c.params;
++    const auto & R = P.regularizers;
++
++    bool only_entropy = !R.empty(), only_kl = !R.empty();
++    float a_ent = 0.0f, a_kl = 0.0f;
++    for (const auto & r : R) {
++        if (r.type != "entropy")    only_entropy = false; else a_ent += r.alpha;
++        if (r.type != "kl_to_base") only_kl      = false; else a_kl  += r.alpha;
++    }
++
++    if (R.empty() || P.lambda == 0.0f) {                 // argmax <q,s>: one-hot
++        size_t best = 0;
++        for (size_t i = 1; i < n; ++i) if (c.s[i] > c.s[best]) best = i;
++        std::fill(c.q.begin(), c.q.end(), 0.0f);
++        c.q[best] = 1.0f;
++        return;
++    }
++    if (only_entropy) {
++        const float strength = std::max(P.lambda * a_ent, EPS);
++        for (size_t i = 0; i < n; ++i) c.q[i] = c.s[i] / strength;
++        softmax_inplace(c.q);
++        return;
++    }
++    if (only_kl) {
++        const float strength = std::max(P.lambda * a_kl, EPS);
++        for (size_t i = 0; i < n; ++i) c.q[i] = logf(std::max(c.p[i], EPS)) + c.s[i] / strength;
++        softmax_inplace(c.q);
++        return;
++    }
++    // mirror ascent from q0 = p
++    for (size_t i = 0; i < n; ++i) c.q[i] = std::max(c.p[i], EPS);
++    { double t = 0; for (float x : c.q) t += x; for (float & x : c.q) x = (float) (x / t); }
++    std::vector<float> q0 = c.q;
++    for (int step = 0; step < P.steps; ++step) {
++        objective_grad(c);
++        float gmax = -INFINITY; double qg = 0.0; bool finite = true;
++        for (size_t i = 0; i < n; ++i) { if (!std::isfinite(c.g[i])) finite = false; gmax = std::max(gmax, c.g[i]); qg += (double) c.q[i] * c.g[i]; }
++        if (!finite) { c.q = q0; return; }
++        if (P.tol > 0.0f && (gmax - qg) <= P.tol) break;
++        double total = 0.0;
++        for (size_t i = 0; i < n; ++i) {
++            const float upd = expf(P.lr * (c.g[i] - gmax));
++            c.q[i] = std::max(c.q[i] * upd, EPS);
++            total += c.q[i];
++        }
++        if (!std::isfinite(total) || total <= 0.0) { c.q = q0; return; }
++        for (float & x : c.q) x = (float) (x / total);
++    }
++}
++
++// ---------------------------------------------------------------- llama_sampler glue
++
++static const char * composed_name(const struct llama_sampler *) { return "composed"; }
++
++static void composed_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++    auto * c = (composed_ctx *) smpl->ctx;
++    const size_t n = cur_p->size;
++    if (n == 0 || c->params.regularizers.empty()) {
++        return;
++    }
++    const float T = (c->temp > 0.0f) ? c->temp : 1.0f;
++    const float bt = std::max(c->params.base_temp, 1e-6f);
++    c->s.resize(n); c->p.resize(n); c->q.resize(n); c->g.resize(n); c->raw.resize(n); c->w.resize(n);
++    for (size_t i = 0; i < n; ++i) {
++        c->s[i]   = cur_p->data[i].logit;          // already / T by the temperature sampler
++        c->raw[i] = cur_p->data[i].logit * T;      // the raw supported logit the paper's terms are defined on
++        c->p[i]   = c->raw[i] / bt;
++    }
++    softmax_inplace(c->p);
++    solve(*c);
++    for (size_t i = 0; i < n; ++i) {
++        const float q = std::max(c->q[i], EPS);
++        cur_p->data[i].p     = q;
++        cur_p->data[i].logit = logf(q);
++    }
++    cur_p->sorted = false;
++}
++
++static struct llama_sampler * composed_clone(const struct llama_sampler * smpl) {
++    const auto * c = (const composed_ctx *) smpl->ctx;
++    return common_sampler_init_composed(c->params, c->temp);
++}
++
++static void composed_free(struct llama_sampler * smpl) {
++    delete (composed_ctx *) smpl->ctx;
++}
++
++static struct llama_sampler_i composed_i = {
++    /* .name              = */ composed_name,
++    /* .accept            = */ nullptr,
++    /* .apply             = */ composed_apply,
++    /* .reset             = */ nullptr,
++    /* .clone             = */ composed_clone,
++    /* .free              = */ composed_free,
++    /* .backend_init      = */ nullptr,
++    /* .backend_accept    = */ nullptr,
++    /* .backend_apply     = */ nullptr,
++    /* .backend_set_input = */ nullptr,
++    /* .backend_reset     = */ nullptr,
++    /* .copy_state        = */ nullptr,
++};
++
++struct llama_sampler * common_sampler_init_composed(const common_composed_params & params, float temp) {
++    auto * c = new composed_ctx{};
++    c->params = params;
++    c->temp   = temp;
++    return llama_sampler_init(&composed_i, c);
++}
+diff --git a/common/composed-sampler.h b/common/composed-sampler.h
+new file mode 100644
+index 000000000..40d78f6f6
+--- /dev/null
++++ b/common/composed-sampler.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++// Composed decoding on the probability simplex (Khamis et al. 2026, arXiv 2609.34992):
++//
++//     q* = argmax_{q in simplex(support)}  <q, s>  -  lambda * sum_i alpha_i * Omega_i(q)
++//
++// s = logits / T over the support the earlier samplers left (top-k / top-p / min-p / ...), the base
++// distribution p = softmax(logits / base_temp) over that same support. Regularisers: kl_to_base,
++// js_to_base, entropy, coverage, diversity_gap. Solved in closed form where one exists (none -> argmax,
++// entropy only -> softmax(s / (lambda*alpha)), KL only -> softmax(log p + s / (lambda*alpha))) and by
++// exponentiated mirror ascent otherwise. The candidate logits are overwritten with log q*, so the
++// dist sampler that follows draws exactly q*.
++//
++// This sampler is meant to sit AFTER "temperature" in the chain: it receives logits already divided
++// by T and undoes that for the base distribution and the diversity gap, which the paper defines on the
++// raw supported logits.
++
++#include "common.h"
++
++#include <string>
++
++struct llama_sampler;
++
++// "kl:0.5,coverage:0.5:K=4:top_m=8"  ->  regularizers. Types: kl | js | entropy | coverage | diversity.
++// Global keys may be given as "lambda=1.0", "base_temp=1.0", "steps=10", "lr=0.1", "tol=0".
++bool common_composed_parse(const std::string & spec, common_composed_params & out, std::string & err);
++
++std::string common_composed_to_string(const common_composed_params & p);
++
++// temp is the temperature the chain applied before this sampler (1.0 if none)
++struct llama_sampler * common_sampler_init_composed(const common_composed_params & params, float temp);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e1c..4e27e81b6 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,4 +1,5 @@
+ #include "sampling.h"
++#include "composed-sampler.h"
+ 
+ #include "common.h"
+ #include "fit.h"
+@@ -340,6 +341,7 @@ struct common_sampler * common_sampler_init(
+     if (params.mirostat == 0) {
+ 
+         bool use_adaptive_p = false; // see below
++        bool composed_added = false;
+ 
+         for (const auto & cnstr : params.samplers) {
+             switch (cnstr) {
+@@ -374,6 +376,12 @@ struct common_sampler * common_sampler_init(
+                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                     samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                     break;
++                case COMMON_SAMPLER_TYPE_COMPOSED:
++                    if (params.composed.enabled()) {
++                        samplers.push_back(common_sampler_init_composed(params.composed, params.temp));
++                        composed_added = true;
++                    }
++                    break;
+                 case COMMON_SAMPLER_TYPE_INFILL:
+                     samplers.push_back(llama_sampler_init_infill(vocab));
+                     break;
+@@ -391,6 +399,11 @@ struct common_sampler * common_sampler_init(
+                     GGML_ASSERT(false && "unknown sampler type");
+             }
+         }
++        if (params.composed.enabled() && !composed_added) {
++            // composed decoding rewrites the candidate distribution; it belongs after every support and
++            // temperature sampler, right before the token is drawn
++            samplers.push_back(common_sampler_init_composed(params.composed, params.temp));
++        }
+         if (use_adaptive_p) {
+             // only if user explicitly included adaptive-p sampler
+             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+@@ -805,6 +818,7 @@ char common_sampler_type_to_chr(enum common_sampler_type cnstr) {
+         case COMMON_SAMPLER_TYPE_INFILL:      return 'i';
+         case COMMON_SAMPLER_TYPE_PENALTIES:   return 'e';
+         case COMMON_SAMPLER_TYPE_ADAPTIVE_P:  return 'a';
++        case COMMON_SAMPLER_TYPE_COMPOSED:    return 'c';
+         default : return '?';
+     }
+ }
+@@ -822,6 +836,7 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr) {
+         case COMMON_SAMPLER_TYPE_INFILL:      return "infill";
+         case COMMON_SAMPLER_TYPE_PENALTIES:   return "penalties";
+         case COMMON_SAMPLER_TYPE_ADAPTIVE_P:  return "adaptive_p";
++        case COMMON_SAMPLER_TYPE_COMPOSED:    return "composed";
+         default : return "";
+     }
+ }
+@@ -841,7 +856,8 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
+             { "xtc",         COMMON_SAMPLER_TYPE_XTC         },
+             { "infill",      COMMON_SAMPLER_TYPE_INFILL      },
+             { "penalties",   COMMON_SAMPLER_TYPE_PENALTIES   },
+-            { "adaptive_p",  COMMON_SAMPLER_TYPE_ADAPTIVE_P  }
++            { "adaptive_p",  COMMON_SAMPLER_TYPE_ADAPTIVE_P  },
++            { "composed",    COMMON_SAMPLER_TYPE_COMPOSED    }
+         };
+         std::unordered_map<std::string, common_sampler_type> alias_name_map;
+         for (const auto & entry : canonical_name_map) {
+@@ -901,6 +917,7 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
+         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_INFILL),      COMMON_SAMPLER_TYPE_INFILL },
+         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_PENALTIES),   COMMON_SAMPLER_TYPE_PENALTIES },
+         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_ADAPTIVE_P),  COMMON_SAMPLER_TYPE_ADAPTIVE_P },
++        { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_COMPOSED),    COMMON_SAMPLER_TYPE_COMPOSED },
+     };
+ 
+     std::vector<common_sampler_type> samplers;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 64b925129..32f4c18c5 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -1,4 +1,5 @@
+ #include "server-schema.h"
++#include "composed-sampler.h"
+ 
+ #include "json-schema-to-grammar.h"
+ 
+@@ -498,6 +499,50 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+             }
+         }));
+ 
++    add((new field_json("composed"))
++        ->set_desc("Composed decoding on the simplex (arXiv 2609.34992): a spec string \"kl:0.5,coverage:0.5:K=4\" or an object {lambda, base_temp, steps, lr, tol, regularizers:[{type, alpha, K, top_m, weight_mode, gap_tau}]}. Applied after temperature. Empty/null disables")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            const auto & c = data.at("composed");
++            common_composed_params out;
++            if (c.is_null() || (c.is_string() && c.get<std::string>().empty())) {
++                ctx.params.sampling.composed = out;
++                return;
++            }
++            if (c.is_string()) {
++                std::string err;
++                if (!common_composed_parse(c.get<std::string>(), out, err)) {
++                    throw std::invalid_argument("composed: " + err);
++                }
++            } else if (c.is_object()) {
++                out.lambda    = c.value("lambda",    out.lambda);
++                out.base_temp = c.value("base_temp", out.base_temp);
++                out.steps     = c.value("steps",     out.steps);
++                out.lr        = c.value("lr",        out.lr);
++                out.tol       = c.value("tol",       out.tol);
++                for (const auto & r : c.value("regularizers", json::array())) {
++                    common_composed_regularizer reg;
++                    reg.type        = r.value("type", std::string());
++                    if (reg.type == "kl") reg.type = "kl_to_base";
++                    if (reg.type == "js") reg.type = "js_to_base";
++                    if (reg.type == "diversity" || reg.type == "div") reg.type = "diversity_gap";
++                    if (reg.type == "cov") reg.type = "coverage";
++                    reg.alpha       = r.value("alpha",       reg.alpha);
++                    reg.K           = r.value("K",           reg.K);
++                    reg.top_m       = r.value("top_m",       reg.top_m);
++                    reg.weight_mode = r.value("weight_mode", reg.weight_mode);
++                    reg.gap_tau     = r.value("gap_tau",     reg.gap_tau);
++                    if (reg.type != "kl_to_base" && reg.type != "js_to_base" && reg.type != "entropy" &&
++                        reg.type != "coverage" && reg.type != "diversity_gap") {
++                        throw std::invalid_argument("composed: unknown regularizer type '" + reg.type + "'");
++                    }
++                    out.regularizers.push_back(reg);
++                }
++            } else {
++                throw std::invalid_argument("composed must be a spec string or an object");
++            }
++            ctx.params.sampling.composed = out;
++        }));
++
+     add((new field_json("samplers"))
+         ->set_desc("The order in which samplers are applied. An array of sampler type names, or a single string of sampler chars")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {

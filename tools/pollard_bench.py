@@ -514,7 +514,7 @@ def _read_chat(got):
 
 
 #: the CLI sampling lists above, as the JSON the server takes
-_SAMPLE_KEY = {"--temp": "temperature", "--top-k": "top_k", "--top-p": "top_p",
+_SAMPLE_KEY = {"--temp": "temperature", "--top-k": "top_k", "--top-p": "top_p", "--composed": "composed",
                "--min-p": "min_p", "--repeat-penalty": "repeat_penalty",
                "--repeat-last-n": "repeat_last_n", "--frequency-penalty": "frequency_penalty",
                "--presence-penalty": "presence_penalty"}
@@ -528,7 +528,7 @@ def _sampling_json(sampling):
         k = _SAMPLE_KEY.get(sampling[i])
         if k:
             v = sampling[i + 1]
-            out[k] = float(v) if "." in str(v) else int(v)
+            out[k] = str(v) if k == "composed" else (float(v) if "." in str(v) else int(v))
         i += 2
     return out
 
@@ -1029,6 +1029,9 @@ def main():
                     help="also measure decode tok/s for --gguf (and --vs), on the same flags so the "
                          "two are comparable. Needs --llama-cli. tok/s is hardware-specific: state "
                          "the machine wherever you publish it.")
+    ap.add_argument("--composed", metavar="SPEC",
+                    help="composed decoding spec (pollard-composed --presets) applied to every gate sampling config, "
+                         "e.g. 'kl:0.5,coverage:0.5:K=4' -- needs the composed-sampler runtime patch")
     ap.add_argument("--gate-tokens", type=int, default=0,
                     help="token budget per gate prompt. Default: read from the model kind, because "
                          "a thinking model spends its first few hundred tokens reasoning and a "
@@ -1070,6 +1073,11 @@ def main():
         cli_bin = find_llama_bin(a.llama_cli)
         if not cli_bin:
             sys.exit("llama-cli not found -- build llama.cpp/ik_llama.cpp or pass --llama-cli.")
+        if a.composed:
+            from pollard_composed import PRESETS
+            spec = PRESETS.get(a.composed, a.composed)
+            for i, (name, samp) in enumerate(SAMPLING_CONFIGS):
+                SAMPLING_CONFIGS[i] = (name + "/composed", list(samp) + ["--composed", spec])
         res = coherence_gate(cli_bin, a.gguf, a.ngl, quick=a.quick, ref=a.ref,
                              ctx=a.gate_ctx, gate_tokens=a.gate_tokens)
         gate_passed = print_gate(res)

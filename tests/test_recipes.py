@@ -2605,3 +2605,69 @@ def test_modelkind_flags_decision_models_from_card_not_arch(tmp_path):
     assert _is_decision("/x/m.gguf", {"general.tags": ["agents", "decision-model"]})
     assert not _is_decision("/x/Qwen2.5-0.5B-Instruct-f16.gguf", {"general.name": "Qwen2.5 0.5B Instruct"})
 
+
+def test_composed_reference_matches_closed_forms_and_composimplex():
+    """The numpy reference for the composed sampler: spec grammar, closed forms exact, and -- when the
+    composimplex library is importable -- the mirror-ascent solution equal to the paper's own code on
+    random logits. The C++ sampler is checked against this reference live (pollard-composed --check)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import numpy as np
+    from pollard_composed import parse_spec, solve, softmax, PRESETS
+    cfg = parse_spec("kl:0.5,coverage:0.5:K=4:top_m=8,lambda=1.0,steps=10,lr=0.1")
+    assert cfg["lambda"] == 1.0 and cfg["steps"] == 10 and [r["type"] for r in cfg["regularizers"]] == ["kl_to_base", "coverage"]
+    assert cfg["regularizers"][1]["K"] == 4 and cfg["regularizers"][1]["top_m"] == 8
+    for name, spec in PRESETS.items():
+        parse_spec(spec)
+    rng = np.random.default_rng(0)
+    logits = rng.normal(size=32) * 3
+    # no regularizer -> one-hot at argmax(s); entropy only -> softmax(s / (lambda*alpha)); kl only -> softmax(log p + s/(lambda*alpha))
+    q = solve(logits, {"lambda": 1.0, "base_temp": 1.0, "steps": 10, "lr": 0.1, "tol": 0.0, "regularizers": []}, 0.7)
+    assert q[int(np.argmax(logits))] == 1.0 and q.sum() == 1.0
+    T = 0.7
+    q = solve(logits, parse_spec("entropy:0.5"), T)
+    assert np.allclose(q, softmax((logits / T) / 0.5))
+    q = solve(logits, parse_spec("kl:0.5"), T)
+    assert np.allclose(q, softmax(np.log(softmax(logits)) + (logits / T) / 0.5))
+    q = solve(logits, parse_spec(PRESETS["best-of-k"]), T)
+    assert abs(q.sum() - 1) < 1e-9 and (q >= 0).all()
+    try:
+        import torch
+        from composimplex.config import normalize_sampler_config
+        from composimplex.sampler import solve_distribution
+    except ImportError:
+        print("    (composimplex not installed -- reference-vs-paper check skipped)")
+        return
+    for spec, ccfg in (
+        ("kl:0.5,coverage:0.5:K=4:top_m=8", {"regularizers": [{"type": "kl_to_base", "alpha": 0.5}, {"type": "coverage", "alpha": 0.5, "K": 4, "top_m": 8}]}),
+        ("kl:0.5,diversity:0.5:K=4:gap_tau=1.0", {"regularizers": [{"type": "kl_to_base", "alpha": 0.5}, {"type": "diversity_gap", "alpha": 0.5, "K": 4, "gap_tau": 1.0}]}),
+        ("js:0.5,entropy:0.5", {"regularizers": [{"type": "js_to_base", "alpha": 0.5}, {"type": "entropy", "alpha": 0.5}]}),
+    ):
+        ours = solve(logits, parse_spec(spec), T)
+        base = {"temperature": T, "support": {"type": "full"}, "base_distribution": {"type": "softmax", "temperature": 1.0},
+                "lambda": 1.0, "solver": "auto", "optimizer": {"name": "mirror_ascent", "steps": 10, "lr": 0.1, "tol": 0.0}}
+        theirs, _ = solve_distribution(torch.tensor(logits, dtype=torch.float32), normalize_sampler_config(dict(base, **ccfg)))
+        assert np.allclose(ours, theirs.numpy(), atol=1e-4), (spec, np.abs(ours - theirs.numpy()).max())
+
+
+def test_runtime_capture_includes_new_source_files(tmp_path):
+    """`git diff HEAD` cannot see an untracked file. A runtime patch that adds common/composed-sampler.cpp
+    must carry that file, or re-applying it after a clone yields a tree that does not build."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import subprocess
+    from pollard_runtime import capture, untracked_sources
+    tree = tmp_path / "rt"; tree.mkdir()
+    def git(*a):
+        return subprocess.run(["git", "-C", str(tree)] + list(a), capture_output=True, text=True, check=True)
+    git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (tree / "old.cpp").write_text("int a = 1;\n"); git("add", "."); git("commit", "-q", "-m", "base")
+    (tree / "old.cpp").write_text("int a = 2;\n")
+    (tree / "new-sampler.cpp").write_text("int b = 3;\n")
+    (tree / "weights.gguf").write_bytes(b"GGUF")
+    assert untracked_sources(str(tree)) == ["new-sampler.cpp"]
+    meta, msg = capture(str(tree), "t", out_dir=str(tmp_path / "patches"))
+    assert meta is not None, msg
+    patch = (tmp_path / "patches" / "rt-t.patch").read_text()
+    assert "+++ b/new-sampler.cpp" in patch and "+int b = 3;" in patch, patch
+    assert "+++ b/old.cpp" in patch and "weights.gguf" not in patch
+    assert sorted(meta["files"]) == ["new-sampler.cpp", "old.cpp"]
+

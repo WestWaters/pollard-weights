@@ -269,6 +269,27 @@ def encoding_noise(diff):
     return "; ".join(bits)
 
 
+_SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".cu", ".cuh", ".m", ".mm", ".metal",
+               ".swift", ".py", ".txt", ".cmake", ".json", ".patch", ".md")
+
+
+def untracked_sources(tree):
+    """Untracked files in a tree that are source (by extension), not build output or weights."""
+    try:
+        r = subprocess.run(["git", "-C", tree, "ls-files", "--others", "--exclude-standard"],
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=120)
+    except Exception:                                                      # noqa: BLE001
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        f = line.strip()
+        if not f or f.startswith("build") or "/build/" in f:
+            continue
+        if f.lower().endswith(_SOURCE_EXT) or os.path.basename(f) == "CMakeLists.txt":
+            out.append(f)
+    return out
+
+
 def capture(tree, name, out_dir=PATCH_DIR):
     """Export a runtime tree's uncommitted changes as a tracked patch plus a manifest.
 
@@ -279,6 +300,14 @@ def capture(tree, name, out_dir=PATCH_DIR):
     # errors="replace" and a generous timeout on purpose: a real runtime patch can be large and can
     # carry bytes that strict UTF-8 rejects, and the whole point of this is not to lose the work.
     try:
+        # A runtime change is often a NEW file (common/composed-sampler.cpp), and `git diff HEAD` does
+        # not see untracked files at all -- the first composed-sampler capture would have shipped a
+        # patch that referenced a source file it did not contain. Intent-to-add (git add -N) makes an
+        # untracked file diffable without staging its content; only source-shaped files, never build
+        # output or models.
+        new = untracked_sources(tree)
+        if new:
+            subprocess.run(["git", "-C", tree, "add", "-N", "--"] + new, capture_output=True, timeout=120)
         r = subprocess.run(["git", "-C", tree, "diff", "HEAD"], capture_output=True,
                            encoding="utf-8", errors="replace", timeout=600)
         diff = r.stdout or ""
@@ -483,7 +512,10 @@ def main():
                                     text=True, timeout=60).stdout.strip().splitlines()
             except Exception:                                              # noqa: BLE001
                 continue
-            mod = [l for l in st if l[:2].strip() and not l.startswith("??")]
+            # untracked SOURCE files are runtime work too (a new sampler is a new .cpp); build output
+            # and weights are not
+            new = set(untracked_sources(t))
+            mod = [l for l in st if l[:2].strip() and (not l.startswith("??") or l[3:].strip() in new)]
             if not mod:
                 print(f"  clean   {t}")
                 continue

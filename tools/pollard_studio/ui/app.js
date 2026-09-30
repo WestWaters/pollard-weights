@@ -713,6 +713,11 @@ const ADV_SECTIONS = [
        + "never write prose. A rung is judged on agreement and option KL against f16 -- calibration is "
        + "the product -- not on free-text coherence.",
     tools: ["pollard_decision"] },
+  { title: "DECODING", icon: "wave",
+    why: "How a build is sampled is part of what it delivers. Composed decoding (arXiv 2609.34992) writes "
+       + "every sampler as one objective on the simplex -- KL to the model, coverage, diversity -- and ships "
+       + "in Pollard's llama.cpp as `--composed`; this is the reference it is checked against and the presets.",
+    tools: ["pollard_composed"] },
   { title: "SOLVER", icon: "wave",
     why: "Full-Hessian error feedback. Pollard trains as well as compresses, and these are the "
        + "solver's own knobs.",

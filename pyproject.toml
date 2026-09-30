@@ -78,6 +78,7 @@ pollard-stop = "pollard_stop:main"
 pollard-modelkind = "pollard_modelkind:main"
 pollard-diffusion = "pollard_diffusion:main"
 pollard-decision = "pollard_decision:main"
+pollard-composed = "pollard_composed:main"
 pollard-fragile = "pollard_fragile:main"
 pollard-mmeval = "pollard_mmeval:main"
 pollard-scorecard = "pollard_scorecard:main"
@@ -118,7 +119,7 @@ package-dir = { "" = "tools" }
 # finds them without being configured.
 packages = ["pollard_studio"]
 py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit",
-    "pollard_flybrain", "pollard_brainverify", "pollard_brainattach", "pollard_brainlanes", "pollard_brain_backends", "pollard_connectome", "pollard_experts", "pollard_route", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_taskeval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_probes", "pollard_convert", "pollard_smoke", "pollard_modelkind", "pollard_diffusion", "pollard_decision", "pollard_mmeval", "pollard_fragile", "pollard_stop", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_vllm", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
+    "pollard_flybrain", "pollard_brainverify", "pollard_brainattach", "pollard_brainlanes", "pollard_brain_backends", "pollard_connectome", "pollard_experts", "pollard_route", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_taskeval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_probes", "pollard_convert", "pollard_smoke", "pollard_modelkind", "pollard_diffusion", "pollard_decision", "pollard_composed", "pollard_mmeval", "pollard_fragile", "pollard_stop", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_vllm", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
     "pollard_serve_eval", "pollard_card", "pollard_onboard", "pollard_envmatch", "imatrix_fix_gate", "exl3_fix_mtp_ehproj",
     "pollard_archfp", "pollard_errtype", "pollard_errsrc", "pollard_recard",
     "pollard_ggufcompat", "pollard_reclaim", "pollard_exl3_band", "pollard_refcheck",
