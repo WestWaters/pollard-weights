@@ -315,8 +315,12 @@ class Runtime:
 
     # -- generation ------------------------------------------------------------------------------
     def complete(self, prompt: str, n_predict: int = 256, temperature: float = 0.7,
-                 timeout: float = 300) -> dict:
-        """One completion. Always reports WHY it stopped, because that is a failure mode."""
+                 timeout: float = 300, composed: str = "") -> dict:
+        """One completion. Always reports WHY it stopped, because that is a failure mode.
+
+        `composed` is a composed-decoding spec ("kl:0.5,coverage:0.5:K=4"): Pollard's llama.cpp carries
+        the sampler (runtime-patches/llama.cpp-composed-sampler), so it is passed straight through to a
+        LOCAL llama-server. A remote OpenAI-style endpoint would reject the field, so it never gets it."""
         try:
             if self.spec["kind"] == REMOTE:
                 return self._openai(prompt, n_predict, temperature, timeout,
@@ -338,10 +342,12 @@ class Runtime:
             base = f"http://127.0.0.1:{self.port}"
             if self.spec["api"] == "openai":
                 return self._openai(prompt, n_predict, temperature, timeout, base + "/v1",
-                                    {}, Path(self.model).name)
-            data = _post(f"{base}/completion",
-                         {"prompt": prompt, "n_predict": int(n_predict),
-                          "temperature": float(temperature), "stream": False}, {}, timeout)
+                                    {}, Path(self.model).name, composed=composed)
+            body = {"prompt": prompt, "n_predict": int(n_predict),
+                    "temperature": float(temperature), "stream": False}
+            if composed:
+                body["composed"] = composed
+            data = _post(f"{base}/completion", body, {}, timeout)
             return {"ok": True, "text": (data.get("content") or "").strip(),
                     "stop_reason": "length" if data.get("stopped_limit") else "stop",
                     "tokens": data.get("tokens_predicted") or 0}
@@ -350,11 +356,12 @@ class Runtime:
         except (urllib.error.URLError, TimeoutError) as e:
             return {"ok": False, "error": f"{self.name}: {e}"}
 
-    def _openai(self, prompt, n, temp, timeout, base, headers, model) -> dict:
-        data = _post(f"{base}/chat/completions",
-                     {"model": model, "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": int(n), "temperature": float(temp)},
-                     headers, timeout)
+    def _openai(self, prompt, n, temp, timeout, base, headers, model, composed: str = "") -> dict:
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": int(n), "temperature": float(temp)}
+        if composed:
+            body["composed"] = composed
+        data = _post(f"{base}/chat/completions", body, headers, timeout)
         ch = (data.get("choices") or [{}])[0]
         return {"ok": True,
                 "text": ((ch.get("message") or {}).get("content") or "").strip(),

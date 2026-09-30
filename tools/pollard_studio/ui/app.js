@@ -858,6 +858,8 @@ SCREENS.chat = () => `
       <div id="c-rtnote" class="hint" style="margin:-8px 0 12px"></div>
       ${field("Max tokens", srow("c-max", 32, 1024, 256, 32, true))}
       ${field("Temperature", srow("c-temp", 0, 20, 7, 1))}
+      ${field("Decoding", `<select id="c-decode" class="sel"><option value="">standard (top-p / temperature)</option></select>
+        <div class="hint">composed decoding (arXiv 2609.34992) rewrites the sampling objective -- KL to the model plus coverage or diversity; ships in Pollard's llama.cpp as <code>--composed</code></div>`)}
       <div class="sep"></div>
       <div class="btns"><button class="btn gold wide" onclick="coherenceGate()">
         ${ic("shield")}RUN TEXT GATE</button></div>
@@ -1886,6 +1888,13 @@ async function wireChat() {
   await renderRuntimes();
   await renderModalities();
   bindSlider("c-max"); bindSlider("c-temp");
+  (async () => {
+    const sel = $("#c-decode"); if (!sel || !bridge() || !bridge().decode_presets) return;
+    const d = await bridge().decode_presets();
+    if (!d || !d.ok) return;
+    for (const [name, spec] of Object.entries(d.presets || {}))
+      sel.insertAdjacentHTML("beforeend", `<option value="${esc(spec)}">${esc(name)} — ${esc(spec)}</option>`);
+  })();
   $("#c-in").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
   bindSlider("art-vol");
   const v = $("#art-vol");
@@ -2029,7 +2038,8 @@ async function sendChat() {
   pushMsg("You", q, "u");
   $("#c-state").innerHTML = chip("RUNNING");
   const r = await bridge().chat(R.gguf, q, +($("#c-max") || {}).value || 256,
-                                (+($("#c-temp") || {}).value || 7) / 10);
+                                (+($("#c-temp") || {}).value || 7) / 10,
+                                ($("#c-decode") || {}).value || "");
   $("#c-state").innerHTML = chip("IDLE");
   if (!r.ok) { pushMsg("Pollard", r.error, ""); return; }
   pushMsg("Pollard", r.text || "(empty)", "");

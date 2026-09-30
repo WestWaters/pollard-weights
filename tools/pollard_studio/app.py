@@ -570,8 +570,18 @@ class Api:
         self.server = probe
         return want
 
+    def decode_presets(self) -> dict:
+        """The composed-decoding presets (pollard-composed), for the chat screen's decode select."""
+        try:
+            sys.path.insert(0, str(runner.tools_dir()))
+            from pollard_composed import PRESETS
+            return {"ok": True, "presets": dict(PRESETS),
+                    "supported": self.server.spec.get("kind") == runtimes.LOCAL if hasattr(self, "server") else True}
+        except Exception as e:                                             # noqa: BLE001
+            return {"ok": False, "error": str(e), "presets": {}}
+
     def chat(self, gguf: str, prompt: str, max_tokens: int = 256,
-             temperature: float = 0.7) -> dict:
+             temperature: float = 0.7, composed: str = "") -> dict:
         """Generate once, and check the result for the failures metrics cannot see.
 
         A build can hold its perplexity and still loop forever, never halt, or open a reasoning
@@ -581,11 +591,11 @@ class Api:
         up = self.server.ensure(gguf)
         if not up["ok"]:
             return {"ok": False, "error": up["error"], "runtime": self.server.name}
-        r = self.server.complete(prompt, max_tokens, temperature)
+        r = self.server.complete(prompt, max_tokens, temperature, composed=composed or "")
         if not r["ok"]:
             return r
         return {"ok": True, "text": r["text"], "tokens": r["tokens"],
-                "runtime": self.server.name, "switched": switched,
+                "runtime": self.server.name, "switched": switched, "composed": composed or "",
                 "coherence": coherence.analyse(r["text"], int(max_tokens), r["stop_reason"])}
 
     def server_status(self) -> dict:
