@@ -708,6 +708,11 @@ const ADV_SECTIONS = [
        + "like the Qwen bodies they are, but llama-server cannot run them: chat and the gate go "
        + "through llama-diffusion-cli, and a score is the canvas, not a perplexity.",
     tools: ["pollard_diffusion"] },
+  { title: "DECISION MODELS", icon: "check",
+    why: "Jev, OpenJev and d1-style models answer typed questions from the logits at position one and "
+       + "never write prose. A rung is judged on agreement and option KL against f16 -- calibration is "
+       + "the product -- not on free-text coherence.",
+    tools: ["pollard_decision"] },
   { title: "SOLVER", icon: "wave",
     why: "Full-Hessian error feedback. Pollard trains as well as compresses, and these are the "
        + "solver's own knobs.",

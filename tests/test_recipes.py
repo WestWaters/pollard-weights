@@ -2555,3 +2555,53 @@ def test_abliterate_gate_judges_like_the_bench_gate():
     assert inspect.signature(abliterate).parameters["skip_embed"].default is False, \
         "the classic recipe stays the default; --embed auto backs it out only when the gate trips"
 
+
+def test_decision_readout_and_verdict():
+    """A decision model is judged on option probabilities at position one, not on prose. The readout
+    must prefer the bare letter token, fall back to " A" / "[A" variants, floor missing letters, and the
+    verdict must fail a build whose mass left the letters before it looks at anything else."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import math
+    from pollard_decision import (letter_logprobs, option_probs, letter_mass, score_rows, verdict,
+                                  build_prompt, DECISION_SET)
+    top = [{"token": "B", "logprob": -0.1}, {"token": " A", "logprob": -2.0}, {"token": "[C", "logprob": -3.0},
+           {"token": "the", "logprob": -4.0}, {"token": "A", "logprob": -1.0}]
+    lps = letter_logprobs(top)
+    assert lps["A"] == -1.0 and lps["B"] == -0.1 and lps["C"] == -3.0, lps
+    p = option_probs(lps, 4)
+    assert abs(sum(p) - 1) < 1e-9 and p[1] > p[0] > p[2] > p[3], p
+    assert letter_mass(top, 3) > 0.9 and letter_mass([{"token": "the", "logprob": -0.01}], 3) < 0.05
+    pr = build_prompt("s", "q?", ["x", "y"])
+    assert "[A] x" in pr and "[B] y" in pr and pr.endswith("only.")
+    assert all(0 <= ans < len(opts) for _, _, opts, ans in DECISION_SET)
+    rows = [{"probs": [0.9, 0.1], "mass": 0.99, "answer": 0}, {"probs": [0.2, 0.8], "mass": 0.99, "answer": 1}]
+    ref = [{"probs": [0.92, 0.08], "mass": 0.99, "answer": 0}, {"probs": [0.15, 0.85], "mass": 0.99, "answer": 1}]
+    b = score_rows(rows, ref)
+    assert b["accuracy"] == 1.0 and b["agreement"] == 1.0 and b["option_kl"] < 0.01
+    assert verdict(b)[0] == "PASS"
+    flipped = [{"probs": [0.3, 0.7], "mass": 0.99, "answer": 0}, {"probs": [0.2, 0.8], "mass": 0.99, "answer": 1}]
+    assert verdict(score_rows(flipped, ref))[0] == "FAIL"
+    lost = [{"probs": [0.5, 0.5], "mass": 0.1, "answer": 0}] * 2
+    v, why = verdict(score_rows(lost, ref))
+    assert v == "FAIL" and "letter mass fell" in why
+    # a chat model that never answered in letters is not the rung's fault: the reference had no mass either
+    chatty_ref = [{"probs": [0.9, 0.1], "mass": 0.03, "answer": 0}, {"probs": [0.2, 0.8], "mass": 0.03, "answer": 1}]
+    chatty = [{"probs": [0.9, 0.1], "mass": 0.03, "answer": 0}, {"probs": [0.2, 0.8], "mass": 0.03, "answer": 1}]
+    assert verdict(score_rows(chatty, chatty_ref))[0] == "PASS"
+    assert verdict(score_rows([{"probs": [0.9, 0.1], "mass": 0.03, "answer": 0}]))[0] == "FAIL"
+
+
+def test_modelkind_flags_decision_models_from_card_not_arch(tmp_path):
+    """OpenJev is a stock qwen35 body: the kind must come from the card tag / name, never the arch."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from pollard_modelkind import _is_decision
+    d = tmp_path / "some-model"; d.mkdir()
+    (d / "README.md").write_text("---\nlicense: apache-2.0\ntags:\n- gguf\n- decision-model\n---\n# x\n")
+    assert _is_decision(str(d), {})
+    e = tmp_path / "plain-qwen"; e.mkdir()
+    (e / "README.md").write_text("---\ntags:\n- chat\n---\n")
+    assert not _is_decision(str(e), {"general.architecture": "qwen35"})
+    assert _is_decision("/x/OpenJev-Q4_K_M.gguf", {"general.architecture": "qwen35"})
+    assert _is_decision("/x/m.gguf", {"general.tags": ["agents", "decision-model"]})
+    assert not _is_decision("/x/Qwen2.5-0.5B-Instruct-f16.gguf", {"general.name": "Qwen2.5 0.5B Instruct"})
+

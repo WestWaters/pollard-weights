@@ -110,6 +110,35 @@ def _modality_evidence(model_dir):
     return ({m: (len(layers[m]) if layers[m] else 0) for m in counts}, projs)
 
 
+_DECISION_TAGS = ("decision-model", "calibrated-probabilities", "system-one")
+_DECISION_NAME = re.compile(r"(^|[^a-z])(jev|openjev|nanojev|laya|semif)([^a-z]|$)|decision[-_ ]?model", re.I)
+
+
+def _is_decision(model, conf) -> bool:
+    """Card tags first (HF README front-matter or GGUF general.tags), then the names this family
+    ships under. Never from the architecture: OpenJev is a stock qwen35 body."""
+    tags = []
+    if isinstance(conf, dict):
+        t = conf.get("general.tags")
+        if isinstance(t, (list, tuple)):
+            tags += [str(x).lower() for x in t]
+        for k in ("general.name", "general.basename", "general.finetune"):
+            if _DECISION_NAME.search(str(conf.get(k, ""))):
+                return True
+    if os.path.isdir(str(model)):
+        rd = os.path.join(model, "README.md")
+        if os.path.isfile(rd):
+            try:
+                head = open(rd, encoding="utf-8", errors="replace").read(4000)
+                fm = head.split("---")[1] if head.startswith("---") and head.count("---") >= 2 else ""
+                tags += re.findall(r"-\s*([a-z0-9_\-]+)", fm.lower())
+            except OSError:
+                pass
+    if any(t in _DECISION_TAGS for t in tags):
+        return True
+    return bool(_DECISION_NAME.search(os.path.basename(str(model).rstrip("/"))))
+
+
 def classify(model) -> dict:
     """What this model is, and what that implies for measuring it."""
     tpl, archs, conf = _template_and_arch(model)
@@ -175,6 +204,14 @@ def classify(model) -> dict:
     if diffusion:
         why.append("diffusion architecture -> masked-denoising decoder; AR perplexity/KL are not "
                    "its objective; generate with llama-diffusion-cli, not llama-server")
+    # A DECISION model (Jev / OpenJev / Laya / d1-style) answers typed questions from the logits at the
+    # first output position and never writes prose. Its product is a probability, so the coherence
+    # gate and a text perplexity say nothing about a rung; calibration against f16 does. The card
+    # says so ("decision-model" tag), and so do the names these ship under.
+    decision = _is_decision(model, conf)
+    if decision:
+        why.append("decision model -> answers from first-position logits; gate = typed-set "
+                   "agreement + option KL vs f16 (pollard-decision), not free-text coherence")
     if not instruct:
         why.append("no chat template -> base model; raw-text perplexity is meaningful here")
 
@@ -183,11 +220,13 @@ def classify(model) -> dict:
     multimodal = [m for m in modalities if m != "speech_out"]
     return {
         "instruct": instruct, "thinking": thinking, "agentic": agentic, "vision": vision,
-        "diffusion": diffusion, "runtime": "llama-diffusion-cli" if diffusion else "llama-server",
+        "diffusion": diffusion, "decision": decision,
+        "runtime": "llama-diffusion-cli" if diffusion else "llama-server",
         "modalities": modalities, "base": not instruct,
         # A model tuned away from raw text must be scored on text it was tuned FOR, or the number
         # describes the mismatch rather than the build.
         "eval": ("diffusion" if diffusion else
+                 "decision" if decision else
                  "multimodal" if multimodal else
                  "raw-text" if not instruct else "in-domain"),
         "gate_tokens": TOKENS_THINKING if thinking else TOKENS_PLAIN,
@@ -196,7 +235,7 @@ def classify(model) -> dict:
 
 
 def describe(k: dict) -> str:
-    tags = [n for n in ("base", "instruct", "thinking", "agentic", "diffusion") if k.get(n)]
+    tags = [n for n in ("base", "instruct", "thinking", "agentic", "diffusion", "decision") if k.get(n)]
     tags += k.get("modalities", [])
     return "+".join(tags) or "unknown"
 
