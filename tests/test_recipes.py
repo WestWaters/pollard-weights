@@ -2682,3 +2682,31 @@ def test_runtime_capture_includes_new_source_files(tmp_path):
     rows = verify_captured([str(tree), str(other)], out_dir=str(tmp_path / "patches"))
     assert rows[0]["state"] == "APPLIED", rows
 
+
+def test_probe_stability_report_separates_stable_from_corpus_dependent_rankings():
+    """Jurly's point: a ranking measured on one calibration set may be that set's, not the model's.
+    stability_report must call a ranking STABLE when every slice orders the layers the same way and
+    UNSTABLE when slices disagree, and _spearman must be exact on a known pair."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    try:
+        from pollard_probe import stability_report, _spearman, _mean_kl
+    except ImportError:                      # pollard_probe imports torch at module level; CI has none
+        print("    (skipped: torch not installed -- the stability report is pure python but lives in the probe)")
+        return
+    assert abs(_spearman([1, 2, 3, 4], [1, 2, 3, 4]) - 1.0) < 1e-9
+    assert abs(_spearman([1, 2, 3, 4], [4, 3, 2, 1]) + 1.0) < 1e-9
+    assert abs(_mean_kl([(2.0, 4.0), (6.0, 4.0)]) - 1.0) < 1e-9
+    # 8 layers, 6 chunks; costs = layer index (stable) with small chunk noise
+    import random
+    rnd = random.Random(0)
+    stable = {"ffn": {str(l): [((l + 1) * (1 + 0.02 * rnd.random()), 1.0) for _ in range(6)] for l in range(8)}}
+    slices = [[0, 1, 2], [3, 4, 5]]
+    st = stability_report(stable, slices)
+    assert st["verdict"] == "STABLE", st
+    assert st["groups"]["ffn"]["spearman_min"] >= 0.8 and st["groups"]["ffn"]["protect_overlap_min"] >= 0.6
+    # the second slice ranks the layers in the OPPOSITE order -> the ranking is the corpus's
+    unstable = {"ffn": {str(l): [((l + 1), 1.0)] * 3 + [((8 - l), 1.0)] * 3 for l in range(8)}}
+    st2 = stability_report(unstable, slices)
+    assert st2["verdict"] == "UNSTABLE" and st2["groups"]["ffn"]["spearman_min"] < 0.5, st2
+    assert "multi-domain" in st2["advice"]
+

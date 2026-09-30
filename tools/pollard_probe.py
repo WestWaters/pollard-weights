@@ -20,6 +20,15 @@ Emits the identical `sensitivity.json` schema pollard-fit consumes:
 Note: this is the torch/RTN proxy for the GGUF crush -- the per-group ranking
 matches; absolute KL is a proxy, not the ik_llama trellis error. For the final
 published card, confirm the winner with a pollard-sensitivity run on the box.
+
+STABILITY (--stability N / --stability-files a.txt,b.txt). A ranking is measured ON a calibration
+set, and a different set could rank the groups differently -- Jurly (@jurlycat) named this as the
+next bottleneck when Pollard was written up in Sept 2026. So the probe can measure its own ranking
+twice over: the per-chunk costs it already computes are split into N slices (contiguous slices of a
+multi-domain set, or one slice per --stability-files corpus), each slice ranks the groups on its own,
+and the profile records how much they agree -- Spearman between slice rankings per group, and how
+much of the protect set (the most sensitive quarter) survives from one slice to the next. STABLE
+means the ranking is the model's; UNSTABLE means it is the corpus's, and the card must say so.
 """
 import argparse, glob, json, os, re, sys
 
@@ -423,15 +432,92 @@ def _logits(model, chunks, dev):
 
 
 @torch.no_grad()
-def _kl_vs(model, chunks, ref_logp, dev):
-    """Mean KL(clean || perturbed) over the eval chunks."""
-    tot = ntok = 0.0
+def _kl_per_chunk(model, chunks, ref_logp, dev):
+    """(sum KL, tokens) per eval chunk -- the pieces every slice-level mean is made of."""
+    out = []
     for c, lp0 in zip(chunks, ref_logp):
         lp1 = model(c.unsqueeze(0).to(dev)).logits[0, :-1].float().log_softmax(-1)
         p0 = lp0.exp()
-        tot += (p0 * (lp0 - lp1)).sum(-1).sum().item()
-        ntok += lp0.size(0)
+        out.append(((p0 * (lp0 - lp1)).sum(-1).sum().item(), float(lp0.size(0))))
+    return out
+
+
+def _mean_kl(per_chunk, idx=None):
+    rows = per_chunk if idx is None else [per_chunk[i] for i in idx]
+    tot = sum(r[0] for r in rows); ntok = sum(r[1] for r in rows)
     return tot / max(ntok, 1)
+
+
+@torch.no_grad()
+def _kl_vs(model, chunks, ref_logp, dev):
+    """Mean KL(clean || perturbed) over the eval chunks."""
+    return _mean_kl(_kl_per_chunk(model, chunks, ref_logp, dev))
+
+
+def _spearman(a, b):
+    """Rank correlation of two equal-length sequences (average ranks for ties)."""
+    def ranks(v):
+        order = sorted(range(len(v)), key=lambda i: v[i])
+        r = [0.0] * len(v); i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and v[order[j + 1]] == v[order[i]]:
+                j += 1
+            for k in range(i, j + 1):
+                r[order[k]] = (i + j) / 2.0
+            i = j + 1
+        return r
+    ra, rb = ranks(a), ranks(b)
+    n = len(ra)
+    if n < 2:
+        return 1.0
+    ma, mb = sum(ra) / n, sum(rb) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    den = (sum((x - ma) ** 2 for x in ra) * sum((y - mb) ** 2 for y in rb)) ** 0.5
+    return num / den if den else 1.0
+
+
+def stability_report(per_chunk_profile, slices, protect_frac=0.25):
+    """How much the ranking depends on WHICH calibration text measured it.
+
+    per_chunk_profile: {group: {layer: [(kl_sum, ntok) per chunk]}}; slices: [[chunk idx], ...].
+    Per group: every slice ranks the layers on its own; report the minimum and mean pairwise
+    Spearman between slice rankings, and the overlap (Jaccard) of each slice's protect set -- the
+    most sensitive `protect_frac` of layers -- with every other slice's. Verdict thresholds:
+    STABLE   min Spearman >= 0.8 and min protect overlap >= 0.6
+    MIXED    min Spearman >= 0.5
+    UNSTABLE otherwise -- the ranking is the corpus's, not the model's."""
+    out = {"slices": len(slices), "groups": {}, "protect_frac": protect_frac}
+    worst_rho, worst_ov = 1.0, 1.0
+    for g, layers in per_chunk_profile.items():
+        keys = sorted(layers, key=lambda k: int(k))
+        per_slice = [[_mean_kl(layers[k], idx) for k in keys] for idx in slices]
+        n_prot = max(1, int(round(len(keys) * protect_frac)))
+        prot = [set(sorted(range(len(keys)), key=lambda i: -v[i])[:n_prot]) for v in per_slice]
+        rhos, ovs = [], []
+        for i in range(len(slices)):
+            for j in range(i + 1, len(slices)):
+                rhos.append(_spearman(per_slice[i], per_slice[j]))
+                ovs.append(len(prot[i] & prot[j]) / max(1, len(prot[i] | prot[j])))
+        rho_min = min(rhos) if rhos else 1.0; ov_min = min(ovs) if ovs else 1.0
+        worst_rho, worst_ov = min(worst_rho, rho_min), min(worst_ov, ov_min)
+        out["groups"][g] = {"spearman_min": round(rho_min, 3),
+                            "spearman_mean": round(sum(rhos) / len(rhos), 3) if rhos else 1.0,
+                            "protect_overlap_min": round(ov_min, 3),
+                            "protect_overlap_mean": round(sum(ovs) / len(ovs), 3) if ovs else 1.0,
+                            "protect_sets": [sorted(keys[i] for i in p) for p in prot],
+                            "per_slice_costs": [[round(v, 5) for v in row] for row in per_slice]}
+    out["verdict"] = ("STABLE" if worst_rho >= 0.8 and worst_ov >= 0.6 else
+                      "MIXED" if worst_rho >= 0.5 else "UNSTABLE")
+    out["spearman_min"], out["protect_overlap_min"] = round(worst_rho, 3), round(worst_ov, 3)
+    out["advice"] = {
+        "STABLE":   "the ranking is the model's, not the corpus's -- allocate on it",
+        "MIXED":    "the coarse order holds but the protect set moves with the corpus -- allocate on the "
+                    "UNION of the slices (a multi-domain calibration set), not on one domain",
+        "UNSTABLE": "different text ranks the groups differently -- do not allocate on a single-domain "
+                    "set; use Calib 3.0-style multi-domain text and re-probe, and say so on the card",
+    }[out["verdict"]]
+    return out
 
 
 def _linears(model, layer, group):
@@ -590,6 +676,12 @@ def main():
     ap.add_argument("--groups", default="ffn,attn")
     ap.add_argument("--probe-bits", type=int, default=2, help="RTN bits to crush a group to (default 2)")
     ap.add_argument("--chunks", type=int, default=4)
+    ap.add_argument("--stability", type=int, default=0, metavar="N",
+                    help="also split the eval chunks into N contiguous slices and report how much the "
+                         "ranking agrees between them (Spearman, protect-set overlap). 0 = off")
+    ap.add_argument("--stability-files", default="",
+                    help="comma list of extra calibration corpora; each becomes its own slice "
+                         "(--chunks chunks from each) alongside --eval. Implies --stability")
     ap.add_argument("--seqlen", type=int, default=1024)
     ap.add_argument("--device", default="auto",
                     help="auto (default: cuda>mps>cpu, and shard+offload if the model is bigger "
@@ -668,6 +760,20 @@ def main():
               "         IQ3_S +7.48% over fp16 vs imatrix+profile +14.17% -- i.e. the profile lost\n"
               "         on a 0.5B. Larger dense models are untested; bench both arms.", flush=True)
     ch = _chunks(tok, open(a.eval, encoding="utf-8").read(), a.seqlen, a.chunks)
+    slices, slice_names = [], []
+    if a.stability_files:
+        slices.append(list(range(len(ch)))); slice_names.append(os.path.basename(a.eval))
+        for f in [x.strip() for x in a.stability_files.split(",") if x.strip()]:
+            extra = _chunks(tok, open(f, encoding="utf-8").read(), a.seqlen, a.chunks)
+            slices.append(list(range(len(ch), len(ch) + len(extra)))); slice_names.append(os.path.basename(f))
+            ch = ch + extra
+    elif a.stability and a.stability > 1:
+        n = a.stability
+        per = max(1, len(ch) // n)
+        slices = [list(range(i * per, (i + 1) * per if i < n - 1 else len(ch))) for i in range(n)]
+        slice_names = [f"slice{i}" for i in range(n)]
+        if len(ch) < 2 * n:
+            print(f"   NOTE: --stability {n} with only {len(ch)} chunks; raise --chunks for a meaningful split", flush=True)
 
     if a.stream:
         print(f"  {layers} layers, {len(ch)} calib chunks -- one-pass Hessian-diagonal estimator", flush=True)
@@ -701,6 +807,7 @@ def main():
 
         # per-(group,layer) sensitivity: crush ONE group at ONE layer, measure KL hit.
         profile = {g: {} for g in groups}
+        per_chunk = {g: {} for g in groups}
         for i in range(layers):
             row = []
             for g in groups:
@@ -708,7 +815,9 @@ def main():
                 saved = [l.weight.data.clone() for l in lins]
                 for l in lins:
                     l.weight.data = _rtn(l.weight.data, a.probe_bits)
-                profile[g][str(i)] = _kl_vs(model, ch, ref, dev)
+                pc = _kl_per_chunk(model, ch, ref, dev)
+                per_chunk[g][str(i)] = pc
+                profile[g][str(i)] = _mean_kl(pc)
                 for l, w in zip(lins, saved):
                     l.weight.data = w
                 row.append(f"{g}={profile[g][str(i)]:.4f}")
@@ -728,6 +837,17 @@ def main():
             out = a.model.rstrip("/").split("/")[-1] + ".sensitivity.json"
     payload = {**profile, "noise": noise, "probe": f"rtn{a.probe_bits}",
                "layers": layers, "source": a.model, "method": method}
+    if slices and not a.stream:
+        st = stability_report(per_chunk, slices)
+        st["slice_names"] = slice_names
+        payload["stability"] = st
+        print(f"\n  stability across {len(slices)} calibration slices ({', '.join(slice_names)}):", flush=True)
+        for g, r in st["groups"].items():
+            print(f"    {g}: Spearman min {r['spearman_min']:.2f} mean {r['spearman_mean']:.2f}  "
+                  f"protect-set overlap min {r['protect_overlap_min']:.2f}", flush=True)
+        print(f"  RANKING {st['verdict']} -- {st['advice']}", flush=True)
+    elif slices:
+        print("  (stability needs the forward-pass sweep; --stream keeps no per-chunk costs)", flush=True)
     json.dump(payload, open(out, "w"), indent=2)
     for g in groups:
         vals = list(profile[g].values())

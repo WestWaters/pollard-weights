@@ -545,6 +545,26 @@ that way).
 New here? Start with `pollard-calc` on a model you know, then `pollard-doctor
 --predict` on an fp16 model to see the diagnostics in action.
 
+
+## Is the ranking the model's, or the corpus's?
+
+A sensitivity ranking is measured *on* a calibration set. Jurly ([@jurlycat](https://x.com/jurlycat)) put it
+plainly when Pollard was written up: the calibration set is the next bottleneck -- rankings could shift with
+the prompts used to measure them. So the probe measures that too:
+
+```bash
+pollard-probe --model <hf> --eval calib.txt --stability 4          # 4 contiguous slices of a multi-domain set
+pollard-probe --model <hf> --eval wiki.txt --stability-files code.txt,chat.txt   # one slice per domain
+```
+
+Each slice ranks the groups on its own; the profile records the Spearman agreement between slices and how
+much of the protect set survives from one to the next, and prints **STABLE / MIXED / UNSTABLE** with what to
+do about it. An UNSTABLE ranking is not allocated on -- it is re-measured on multi-domain text, and the card
+says which. First measurement, Qwen2.5-0.5B-Instruct across four wikitext-2 slices: **STABLE** -- ffn Spearman
+min 0.96 (mean 0.98), attn 0.92 (0.95); protect-set overlap 0.71 / 1.00. The ranking is the model's.
+
+Write-ups by others: [Yume_X, "What Pollard actually is"](https://x.com/yume_arasaki) (Sept 2026).
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). Built on and grateful to the open-source
