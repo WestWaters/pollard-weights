@@ -269,6 +269,27 @@ def encoding_noise(diff):
     return "; ".join(bits)
 
 
+_SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".cu", ".cuh", ".m", ".mm", ".metal",
+               ".swift", ".py", ".txt", ".cmake", ".json", ".patch", ".md")
+
+
+def untracked_sources(tree):
+    """Untracked files in a tree that are source (by extension), not build output or weights."""
+    try:
+        r = subprocess.run(["git", "-C", tree, "ls-files", "--others", "--exclude-standard"],
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=120)
+    except Exception:                                                      # noqa: BLE001
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        f = line.strip()
+        if not f or f.startswith("build") or "/build/" in f:
+            continue
+        if f.lower().endswith(_SOURCE_EXT) or os.path.basename(f) == "CMakeLists.txt":
+            out.append(f)
+    return out
+
+
 def capture(tree, name, out_dir=PATCH_DIR):
     """Export a runtime tree's uncommitted changes as a tracked patch plus a manifest.
 
@@ -279,6 +300,14 @@ def capture(tree, name, out_dir=PATCH_DIR):
     # errors="replace" and a generous timeout on purpose: a real runtime patch can be large and can
     # carry bytes that strict UTF-8 rejects, and the whole point of this is not to lose the work.
     try:
+        # A runtime change is often a NEW file (common/composed-sampler.cpp), and `git diff HEAD` does
+        # not see untracked files at all -- the first composed-sampler capture would have shipped a
+        # patch that referenced a source file it did not contain. Intent-to-add (git add -N) makes an
+        # untracked file diffable without staging its content; only source-shaped files, never build
+        # output or models.
+        new = untracked_sources(tree)
+        if new:
+            subprocess.run(["git", "-C", tree, "add", "-N", "--"] + new, capture_output=True, timeout=120)
         r = subprocess.run(["git", "-C", tree, "diff", "HEAD"], capture_output=True,
                            encoding="utf-8", errors="replace", timeout=600)
         diff = r.stdout or ""
@@ -308,7 +337,7 @@ def capture(tree, name, out_dir=PATCH_DIR):
     with open(pp, "w", encoding="utf-8") as fh:
         fh.write(diff)
     files = sorted(re.findall(r"^\+\+\+ b/(.+)$", diff, re.M))
-    meta = {"name": name, "tree_slug": slug, "remote": gi.get("remote"),
+    meta = {"name": name, "tree_slug": slug, "tree_path": os.path.abspath(tree), "remote": gi.get("remote"),
             "base_commit": gi.get("commit"), "base_describe": gi.get("describe"),
             "base_date": gi.get("date"), "files": files, "adds_strings": added_archs,
             "diff_bytes": len(diff)}
@@ -364,15 +393,36 @@ def verify_captured(trees, out_dir=PATCH_DIR):
     happened to `spark2_5` and was invisible until a published model would not load.
     """
     rows = []
-    by_slug = {_slug(t): t for t in trees}
     for m in load_captured(out_dir):
-        tree = by_slug.get(m.get("tree_slug"))
+        # Two trees can share a basename (runtime/llama.cpp and pollard-stq/llama.cpp are both
+        # "llama.cpp"); a dict keyed by slug silently kept one of them and verified the patch against
+        # the wrong tree -- LOST, for a patch that was applied. Try the recorded path first, then every
+        # scanned tree with that slug, and keep the tree where most of the patch is present.
+        cands = []
+        rec = m.get("tree_path")
+        if rec and os.path.isdir(rec):
+            cands.append(rec)
+        cands += [t for t in trees if _slug(t) == m.get("tree_slug") and os.path.abspath(t) not in
+                  {os.path.abspath(c) for c in cands}]
         want = [a for a in m.get("adds_strings") or [] if a]
-        row = {"name": m.get("name"), "slug": m.get("tree_slug"), "tree": tree, "wants": want}
-        if not tree:
-            row["state"] = "tree missing"
-            rows.append(row)
+        if not cands:
+            rows.append({"name": m.get("name"), "slug": m.get("tree_slug"), "tree": None, "wants": want,
+                         "state": "tree missing"})
             continue
+        best = None
+        for tree in cands:
+            row = _verify_one(m, tree, want)
+            if best is None or row["present_frac"] > best["present_frac"]:
+                best = row
+            if best["state"] == "APPLIED":
+                break
+        rows.append(best)
+    return rows
+
+
+def _verify_one(m, tree, want):
+    row = {"name": m.get("name"), "slug": m.get("tree_slug"), "tree": tree, "wants": want}
+    if True:
         # The general test, and the only one that works for a patch that adds no distinctive strings
         # (the MSVC regex fix and the STQ quant kernels both do not): if the patch REVERSE-applies
         # cleanly, its changes are present in the tree right now.
@@ -409,8 +459,7 @@ def verify_captured(trees, out_dir=PATCH_DIR):
             row["state"] = "DRIFTED"          # most of it is there; the tree moved under the patch
         else:
             row["state"] = "LOST"
-        rows.append(row)
-    return rows
+        return row
 
 
 def apply_patch(tree, name, out_dir=PATCH_DIR):
@@ -483,7 +532,10 @@ def main():
                                     text=True, timeout=60).stdout.strip().splitlines()
             except Exception:                                              # noqa: BLE001
                 continue
-            mod = [l for l in st if l[:2].strip() and not l.startswith("??")]
+            # untracked SOURCE files are runtime work too (a new sampler is a new .cpp); build output
+            # and weights are not
+            new = set(untracked_sources(t))
+            mod = [l for l in st if l[:2].strip() and (not l.startswith("??") or l[3:].strip() in new)]
             if not mod:
                 print(f"  clean   {t}")
                 continue

@@ -31,6 +31,7 @@ against, the files it touches, and any architecture-like strings it adds.
 | `ifm-llama-k2-msvc-regex` | MBZUAI-IFM/llama.cpp | `35999d1` 2026-09-01 | K2 pre-tokenizer splitter; MSVC `std::regex` rejects `\p{L}`, which libc++ tolerates. Without it the box loads no K2 GGUF at all. |
 | `ik_llama.cpp-k2-horizon-arch` | ikawrakow/ik_llama.cpp | `850320b` 2026-08-26 | `k2-horizon` architecture support across converter, arch tables, hparams, tensor loading and vocab — what makes the trellis lane reachable for K2. |
 | `llama-stq-stq1_0-quants` | ggml-org/llama.cpp | `1e411d8f5` 2026-08-10 | STQ1_0 quant kernels in `ggml-quants.c`. |
+| `llama.cpp-composed-sampler` | ggml-org/llama.cpp | `df03399b8` 2026-09-10 | `composed` sampler (common/composed-sampler.{h,cpp}): composed decoding on the simplex (arXiv 2609.34992) — KL/JS/entropy/coverage/diversity regularisers, closed forms + mirror ascent — after `temperature` in the chain; `--composed SPEC` on every binary, `"composed"` field on llama-server. Checked against `pollard-composed` to 1e-7. |
 
 ## Verification is by content, not by `git apply`
 
