@@ -14,6 +14,7 @@ Raw captures/logs from our runs stay out of git — the scripts regenerate them.
 | `e5_cache_sim.py` | Replay the trace against a bounded hot-expert cache: hit rate and bytes-from-flash per token at each cache size — the residency curve `pollard-calc`'s verdict points at | a routing trace |
 | `pollard_mattr.py` | Can ONE training run (Matryoshka Attribution, arXiv 2609.25518: sigmoid top-k mask at a random k every step) learn the whole bit-allocation ordering that `pollard-probe` finds by crushing 2×layers groups one at a time? Interpolates every weight row between f16 and its RTN-2 crush, KL-to-f16 loss; evaluates the learned order vs the probe's vs random at equal budgets on held-out text. | transformers + torch (MPS ok), small model, a `pollard-probe` sensitivity.json |
 | `pollard_recovery.py` | Does a LIFT-style recovery vector (arXiv 2609.31140: mean hidden-state difference, strong minus degraded, injected at one layer) buy back quality on a low rung? Here strong = f16, degraded = the RTN crush of the same model, so the vector is a constant — a bias the GGUF can carry for free. | transformers + torch (MPS ok), small model |
+| `pollard_decode.py` | Does composed decoding (CompoSimplex, arXiv 2609.34992: KL/coverage/diversity regularisers solved on the simplex) buy back MORE accuracy on a low rung than on f16? Same body at f16 and RTN-crushed, GSM8K subset, K lockstep samples, the paper's own loop and grader. | transformers + torch, the composimplex clone, small model |
 
 Typical flow on a new MoE model:
 
@@ -84,3 +85,23 @@ More vectors is not better: the mean shift is a lever for a couple of layers, no
 could still pay: a 2-bit rung (larger residual mismatch to correct) or as a free add-on to a build that is already protected by
 the learned allocation. Baking path, if it comes back: llama.cpp's Qwen2 graph already passes `wo_b`, the loader just never
 creates it (one `TENSOR_NOT_REQUIRED` line), and gguf-py `add_tensor` writes the extra bias tensors.
+
+### Composed decoding on a low rung (`pollard_decode.py`) — Qwen2.5-0.5B-Instruct, 2026-09-29
+
+30 GSM8K test questions · K=3 lockstep samples (greedy K=1) · 320-token budget · paper's grader · M4 MPS. pass@1 = mean over samples, pass@3 = any.
+
+| decoder | f16 pass@1 / pass@3 | RTN-4 pass@1 / pass@3 | RTN-3 pass@1 / pass@3 |
+|---|---|---|---|
+| greedy | 0.233 / 0.233 | **0.167** / 0.167 | 0.000 / 0.000 |
+| top-p 0.95, T 0.7 | 0.267 / 0.467 | 0.144 / 0.300 | 0.000 / 0.000 |
+| KL + coverage (paper's Best-of-K) | 0.244 / 0.533 | 0.144 / **0.367** | 0.000 / 0.000 |
+| KL + diversity | **0.278** / **0.600** | 0.122 / 0.333 | 0.022 / 0.067 |
+
+Reading: on f16 the paper holds — every sampler beats greedy on pass@1 (+1 to +4.5pp) and the composed ones lead pass@3 (0.53–0.60 vs
+0.47 top-p, 0.23 greedy). On the crushed rung the gain **inverts**: greedy is the best pass@1 and all three samplers sit below it;
+composed decoding still leads pass@3 (0.367 vs 0.300) but by less than at f16. A crushed model's distribution is noisier, and a
+regulariser that spreads mass across the reference's top tokens spreads it over more wrong paths. So this is a generic multi-sample
+lever, not a low-rung lever: nothing here justifies carrying a sampler port in llama.cpp for Pollard's sake. n=30 puts ±8pp on
+pass@1, so the individual gaps are inside noise — the *direction* (sampler gain shrinking under crush) is consistent across all three.
+Open at scale: the paper's gains were at 1.2B–26B; a real 7B GGUF rung would need the sampler in llama.cpp first, and that is only
+worth writing if some other reason appears. Parked.

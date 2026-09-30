@@ -1,0 +1,61 @@
+{
+ "model": "/Users/marbit/pollard/downloads/Qwen__Qwen2.5-0.5B-Instruct",
+ "n": 30,
+ "k": 3,
+ "bits": 3,
+ "states": {
+  "f16": {
+   "greedy": {
+    "pass1": 0.23333333333333334,
+    "passk": 0.23333333333333334,
+    "tokens_per_sample": 297.43333333333334,
+    "seconds": 191
+   },
+   "top_p": {
+    "pass1": 0.26666666666666666,
+    "passk": 0.4666666666666667,
+    "tokens_per_sample": 289.3,
+    "seconds": 265
+   },
+   "kl+coverage": {
+    "pass1": 0.24444444444444438,
+    "passk": 0.5333333333333333,
+    "tokens_per_sample": 289.5111111111111,
+    "seconds": 484
+   },
+   "kl+diversity": {
+    "pass1": 0.27777777777777773,
+    "passk": 0.6,
+    "tokens_per_sample": 292.8333333333333,
+    "seconds": 555
+   }
+  },
+  "rtn3": {
+   "greedy": {
+    "pass1": 0.0,
+    "passk": 0.0,
+    "tokens_per_sample": 301.9,
+    "seconds": 196
+   },
+   "top_p": {
+    "pass1": 0.0,
+    "passk": 0.0,
+    "tokens_per_sample": 287.0888888888889,
+    "seconds": 294
+   },
+   "kl+coverage": {
+    "pass1": 0.0,
+    "passk": 0.0,
+    "tokens_per_sample": 289.53333333333336,
+    "seconds": 494
+   },
+   "kl+diversity": {
+    "pass1": 0.02222222222222222,
+    "passk": 0.06666666666666667,
+    "tokens_per_sample": 293.3777777777778,
+    "seconds": 557
+   }
+  }
+ },
+ "seconds": 3036
+}
