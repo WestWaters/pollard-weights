@@ -1,0 +1,35 @@
+{
+ "model": "/Users/marbit/pollard/downloads/Qwen__Qwen2.5-0.5B-Instruct",
+ "n": 30,
+ "k": 3,
+ "bits": 4,
+ "states": {
+  "rtn4": {
+   "greedy": {
+    "pass1": 0.16666666666666666,
+    "passk": 0.16666666666666666,
+    "tokens_per_sample": 292.0,
+    "seconds": 189
+   },
+   "top_p": {
+    "pass1": 0.14444444444444443,
+    "passk": 0.3,
+    "tokens_per_sample": 297.96666666666664,
+    "seconds": 272
+   },
+   "kl+coverage": {
+    "pass1": 0.14444444444444443,
+    "passk": 0.36666666666666664,
+    "tokens_per_sample": 294.2111111111111,
+    "seconds": 490
+   },
+   "kl+diversity": {
+    "pass1": 0.12222222222222223,
+    "passk": 0.3333333333333333,
+    "tokens_per_sample": 294.64444444444445,
+    "seconds": 549
+   }
+  }
+ },
+ "seconds": 1501
+}
