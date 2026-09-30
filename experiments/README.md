@@ -44,7 +44,19 @@ groups is what hurts). The gain is granularity, from one run: tensor-level (what
 the group sweep at every budget; row-level halves it again (an upper bound — GGUF/EXL3 pick one type per tensor).
 The learned tensor ranking recovers the allocator's rule of thumb from data: protect `attn_v` > `ffn_down` > `attn_k`,
 crush `attn_q` > `ffn_gate` > `ffn_up` first. Spearman vs probe at tensor level ≈ 0 — the two orderings genuinely differ.
-Next: same run on a 3B, then feed `protect_first` into `pollard-automap` and measure a real rung's KLD against the probe-built one.
+
+**Qwen2.5-1.5B-Instruct, same setup (645,120 rows over 196 tensors, 12 calib / 4 eval chunks, 300 steps):**
+
+| rows crushed | learned (row) | learned → tensor | learned → group | `pollard-probe` (group) | random |
+|---|---|---|---|---|---|
+| 20 % | **0.427** | 0.558 | 1.547 | 0.841 | 0.584 |
+| 50 % | **0.988** | 1.072 | 3.269 | 2.995 | 2.884 |
+| 85 % | **2.458** | 2.568 | 8.645 | 6.890 | 8.651 |
+
+Holds at 3× the size: tensor-level learned order is 2.8× lower KL than the probe sweep at 50 % crushed, and at 1.5B the group
+sweep is no better than random at any budget — whole-group crushing is the wrong unit, whichever order you crush in. Same type
+ranking as the 0.5B, from data: protect `attn_v` > `ffn_down` > `attn_output`, crush `attn_q` > `ffn_gate` > `ffn_up` first.
+Next: feed `protect_first` into `pollard-automap` and measure a real rung's KLD against the probe-built one.
 
 ### Recovery vectors (`pollard_recovery.py`) — first number, Qwen2.5-0.5B-Instruct, 2026-09-29
 
@@ -64,5 +76,11 @@ Vector r_L = mean over calib tokens of (f16 hidden_states[L] − crushed hidden_
 Reading: two constant vectors (2 × 896 floats, zero runtime cost) recover a fifth of a 3-bit crush's KL. μ=1 is the right scale
 (0.5 and 1.5 both worse). The final hidden state (norm 47 vs 2–12 elsewhere) must be left alone — its vector alone is +83 %.
 More vectors is not better: the mean shift is a lever for a couple of layers, not a per-block correction.
-Next: same on a 3B and at 2-bit; then bake — llama.cpp's Qwen2 graph already passes `wo_b`, the loader just never creates it
-(one `TENSOR_NOT_REQUIRED` line), and gguf-py `add_tensor` writes the extra `blk.N.ffn_down.bias`; measure the real rung's KLD.
+
+**Qwen2.5-1.5B-Instruct, same setup (28 blocks, 196 linears, 4 eval chunks, 440 s):** baseline KL 0.693 → best single vector
+(layer 26) 0.634, **−8.4 %**, top-1 60.5 → 63.2 %; layers 10–26 all help (−2 to −8 %), layers 2–8 hurt (+5 to +23 %). Joint 26+24 is
+*worse* than 26 alone (−3.0 %); every-block mean-shift is catastrophic (+300 %). The lever shrinks with scale — a fifth of the KL at
+0.5B, under a tenth at 1.5B — and stops stacking. Below the 10 % bar; not worth a runtime patch on its own at this size. Where it
+could still pay: a 2-bit rung (larger residual mismatch to correct) or as a free add-on to a build that is already protected by
+the learned allocation. Baking path, if it comes back: llama.cpp's Qwen2 graph already passes `wo_b`, the loader just never
+creates it (one `TENSOR_NOT_REQUIRED` line), and gguf-py `add_tensor` writes the extra bias tensors.
