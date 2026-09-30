@@ -15,6 +15,7 @@ Raw captures/logs from our runs stay out of git — the scripts regenerate them.
 | `pollard_mattr.py` | Can ONE training run (Matryoshka Attribution, arXiv 2609.25518: sigmoid top-k mask at a random k every step) learn the whole bit-allocation ordering that `pollard-probe` finds by crushing 2×layers groups one at a time? Interpolates every weight row between f16 and its RTN-2 crush, KL-to-f16 loss; evaluates the learned order vs the probe's vs random at equal budgets on held-out text. | transformers + torch (MPS ok), small model, a `pollard-probe` sensitivity.json |
 | `pollard_recovery.py` | Does a LIFT-style recovery vector (arXiv 2609.31140: mean hidden-state difference, strong minus degraded, injected at one layer) buy back quality on a low rung? Here strong = f16, degraded = the RTN crush of the same model, so the vector is a constant — a bias the GGUF can carry for free. | transformers + torch (MPS ok), small model |
 | `pollard_decode.py` | Does composed decoding (CompoSimplex, arXiv 2609.34992: KL/coverage/diversity regularisers solved on the simplex) buy back MORE accuracy on a low rung than on f16? Same body at f16 and RTN-crushed, GSM8K subset, K lockstep samples, the paper's own loop and grader. | transformers + torch, the composimplex clone, small model |
+| `mattr_to_tensor_types.py` | Turns a learned (MAttr) tensor ordering into a `llama-quantize --tensor-type-file` at a reference rung's exact per-atom byte budget, shape-aware (tensors no IQ atom can take are fixed at iq4_nl on both sides) — the like-for-like GGUF test of a learned allocation. | gguf-py, a reference `.tensor-types.txt`, a `pollard_mattr` result |
 
 Typical flow on a new MoE model:
 
@@ -57,7 +58,26 @@ crush `attn_q` > `ffn_gate` > `ffn_up` first. Spearman vs probe at tensor level 
 Holds at 3× the size: tensor-level learned order is 2.8× lower KL than the probe sweep at 50 % crushed, and at 1.5B the group
 sweep is no better than random at any budget — whole-group crushing is the wrong unit, whichever order you crush in. Same type
 ranking as the 0.5B, from data: protect `attn_v` > `ffn_down` > `attn_output`, crush `attn_q` > `ffn_gate` > `ffn_up` first.
-Next: feed `protect_first` into `pollard-automap` and measure a real rung's KLD against the probe-built one.
+
+**On real GGUF rungs (2026-09-30).** Same bytes, same atoms, only the placement differs (`mattr_to_tensor_types.py`;
+allocations in `experiments/allocations/`). Held-out wikitext-2, `pollard-bench --ref f16`:
+
+| model | rung | placed by | size | PPL | MeanKLD | MedKLD | top-1 |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | IQ3_S | probe (layer groups) | 337,957,376 | 14.03 | 0.1002 | 0.0685 | 83.8 % |
+| | | **learned (MAttr)** | 337,957,376 | 13.96 | **0.0988** | **0.0655** | **84.1 %** |
+| Qwen2.5-1.5B-Instruct | IQ3_S | **probe (layer groups)** | 730,086,848 | **10.66** | **0.2154** | **0.1398** | **77.8 %** |
+| | | learned (MAttr) | 729,705,920 | 11.13 | 0.2742 | 0.1769 | 74.3 % |
+
+Reading: the 0.5B is a tiny action space — 240 of its 264 block tensors have a first dimension of 896 or 128, which no IQ
+atom accepts, so `llama-quantize` makes them iq4_nl whatever the allocator says and only the 24 `ffn_down` tensors are in
+play; the learned order edges it there (−1.4 % KLD). The 1.5B is fully allocatable and the learned order **loses by 27 %
+KLD**. In the torch proxy the same order was 2.8× *better* than the probe's. The proxy crushed rows with uniform RTN-2;
+the build crushes tensors with imatrix-weighted IQ atoms, and those damage different things — the probe's layer plan is
+measured closer to what the quantizer actually does. Build ≠ proxy, in numbers. What would make the learned order
+real: score against the actual atom crush (dequantized iq2/iq3 with the imatrix as the "other" checkpoint) and learn
+at tensor granularity directly, since that is what a GGUF can express. Until then the probe/sensitivity path stays the
+allocator.
 
 ### Recovery vectors (`pollard_recovery.py`) — first number, Qwen2.5-0.5B-Instruct, 2026-09-29
 
