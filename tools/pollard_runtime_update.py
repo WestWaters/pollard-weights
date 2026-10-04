@@ -270,6 +270,15 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False):
     if r.returncode != 0:
         log(f"{name}: clone failed: {r.stderr.strip()[-300:]}")
         return False
+    live = [m for m in _patches_for(tree) if patch_is_live(tree, m)] if st.get("present") else []
+    if live:
+        # A depth-1 clone has none of the base blobs, so `git apply --3way` cannot merge and every patch
+        # falls back to exact context. Fetch history back to the oldest live patch's base, and the
+        # composed-sampler patch, for one, applies cleanly to a month-newer upstream.
+        since = min((m.get("base_date") or "2026-01-01") for m in live)
+        since = (_dt.date.fromisoformat(since) - _dt.timedelta(days=2)).isoformat()
+        r = _run(["git", "-C", staging, "fetch", "-q", f"--shallow-since={since}", "origin"], timeout=1800)
+        log(f"{name}: history back to {since} for 3-way patch merges" + ("" if r.returncode == 0 else f" (fetch failed: {r.stderr.strip()[-200:]})"))
     block, notes = reapply(staging, tree) if st.get("present") else ([], [])
     for n in notes:
         log(f"{name}: {n}")
