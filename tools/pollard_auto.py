@@ -265,6 +265,12 @@ def _find_convert(hf_dir=None):
     23.8GB GGUF across the network rather than copy a 3MB script."""
     from pollard_convert import find_converter
     conv, note = find_converter(hf_dir)
+    if conv is None and "registers" in note:
+        # The converter exists but predates this architecture: update the managed engine and look again.
+        from pollard_runtime_update import auto_update_for
+        from pollard_convert import model_architectures
+        if auto_update_for(",".join(model_architectures(hf_dir)) or "this model"):
+            conv, note = find_converter(hf_dir)
     if conv is None:
         raise SystemExit(f"\n   cannot convert on this machine: {note}")
     if hf_dir:

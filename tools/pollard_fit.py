@@ -578,6 +578,12 @@ def main():
         return
     arch_name = cfg.get("_gguf_arch")
     resolved = find_llama_bin(cmd[0], arch=arch_name)
+    if resolved is None and find_llama_bin(cmd[0]) is not None and arch_name and arch_name != "unknown":
+        # Present but too old for this architecture: update the managed engine from upstream and retry,
+        # instead of stopping a build the day a new model family lands (POLLARD_AUTO_UPDATE=0 disables).
+        from pollard_runtime_update import auto_update_for
+        if auto_update_for(arch_name):
+            resolved = find_llama_bin(cmd[0], arch=arch_name)
     if resolved is None:
         # distinguish "no binary at all" from "binary present but too old for THIS arch"
         present = find_llama_bin(cmd[0])

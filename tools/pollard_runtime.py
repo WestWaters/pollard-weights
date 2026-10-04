@@ -497,7 +497,30 @@ def main():
                     help="just list trees with uncommitted changes -- runtime work that is not yet "
                          "an artifact and would be lost by a checkout")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--update", nargs="?", const="llama.cpp", metavar="ENGINE",
+                    help="update a managed engine from upstream: llama.cpp (default), ik_llama.cpp or all. "
+                         "Captures local work, builds beside the live tree, verifies, never goes backward")
+    ap.add_argument("--check", action="store_true", help="with --update: only report live vs upstream")
+    ap.add_argument("--rollback", metavar="ENGINE", help="swap the previous build back in")
+    ap.add_argument("--schedule", choices=["daily", "weekly", "off"], help="update automatically (low priority)")
+    ap.add_argument("--allow-drop", action="store_true", help="with --update: swap even if an architecture is lost")
+    ap.add_argument("--jobs", type=int, help="with --update: parallel compile jobs (default 60%% of cores)")
     a = ap.parse_args()
+
+    if a.update or a.rollback or a.schedule:
+        import pollard_runtime_update as U
+        if a.schedule:
+            U.schedule(a.schedule)
+            return 0
+        if a.rollback:
+            return 0 if U.rollback(a.rollback) else 1
+        names = list(U.ENGINES) if a.update == "all" else [a.update]
+        bad = [n for n in names if n not in U.ENGINES]
+        if bad:
+            print(f"unknown engine {bad}; choose from {list(U.ENGINES)} or all")
+            return 2
+        ok = all([U.update_engine(n, check=a.check, jobs=a.jobs, allow_drop=a.allow_drop) for n in names])
+        return 0 if ok else 1
 
     trees = find_trees(a.scan)
     if not trees:
