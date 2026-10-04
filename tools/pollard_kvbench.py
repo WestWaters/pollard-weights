@@ -84,7 +84,7 @@ class VramPeak(threading.Thread):
 def gguf_meta(path):
     """Layer count, KV heads and head dims from the GGUF header (for the fit check)."""
     from pollard_calc import _read_one_gguf
-    kv, _ = _read_one_gguf(path)
+    kv = _read_one_gguf(path)[0]
     arch = kv.get("general.architecture", "")
     g = lambda k, d=None: kv.get(f"{arch}.{k}", d)                         # noqa: E731
     heads_kv = g("attention.head_count_kv", g("attention.head_count", 8))
