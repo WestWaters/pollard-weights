@@ -207,8 +207,11 @@ def _patches_for(tree):
     return [m for m in caps if m.get("tree_slug") == slug]
 
 
-def reapply(staging, tree):
-    """Captured patches + scripted patches. Returns (blocking_failures, notes)."""
+def reapply(staging, tree, fresh=False):
+    """Captured patches + scripted patches. Returns (blocking_failures, notes).
+
+    `fresh`: there is no live tree to compare against, so every DECLARED patch is part of what this
+    engine is (ik_llama without k2-horizon is not the engine Pollard means) and must apply."""
     from pollard_runtime import _arch_list_from_source
     up = _arch_list_from_source(staging) or set()
     block, notes = [], []
@@ -218,7 +221,7 @@ def reapply(staging, tree):
             notes.append(f"re-applied {os.path.basename(m['_patch'])}")
             continue
         name = os.path.basename(m["_patch"])
-        if not patch_is_live(tree, m):
+        if not fresh and not patch_is_live(tree, m):
             notes.append(f"{name} is not in the live build -- nothing to carry over")
         elif _is_arch_patch(m, up):
             notes.append(f"{name} not needed: upstream now carries the architecture it added")
@@ -302,7 +305,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
         if r.returncode != 0:
             log(f"{name}: fetch failed ({' '.join(stp[-2:])}): {r.stderr.strip()[-300:]}")
             return False
-    live = [m for m in _patches_for(tree) if patch_is_live(tree, m)] if st.get("present") else []
+    live = [m for m in _patches_for(tree) if patch_is_live(tree, m)] if st.get("present") else _patches_for(tree)
     if live:
         # A depth-1 clone has none of the base blobs, so `git apply --3way` cannot merge and every patch
         # falls back to exact context. Fetch history back to the oldest live patch's base, and the
@@ -311,7 +314,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
         since = (_dt.date.fromisoformat(since) - _dt.timedelta(days=2)).isoformat()
         r = _run(["git", "-C", staging, "fetch", "-q", f"--shallow-since={since}", "origin"] + ([ref] if ref else []), timeout=1800)
         log(f"{name}: history back to {since} for 3-way patch merges" + ("" if r.returncode == 0 else f" (fetch failed: {r.stderr.strip()[-200:]})"))
-    block, notes = reapply(staging, tree) if st.get("present") else ([], [])
+    block, notes = reapply(staging, tree, fresh=not st.get("present"))
     for n in notes:
         log(f"{name}: {n}")
     if block:
