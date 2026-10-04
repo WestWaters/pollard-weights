@@ -38,10 +38,22 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENGINES = {
-    "llama.cpp": {"url": "https://github.com/ggml-org/llama.cpp", "dir": os.path.join(REPO, "runtime", "llama.cpp")},
-    "ik_llama.cpp": {"url": "https://github.com/ikawrakow/ik_llama.cpp", "dir": os.path.join(REPO, "runtime", "ik_llama.cpp")},
-}
+def _load_engines():
+    """runtime-patches/engines.json: every engine Pollard builds against, where it comes from (a branch or
+    a pull ref when the work is not upstream yet), and which captured patches ride on it."""
+    reg = {"llama.cpp": {"url": "https://github.com/ggml-org/llama.cpp"},
+           "ik_llama.cpp": {"url": "https://github.com/ikawrakow/ik_llama.cpp"}}
+    try:
+        reg.update({k: v for k, v in json.load(open(os.path.join(REPO, "runtime-patches", "engines.json"))).items()
+                    if not k.startswith("_")})
+    except (OSError, ValueError):
+        pass
+    for name, e in reg.items():
+        e.setdefault("dir", os.path.join(REPO, "runtime", name))
+    return reg
+
+
+ENGINES = _load_engines()
 KEY_BINS = ("llama-quantize", "llama-imatrix", "llama-perplexity", "llama-cli", "llama-server")
 CARRY_FLAGS = ("GGML_CUDA", "CMAKE_CUDA_ARCHITECTURES", "GGML_METAL", "GGML_RPC", "GGML_NATIVE", "GGML_VULKAN",
                "GGML_HIP", "GGML_CUDA_FA_ALL_QUANTS", "GGML_BLAS", "GGML_BLAS_VENDOR", "LLAMA_CURL")
@@ -77,9 +89,12 @@ def _git(tree, *a):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def upstream_head(url):
-    """(sha, date) of upstream's default branch, via the GitHub API; (sha, None) via ls-remote."""
+def upstream_head(url, ref=None):
+    """(sha, date) of the source an engine tracks: the default branch, a branch, or a pull ref."""
     m = re.match(r"https://github.com/([^/]+/[^/]+?)(?:\.git)?$", url)
+    if ref:
+        r = _run(["git", "ls-remote", url, ref if ref.startswith("pull/") else f"refs/heads/{ref}"], timeout=60)
+        return (r.stdout.split()[0][:9] if r.returncode == 0 and r.stdout.strip() else None), None
     if m:
         try:
             import urllib.request
@@ -181,9 +196,15 @@ def smoke(tree):
 
 
 def _patches_for(tree):
+    """The engine's declared patches (engines.json), else every capture made from a tree of this name."""
     from pollard_runtime import load_captured, _slug
+    caps = load_captured(os.path.join(REPO, "runtime-patches"))
+    for e in ENGINES.values():
+        if os.path.abspath(e["dir"]) == os.path.abspath(tree) and e.get("patches"):
+            want = set(e["patches"])
+            return [m for m in caps if os.path.basename(m["_patch"])[:-6] in want]
     slug = _slug(tree)
-    return [m for m in load_captured(os.path.join(REPO, "runtime-patches")) if m.get("tree_slug") == slug]
+    return [m for m in caps if m.get("tree_slug") == slug]
 
 
 def reapply(staging, tree):
@@ -250,7 +271,8 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
     e = ENGINES[name]
     tree, url = e["dir"], e["url"]
     st = live_state(tree)
-    head, hdate = upstream_head(url)
+    ref = e.get("ref")
+    head, hdate = upstream_head(url, ref)
     if check:
         cur = st.get("commit") or ("binary-only tree" if st.get("present") else "not installed")
         log(f"{name}: live {cur} {st.get('date') or ''} | upstream {head} {hdate or ''}"
@@ -268,11 +290,18 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
             return False
     staging, prev = tree + ".next", tree + ".prev"
     _rmtree(staging)
-    log(f"{name}: cloning upstream {head or ''} into {staging}")
-    r = _run(["git", "clone", "--depth", "1", url, staging], timeout=1800)
-    if r.returncode != 0:
-        log(f"{name}: clone failed: {r.stderr.strip()[-300:]}")
-        return False
+    log(f"{name}: fetching {ref or 'upstream'} {head or ''} into {staging}")
+    if ref:   # a branch or pull ref: init + fetch works for both, a plain clone --branch does not do pull refs
+        steps = [["git", "init", "-q", staging], ["git", "-C", staging, "remote", "add", "origin", url],
+                 ["git", "-C", staging, "fetch", "-q", "--depth", "1", "origin", ref],
+                 ["git", "-C", staging, "checkout", "-q", "FETCH_HEAD"]]
+    else:
+        steps = [["git", "clone", "--depth", "1", url, staging]]
+    for stp in steps:
+        r = _run(stp, timeout=1800)
+        if r.returncode != 0:
+            log(f"{name}: fetch failed ({' '.join(stp[-2:])}): {r.stderr.strip()[-300:]}")
+            return False
     live = [m for m in _patches_for(tree) if patch_is_live(tree, m)] if st.get("present") else []
     if live:
         # A depth-1 clone has none of the base blobs, so `git apply --3way` cannot merge and every patch
@@ -280,7 +309,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
         # composed-sampler patch, for one, applies cleanly to a month-newer upstream.
         since = min((m.get("base_date") or "2026-01-01") for m in live)
         since = (_dt.date.fromisoformat(since) - _dt.timedelta(days=2)).isoformat()
-        r = _run(["git", "-C", staging, "fetch", "-q", f"--shallow-since={since}", "origin"], timeout=1800)
+        r = _run(["git", "-C", staging, "fetch", "-q", f"--shallow-since={since}", "origin"] + ([ref] if ref else []), timeout=1800)
         log(f"{name}: history back to {since} for 3-way patch merges" + ("" if r.returncode == 0 else f" (fetch failed: {r.stderr.strip()[-200:]})"))
     block, notes = reapply(staging, tree) if st.get("present") else ([], [])
     for n in notes:

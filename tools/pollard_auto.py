@@ -211,7 +211,8 @@ def lane_report(gguf_path, ik_bin_dir=None):
     if not arch:
         return None
     known = None
-    for cand in ([ik_bin_dir] if ik_bin_dir else []) + [os.environ.get("IK_LLAMA_BIN")]:
+    managed = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "ik_llama.cpp", "build", "bin")
+    for cand in ([ik_bin_dir] if ik_bin_dir else []) + [os.environ.get("IK_LLAMA_BIN"), managed]:
         known = _build_knows_arch(cand, arch)
         if known is not None:
             break
