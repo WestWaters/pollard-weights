@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -45,6 +46,19 @@ KEY_BINS = ("llama-quantize", "llama-imatrix", "llama-perplexity", "llama-cli", 
 CARRY_FLAGS = ("GGML_CUDA", "CMAKE_CUDA_ARCHITECTURES", "GGML_METAL", "GGML_RPC", "GGML_NATIVE", "GGML_VULKAN",
                "GGML_HIP", "GGML_CUDA_FA_ALL_QUANTS", "GGML_BLAS", "GGML_BLAS_VENDOR", "LLAMA_CURL")
 WIN = sys.platform == "win32"
+
+
+def _rmtree(path):
+    """rmtree that works on Windows, where git marks its object files read-only."""
+    def _force(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    if os.path.exists(path):
+        shutil.rmtree(path, onerror=_force)
+    return not os.path.exists(path)
 
 
 def log(msg):
@@ -250,7 +264,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False):
             log(f"{name}: refusing to update: {msg}")
             return False
     staging, prev = tree + ".next", tree + ".prev"
-    shutil.rmtree(staging, ignore_errors=True)
+    _rmtree(staging)
     log(f"{name}: cloning upstream {head or ''} into {staging}")
     r = _run(["git", "clone", "--depth", "1", url, staging], timeout=1800)
     if r.returncode != 0:
@@ -279,7 +293,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False):
             log(f"{name}: NOT swapping -- the new build cannot load {lost[:10]} which the live one can. "
                 "Capture/rebase that support or pass --allow-drop.")
             return False
-    shutil.rmtree(prev, ignore_errors=True)
+    _rmtree(prev)
     if st.get("present"):
         os.replace(tree, prev)
     os.replace(staging, tree)
@@ -298,7 +312,7 @@ def rollback(name):
         log(f"{name}: no previous build to roll back to")
         return False
     tmp = tree + ".rolled"
-    shutil.rmtree(tmp, ignore_errors=True)
+    _rmtree(tmp)
     os.replace(tree, tmp)
     os.replace(prev, tree)
     os.replace(tmp, prev)
