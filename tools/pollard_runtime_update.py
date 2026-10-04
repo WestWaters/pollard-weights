@@ -225,6 +225,8 @@ def reapply(staging, tree, fresh=False):
             notes.append(f"{name} is not in the live build -- nothing to carry over")
         elif _is_arch_patch(m, up):
             notes.append(f"{name} not needed: upstream now carries the architecture it added")
+        elif _absorbed(staging, m):
+            notes.append(f"{name} not needed: upstream already carries its changes")
         else:
             block.append(f"{name} is live in this engine and does not apply to upstream -- rebase it first "
                          f"(it changes {', '.join(m.get('files', [])[:4])}{'...' if len(m.get('files', [])) > 4 else ''})")
@@ -256,6 +258,26 @@ def _is_arch_patch(m, upstream_archs):
     """A patch that only added architecture registrations upstream now has is safely superseded."""
     adds = [x for x in m.get("adds_strings", []) if re.match(r"^[a-z][a-z0-9_.\-]{2,24}$", x)]
     return bool(adds) and any(x in upstream_archs for x in adds)
+
+
+def _absorbed(staging, m, need=0.9):
+    """Did upstream merge this patch's change itself? Checked by content: the patch's substantive added
+    lines are (nearly) all in the staged files already. The ifm-llama MSVC regex fix was merged upstream
+    (69d3a4e) and then edited there (e78bd94), so it neither applies nor reverse-applies -- yet carrying
+    it is exactly what upstream now does."""
+    from pollard_runtime import _added_lines
+    try:
+        want = {x for x in _added_lines(open(m["_patch"], encoding="utf-8", errors="replace").read())
+                if len(x) >= 12 and not x.startswith("//")}
+    except OSError:
+        return False
+    have = set()
+    for f in m.get("files") or []:
+        try:
+            have |= {ln.strip() for ln in open(os.path.join(staging, f), encoding="utf-8", errors="replace")}
+        except OSError:
+            return False                               # a file the patch touches is gone: not absorbed
+    return bool(want) and len(want & have) >= need * len(want)
 
 
 def lost_archs(old_tree, new_tree):

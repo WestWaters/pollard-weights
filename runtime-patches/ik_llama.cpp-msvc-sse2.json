@@ -1,0 +1,13 @@
+{
+ "name": "msvc-sse2",
+ "tree_slug": "ik_llama.cpp",
+ "remote": "https://github.com/ikawrakow/ik_llama.cpp",
+ "base_commit": "5f89bfc81",
+ "base_describe": "5f89bfc81",
+ "base_date": "2026-10-02",
+ "files": [
+  "ggml/src/ggml-quants.c"
+ ],
+ "adds_strings": [],
+ "diff_bytes": 735
+}
