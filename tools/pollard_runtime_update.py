@@ -179,15 +179,42 @@ def reapply(staging, tree):
         if r.returncode == 0:
             notes.append(f"re-applied {os.path.basename(m['_patch'])}")
             continue
-        missing = [s for s in m.get("adds_strings", []) if s not in up and re.match(r"^[a-z][a-z0-9_.\-]+$", s)]
-        if missing and any(len(s) <= 24 for s in missing):
-            block.append(f"{os.path.basename(m['_patch'])} did not apply and upstream lacks {missing[:6]}")
+        name = os.path.basename(m["_patch"])
+        if not patch_is_live(tree, m):
+            notes.append(f"{name} is not in the live build -- nothing to carry over")
+        elif _is_arch_patch(m, up):
+            notes.append(f"{name} not needed: upstream now carries the architecture it added")
         else:
-            notes.append(f"{os.path.basename(m['_patch'])} not needed: upstream now carries it")
+            block.append(f"{name} is live in this engine and does not apply to upstream -- rebase it first "
+                         f"(it changes {', '.join(m.get('files', [])[:4])}{'...' if len(m.get('files', [])) > 4 else ''})")
     for sc in sorted(glob.glob(os.path.join(REPO, "runtime-patches", "scripts", "*.py"))):
         r = _run([sys.executable, sc, staging], timeout=600)
         notes.append(f"{os.path.basename(sc)}: {'ok' if r.returncode == 0 else 'not applicable (' + (r.stdout + r.stderr).strip().splitlines()[-1][:120] + ')'}")
     return block, notes
+
+
+def patch_is_live(tree, m):
+    """Is this captured patch part of the build that is serving right now?
+
+    A git tree answers exactly (the patch reverse-applies). A binary-only tree is asked for the patch's
+    most distinctive strings. A patch the live engine does not carry cannot be lost by updating it."""
+    if not os.path.isdir(tree):
+        return False
+    if os.path.isdir(os.path.join(tree, ".git")):
+        r = _run(["git", "-C", tree, "apply", "--check", "--reverse", "--ignore-whitespace", m["_patch"]], timeout=120)
+        return r.returncode == 0
+    from pollard_runtime import archs_in_binaries
+    distinct = [x for x in m.get("adds_strings", []) if len(x) >= 8 and re.search(r"[-_.]", x)]
+    if not distinct:
+        return False
+    found, _ = archs_in_binaries(tree, distinct)
+    return len(found) >= max(1, len(distinct) // 2)
+
+
+def _is_arch_patch(m, upstream_archs):
+    """A patch that only added architecture registrations upstream now has is safely superseded."""
+    adds = [x for x in m.get("adds_strings", []) if re.match(r"^[a-z][a-z0-9_.\-]{2,24}$", x)]
+    return bool(adds) and any(x in upstream_archs for x in adds)
 
 
 def lost_archs(old_tree, new_tree):
