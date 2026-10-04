@@ -1,0 +1,155 @@
+# Targeted Parameter Decomposition (tPD) of Qwen3-0.6B MLPs for a Python-code target.
+# Schema = spd.configs.Config from github.com/Antovigo/targeted-parameter-decomposition (pydantic,
+# extra="forbid" -> unknown keys are a hard error). Modeled on the paper's code-target reference
+# run: spd/experiments/lm/targeted_decomposition/css/config_css_reference.yaml
+#
+# Launch through run_tpd.py (it puts this dir on PYTHONPATH for tpd_models, sets SPD_OUT_DIR,
+# applies --data-root/--steps/--batch overrides and a fixed run_id). Do not hand-edit paths here
+# if you can pass --data-root instead.
+
+# --- WandB (off: everything is logged locally under $SPD_OUT_DIR/spd/<run_id>/) ---
+wandb_project: null
+wandb_run_name: null
+wandb_run_name_prefix: ""
+label: "qwen3_06b_pycode_mlp_L16-23"
+notes: "Pollard tpd_quant: tPD side-path vs SVD side-path for 2/3-bit quant"
+
+# --- General ---
+seed: 0
+n_mask_samples: 1
+ci_config:
+  mode: global
+  fn_type: global_shared_transformer
+  simple_transformer_ci_cfg:
+    d_model: 1024
+    n_blocks: 2
+    mlp_hidden_dim: [2048]
+    attn_config:
+      n_heads: 4
+      max_len: 512
+      rope_base: 10000
+sampling: binomial
+sigmoid_type: leaky_hard
+# 8 middle-to-late layers (Qwen3-0.6B has 28: 0..27) x {gate,up,down}_proj = 24 matrices, C=256 each.
+# fnmatch patterns; '*' also matches dots, '[6-9]' is a char class. Patterns must not overlap.
+module_info:
+  - module_pattern: "model.layers.1[6-9].mlp.*_proj"
+    C: 256
+  - module_pattern: "model.layers.2[0-3].mlp.*_proj"
+    C: 256
+identity_module_info: null
+use_delta_component: true   # the full-rank residual Delta = W - sum_i U_i V_i^T  (what we quantize hard)
+
+# --- Losses: output-KL recon (stochastic masks) + adversarial (persistent PGD) masks
+#     + unmasked recon + importance minimality. Nontarget batches get ImpMin x nontarget_impmin_coeff_ratio.
+loss_metric_configs:
+  - classname: ImportanceMinimalityLoss
+    coeff: 3.0e-4
+    pnorm: 2.0
+    beta: 0.5
+    p_anneal_start_frac: 0.1
+    p_anneal_final_p: 0.4
+    p_anneal_end_frac: 1.0
+    eps: 1.0e-12
+    coeff_warmup_frac: 0.1
+    coeff_peak_multiplier: 10.0
+    coeff_anneal_start_frac: 0.1
+    coeff_anneal_end_frac: 1.0
+  - classname: StochasticReconSubsetLoss
+    coeff: 1.0
+    routing:
+      type: uniform_k_subset
+  - classname: PersistentPGDReconLoss   # adversarial mask reconstruction ("adversarial loss on")
+    coeff: 1.0
+    optimizer:
+      type: adam
+      beta1: 0.5
+      beta2: 0.99
+      eps: 1.0e-08
+      lr_schedule:
+        start_val: 0.01
+        warmup_pct: 0.025
+        final_val_frac: 1
+        fn_type: constant
+    scope:
+      type: per_batch_per_position
+    use_sigmoid_parameterization: false
+    n_warmup_steps: 2
+    start_frac: 0.2
+  - classname: UnmaskedReconLoss
+    coeff: 0.2
+output_loss_type: kl
+
+# --- Training ---
+# The paper ran 30k-50k steps at lr 1e-4..5e-4 with batch 64-128. We run 5k steps at batch 16, so
+# lr is at the top of their range.
+lr_schedule:
+  start_val: 3.0e-4
+  warmup_pct: 0.0
+  final_val_frac: 0.1
+  fn_type: cosine
+steps: 5000
+batch_size: 16
+eval_batch_size: 16
+nontarget_batch_size: 16
+nontarget_eval_batch_size: 16
+grad_clip_norm_components: 0.01
+grad_clip_norm_ci_fns: null
+component_weight_decay: 0.1
+autocast_bf16: true
+
+# --- Faithfulness warmup (must stay 0: FaithfulnessLoss is incompatible with targeted decomposition) ---
+faithfulness_warmup_steps: 0
+
+# --- Logging & saving ---
+train_log_freq: 50
+eval_freq: 500
+slow_eval_freq: 2500
+n_eval_steps: 4
+slow_eval_on_first_step: false
+save_freq: 1000
+ci_alive_threshold: 0.01
+
+eval_metric_configs:
+  - classname: CI_L0
+    groups:
+      total:
+        - "*"
+  - classname: TargetReconLoss
+    rounding_threshold: 0.01
+  - classname: NontargetReconLoss
+    rounding_threshold: 0.01
+    n_nontarget_batches: 4
+  - classname: CIMeanPerComponent
+  - classname: WeightMagnitude
+
+# --- Pretrained model ---
+pretrained_model_class: tpd_models.Qwen3ForTPD   # fp32 master weights, use_cache off (see tpd_models.py)
+pretrained_model_path: null
+pretrained_model_name: Qwen/Qwen3-0.6B
+pretrained_model_output_attr: logits
+tokenizer_name: Qwen/Qwen3-0.6B
+
+# --- Target data: Python code (pre-tokenized by prep_data.py, rows of 128 tokens) ---
+task_config:
+  task_name: lm
+  dataset_name: C:/pollard/tpd_data/target_code
+  max_seq_len: 128
+  column_name: input_ids
+  is_tokenized: true
+  streaming: false
+  train_data_split: train
+  eval_data_split: validation
+
+# --- Non-target data: wikitext-103 + ultrachat mix (pre-tokenized by prep_data.py) ---
+nontarget_task_config:
+  task_name: lm
+  dataset_name: C:/pollard/tpd_data/nontarget_mix
+  max_seq_len: 128
+  column_name: input_ids
+  is_tokenized: true
+  streaming: false
+  train_data_split: train
+  eval_data_split: validation
+  dataset_seed: 0
+nontarget_impmin_coeff_ratio: 2
