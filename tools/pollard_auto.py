@@ -416,6 +416,10 @@ def _ensure_sensitivity(a, hf_dir, calib, here):
     print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
     if a.run:
         cmd = ["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof]
+        if str(getattr(a, "ngl", "auto")) == "0":
+            # --ngl 0 means "this GPU is not ours" (a shared box). It used to reach only llama.cpp, so the
+            # torch probe still picked cuda on the son's GPU and crashed (0xC0000005) mid-session.
+            cmd += ["--device", "cpu"]
         if _use_stream_probe(hf_dir, getattr(a, "probe_method", "auto")):
             cmd.append("--stream")
             print(f"      ({_weights_gb(hf_dir):.1f}GB of weights vs {detect_available_ram_gb() or 0:.1f}GB "
