@@ -172,8 +172,11 @@ def smoke(tree):
             bad.append(f"{b} missing")
             continue
         r = _run([exe, "--version"], timeout=60)
-        if r.returncode != 0:
-            bad.append(f"{b} --version exit {r.returncode}")
+        out = (r.stdout or "") + (r.stderr or "")
+        # The question is "does it start", not "does it implement --version": llama-quantize has no
+        # --version and answers with its usage and exit 1. A crash or a missing DLL prints neither.
+        if r.returncode != 0 and not re.search(r"usage|version|build", out, re.I):
+            bad.append(f"{b} did not start (exit {r.returncode}): {out.strip()[-160:]}")
     return (not bad), ("; ".join(bad) if bad else f"{len(KEY_BINS)} binaries answer --version")
 
 
