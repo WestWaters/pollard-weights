@@ -246,7 +246,7 @@ def lost_archs(old_tree, new_tree):
     return sorted(set(old) - set(new))
 
 
-def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False):
+def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None):
     e = ENGINES[name]
     tree, url = e["dir"], e["url"]
     st = live_state(tree)
@@ -256,7 +256,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False):
         log(f"{name}: live {cur} {st.get('date') or ''} | upstream {head} {hdate or ''}"
             + (" | UP TO DATE" if head and st.get("commit") and head.startswith(st["commit"][:7]) else ""))
         return True
-    if st.get("commit") and head and head.startswith(st["commit"][:7]):
+    if st.get("commit") and head and head.startswith(st["commit"][:7]) and not extra:
         log(f"{name}: already at upstream {head}")
         return True
     if st.get("dirty"):
@@ -290,6 +290,7 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False):
         return False
     jobs = jobs or max(2, int((os.cpu_count() or 4) * 0.6))       # leave the machine usable (60/40)
     flags = cache_flags(tree) if st.get("present") else cache_flags(staging)
+    flags.update(extra or {})                      # --with K=V; carried into every later update via the cache
     log(f"{name}: building all targets -j{jobs} with {flags}")
     ok, msg = build(staging, flags, jobs)
     if not ok:
