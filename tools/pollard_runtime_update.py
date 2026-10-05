@@ -216,10 +216,17 @@ def reapply(staging, tree, fresh=False):
     up = _arch_list_from_source(staging) or set()
     block, notes = [], []
     for m in _patches_for(tree):
+        snap = _git(staging, "stash", "create")          # index + tree as the earlier patches left them
         r = _run(["git", "-C", staging, "apply", "--3way", "--ignore-whitespace", m["_patch"]], timeout=300)
         if r.returncode == 0:
             notes.append(f"re-applied {os.path.basename(m['_patch'])}")
             continue
+        # A failed --3way apply does NOT leave the tree alone: the hunks that merged stay applied and the
+        # rest are written as <<<<<<< conflicts. ik_llama's superseded k2-horizon-arch patch did exactly
+        # that, was reported "not needed", and the build then died on conflict markers in llama-arch.h.
+        _run(["git", "-C", staging, "reset", "-q", "--hard", "HEAD"], timeout=300)
+        if snap:
+            _run(["git", "-C", staging, "stash", "apply", "-q", "--index", snap], timeout=300)
         name = os.path.basename(m["_patch"])
         if not fresh and not patch_is_live(tree, m):
             notes.append(f"{name} is not in the live build -- nothing to carry over")
