@@ -9,7 +9,8 @@ over plain HTTP -- no torch, no transformers, stdlib only -- and reports:
   * perplexity      -- teacher-forced NLL over a text corpus, via echo+prompt_logprobs
   * top-1 agreement -- how often the quantized model's greedy next token matches the baseline's
                       (the metric that actually predicts "does it still behave like the original")
-  * KL (optional)   -- mean KL(baseline || quantized) over next-token logprobs, if both serve logprobs
+  * coarsened KL (optional) -- KL on shared reported tokens plus an "other" bucket;
+                      a lower bound, not full-vocabulary KL, when logprobs are truncated
   * spec-decode acceptance (optional, vLLM) -- with --metrics <url>/metrics and --accept-gen N: generates N tokens per
                       sample and reads the delta of vLLM's spec_decode counters -> accepted draft tokens per step and
                       per-position acceptance. Teacher-forced PPL never decodes, so this is the only way to see the
@@ -112,8 +113,40 @@ def _greedy_next(base, model, prompt, key=None):
     return (tokens[0] if tokens else ch.get("text", "")), (top[0] if top else {})
 
 
+def coarsened_kl(base_top, cand_top):
+    """KL over shared tokens and their remaining mass, using the SAME partition.
+
+    Summing only an intersection can yield a negative number. Dividing that sum
+    by the number of reported tokens also changes the metric when logprobs depth
+    changes. Aggregate the unreported/non-shared tokens into one bucket instead,
+    and average complete per-position divergences in the caller.
+    """
+    shared = set(base_top) & set(cand_top)
+    if not shared:
+        return None
+    def probabilities(top):
+        values = list(top.values())
+        if any(not isinstance(x, (int, float)) or not math.isfinite(x) or x > 0 for x in values):
+            raise ValueError("top logprobs must be finite and non-positive")
+        if math.fsum(math.exp(x) for x in values) > 1 + 1e-6:
+            raise ValueError("reported token probabilities exceed one")
+        head = [math.exp(top[token]) for token in sorted(shared)]
+        return head + [max(0.0, 1 - math.fsum(head))]
+    p, q = probabilities(base_top), probabilities(cand_top)
+    terms = []
+    for left, right in zip(p, q):
+        if left == 0:
+            continue
+        if right == 0:
+            return float("inf")
+        terms.append(left * math.log(left / right))
+    return max(0.0, math.fsum(terms))
+
+
 def ab_agreement(base, bmodel, cand, cmodel, texts, key=None, stride=8):
-    """Top-1 agreement + optional KL between baseline and candidate, at each position (strided)."""
+    """Top-1 agreement + optional coarsened KL at word-strided text prefixes."""
+    if stride <= 0:
+        raise ValueError("stride must be positive")
     match = total = 0
     kl_sum = 0.0
     kl_n = 0
@@ -125,11 +158,11 @@ def ab_agreement(base, bmodel, cand, cmodel, texts, key=None, stride=8):
             ct, ctop = _greedy_next(cand, cmodel, prefix, key=key)
             total += 1
             match += int(bt == ct)
-            if btop and ctop:                                  # KL(base || cand) over the shared support
-                for tokn, blp in btop.items():
-                    if tokn in ctop:
-                        p = math.exp(blp)
-                        kl_sum += p * (blp - ctop[tokn]); kl_n += 1
+            if btop and ctop:
+                divergence = coarsened_kl(btop, ctop)
+                if divergence is not None:
+                    kl_sum += divergence
+                    kl_n += 1
     agree = (match / total) if total else float("nan")
     kl = (kl_sum / kl_n) if kl_n else None
     return agree, total, kl
@@ -146,12 +179,14 @@ def main():
     ap.add_argument("--calib", help="calibration corpus to EXCLUDE from --text (gate hygiene): any eval "
                     "line that also appears in the calib set is dropped so the score isn't inflated by overlap")
     ap.add_argument("--max-samples", type=int, default=50, help="cap on lines used (keeps it quick)")
-    ap.add_argument("--stride", type=int, default=8, help="token stride for the A/B agreement probes")
+    ap.add_argument("--stride", type=int, default=8, help="word stride for the A/B agreement probes")
     ap.add_argument("--api-key", default=None, help="bearer token if the endpoint needs one")
     ap.add_argument("--metrics", help="vLLM Prometheus endpoint of the model under test, e.g. http://host:8000/metrics -- "
                     "enables the speculative-decoding acceptance read (counter deltas around real generations)")
     ap.add_argument("--accept-gen", type=int, default=128, help="tokens to generate per sample for the acceptance read")
     a = ap.parse_args()
+    if a.stride <= 0:
+        ap.error("--stride must be positive")
 
     texts = [ln.strip() for ln in open(a.text, encoding="utf-8") if ln.strip()]
     if a.calib:                                            # gate hygiene: drop eval lines seen in calib
@@ -185,7 +220,8 @@ def main():
         agree, n, kl = ab_agreement(a.base, a.model, a.cand, cmodel, texts, key=a.api_key, stride=a.stride)
         print(f"top-1 agreement: {agree*100:.2f}%  over {n} positions")
         if kl is not None:
-            print(f"mean KL(base||cand): {kl:.4f} nats  (lower = closer to the original distribution)")
+            print(f"mean coarsened KL(base||cand): {kl:.4f} nats  "
+                  "(shared tokens + other; lower bound, not full-vocabulary KL)")
     if a.metrics:
         tgt_base = a.cand or a.base; tgt_model = (a.cand_model or a.model) if a.cand else a.model
         try:
