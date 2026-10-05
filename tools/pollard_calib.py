@@ -13,6 +13,8 @@ It emits a raw text corpus (newline-separated samples) that works for BOTH `llam
 datasets when `datasets` is importable and reachable; ALWAYS falls back to bundled seeds so it
 produces a valid (smaller) corpus offline. Optionally writes a held-out split so you can check the
 imatrix isn't overfit (KL on unseen text should track KL on the calib text).
+Held-out splits deduplicate sample content across domains before splitting;
+offline seeds therefore yield fewer samples than --per-domain requests.
 
   pollard-calib --out calib.txt                          # balanced default (~all domains)
   pollard-calib --out calib.txt --per-domain 400 --held-out calib.heldout.txt
@@ -20,7 +22,8 @@ imatrix isn't overfit (KL on unseen text should track KL on the calib text).
   pollard-calib --out calib.txt --min-chars 200 --seed 0
 The imatrix/sensitivity COMPUTE (GPU) is a separate step -- this only builds the corpus.
 """
-import argparse, random, sys, textwrap
+import argparse, math, os, random, sys, textwrap, unicodedata
+from pathlib import Path
 
 DOMAINS = ["prose", "code", "math", "chat", "multilingual"]
 
@@ -118,6 +121,39 @@ def build_domain(domain, need, min_chars, rng):
     return got[:need], src
 
 
+def split_domains(rows, fraction, rng):
+    """Split unique content, retaining original formatting in both corpora."""
+    if not math.isfinite(fraction) or not 0 < fraction < 1:
+        raise ValueError("held-out fraction must be between 0 and 1")
+    seen = set()
+    train, held, stats = [], [], []
+    for domain, source, samples in rows:
+        unique = []
+        for sample in samples:
+            key = " ".join(unicodedata.normalize("NFC", sample).split())
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(sample)
+        if len(unique) < 2:
+            raise ValueError(f"{domain} needs at least two unique samples for a held-out split")
+        rng.shuffle(unique)
+        count = min(len(unique) - 1, max(1, int(len(unique) * fraction)))
+        held.extend((domain, sample) for sample in unique[:count])
+        train.extend((domain, sample) for sample in unique[count:])
+        stats.append((domain, source, len(unique) - count, count))
+    return train, held, stats
+
+
+def same_output(first, second):
+    """Catch relative paths, symlinks and existing hardlinks before writing."""
+    if Path(first).resolve() == Path(second).resolve():
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except FileNotFoundError:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -130,31 +166,49 @@ def main():
     ap.add_argument("--held-frac", type=float, default=0.1, help="fraction of each domain held out")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    if a.per_domain < 1 or a.min_chars < 1:
+        ap.error("--per-domain and --min-chars must be positive")
+    if a.held_out and (not math.isfinite(a.held_frac) or not 0 < a.held_frac < 1):
+        ap.error("--held-frac must be between 0 and 1")
 
     rng = random.Random(a.seed)
     doms = [d.strip() for d in a.domains.split(",") if d.strip()]
     bad = [d for d in doms if d not in DOMAINS]
     if bad:
         sys.exit(f"ERROR: unknown domain(s) {bad}; choose from {DOMAINS}")
+    if not doms or len(doms) != len(set(doms)):
+        ap.error("--domains must contain distinct domains")
+    if not a.out:
+        try:
+            import pollard_workspace as ws
+            a.out = os.path.join(ws.calibration_dir(create=True), "calib-3.0.txt")
+        except Exception:
+            a.out = "calib-3.0.txt"
+    if a.held_out and same_output(a.out, a.held_out):
+        ap.error("calibration and held-out paths must be different files")
 
     train, held, stats = [], [], []
+    rows = []
     for d in doms:
         samples, src = build_domain(d, a.per_domain, a.min_chars, rng)
-        rng.shuffle(samples)
-        nh = int(len(samples) * a.held_frac) if a.held_out else 0
-        held += [(d, s) for s in samples[:nh]]
-        train += [(d, s) for s in samples[nh:]]
-        stats.append((d, src, len(samples) - nh, nh))
+        rows.append((d, src, samples))
+        if not a.held_out:
+            rng.shuffle(samples)
+            train += [(d, s) for s in samples]
+            stats.append((d, src, len(samples), 0))
+    if a.held_out:
+        try:
+            train, held, stats = split_domains(rows, a.held_frac, rng)
+        except ValueError as exc:
+            ap.error(str(exc))
+        for d, _, ntr, nh in stats:
+            if ntr + nh < a.per_domain:
+                print(f"  [{d}] retained {ntr + nh} unique samples of {a.per_domain} requested",
+                      file=sys.stderr)
 
     rng.shuffle(train)
     rng.shuffle(held)
     chars = sum(len(s) for _, s in train)
-    if not a.out:
-        try:
-            import pollard_workspace as ws, os
-            a.out = os.path.join(ws.calibration_dir(create=True), "calib-3.0.txt")
-        except Exception:
-            a.out = "calib-3.0.txt"
     with open(a.out, "w", encoding="utf-8") as f:
         f.write("\n".join(s for _, s in train))
     print(f"== pollard-calib :: Calib 3.0 multi-domain corpus")
