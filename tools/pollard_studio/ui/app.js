@@ -728,6 +728,12 @@ const ADV_SECTIONS = [
        + "change the selection.",
     tools: ["pollard_route", "pollard_experts", "pollard_prune", "pollard_routecheck",
             "pollard_run"] },
+  { title: "LOOKUP TABLES ON THE SSD", icon: "layers",
+    why: "N-gram and per-layer embedding tables (Qwen3.8-Flash-Next's 51B table, Gemma 4) are only ever "
+       + "READ a few rows at a time, so llama.cpp can serve them straight from the file. fit --disk keeps "
+       + "them high precision and out of the RAM budget; inspect, run and watch cover the rest, including "
+       + "whether SSD writes during a run are swap.",
+    tools: ["pollard_ngram"] },
   { title: "LANE EMITTERS", icon: "box",
     why: "One solved allocation, emitted into whichever runtime you need. Each lane has its own "
        + "atoms and its own knobs.",

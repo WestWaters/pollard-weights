@@ -204,7 +204,7 @@ def block_safe_type(t: str, row_len: int, fallback: str = "q8_0") -> str:
 
 
 def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False, tiers=None,
-                    emb_imatrix_ok=True):
+                    emb_imatrix_ok=True, disk=None):
     """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
@@ -219,7 +219,11 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     the model compete for what is left. That is the axis a per-tensor allocator cannot express, and
     it is how the vendor recipes are written (NVIDIA's Qwen3.8-27B-NVFP4: MLP at NVFP4, every
     attention path at FP8, vision untouched). Pinning is a CONSTRAINT, not a measurement -- it says
-    "I want this guarantee, spend the remainder wisely" -- so the steering it frees is the point."""
+    "I want this guarantee, spend the remainder wisely" -- so the steering it frees is the point.
+
+    `disk` (from pollard_ngram.disk_plan) names lookup tables that llama.cpp reads row by row from the file
+    (--lazy-mode): an n-gram / per-layer embedding table. Their params leave the 'other' group, they are pinned
+    to disk['type'], and their bytes are NOT charged to RAM -- so a 51B table no longer crushes the transformer."""
     budget = ram_gb * 0.85 - reserve_gb
     if budget <= 0:
         sys.exit(f"ERROR: RAM budget {ram_gb}GB minus {reserve_gb}GB activation "
@@ -230,11 +234,16 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
                else (arch.get("dense_ffn_params") or 0))
     attn_pl = arch.get("attn_params") or 0
     other = max(0, total - bulk_pl * layers - attn_pl * layers)   # emb + output + norms
+    disk_params = (disk or {}).get("params") or 0
+    if disk_params:                                    # the table lives on the SSD, not in the RAM budget
+        other = max(0, other - disk_params)
+        total = total - disk_params
 
     if bulk_pl <= 0:                                    # dims unknown -> safe uniform
+        dpins = [(pat, disk["type"]) for pat in disk["patterns"]] if disk_params else []
         for name, bpw in QTYPES:
             if total * bpw / 8 / 1e9 <= budget:
-                return [], name, total * bpw / 8 / 1e9, PRESET[name], (f"uniform {name}", "no dims")
+                return dpins, name, total * bpw / 8 / 1e9, PRESET[name], (f"uniform {name}", "no dims")
         sys.exit("ERROR: does not fit at any supported type; see pollard-calc.")
 
     # per-group sensitivity: MEASURED profile, else UNIFORM. We deliberately do NOT
@@ -299,6 +308,8 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     # budget is spent only where allocation still has a choice.
     tiers = tiers or {}
     pinned, pinned_gb = [], 0.0
+    if disk_params:
+        pinned += [(pat, disk["type"]) for pat in disk["patterns"]]     # pinned, but 0 GB of RAM
     if tiers:
         keep_items, keep_meta = [], []
         for (kind, pats), (params, imp) in zip(meta, items):
@@ -359,6 +370,8 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     summary = ", ".join(f"{n}L@{t}" for t, n in sorted(c.items(), key=lambda x: -BPW[x[0]]))
     if tiers:
         summary += "  [pinned: " + ", ".join(f"{k}={v}" for k, v in sorted(tiers.items())) + "]"
+    if disk_params:
+        summary += f"  [disk: {len(disk['patterns'])} table(s) @ {disk['type']}, {disk['gb']:.1f} GB on SSD]"
     if not bulk_types:
         base_t = tiers.get("bulk") or LADDER[0]
     return overrides, emb_type, gb, PRESET[base_t], (summary, src)
@@ -396,6 +409,12 @@ def main():
                          "where allocation still has a choice. This is how the vendor recipes are "
                          "written (NVIDIA NVFP4: MLP 4-bit, all attention FP8, vision untouched); "
                          "it is a guarantee you are asking for, not a measurement. Repeatable.")
+    ap.add_argument("--disk", default="auto", metavar="auto|off|REGEX[,REGEX]",
+                    help="lookup tables (n-gram / per-layer embeddings) that llama.cpp reads from the SSD on demand: "
+                         "pinned to --disk-type and NOT charged to --ram (default auto: detect, if this runtime "
+                         "lazy-reads the architecture). See pollard-ngram.")
+    ap.add_argument("--disk-type", default="q8_0", choices=["q8_0", "q6_K", "q5_K", "f16", "bf16"],
+                    help="precision for --disk tables (default q8_0: disk is cheap, so keep them near-lossless)")
     ap.add_argument("--allow-1bit", action="store_true",
                     help="extend the floor to 1-bit (iq1_m/iq1_s) for models that won't "
                          "fit at iq2_xxs -- heavy quality loss, but giant MoEs absorb it. "
@@ -436,8 +455,11 @@ def main():
     # cost is a slightly larger embedding and the alternative is a hard crash mid-build.
     covered = imatrix_covered_tensors(a.imatrix) if a.imatrix else None
     emb_imatrix_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
+    from pollard_ngram import disk_plan
+    disk = disk_plan(meta, a.disk, a.disk_type)
     overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
-        arch, a.ram, a.reserve, sensitivity, a.allow_1bit, tiers, emb_imatrix_ok)
+        arch, a.ram, a.reserve, sensitivity, a.allow_1bit, tiers, emb_imatrix_ok,
+        disk if disk and disk["params"] else None)
     if a.out:
         out = a.out
     else:
@@ -457,7 +479,8 @@ def main():
     # GUARD 1 -- refuse a build LARGER than an already-quantized source. Requantizing
     # UP only adds size and loses quality (Frank's Qwen30B: Q4_K_M 18.6 -> Q6_K 23.4 GB,
     # 23% slower -- no Pollard content, just llama-quantize promoting every tensor).
-    if requant and gb > src_gb * 1.02 and not a.allow_grow:
+    disk_gb = disk["gb"] if disk and disk["params"] else 0.0
+    if requant and gb + disk_gb > src_gb * 1.02 and not a.allow_grow:
         sys.exit(
             f"ERROR: this build (~{gb:.1f} GB) would be LARGER than the source "
             f"(~{src_gb:.1f} GB, ~{src_bpw:.1f} bpw).\n"
@@ -513,6 +536,12 @@ def main():
     label = "expert+attn mix" if arch["kind"] == "moe" else "FFN+attn mix   "
     print(f"{label}     : {summary}  (base {base_preset})")
     print(f"sensitivity source  : {src}")
+    if disk and disk["params"]:
+        print(f"on the SSD (lazy)   : {disk['params']/1e9:.2f}B params @ {disk['type']} = {disk['gb']:.1f} GB, not in the RAM "
+              f"budget: {', '.join(disk['names'][:3])}{' ...' if len(disk['names']) > 3 else ''}")
+        print(f"   run it with:  pollard-ngram run <build>.gguf --ram {a.ram:.0f}   (mmap + --lazy-mode on; never --no-mmap)")
+    elif disk and disk.get("note"):
+        print(f"NOTE: {disk['note']}")
 
     # NOTE -- scope the evidence honestly. The reallocation can cost more than it buys, and on
     # Qwen2.5-0.5B at matched size it did (imatrix-only IQ3_S +7.48% over fp16 vs imatrix +

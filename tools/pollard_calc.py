@@ -220,9 +220,11 @@ def _read_one_gguf(path):
         total_params = 0
         dcounts = {}
         tnames = []
+        tparams = {}             # name -> param count: lets a caller size a tensor CLASS (e.g. an n-gram table)
         try:
             for _ in range(n_tensors):
-                tnames.append(rd_str())  # tensor name -- the model's real layout, free while we're here
+                nm = rd_str()
+                tnames.append(nm)  # tensor name -- the model's real layout, free while we're here
                 nd, = struct.unpack("<I", f.read(4))
                 dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
                 dt, = struct.unpack("<I", f.read(4)); f.read(8)  # ggml dtype + offset
@@ -231,9 +233,11 @@ def _read_one_gguf(path):
                 for d in dims:
                     n *= d
                 total_params += n
+                tparams[nm if isinstance(nm, str) else nm.decode("utf-8", "replace")] = n
         except Exception:
             total_params = None  # malformed tail: key-based analysis only
     meta["_tensor_names"] = tnames
+    meta["_tensor_params"] = tparams
     return meta, total_params, dcounts
 
 
@@ -242,9 +246,10 @@ def read_gguf_meta(path):
     the tensor param count AND file bytes across ALL shards, so multi-shard models
     report their true size instead of one shard's slice."""
     shards = _shard_paths(path)
-    meta, param_sum, ok, dcounts = None, 0, True, {}
+    meta, param_sum, ok, dcounts, tparams = None, 0, True, {}, {}
     for i, sp in enumerate(shards):
         kv, psum, dc = _read_one_gguf(sp)
+        tparams.update(kv.get("_tensor_params") or {})
         if i == 0:
             meta = kv  # full arch KV lives in the first shard
         if psum is None:
@@ -254,6 +259,7 @@ def read_gguf_meta(path):
         for t, c in dc.items():
             dcounts[t] = dcounts.get(t, 0) + c
     meta["_tensor_param_sum"] = param_sum if ok else None
+    meta["_tensor_params"] = tparams                      # every shard's tensors, not just shard 1's
     meta["_total_file_bytes"] = sum(os.path.getsize(s) for s in shards)
     meta["_shard_count"] = len(shards)
     # the most common tensor type IS the model's quant, read from the file itself --
