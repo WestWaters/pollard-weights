@@ -30,7 +30,7 @@ and the profile records how much they agree -- Spearman between slice rankings p
 much of the protect set (the most sensitive quarter) survives from one slice to the next. STABLE
 means the ranking is the model's; UNSTABLE means it is the corpus's, and the card must say so.
 """
-import argparse, glob, json, os, re, sys
+import argparse, glob, json, math, os, re, sys
 
 # `--device cpu` has to MEAN cpu, and this has to happen BEFORE torch is imported.
 # device_map="auto" enumerates every visible device, so accelerate places layers on the GPU even
@@ -319,8 +319,15 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
     nscored = {}                                            # (group, layer) -> tensors scored
     pinned = {}                                             # layer -> uncovered tensor names
     seen_covered = set()                                    # imatrix tensors we actually scored
+    excluded = {}                                          # known tensors not allocated by this profile
 
     for t in rd.tensors:
+        if re.fullmatch(r"blk\.\d+\.ffn_gate_inp\.weight", t.name):
+            # llama-quantize keeps MoE routers unchanged unless its separate
+            # router-type option is supplied. They are not expert FFN weights.
+            excluded[t.name] = {"source_type": t.tensor_type.name,
+                                "reason": "MoE router; retain source precision"}
+            continue
         slot = _gguf_slot(t.name, groups)
         if slot is None:
             continue
@@ -336,16 +343,16 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
             continue
         try:
             W = torch.from_numpy(np.asarray(_dequant(t))).float()
+            h = _imatrix_weights(W, hj, t.name.endswith("_exps.weight"))
         except Exception as e:
             skipped.append(f"{t.name} ({e})")
             continue
-        if W.ndim != 2 or W.shape[1] != len(hj):
-            skipped.append(f"{t.name} (shape {tuple(W.shape)} vs imatrix {len(hj)})")
-            continue
-        h = torch.tensor(hj, dtype=torch.float32).unsqueeze(0)
+        rows = W.reshape(-1, W.shape[-1])
         for b in bitset:                                    # ONE read, every bit-width off it
-            dW = W - _rtn(W, b).float()
+            dW = W - _rtn(rows, b).reshape(W.shape).float()
             c = float((dW * dW * h).sum())
+            if not math.isfinite(c):
+                raise SystemExit(f"non-finite probe cost for {t.name}; refusing to emit a profile")
             if b == probe_bits:
                 cost[g][str(i)] = cost[g].get(str(i), 0.0) + c
             for ty, tb in ladder_bits:
@@ -356,12 +363,12 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
         seen_covered.add(t.name)
         del W
 
-    if not scored:
-        raise SystemExit("no scored tensors -- the imatrix and the GGUF do not share tensor names.")
     if skipped:
         # A partial profile that LOOKS measured is the failure mode this whole tool guards against.
         raise SystemExit(f"\n  {len(skipped)} tensors could not be scored, so the profile would be "
                          f"partial.\n  REFUSING to emit it. first: " + ", ".join(skipped[:3]))
+    if not scored:
+        raise SystemExit("no scored tensors -- the imatrix and the GGUF do not share tensor names.")
 
     # THE INVARIANT: the imatrix is the ground truth for what actually gets quantized -- it holds an
     # entry for every matmul llama-quantize will touch. So a covered tensor we did not score means
@@ -370,7 +377,8 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
     # tell the allocator. Qwen3.8-27B is how this was found: 48 of 65 blocks mix with an SSM rather
     # than attention, 240 of 496 covered matmuls went unscored, and the profile looked fine.
     missed = sorted({re.sub(r"^blk\.\d+\.", "", n) for n in H
-                     if re.match(r"^blk\.\d+\..+\.weight$", n) and n not in seen_covered})
+                     if re.match(r"^blk\.\d+\..+\.weight$", n)
+                     and n not in seen_covered and n not in excluded})
     if missed:
         # An unfamiliar architecture is an ONBOARDING case, not a dead end. Pollard's convention is
         # to forward it so the next person's model of that family one-shots -- every onboarding
@@ -394,6 +402,10 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
         raise SystemExit("every layer scored zero tensors -- nothing to allocate on.")
 
     print(f"  scored {scored} tensors across {layers} layers", flush=True)
+    if excluded:
+        cost["excluded_tensors"] = excluded
+        print(f"  {len(excluded)} MoE routers excluded from the score; retain their source "
+              "precision. Quantizing routers separately requires a separate measurement.", flush=True)
     if pinned:
         ex = sorted(pinned)[:4]
         print(f"  {sum(len(v) for v in pinned.values())} tensors in {len(pinned)} layer(s) are NOT "
@@ -402,11 +414,27 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
     return cost, noise, layers
 
 
+def _imatrix_weights(weights, importance, merged_experts=False):
+    """Align dense or expert-specific input-channel importance with weight rows."""
+    h = torch.tensor(importance, dtype=torch.float32)
+    if not torch.isfinite(weights).all() or not torch.isfinite(h).all() or (h < 0).any():
+        raise ValueError("weights and nonnegative importance must be finite")
+    if h.ndim != 1 or any(size == 0 for size in weights.shape):
+        raise ValueError("empty weights or non-vector importance")
+    if weights.ndim == 2 and weights.shape[-1] == h.numel():
+        return h.unsqueeze(0)
+    if weights.ndim == 3 and merged_experts:
+        experts, _, channels = weights.shape
+        if experts * channels == h.numel():
+            return h.reshape(experts, 1, channels)
+    raise ValueError(f"weight shape {tuple(weights.shape)} vs imatrix {h.numel()}")
+
+
 def _dequant(t):
-    """Tensor data as a 2-D float array, whatever the GGUF stored it as."""
+    """Decode stored GGUF values, preserving logical tensor dimensions."""
     import numpy as np
     from gguf import GGUFReader                             # noqa: F401  (import-time type table)
-    if t.tensor_type.name in ("F32", "F16", "BF16"):
+    if t.tensor_type.name in ("F32", "F16"):
         return t.data.astype(np.float32)
     from gguf.quants import dequantize                      # lets a Q6_K host serve as the source
     return dequantize(t.data, t.tensor_type).astype(np.float32)

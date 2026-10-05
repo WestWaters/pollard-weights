@@ -1,0 +1,49 @@
+{
+  "seed": 0,
+  "purpose": "Allocation-only inputs for the small HF/BF16 GGUF reference comparison",
+  "row_selection": "Zero-based indices in the pinned Parquet files, in listed order",
+  "join": "Strip each sample, join with two newlines, append one final newline; UTF-8",
+  "format": {
+    "prose": "row.text.strip()",
+    "reasoning": "Question: {row.question.strip()}\nAnswer: {row.answer.strip()}",
+    "code": "{row.prompt.strip()}\n{row.code.strip()}"
+  },
+  "sources": [
+    {
+      "domain": "prose",
+      "repo": "Salesforce/wikitext",
+      "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+      "parquet": "wikitext-2-raw-v1/train-00000-of-00001.parquet",
+      "license": "cc-by-sa-3.0",
+      "parquet_sha256": "e83889baabc497075506f91975be5fac0d45c5290b6b20582c8cd1e853d0c9f7",
+      "ordered_row_indices": [33120,14172,21886,5409,13253,35844,8724,18006,16762,26694,25491,14928,6274,1051,20286,2709,20814,28338,13128,5961,19914,33245,35306,18172,30500,28201,17499,34192,26084,13791,18469,25957,33278,30439,22081,33838,31681,16527,16087,17549],
+      "output": "allocation-prose.txt",
+      "output_sha256": "b26afc33d74d5e0270343431d0c0e15a9f46a7c757beb36baac6e2bc37cefef4",
+      "output_bytes": 27552
+    },
+    {
+      "domain": "reasoning",
+      "repo": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "parquet": "main/train-00000-of-00001.parquet",
+      "license": "mit",
+      "parquet_sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+      "ordered_row_indices": [1197,5330,5583,3722,5974,7399,6472,7000,494,4131,1441,3845,4651,3587,2118,2029,2923,5440,2447,6179,2831,6705,2006,6220,4656,2711,6355,5378,6845,1194,7360,263,1936,4510,5703,6373,7421,485,6005,841],
+      "output": "allocation-reasoning.txt",
+      "output_sha256": "25312cfe7310e069c5c1c57dde559c8f72cd2066aa9e76e051ac25171af4b9a4",
+      "output_bytes": 19364
+    },
+    {
+      "domain": "code",
+      "repo": "google-research-datasets/mbpp",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "parquet": "sanitized/train-00000-of-00001.parquet",
+      "license": "cc-by-4.0",
+      "parquet_sha256": "d95f8ad6d2fff08fe4826122d6e3e31f75716825d0c5c340d297aca5e9e0de0e",
+      "ordered_row_indices": [40,55,105,89,71,60,42,87,9,117,39,18,77,90,68,32,79,12,96,101,36,17,64,27,74,45,61,38,106,100,51,62,65,33,5,53,113,97,49,108],
+      "output": "allocation-code.txt",
+      "output_sha256": "eb645899d0a05c1517a655e5cd5daf091a09b101888c6d6f260b77d1f1dc235e",
+      "output_bytes": 10792
+    }
+  ]
+}
