@@ -158,6 +158,10 @@ def check_converter(model_dir=None):
     if conv is None:
         return False, note
     archs = model_architectures(model_dir) if model_dir else []
+    if model_dir and not archs:
+        # A model WAS named and its architecture could not be read: that is not a pass. Starting a
+        # long build on "not verified" is the exact failure this preflight exists to prevent.
+        return False, f"{note} -- could not read the architecture of {model_dir} (no config.json locally or on the hub)"
     return True, note if archs else f"{note} (no model given -- capability not verified)"
 
 
