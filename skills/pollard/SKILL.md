@@ -258,6 +258,25 @@ Reading the table never writes to the SSD. **Writes during a run are swap**: the
 `--disk auto` only applies to architectures whose llama.cpp loader marks the table lazy (read from
 `runtime/llama.cpp/src/models/*.cpp`); otherwise it says so and keeps the table in the budget.
 
+## Make your own foundation model (`pollard-forge`)
+
+Pollard builds models, not only quants of other people's. `pollard-forge` is the small-open-model recipe the labs
+use (NVIDIA Minitron/Nemotron-style): **new** (a fresh qwen3 / llama / qwen2 architecture at a size preset or exact
+dims; tokenizer copied or trained), **prune** (carve a smaller model out of a teacher: drop the layers with the
+lowest block influence and the FFN channels that fire least, measured on `--calib`), **train** (pretrain,
+continue, or distill from the teacher: CE + temperature-scaled KL; `--data` mixes text / jsonl / `hf:` sources by
+weight; checkpoint + `--resume`; multi-GPU via `torchrun`), **card** (lineage from `forge.json`, license required).
+```bash
+pollard-forge prune --teacher Qwen/Qwen3-4B --calib calib.txt --keep-layers 0.75 --ffn 0.6 --out my-2b
+pollard-forge train --model my-2b --teacher Qwen/Qwen3-4B --kd 0.7 \
+    --data hf:HuggingFaceFW/fineweb-edu@0.6 --data chat.jsonl@0.4 --tokens 2e9 --save-every 500
+pollard-forge card --model my-2b --name "My-2B" --license apache-2.0
+pollard --hf my-2b --run            # GGUF ladder + card like any model
+```
+Keep chat data in the mix for an instruct model (raw web text alone erases chat — measured on STQ1_0). A pruned or
+distilled model inherits its teacher's license terms; the card refuses to guess one. Checkpoints save in bf16
+(`--save-dtype`); mid-run checkpoints stay fp32 so `--resume` is exact.
+
 ## Runtime targets (where the build will actually run)
 
 - **llama.cpp / ik_llama.cpp / Ollama / LM Studio** — the GGUF above runs as-is. The
@@ -434,6 +453,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-pack` | Cerebras wafer capacity + expert-prune plan (forecast) | MoE (lever) |
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-ngram` | n-gram / per-layer embedding tables on the SSD: inspect, launch line, swap watch (`pollard-fit --disk`) | models with a lookup table |
+| `pollard-forge` | make your own model: new architecture, Minitron-style prune, pretrain / distill, lineage card | any decoder-only |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
 | `pollard-experts` | measured hot-expert report | **MoE only** |
