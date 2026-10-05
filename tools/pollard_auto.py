@@ -31,7 +31,7 @@ EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix 
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
 pollard-probe, --no-measure to skip); EXL3 = smoothing + Calib 3.0 packed to -cd + EXL3's native allocator.
 """
-import argparse, contextlib, json, os, subprocess, sys
+import argparse, contextlib, json, os, re, subprocess, sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse, find_llama_bin,
                           detect_gpu_gb, detect_available_ram_gb)
@@ -124,7 +124,29 @@ def size_ladder(params_b, pollard_gb=None, pollard_label="Pollard"):
           (f"  ->  {pollard_label} {pollard_gb:.2f}GB" if pollard_gb else ""))
 
 
+def _resolve_tool(cmd):
+    """A `pollard-*` step runs even when its console launcher was never installed.
+
+    An editable checkout keeps the code current but only writes launchers when pip runs, and a
+    scheduled task on Windows does not have the venv's Scripts on PATH either -- FrogNano died after a
+    clean convert because `pollard-calib` was "not found" on a box that had the module right here. If
+    the launcher is missing, run the module behind it with this interpreter instead."""
+    import shutil
+    if not cmd or not str(cmd[0]).startswith("pollard-") or shutil.which(str(cmd[0])):
+        return cmd
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        proj = open(os.path.join(os.path.dirname(here), "pyproject.toml"), encoding="utf-8").read()
+        m = re.search(rf'^{re.escape(str(cmd[0]))}\s*=\s*"([\w_]+):', proj, re.M)
+    except OSError:
+        m = None
+    mod = m.group(1) if m else str(cmd[0]).replace("-", "_")
+    path = os.path.join(here, mod + ".py")
+    return [sys.executable, path, *cmd[1:]] if os.path.isfile(path) else cmd
+
+
 def _run(cmd, do_run, cwd=None):
+    cmd = _resolve_tool(list(cmd))
     print("   $ " + " ".join(str(c) for c in cmd))
     if do_run:
         r = subprocess.run(cmd, cwd=cwd)
@@ -189,7 +211,8 @@ def lane_report(gguf_path, ik_bin_dir=None):
     if not arch:
         return None
     known = None
-    for cand in ([ik_bin_dir] if ik_bin_dir else []) + [os.environ.get("IK_LLAMA_BIN")]:
+    managed = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "ik_llama.cpp", "build", "bin")
+    for cand in ([ik_bin_dir] if ik_bin_dir else []) + [os.environ.get("IK_LLAMA_BIN"), managed]:
         known = _build_knows_arch(cand, arch)
         if known is not None:
             break
@@ -265,6 +288,12 @@ def _find_convert(hf_dir=None):
     23.8GB GGUF across the network rather than copy a 3MB script."""
     from pollard_convert import find_converter
     conv, note = find_converter(hf_dir)
+    if conv is None and "registers" in note:
+        # The converter exists but predates this architecture: update the managed engine and look again.
+        from pollard_runtime_update import auto_update_for
+        from pollard_convert import model_architectures
+        if auto_update_for(",".join(model_architectures(hf_dir)) or "this model"):
+            conv, note = find_converter(hf_dir)
     if conv is None:
         raise SystemExit(f"\n   cannot convert on this machine: {note}")
     if hf_dir:
@@ -387,11 +416,15 @@ def _ensure_sensitivity(a, hf_dir, calib, here):
     print(f"   auto-measure allocation (gold): pollard-probe --model {hf_dir} --eval {os.path.basename(evalf or 'calib')} --out {os.path.basename(prof)}")
     if a.run:
         cmd = ["pollard-probe", "--model", hf_dir, "--eval", evalf, "--out", prof]
+        if str(getattr(a, "ngl", "auto")) == "0":
+            # --ngl 0 means "this GPU is not ours" (a shared box). It used to reach only llama.cpp, so the
+            # torch probe still picked cuda on the son's GPU and crashed (0xC0000005) mid-session.
+            cmd += ["--device", "cpu"]
         if _use_stream_probe(hf_dir, getattr(a, "probe_method", "auto")):
             cmd.append("--stream")
             print(f"      ({_weights_gb(hf_dir):.1f}GB of weights vs {detect_available_ram_gb() or 0:.1f}GB "
                   "free -- one-pass estimator; perturb+KL would need ~layers*groups full passes)")
-        r = subprocess.run(cmd, cwd=here)
+        r = subprocess.run(_resolve_tool(cmd), cwd=here)
         # This used to fall back to uniform "rather than killing the whole build". But a uniform
         # allocation is not a lesser Pollard build -- it is the thing pollard-fit itself warns has
         # no quality win over a stock K-quant. Degrading to it silently spends hours producing a
@@ -604,7 +637,7 @@ def _emit_card(a):
     out = os.path.join(os.path.dirname(os.path.abspath(a.out or src)) or ".", "README.md")
     cmd += ["--out", out]
     print("\n   3) the card (what was built, which runtime each rung needs, what was measured):")
-    r = subprocess.run(cmd)
+    r = subprocess.run(_resolve_tool(cmd))
     if r.returncode != 0:
         print("   (card step failed -- the builds are fine; run pollard-card yourself to write it)")
         return

@@ -39,8 +39,15 @@ import argparse, glob, json, os, re, sys
 #     ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)
 # Setting this after `import torch` is too late -- torch caches cuda availability, so is_available()
 # keeps answering True. On a shared box it also matters that we do not quietly take the GPU.
+# "-1", not "": on Windows an EMPTY mask leaves torch.cuda.is_available() True with zero devices, and the first
+# device query (torchao's Triton check, pulled in by importing transformers) dies with IndexError.
+# Same block: linear-attention models (Qwen3.5 / FrogNano Gated DeltaNet) pick up `fla` whenever it is importable,
+# with no device check, and fla's Triton kernels then start a CUDA driver on a CPU run -- a native access violation
+# (exit 3221225477) with no traceback. Hiding fla and causal_conv1d makes transformers use its own torch path.
 if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == "cpu":
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    sys.modules["fla"] = None
+    sys.modules["causal_conv1d"] = None
 
 import torch, torch.nn.functional as F
 

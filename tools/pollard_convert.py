@@ -50,8 +50,20 @@ def _search_paths():
 
 
 def model_architectures(model_dir) -> list[str]:
-    """The `architectures` a checkpoint declares -- the exact class names a converter registers."""
+    """The `architectures` a checkpoint declares -- the exact class names a converter registers.
+
+    `model_dir` may be a local checkout OR a hub id ("org/name"). Preflight is run before anything is
+    downloaded, so a hub id must still be checkable: fetch config.json alone (a few KB). Without this
+    a hub id read as "no model given", the converter check printed PASS with "not verified", and a
+    box whose llama.cpp predates the architecture would have started a build that could not convert.
+    """
     cfg = Path(model_dir) / "config.json"
+    if not cfg.is_file() and isinstance(model_dir, str) and model_dir.count("/") == 1 and not Path(model_dir).exists():
+        try:
+            from huggingface_hub import hf_hub_download
+            cfg = Path(hf_hub_download(model_dir, "config.json"))
+        except Exception:
+            return []
     if not cfg.is_file():
         return []
     try:
