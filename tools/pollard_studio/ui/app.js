@@ -739,6 +739,12 @@ const ADV_SECTIONS = [
        + "atoms and its own knobs.",
     tools: ["pollard_mlx", "pollard_mx", "pollard_exl3", "pollard_exl3_band",
             "pollard_export", "pollard_vllm"] },
+  { title: "FOUNDATION MODELS", icon: "layers",
+    why: "Make your own model, the way the labs make their small open ones: a fresh architecture, or a smaller "
+       + "model carved out of a bigger one (depth and width pruning measured on your text), then pretraining "
+       + "or distillation from the bigger one. Every step is recorded in forge.json and the card, and the "
+       + "result goes through the rest of Pollard like any model.",
+    tools: ["pollard_forge"] },
   { title: "NEW ARCHITECTURES", icon: "box",
     why: "Pollard is not a list of supported models. onboard audits an architecture it has never "
        + "seen and writes the profile the allocator then works from, so an unknown model is a "
