@@ -42,3 +42,17 @@ jobs:
           PY
       - name: Regression suite (locked recipes can't silently drift)
         run: pytest tests/ -v
+
+  routing-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU-only routing test dependencies
+        run: |
+          pip install -e . pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Core and routing tensor fixtures without vLLM or a GPU
+        run: pytest tests/ --ignore=tests/studio -v
