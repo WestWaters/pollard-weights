@@ -238,6 +238,26 @@ count. **Producing the artifact needs the source weights + storage + a big box**
 runs on the box that holds the model; a user without the disk downloads the finished small
 build instead of making it.
 
+### Models with a lookup table (n-gram / per-layer embeddings) — keep the table on the SSD
+
+Qwen3.8-Flash-Next (a 51B n-gram PLE table), Gemma 4 E-series (per-layer embeddings), Engram / LongCat n-gram
+embeddings: a big table that is only ever READ, a few rows per token. llama.cpp serves those rows straight from
+the file (`--load-mode mmap --lazy-mode on`), so the table needs neither RAM nor VRAM. **Do not let it eat the
+RAM budget:** `pollard-fit` does this by default (`--disk auto`) — the table is pinned at `--disk-type` (q8_0,
+near-lossless; disk is cheap) and every GB of `--ram` goes to the transformer. On a 24 GB box with a 20B table
+that is the difference between the layers at Q2_K and at Q6_K.
+```bash
+pollard-ngram inspect model-f16.gguf                       # tables, their size, does this runtime lazy-read the arch
+pollard-fit --gguf model-f16.gguf --ram 24 --disk auto     # table on the SSD at q8_0, transformer gets the budget
+pollard-ngram run build.gguf --ram 24 --vram 12            # the launch line (mmap + lazy + table on CPU)
+pollard-ngram watch --pid <llama-server pid>               # disk writes vs swap while it runs (10+ min)
+```
+Reading the table never writes to the SSD. **Writes during a run are swap**: the model was loaded with
+`--no-mmap` / `-lm none|mlock` (copies the table into RAM), or the rest of the model plus KV doesn't fit.
+`watch` says which. Reads far under the drive's rated speed are normal (small random reads: latency-bound).
+`--disk auto` only applies to architectures whose llama.cpp loader marks the table lazy (read from
+`runtime/llama.cpp/src/models/*.cpp`); otherwise it says so and keeps the table in the budget.
+
 ## Runtime targets (where the build will actually run)
 
 - **llama.cpp / ik_llama.cpp / Ollama / LM Studio** — the GGUF above runs as-is. The
@@ -413,6 +433,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-probe` | `pollard-sensitivity` **cheap mode** — same profile, in-process, no GGUF/imatrix sweep | any |
 | `pollard-pack` | Cerebras wafer capacity + expert-prune plan (forecast) | MoE (lever) |
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
+| `pollard-ngram` | n-gram / per-layer embedding tables on the SSD: inspect, launch line, swap watch (`pollard-fit --disk`) | models with a lookup table |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
 | `pollard-experts` | measured hot-expert report | **MoE only** |

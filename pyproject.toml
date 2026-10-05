@@ -48,6 +48,7 @@ pollard-studio = "pollard_studio.app:main"
 pollard-node = "pollard_studio.node:main"
 pollard-calc = "pollard_calc:main"
 pollard-fit = "pollard_fit:main"
+pollard-ngram = "pollard_ngram:main"
 pollard-run = "pollard_run:main"
 pollard-fit-dit = "pollard_fit_dit:main"
 pollard-experts = "pollard_experts:main"
@@ -119,7 +120,7 @@ package-dir = { "" = "tools" }
 # Studio is a package, not a flat module; it installs beside the tools it reads, which is how it
 # finds them without being configured.
 packages = ["pollard_studio"]
-py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_run", "pollard_fit_dit",
+py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "pollard_run", "pollard_fit_dit",
     "pollard_flybrain", "pollard_brainverify", "pollard_brainattach", "pollard_brainlanes", "pollard_brain_backends", "pollard_connectome", "pollard_experts", "pollard_route", "pollard_sensitivity", "pollard_smooth", "pollard_rotate", "pollard_precondition", "pollard_eval", "pollard_taskeval", "pollard_health", "pollard_pack", "pollard_prune", "pollard_bench", "pollard_export", "pollard_gptq", "pollard_automap", "pollard_abliterate", "pollard_probe", "pollard_probes", "pollard_convert", "pollard_smoke", "pollard_modelkind", "pollard_diffusion", "pollard_decision", "pollard_composed", "pollard_mmeval", "pollard_fragile", "pollard_stop", "pollard_scorecard", "pollard_kl", "pollard_lowbit", "pollard_verify", "pollard_vllm", "pollard_doctor", "pollard_hf_smooth", "pollard_mx", "pollard_mlx", "pollard_exl3", "pollard_calib", "pollard_palette", "pollard_ls", "pollard_workspace",
     "pollard_serve_eval", "pollard_card", "pollard_onboard", "pollard_envmatch", "imatrix_fix_gate", "exl3_fix_mtp_ehproj",
     "pollard_archfp", "pollard_errtype", "pollard_errsrc", "pollard_recard",
