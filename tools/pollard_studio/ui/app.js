@@ -741,8 +741,9 @@ const ADV_SECTIONS = [
   { title: "MEASUREMENT", icon: "activity",
     why: "The eval and bench screens run the standard passes. These are the manual ones: probes "
        + "scores real task accuracy on the build, serve-eval A/Bs a SERVED endpoint against its "
-       + "reference so you measure what users will actually hit.",
-    tools: ["pollard_probes", "pollard_serve_eval"] },
+       + "reference so you measure what users will actually hit. kvbench measures the KV-cache "
+       + "formats themselves -- KLD and speed from 8K to 64K context.",
+    tools: ["pollard_probes", "pollard_serve_eval", "pollard_kvbench"] },
   { title: "BEHAVIOUR", icon: "brain",
     why: "Optional, and measured rather than assumed: abliterate reports what it changed, and "
        + "pollard-kl is how you check it changed only that.",
