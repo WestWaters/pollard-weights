@@ -434,6 +434,7 @@ def main():
     ap.add_argument("--lane", help="only this lane's builds")
     ap.add_argument("--results", help="JSON: {file_or_tag: {ppl, kld, tps, note}} + optional "
                     "{_eval, _f16_ppl, _hw}. `tps` adds a tok/s column; `_hw` names the machine.")
+    ap.add_argument("--thinklean", help="pollard-thinklean --json output; a MEASURED preset adds a 'Think-lean' section")
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
@@ -809,6 +810,19 @@ def main():
                 "The old `Q4_0_4_4/4_8/8_8` variants are not required.", ""]
 
     # ---- errata + footer
+    tl = json.load(open(a.thinklean)) if a.thinklean and os.path.exists(a.thinklean) else None
+    if tl and tl.get("measured"):
+        m = tl["measured"]
+        out += ["## Think-lean preset (shorter reasoning)", "",
+                "Quantized reasoning models over-use hedging words (\"wait\", \"but\", \"alternatively\"...) -- "
+                "Meta FAIR measured it in [arXiv 2606.00206](https://arxiv.org/abs/2606.00206). A small negative logit "
+                f"bias on those tokens ({len(tl['token_ids'])} ids for this tokenizer) trims the rumination.", "",
+                f"Measured on `{m['gguf']}`, {m['bench']}:", "",
+                "| | Accuracy | Mean tokens | Median tokens |", "|---|---|---|---|",
+                f"| default | {m['default']['accuracy']:.1%} | {m['default']['mean_tokens']:.0f} | {m['default']['median_tokens']} |",
+                f"| think-lean | {m['think-lean']['accuracy']:.1%} | {m['think-lean']['mean_tokens']:.0f} | {m['think-lean']['median_tokens']} |", "",
+                f"Tokens {m['token_change_pct']:+.1f}%, accuracy {m['accuracy_change_pts']:+.1f} points.", "",
+                "```bash", f"llama-server -m <file>.gguf {tl['llama_cpp_flags']}", "```", ""]
     out += ["## Errata", ""]
     if "gguf" in lanes:
         if ik_builds and fork_arch and arch_verdict == "newer":

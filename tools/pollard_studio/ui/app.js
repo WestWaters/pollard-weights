@@ -716,8 +716,10 @@ const ADV_SECTIONS = [
   { title: "DECODING", icon: "wave",
     why: "How a build is sampled is part of what it delivers. Composed decoding (arXiv 2609.34992) writes "
        + "every sampler as one objective on the simplex -- KL to the model, coverage, diversity -- and ships "
-       + "in Pollard's llama.cpp as `--composed`; this is the reference it is checked against and the presets.",
-    tools: ["pollard_composed"] },
+       + "in Pollard's llama.cpp as `--composed`; this is the reference it is checked against and the presets. "
+       + "thinklean writes a per-tokenizer logit-bias preset that trims a reasoning model's hedging, and "
+       + "measures tokens and accuracy with and without it before a card may mention it.",
+    tools: ["pollard_composed", "pollard_thinklean"] },
   { title: "SOLVER", icon: "wave",
     why: "Full-Hessian error feedback. Pollard trains as well as compresses, and these are the "
        + "solver's own knobs.",
