@@ -61,6 +61,9 @@ flowchart LR
 
 ## Quick start
 
+Nix/NixOS users can build and install the core CLI with the
+[Nix flake](notes/nix.md). GPU quantization dependencies and llama.cpp are separate.
+
 ```bash
 ./install.sh                                     # tools + the llama.cpp runtime, one shot
 pollard-calc --model Qwen/Qwen3-30B-A3B --ram 16 # what CAN this machine do
