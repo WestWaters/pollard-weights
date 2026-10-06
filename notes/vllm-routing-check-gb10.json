@@ -1,0 +1,126 @@
+{
+  "tested_on": "2026-10-04",
+  "scope": "routing accounting and greedy-output controls, not quality or performance",
+  "hardware": {
+    "device": "NVIDIA GB10",
+    "devices_used": 1,
+    "architecture": "aarch64",
+    "os": "NixOS"
+  },
+  "model": {
+    "name": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    "checkpoint_revision": null,
+    "config_sha256": "f1d98b530846087dc08b574a219713a94f945bf6583dc7230a19ebf1e8c50933"
+  },
+  "runtime": {
+    "version": "0.29.1rc1.dev513+g0961bbae2",
+    "build": "local image, not a stock upstream release; also contains support patches for another model family",
+    "tensor_parallel_size": 1,
+    "moe_backend": "marlin",
+    "attention_backend": "FlashInfer",
+    "cuda_graphs": false,
+    "speculation": false,
+    "prefix_caching": false,
+    "chunked_prefill": true,
+    "flashinfer_autotune": false,
+    "seed": 0
+  },
+  "limitations": [
+    "The cached checkpoint revision was not recorded; this is not a pinned quantization benchmark.",
+    "The earlier four-request capture passed token accounting, but fresh-process output hashes differed even with autotuning off for longer generations.",
+    "Serial same-engine control matches do not establish batch invariance, TP/EP correctness, or negligible overhead.",
+    "GLM TP8, longer-domain routing profiles and measured-vs-uniform quantization remain untested."
+  ],
+  "check": {
+    "schema_version": 1,
+    "vllm": "0.29.1rc1.dev513+g0961bbae2",
+    "capture": true,
+    "flashinfer_autotune": false,
+    "serial": true,
+    "quality_benchmark": false,
+    "performance_benchmark": false,
+    "batches": [
+      {
+        "requests": 4,
+        "prompt_tokens": 68,
+        "output_tokens": 4,
+        "expected_decode_tokens": 0,
+        "output_sha256": "f7b3ab81626a2ffa862be5939d91c0e119cfc1e315ce47abbec44ab790045601",
+        "max_tokens": 1,
+        "workers": [
+          {
+            "layers": 23,
+            "calls": 92,
+            "errors": 0,
+            "tokens_per_layer": {
+              "prefill": 68,
+              "decode": 0,
+              "unknown": 0
+            }
+          }
+        ]
+      },
+      {
+        "requests": 4,
+        "prompt_tokens": 68,
+        "output_tokens": 192,
+        "expected_decode_tokens": 188,
+        "output_sha256": "92a9e2812bc06edc76c5cf7fc528cda22497c53e558342c530c06e2f9ec4e082",
+        "max_tokens": 48,
+        "workers": [
+          {
+            "layers": 23,
+            "calls": 4416,
+            "errors": 0,
+            "tokens_per_layer": {
+              "prefill": 68,
+              "decode": 188,
+              "unknown": 0
+            }
+          }
+        ]
+      }
+    ],
+    "hook_removal": [
+      {
+        "removed": true
+      }
+    ],
+    "same_engine_controls": [
+      [
+        {
+          "requests": 4,
+          "prompt_tokens": 68,
+          "output_tokens": 4,
+          "expected_decode_tokens": 0,
+          "output_sha256": "f7b3ab81626a2ffa862be5939d91c0e119cfc1e315ce47abbec44ab790045601"
+        },
+        {
+          "requests": 4,
+          "prompt_tokens": 68,
+          "output_tokens": 192,
+          "expected_decode_tokens": 188,
+          "output_sha256": "92a9e2812bc06edc76c5cf7fc528cda22497c53e558342c530c06e2f9ec4e082"
+        }
+      ],
+      [
+        {
+          "requests": 4,
+          "prompt_tokens": 68,
+          "output_tokens": 4,
+          "expected_decode_tokens": 0,
+          "output_sha256": "f7b3ab81626a2ffa862be5939d91c0e119cfc1e315ce47abbec44ab790045601"
+        },
+        {
+          "requests": 4,
+          "prompt_tokens": 68,
+          "output_tokens": 192,
+          "expected_decode_tokens": 188,
+          "output_sha256": "92a9e2812bc06edc76c5cf7fc528cda22497c53e558342c530c06e2f9ec4e082"
+        }
+      ]
+    ],
+    "control_repeats_match": true,
+    "capture_matches_controls": true
+  }
+}

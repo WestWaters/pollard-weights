@@ -1762,7 +1762,7 @@ def test_layer_access_goes_through_text_layers():
 
 
 
-def test_probe_places_a_model_too_big_for_the_accelerator():
+def test_probe_places_a_model_too_big_for_the_accelerator(monkeypatch):
     """The probe pinned the WHOLE model to one device, so the first model bigger than the box OOM'd
     (Gemma4 12B: 22GB onto a 16GB Mac). It must shard+offload instead of dying."""
     try:
@@ -1771,6 +1771,10 @@ def test_probe_places_a_model_too_big_for_the_accelerator():
         print("    (skipped: torch not installed -- `pip install pollard-weights[flybrain]`)")
         return
     import pollard_probe as P
+    # A placement contract, not a query of the test runner's hardware. Linux
+    # builds of Torch expose torch.mps but cannot call its memory-query API.
+    monkeypatch.setattr(P, "_accel_bytes", lambda _dev: 16 * (1 << 30))
+    monkeypatch.setattr(P, "_host_bytes", lambda: 64 * (1 << 30))
     d = tempfile.mkdtemp()
     # State the size; do not write it. Truncating 400GB here is free on a filesystem with sparse
     # files and writes 400 REAL GB on one without -- running this suite on NTFS filled a disk.
@@ -2709,4 +2713,3 @@ def test_probe_stability_report_separates_stable_from_corpus_dependent_rankings(
     st2 = stability_report(unstable, slices)
     assert st2["verdict"] == "UNSTABLE" and st2["groups"]["ffn"]["spearman_min"] < 0.5, st2
     assert "multi-domain" in st2["advice"]
-
