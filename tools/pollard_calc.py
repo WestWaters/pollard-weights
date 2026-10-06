@@ -842,6 +842,105 @@ def describe_source(meta, bpw):
     return name, full, advice
 
 
+def validate_cluster_profile(profile):
+    """A hardware snapshot, not an assertion that the runtime supports this pool."""
+    import math
+    def positive(value, label, zero=False):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{label} must be a finite number")
+        if value < 0 or (value == 0 and not zero):
+            raise ValueError(f"{label} must be {'non-negative' if zero else 'positive'}")
+    if not isinstance(profile, dict) or type(profile.get("schema_version")) is not int or profile["schema_version"] != 1:
+        raise ValueError("cluster profile needs schema_version 1")
+    if set(profile) - {"schema_version", "nodes", "kv_layout", "fabric"}:
+        raise ValueError("unsupported profile fields")
+    nodes = profile.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("cluster profile needs a non-empty nodes list")
+    names = set()
+    allowed = {"name", "available_memory_gb", "runtime_reserve_gb", "weight_fraction", "kv_fraction",
+               "memory_bandwidth_gbps", "bandwidth_basis"}
+    for node in nodes:
+        if not isinstance(node, dict) or set(node) - allowed:
+            raise ValueError("unsupported node fields; use anonymous hardware labels, not connection details")
+        name = node.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) or name in names:
+            raise ValueError("node names must be distinct simple labels")
+        names.add(name)
+        for field in ("available_memory_gb", "runtime_reserve_gb"):
+            positive(node.get(field), field, zero=field == "runtime_reserve_gb")
+        if node["runtime_reserve_gb"] >= node["available_memory_gb"]:
+            raise ValueError("runtime reserve must be smaller than available memory")
+        for field in ("weight_fraction", "kv_fraction", "memory_bandwidth_gbps"):
+            if field in node:
+                positive(node[field], field)
+        if "memory_bandwidth_gbps" in node and node.get("bandwidth_basis") not in ("measured", "assumed"):
+            raise ValueError("memory bandwidth needs a measured/assumed basis")
+    for field in ("weight_fraction", "kv_fraction"):
+        present = [field in n for n in nodes]
+        if any(present) and (not all(present) or not math.isclose(sum(n[field] for n in nodes), 1, abs_tol=1e-6)):
+            raise ValueError(f"{field} must be specified on every node and sum to one")
+    layout = profile.get("kv_layout", "replicated")
+    if layout not in ("replicated", "partitioned"):
+        raise ValueError("kv_layout must be replicated or partitioned")
+    if layout == "partitioned" and not all("kv_fraction" in n for n in nodes):
+        raise ValueError("partitioned KV requires explicit per-node kv_fraction")
+    if layout == "replicated" and any("kv_fraction" in n for n in nodes):
+        raise ValueError("replicated KV does not use kv_fraction")
+    fabric = profile.get("fabric")
+    if fabric is not None:
+        if not isinstance(fabric, dict) or set(fabric) != {"bandwidth_gbps", "basis"}:
+            raise ValueError("fabric requires bandwidth_gbps and basis")
+        positive(fabric["bandwidth_gbps"], "fabric bandwidth")
+        if fabric["basis"] not in ("measured", "assumed"):
+            raise ValueError("fabric bandwidth basis must be measured or assumed")
+    return profile
+
+
+def cluster_estimate(profile, weights_gb, kv_gb):
+    """Check every node's stated allocation, never just summed capacity.
+
+    available_memory_gb is ONE allocatable pool on each node. For UMA hardware
+    do not add host RAM and GPU-reported memory. Runtime reserves cover non-KV
+    workspaces/activations. KV is replicated unless explicitly partitioned.
+    """
+    import math
+    validate_cluster_profile(profile)
+    for value in (weights_gb, kv_gb):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ValueError("weight and KV sizes must be finite and non-negative")
+    nodes = profile["nodes"]
+    estimates = []
+    for node in nodes:
+        weight = weights_gb * node.get("weight_fraction", 1 / len(nodes))
+        kv = kv_gb * (node["kv_fraction"] if profile.get("kv_layout") == "partitioned" else 1)
+        capacity = node["available_memory_gb"] - node["runtime_reserve_gb"]
+        estimates.append({"name": node["name"], "capacity_gb": capacity, "weights_gb": weight,
+                          "kv_gb": kv, "headroom_gb": capacity - weight - kv})
+    return {"nodes": estimates, "fits_all_nodes": all(n["headroom_gb"] >= 0 for n in estimates),
+            "capacity_gb": sum(n["capacity_gb"] for n in estimates),
+            "kv_layout": profile.get("kv_layout", "replicated")}
+
+
+def cluster_report(profile, weights_gb, kv_gb, ctx):
+    result = cluster_estimate(profile, weights_gb, kv_gb)
+    print(f"cluster allocation estimate: {len(result['nodes'])} nodes, KV {result['kv_layout']}")
+    print("Weights: explicit per-node fractions." if "weight_fraction" in profile["nodes"][0]
+          else "Weights: assumed equal shards; verify the runtime's actual placement.")
+    print("node | allocatable GB | weights GB | KV GB | headroom GB")
+    for node in result["nodes"]:
+        print(f"{node['name']} | {node['capacity_gb']:.1f} | {node['weights_gb']:.1f} | "
+              f"{node['kv_gb']:.1f} | {node['headroom_gb']:+.1f}")
+    print("Allocation fits the stated budgets." if result["fits_all_nodes"] else "Allocation exceeds at least one node's budget.")
+    if not ctx:
+        print("KV excluded: pass --ctx to include one sequence's estimated cache.")
+    if profile.get("fabric"):
+        f = profile["fabric"]
+        print(f"fabric: {f['bandwidth_gbps']:.2f} GB/s ({f['basis']}); not used as a throughput multiplier")
+    print("This is byte accounting, not runtime validation. Check kernel/parallelism support, actual sharding, "
+          "batch concurrency and measured peak memory. No cluster speed prediction is made.")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     src = p.add_mutually_exclusive_group(required=True)
@@ -869,6 +968,9 @@ def main():
                                  "card from nvidia-smi, total VRAM GB, a card name, or "
                                  "CARDxCOUNT -- e.g. 'auto', '96', '16x2', '5090x4', "
                                  "'rtx6000prox2'. Any card, listed or not: pass GB.")
+    p.add_argument("--cluster-profile", help="JSON hardware snapshot with per-node memory budgets and explicit KV layout")
+    p.add_argument("--cluster-concurrency", type=int, default=1,
+                   help="sequences at --ctx each in the cluster KV estimate (default 1)")
     p.add_argument("--device", default="gpu", choices=["gpu", "unified", "mac", "phone"],
                    help="what --gpu's number is: dedicated 'gpu' VRAM (~94%% usable, "
                         "default), 'unified'/'mac' RAM (~75%%), or 'phone' (~55%% -- the OS "
@@ -876,6 +978,19 @@ def main():
     p.add_argument("--build-hw", type=float, default=1.0,
                    help="build-time scale vs a GB10/Spark-class box (e.g. ~0.4 for a 5090, ~0.5 A100)")
     a = p.parse_args()
+    if a.cluster_concurrency <= 0 or a.ctx < 0:
+        p.error("cluster concurrency must be positive and context length non-negative")
+    if a.cluster_concurrency != 1 and not a.cluster_profile:
+        p.error("--cluster-concurrency requires --cluster-profile")
+    cluster = None
+    if a.cluster_profile:
+        if a.gpu:
+            p.error("--cluster-profile and --gpu describe different allocations; use only one")
+        try:
+            with open(a.cluster_profile, encoding="utf-8") as f:
+                cluster = validate_cluster_profile(json.load(f))
+        except (OSError, ValueError) as exc:
+            p.error(str(exc))
 
     meta = None
     if a.gguf:
@@ -903,24 +1018,33 @@ def main():
         # ground truth beats estimate: derive effective bpw from the file itself
         qbits = cfg["_gguf_file_bytes"] * 8.0 / arch["total"]
     print(f"== pollard-calc :: {name} ==")
-    print(f"hardware            : {a.ram:.0f} GB RAM, {a.flash} GB/s flash, "
-          f"{a.rambw} GB/s membw, "
-          + (f"measured {qbits:.2f} bpw from file" if a.gguf else f"quant {a.quant}")
-          + "\n")
+    if cluster:
+        print(f"hardware            : {len(cluster['nodes'])}-node profile (per-node budgets below)\n")
+    else:
+        print(f"hardware            : {a.ram:.0f} GB RAM, {a.flash} GB/s flash, "
+              f"{a.rambw} GB/s membw, "
+              + (f"measured {qbits:.2f} bpw from file" if a.gguf else f"quant {a.quant}")
+              + "\n")
     if meta is not None:                                # a "what have I got" model check
         label, full, advice = describe_source(meta, qbits)
         shards = cfg.get("_shard_count", 1)
         shard_note = f", {shards} shards" if shards > 1 else ""
         print(f"source quant        : {label} (~{qbits:.2f} bpw{shard_note})  "
               f"{'OK' if full else '!'} {advice}\n")
-    report(arch, a.ram, a.flash, a.rambw, qbits, cache)
+    if cluster:
+        kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}[a.kv_quant]
+        cluster_report(cluster, arch["total"] * qbits / 8 / 1e9,
+                       kv_cache_bytes(arch, a.ctx, kv_bytes) * a.cluster_concurrency / 1e9, a.ctx)
+        print(f"KV assumption: {a.cluster_concurrency} sequences at {a.ctx} tokens each.")
+    else:
+        report(arch, a.ram, a.flash, a.rambw, qbits, cache)
     bt = estimate_build_time(arch, a.build_hw)
     hw = "GB10/Spark-class" if a.build_hw == 1.0 else f"{a.build_hw:.2f}x GB10-class"
     print(f"est. quant build time ({hw}; +/-~2x, calibrate to your box):")
     print(f"   GGUF ladder {_fmt_hours(bt['gguf'])}  |  GPTQ {_fmt_hours(bt['gptq'])}  |  "
           f"MLX {_fmt_hours(bt['mlx'])}  |  EXL3 {_fmt_hours(bt['exl3'])} (one bpw)  "
           f"-- the cheap->heavy spread: pick your lane before you run")
-    if a.ctx:
+    if a.ctx and not cluster:
         kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}[a.kv_quant]
         rig_gb = None
         if a.gpu:
