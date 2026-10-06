@@ -299,6 +299,45 @@ def lost_archs(old_tree, new_tree):
     return sorted(set(old) - set(new))
 
 
+def _changed_lines(diff_text):
+    """{file: sorted added/removed lines} -- what a diff changes, independent of hunk order, line numbers,
+    context and line endings. Header lines are only recognised between `diff --git` and the first hunk."""
+    out, cur, in_hunk = {}, None, False
+    for line in diff_text.splitlines():
+        line = line.rstrip("\r")
+        if line.startswith("diff --git "):
+            cur, in_hunk = None, False
+        elif not in_hunk and line.startswith("+++ "):
+            cur = line[4:].strip()
+            cur = cur[2:] if cur.startswith("b/") else cur
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and cur and line[:1] in "+-":
+            out.setdefault(cur, []).append(line.rstrip())
+    return {f: sorted(v) for f, v in out.items() if v}
+
+
+def dirty_is_declared(tree):
+    """True when a tree's uncommitted changes are exactly its live declared patches.
+
+    Those are already stored in runtime-patches/, so a pre-update capture of them only writes the same patch
+    again under a new date -- every night, on every box. Any untracked source file, or any change that is
+    not one of the declared patches, still returns False, and is captured before the update as before."""
+    from pollard_runtime import untracked_sources
+    if untracked_sources(tree):
+        return False
+    have = _changed_lines(_run(["git", "-C", tree, "diff", "HEAD"], timeout=600).stdout or "")
+    if not have:
+        return False
+    want = {}
+    for m in _patches_for(tree):
+        if not patch_is_live(tree, m):
+            continue
+        for f, lines in _changed_lines(open(m["_patch"], encoding="utf-8", errors="replace").read()).items():
+            want.setdefault(f, []).extend(lines)
+    return have == {f: sorted(v) for f, v in want.items()}
+
+
 def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None):
     e = ENGINES[name]
     tree, url = e["dir"], e["url"]
@@ -313,7 +352,9 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
     if st.get("commit") and head and head.startswith(st["commit"][:7]) and not extra:
         log(f"{name}: already at upstream {head}")
         return True
-    if st.get("dirty"):
+    if st.get("dirty") and dirty_is_declared(tree):
+        log(f"{name}: local changes are exactly the declared patches -- already in runtime-patches/, nothing new to capture")
+    elif st.get("dirty"):
         from pollard_runtime import capture
         meta, msg = capture(tree, f"pre-update-{_dt.date.today():%Y%m%d}", os.path.join(REPO, "runtime-patches"))
         log(f"{name}: captured local runtime work first -- {msg}")
