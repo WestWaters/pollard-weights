@@ -868,7 +868,7 @@ def _ppl_kl(ppl_bin, model, eval_f, base, ngl, chunks=0):
     # line: a negated-colon class matches NEWLINES too, so the old top-1 pattern latched onto the
     # table header ("... Same top p") and ran on to the next colon anywhere below, reporting a
     # number that was not a percentage and looked like a result.
-    return {
+    res = {
         "ppl":    g(r"^Mean PPL\(Q\)\s*:\s*([0-9.]+)")
                   or g(r"Final estimate:\s*PPL[^=\n]*=\s*([0-9.]+)"),
         "ref_ppl":    g(r"^Mean PPL\(base\)\s*:\s*([0-9.]+)"),
@@ -876,6 +876,16 @@ def _ppl_kl(ppl_bin, model, eval_f, base, ngl, chunks=0):
         "median_kld": g(r"^Median\s+KLD:\s*([0-9.]+)"),
         "top1":   g(r"^Same top p:\s*([0-9.]+)"),        # top-1 agreement %
     }
+    # llama-perplexity prints its summary only after the LAST chunk, so any failure on the way (a KL base cut
+    # short by a full disk, an architecture the binary can't load, out of memory) used to leave every column
+    # "--" with no reason given. Say why, in llama-perplexity's own words.
+    if r.returncode or all(v is None for v in res.values()):
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        why = [l for l in lines if re.search(r"error|failed|unknown model|out of memory|cannot|unable", l, re.I)]
+        print(f"  !! llama-perplexity failed on {os.path.basename(model)} (exit {r.returncode}):", file=sys.stderr)
+        for l in (why[-3:] or lines[-3:]):
+            print(f"     {l[:200]}", file=sys.stderr)
+    return res
 
 
 def _fmt(v, nd=4):
@@ -1151,8 +1161,12 @@ def main():
                    "-ngl", str(a.ngl), "--kl-divergence-base", base]
             if a.chunks:
                 cmd += ["--chunks", str(a.chunks)]
-            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
+            # a base that ran out of disk is not empty, it is SHORT: every scoring run then dies at the chunk
+            # where it ends, after the chunks it did score, and prints no summary. Never keep a partial base.
+            if (r.returncode or free < 1e9) and os.path.exists(base):    # a full disk can still exit 0
+                os.remove(base)
             if not os.path.exists(base) or os.path.getsize(base) == 0:
                 sys.exit(f"could not build KL base logits ({free/1e9:.1f} GB free). The base holds "
                          "FULL logits -- tokens x vocab x 4 bytes -- so a large vocab over a long "
