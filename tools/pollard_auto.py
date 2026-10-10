@@ -246,6 +246,74 @@ def lane_report(gguf_path, ik_bin_dir=None):
     return known
 
 
+#: The publish ladder: (label, presets that count as it, target size as a fraction of the f16 file).
+#: The fractions are where the published Pollard ladders landed (FrogNano / FrogMini / clef-flash):
+#: within each label's band of budgets, the rung nearest its fraction is the one that ships.
+LADDER = [("Q6_K", ("Q6_K",), 0.42),
+          ("IQ4_XS", ("IQ4_XS",), 0.31),
+          ("IQ3_S", ("IQ3_S",), 0.26),
+          ("IQ2", ("IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS"), 0.20)]
+
+
+def ladder_points(gguf, imatrix=None, sensitivity=None, step=0.1):
+    """[(ram, preset, projected_gb)] over a budget grid, from pollard-fit's own planner (reserve 0,
+    so --ram is the weights budget it plans against). Nothing is quantized; it is the --plan-only
+    search the hand-written ladder scripts did by trial and error, done in-process."""
+    from pollard_fit import plan_allocation
+    from pollard_calc import imatrix_covered_tensors
+    from pollard_ngram import disk_plan
+    meta = read_gguf_meta(gguf)
+    arch = analyse(gguf_to_config(meta, gguf))
+    covered = imatrix_covered_tensors(imatrix) if imatrix else None
+    emb_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
+    disk = disk_plan(meta, "auto", "q8_0")
+    sens = json.load(open(sensitivity)) if sensitivity else None
+    top = os.path.getsize(gguf) / 1e9 * 1.25 if os.path.exists(gguf) else 64.0
+    pts, r = [], 1.0
+    while r <= top:
+        try:
+            with contextlib.redirect_stdout(open(os.devnull, "w")):
+                _, _, gb, preset, _ = plan_allocation(arch, r, 0.0, sens, False, None, emb_ok,
+                                                      disk if disk and disk["params"] else None)
+            pts.append((round(r, 2), str(preset), float(gb)))
+        except (SystemExit, Exception):
+            pass
+        r += step
+    return pts
+
+
+def pick_ladder(points, f16_gb, ik_flagship=False):
+    """{label: (ram, preset, gb)} -- per LADDER label, the budget whose preset counts as it and whose
+    projected size is nearest the label's fraction of the f16. The 2-bit rung is left to the IQ*_KT
+    flagship when ik_llama can build it (that is the rung Pollard publishes there); otherwise a stock
+    IQ2 type, which mainline llama.cpp runs. A label no budget reaches is simply absent."""
+    out = {}
+    for label, presets, frac in LADDER:
+        if label == "IQ2" and ik_flagship:
+            continue
+        band = [p for p in points if p[1] in presets]
+        if band:
+            out[label] = min(band, key=lambda p: (abs(p[2] - frac * f16_gb), p[0]))
+    return out
+
+
+def _build_ladder(a, ik_flagship):
+    pts = ladder_points(a.gguf, a.imatrix, a.sensitivity)
+    f16_gb = os.path.getsize(a.gguf) / 1e9
+    picks = pick_ladder(pts, f16_gb, ik_flagship)
+    print(f"   1) the publish ladder ({', '.join(picks) or 'nothing reachable'}):")
+    for label, (ram, preset, gb) in picks.items():
+        print(f"      {label:<7} --ram {ram:<5} -> {preset} ~{gb:.1f} GB")
+    binq = os.path.join(a.bin, "llama-quantize") if a.bin else None
+    for label, (ram, preset, gb) in picks.items():
+        cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0"]
+        if a.imatrix: cmd += ["--imatrix", a.imatrix]
+        if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]
+        if binq: cmd += ["--llama-quantize", binq]
+        if not a.run: cmd += ["--plan-only"]
+        _run(cmd, a.run)
+
+
 def _automap_mix(a, is_moe):
     """Emit + (with --run) build the automap mix -- the hand-coded mixed-precision flagship.
     MoE: expert-allocation (crush cold experts, protect router/down/shared/attn). DENSE: the
@@ -712,6 +780,10 @@ def main():
                     help="do NOT auto-generate an imatrix when --imatrix is omitted (K-quant ladder only)")
     ap.set_defaults(auto_imatrix=True)
     ap.add_argument("--ram", default="16", help="RAM budget in GB for the dense memory-fit build")
+    ap.add_argument("--ladder", action="store_true",
+                    help="build the whole publish ladder (Q6_K / IQ4_XS / IQ3_S / 2-bit) instead of one "
+                         "--ram build: budgets are found by pollard-fit's own planner, the 2-bit rung is the "
+                         "IQ*_KT flagship where ik_llama can build it and a stock IQ2 type where it cannot")
     ap.add_argument("--out", help="output path (dense build)")
     ap.add_argument("--eval", default="wikitext2_test.txt")
     ap.add_argument("--bin", help="llama.cpp bin dir (for the MoE dry-run/build)")
@@ -816,7 +888,7 @@ def _dispatch(a):
     size_ladder((arch.get("total") or 0) / 1e9)
 
     # Autoaware: which lanes are actually open for THIS architecture (never plan an impossible build)
-    lane_report(a.gguf, ik_bin_dir=getattr(a, "bin", None))
+    ik_known = lane_report(a.gguf, ik_bin_dir=getattr(a, "bin", None))
 
     # WINNING PATH -- SAME shape for dense AND MoE (no losing fallback):
     #   (1) the imatrix K-quant ladder (pollard-fit) -- the honest, fit-your-RAM baseline, and
@@ -837,14 +909,20 @@ def _dispatch(a):
         here = os.path.dirname(os.path.abspath(a.gguf)) or "."
         calib = a.calib or os.path.join(here, "pollard_calib.txt")
         a.sensitivity = _ensure_sensitivity(a, hf_dir, calib, here)
-    cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
-    if a.imatrix: cmd += ["--imatrix", a.imatrix]
-    if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]   # measured per-layer allocation
-    if a.out: cmd += ["--out", a.out]
-    if not a.run: cmd += ["--plan-only"]
-    print("   1) the K-quant ladder (measured allocation, fits your RAM budget):")
-    _run(cmd, a.run)
-    if a.imatrix:
+    if a.ladder:
+        _build_ladder(a, ik_flagship=bool(a.imatrix) and ik_known is True)
+    else:
+        cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
+        if a.imatrix: cmd += ["--imatrix", a.imatrix]
+        if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]   # measured per-layer allocation
+        if a.out: cmd += ["--out", a.out]
+        if not a.run: cmd += ["--plan-only"]
+        print("   1) the K-quant ladder (measured allocation, fits your RAM budget):")
+        _run(cmd, a.run)
+    if a.imatrix and ik_known is False:
+        print(f"   2) (no {flagship} flagship: ik_llama.cpp does not know this architecture -- see above. "
+              "The ladder is what ships until it is ported.)")
+    elif a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
         _automap_mix(a, is_moe=is_moe)
     else:
