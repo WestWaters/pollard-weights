@@ -255,6 +255,16 @@ LADDER = [("Q6_K", ("Q6_K",), 0.42),
           ("IQ2", ("IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS"), 0.20)]
 
 
+def _bin_in(bin_dir, name):
+    """`name` inside a --bin directory, with .exe on Windows. A bare join handed pollard-fit
+    "...\\build\\bin\\llama-quantize", which does not exist on Windows: the Clef 27B ladder (2026-10-10) died
+    "llama-quantize not found" after a 2-hour imatrix, while the same build without --bin worked."""
+    p = os.path.join(bin_dir, name)
+    if os.name == "nt" and not p.lower().endswith(".exe") and os.path.isfile(p + ".exe"):
+        return p + ".exe"
+    return p
+
+
 def ladder_points(gguf, imatrix=None, sensitivity=None, step=0.1):
     """[(ram, preset, projected_gb)] over a budget grid, from pollard-fit's own planner (reserve 0,
     so --ram is the weights budget it plans against). Nothing is quantized; it is the --plan-only
@@ -304,7 +314,7 @@ def _build_ladder(a, ik_flagship):
     print(f"   1) the publish ladder ({', '.join(picks) or 'nothing reachable'}):")
     for label, (ram, preset, gb) in picks.items():
         print(f"      {label:<7} --ram {ram:<5} -> {preset} ~{gb:.1f} GB")
-    binq = os.path.join(a.bin, "llama-quantize") if a.bin else None
+    binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, (ram, preset, gb) in picks.items():
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0"]
         if a.imatrix: cmd += ["--imatrix", a.imatrix]
@@ -320,7 +330,7 @@ def _automap_mix(a, is_moe):
     IQ1_KT crush-body / protect-attn+down+edges flagship (automap-on-dense, --allow-dense).
     Fast by default (--mix-only --no-eval); --benchmark emits the 3-bar + PPL board instead.
     This is what keeps the winning hand-coded mix a first-class BUILD, not benchmark-only."""
-    binq = find_llama_bin("llama-quantize") if not a.bin else os.path.join(a.bin, "llama-quantize")
+    binq = find_llama_bin("llama-quantize") if not a.bin else _bin_in(a.bin, "llama-quantize")
     here = os.path.dirname(os.path.abspath(a.gguf)) or "."
     tensors = os.path.join(here, "pollard_auto_tensors.txt")
     print(f"   tensor list (Q6_K dry-run): {binq} --dry-run {os.path.basename(a.gguf)} x.gguf Q6_K > tensors")
@@ -575,7 +585,7 @@ def _ensure_imatrix(a):
     here = os.path.dirname(os.path.abspath(a.gguf)) or "."
     calib = a.calib or os.path.join(here, "pollard_calib.txt")
     imat = os.path.join(here, os.path.splitext(os.path.basename(a.gguf))[0] + ".imatrix")
-    binim = (os.path.join(a.bin, "llama-imatrix") if a.bin
+    binim = (_bin_in(a.bin, "llama-imatrix") if a.bin
              else find_llama_bin("llama-imatrix")) or "llama-imatrix"
     print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) -- no manual calibration step:")
     if not a.calib:
