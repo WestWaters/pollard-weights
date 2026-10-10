@@ -348,7 +348,7 @@ def _server_supports(binary, flag):
 
 
 @contextlib.contextmanager
-def _served(model, ngl, ctx=4096, port=0):
+def _served(model, ngl, ctx=4096, port=0, extra=()):
     """llama-server for the duration, yielding its base url (or None if it will not start)."""
     if not port:
         s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
@@ -368,7 +368,7 @@ def _served(model, ngl, ctx=4096, port=0):
            "--no-context-shift",
            "--no-cont-batching",
            # apply the model's OWN template (default off on ik, on upstream)
-           "--jinja"] + _t()
+           "--jinja"] + _t() + list(extra)
     # Without this the reply can land entirely in reasoning_content with content empty: llama.cpp
     # passes enable_thinking=true even when the template's own default is false, so generation
     # starts inside <think>, and a model that emits EOS without ever closing it has written
