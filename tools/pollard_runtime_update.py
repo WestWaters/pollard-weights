@@ -317,6 +317,17 @@ def _changed_lines(diff_text):
     return {f: sorted(v) for f, v in out.items() if v}
 
 
+def _touched_files(diff_text):
+    """Every file a diff touches, from its `diff --git a/X b/Y` headers -- including mode-only, rename and
+    binary changes, which carry no +/- lines and so never show up in _changed_lines."""
+    out = set()
+    for line in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(.*) b/(.*)$", line.rstrip("\r"))
+        if m:
+            out.update(m.groups())
+    return out
+
+
 def dirty_is_declared(tree):
     """True when a tree's uncommitted changes are exactly its live declared patches.
 
@@ -326,16 +337,21 @@ def dirty_is_declared(tree):
     from pollard_runtime import untracked_sources
     if untracked_sources(tree):
         return False
-    have = _changed_lines(_run(["git", "-C", tree, "diff", "HEAD"], timeout=600).stdout or "")
+    live = _run(["git", "-C", tree, "diff", "HEAD"], timeout=600).stdout or ""
+    have = _changed_lines(live)
     if not have:
         return False
-    want = {}
+    want, want_files = {}, set()
     for m in _patches_for(tree):
         if not patch_is_live(tree, m):
             continue
-        for f, lines in _changed_lines(open(m["_patch"], encoding="utf-8", errors="replace").read()).items():
+        text = open(m["_patch"], encoding="utf-8", errors="replace").read()
+        want_files |= _touched_files(text)
+        for f, lines in _changed_lines(text).items():
             want.setdefault(f, []).extend(lines)
-    return have == {f: sorted(v) for f, v in want.items()}
+    # Content alone is not enough: a declared patch plus a chmod / rename / binary edit has the same +/- lines,
+    # and the extra change would skip capture (Joey's review). The touched-file sets must match too.
+    return have == {f: sorted(v) for f, v in want.items()} and _touched_files(live) == want_files
 
 
 def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None):

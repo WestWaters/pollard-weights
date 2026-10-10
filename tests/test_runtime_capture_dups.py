@@ -72,3 +72,15 @@ def test_changed_lines_ignores_headers_inside_hunks():
     diff = ("diff --git a/x.c b/x.c\n--- a/x.c\n+++ b/x.c\n@@ -1,2 +1,2 @@\n"
             "--- a removed line that looks like a header\n+++ an added one too\n")
     assert U._changed_lines(diff) == {"x.c": sorted(["--- a removed line that looks like a header", "+++ an added one too"])}
+
+
+def test_a_mode_only_change_beyond_the_patch_is_still_captured(monkeypatch):
+    """A chmod carries no +/- lines, so content-only dedup missed it (Joey's review)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tree, src, patch = _engine(tmp)
+        other = os.path.join(tree, "src", "run.sh")
+        open(other, "w").write("echo hi\n")
+        _git(tree, "add", "src/run.sh"); _git(tree, "commit", "-q", "-m", "script")
+        os.chmod(other, 0o755)
+        _declare(monkeypatch, patch)
+        assert not U.dirty_is_declared(tree), "a mode change beyond the declared patch must be captured"

@@ -204,8 +204,9 @@ def block_safe_type(t: str, row_len: int, fallback: str = "q8_0") -> str:
 
 
 def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False, tiers=None,
-                    emb_imatrix_ok=True, disk=None):
-    """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)).
+                    emb_imatrix_ok=True, disk=None, want_pinned=False):
+    """Return (overrides, emb_type, projected_GB, base_preset, (summary, src)), plus -- with want_pinned -- the
+    patterns the caller pinned explicitly (--disk tables, --tier classes), which no later guard may override.
     KL-aware per-GROUP allocation for dense AND moe: every per-layer FFN/expert
     group AND every per-layer attention group is allocated separately, weighted
     by MEASURED sensitivity (a pollard-sensitivity profile) -- else uniform. There
@@ -243,7 +244,8 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
         dpins = [(pat, disk["type"]) for pat in disk["patterns"]] if disk_params else []
         for name, bpw in QTYPES:
             if total * bpw / 8 / 1e9 <= budget:
-                return dpins, name, total * bpw / 8 / 1e9, PRESET[name], (f"uniform {name}", "no dims")
+                res = (dpins, name, total * bpw / 8 / 1e9, PRESET[name], (f"uniform {name}", "no dims"))
+                return res + ({p for p, _ in dpins},) if want_pinned else res
         sys.exit("ERROR: does not fit at any supported type; see pollard-calc.")
 
     # per-group sensitivity: MEASURED profile, else UNIFORM. We deliberately do NOT
@@ -374,10 +376,11 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
         summary += f"  [disk: {len(disk['patterns'])} table(s) @ {disk['type']}, {disk['gb']:.1f} GB on SSD]"
     if not bulk_types:
         base_t = tiers.get("bulk") or LADDER[0]
-    return overrides, emb_type, gb, PRESET[base_t], (summary, src)
+    res = (overrides, emb_type, gb, PRESET[base_t], (summary, src))
+    return res + ({p for p, _ in pinned},) if want_pinned else res
 
 
-def pin_uncovered(overrides, names, covered, base_preset):
+def pin_uncovered(overrides, names, covered, base_preset, explicit=()):
     """(overrides, n_pinned): every tensor the imatrix does not cover, held at EMB_FLOOR wherever the plan
     puts it below that, the pins placed FIRST.
 
@@ -392,18 +395,29 @@ def pin_uncovered(overrides, names, covered, base_preset):
     part whose output IS the product, at iq4 uncalibrated. MTP / nextn layers and DeepSeek's compressors
     are the other uncovered tensors this has always been for."""
     req = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q2_k_s"}
-    bpw = {k.lower(): v for k, v in BPW.items()}
+    bpw = {"q4_k": 4.5, "q3_k": 3.4375, "q2_k": 2.625, "q4_0": 4.5, "q5_0": 5.5}   # K/legacy types not in BPW
+    bpw.update({k.lower(): v for k, v in BPW.items()})
     floor = bpw.get(EMB_FLOOR.lower(), 6.56)
-    ovc = [(re.compile(p), str(t).lower()) for p, t in overrides]
+    # A preset NAME is not a tensor type: "Q5_K_M" / "Q4_K_M" missed the bpw table, read as the floor, and pinned
+    # nothing -- uncovered tensors then built at 4.5-5.5 bpw uncalibrated (found in review by Joey, 2026-10-10).
+    preset_base = {v.lower(): k.lower() for k, v in PRESET.items()}
+    preset_base.update({"q4_k_m": "q4_k", "q4_k_s": "q4_k", "q5_k_s": "q5_k", "q3_k_m": "q3_k",
+                        "q3_k_s": "q3_k", "q3_k_l": "q3_k", "q2_k": "q2_k"})
+    explicit = set(explicit or ())
+    ovc = [(re.compile(p), str(t).lower(), p in explicit) for p, t in overrides]
     pins = []
     for nm in names:
         if nm in ("token_embd.weight", "output.weight") or nm in covered:
             continue
-        planned = base_preset.lower()
-        for pat, ty in ovc:
+        planned, chosen = preset_base.get(base_preset.lower(), base_preset.lower()), False
+        for pat, ty, exp in ovc:
             if pat.search(nm):
-                planned = ty
+                planned, chosen = ty, exp
                 break
+        # An explicit --disk / --tier choice is the user's, not the allocator's: a q5_K n-gram table stays q5_K
+        # (pins-first had silently promoted it to q6_K -- Joey's F1).
+        if chosen:
+            continue
         if planned in req or bpw.get(planned, floor) < floor:
             pins.append((re.escape(nm), EMB_FLOOR))
     return pins + list(overrides), len(pins)
@@ -489,9 +503,9 @@ def main():
     emb_imatrix_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
     from pollard_ngram import disk_plan
     disk = disk_plan(meta, a.disk, a.disk_type)
-    overrides, emb_type, gb, base_preset, (summary, src) = plan_allocation(
+    overrides, emb_type, gb, base_preset, (summary, src), explicit = plan_allocation(
         arch, a.ram, a.reserve, sensitivity, a.allow_1bit, tiers, emb_imatrix_ok,
-        disk if disk and disk["params"] else None)
+        disk if disk and disk["params"] else None, want_pinned=True)
     if a.out:
         out = a.out
     else:
@@ -543,7 +557,8 @@ def main():
     base_pins = 0
     handled = ("token_embd.weight", "output.weight")
     if covered is not None:
-        overrides, base_pins = pin_uncovered(overrides, read_gguf_tensor_names(a.gguf), covered, base_preset)
+        overrides, base_pins = pin_uncovered(overrides, read_gguf_tensor_names(a.gguf), covered, base_preset,
+                                             explicit)
     elif base_preset in IMATRIX_REQUIRED_PRESETS:            # fallback: no imatrix parse
         for nm in read_gguf_tensor_names(a.gguf):
             if nm not in handled and not any(re.search(p, nm) for p, _ in overrides):
