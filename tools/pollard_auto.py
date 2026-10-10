@@ -484,6 +484,22 @@ def _emit_nongguf(a):
     print(f"   -> {out}  ({_rt.get(a.format, '')})")
 
 
+def _imatrix_shape(gguf):
+    """Extra llama-imatrix flags a model's runtime shape demands. A decision HEAD (clef: a
+    "<arch>.decision.*" block) runs in embedding mode, and llama.cpp then forces n_batch = n_ubatch
+    = 512 after imatrix has sized its sequences from the defaults -- it dies on
+    GGML_ASSERT(params.n_ctx == n_seq * n_ctx) (exit 0xC0000409 on Windows) before the first chunk.
+    Asking for that shape up front is what it ends up with anyway. The perplexity it prints is then
+    meaningless (no LM head) -- the activations it collects are not."""
+    try:
+        meta = read_gguf_meta(gguf)
+    except Exception:
+        return []
+    if any(".decision." in str(k) for k in meta):
+        return ["-c", "512", "-b", "512", "-ub", "512"]
+    return []
+
+
 def _ensure_imatrix(a):
     """TRUE one-shot: if the user gave no --imatrix, auto-build one (Calib 3.0 multi-domain
     corpus -> llama-imatrix) so they never run a manual calibration step. Returns the imatrix
@@ -507,7 +523,7 @@ def _ensure_imatrix(a):
         # only the legacy format and fails with "load_imatrix: failed reading number of values".
         # The ladder still builds, so the loss is silent: the flagship is simply skipped.
         r = subprocess.run([binim, "-m", a.gguf, "-f", calib, "-o", imat, "-ngl", ngl,
-                            "--output-format", "dat"], cwd=here)
+                            "--output-format", "dat"] + _imatrix_shape(a.gguf), cwd=here)
         # An unchecked imatrix is how a build gets all the way to llama-quantize before anyone finds
         # out there is no imatrix -- at which point it reports "failed to open" and quietly ships a
         # stock K-quant. Fail here, where the cause is still on screen.
