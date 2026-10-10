@@ -32,7 +32,7 @@ the model runs, so `--ram` is the *target's* budget, not the build machine's
 common demo, not a ceiling.
 
 **One measured allocation, five output lanes** — GGUF (llama.cpp/Ollama/LM Studio),
-GPTQ (vLLM/SGLang), MLX (Apple), EXL3 (exllamav3), and MX/NVFP4 (Blackwell) — pick
+GPTQ (vLLM/SGLang), MLX (Apple), EXL3 (exllamav3), and MX/NVFP4 (Blackwell / Vera Rubin) — pick
 the runtime, keep the allocation.
 
 ## How it works
@@ -44,7 +44,7 @@ flowchart LR
     ALLOC --> GPTQ["GPTQ · vLLM / SGLang"]
     ALLOC --> MLX["MLX · Apple Silicon"]
     ALLOC --> EXL3["EXL3 · exllamav3"]
-    ALLOC --> MX["MX / NVFP4 · Blackwell FP4"]
+    ALLOC --> MX["MX / NVFP4 · Blackwell / Rubin FP4"]
     GGUF --> V["pollard-verify<br/>(real-reconstruction gate)"]
     GPTQ --> V
     MLX --> V
@@ -149,7 +149,7 @@ its own fast path. Pick by where the model will actually run:
 | **GPTQ** — torch / HF | `pollard-gptq` | INT3/INT4 error-feedback (full-Hessian) | GPU low-bit with the reconstruction lever an imatrix can't do (recovers ~46% of round-to-nearest's 4-bit error). |
 | **MLX** — Apple Silicon | `pollard-mlx` | mixed 4/8-bit | running on a Mac (Metal); mixed-precision at Apple-native speed. |
 | **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **The Pollard method beats EXL3 on EXL3's own allocator, atoms, and kernel** — Qwen2.5-3B @4bpw: Pollard **8.670** vs EXL3 out-of-box **8.699**, untuned; and smoothed 4bpw ≈ 8bpw quality at half the size. `pollard --format exl3` runs the gold recipe (smoothing + Calib 3.0) by default. |
-| **MX (FP4)** — Blackwell / vLLM | `pollard-mx` | NVFP4 (MXFP4 experimental) | Blackwell FP4 tensor cores via vLLM's compressed-tensors path. |
+| **MX (FP4)** — Blackwell / Rubin / vLLM | `pollard-mx` | NVFP4 (MXFP4 experimental), optional FP8 KV (`--kv-fp8`) | Blackwell and Vera Rubin FP4 tensor cores via vLLM's compressed-tensors path (same formats on both; Rubin serves from the `vllm/vllm-openai:cu134-nightly` image). MoE routers stay unquantized; `--moe-protect-attn-only` keeps every expert NVFP4 so one MoE backend covers the model. Rubin support is upstream-nightly and not yet run by Pollard on Rubin hardware. |
 
 **Low-bit note:** for the trellis/error-feedback lanes (EXL3, GPTQ) at low bit,
 run `pollard-hf-smooth` on the fp16 model first — it migrates massive-activation
@@ -204,7 +204,7 @@ edge). Run it and pollard beats uniform IQ at matched size.
 
 | # | command | when | needs |
 |---|---|---|---|
-| 1 | `pollard-calc --model <hf-id \| --gguf file>` | first — will it fit, what size, **what quant you already have** (f16 = ideal source; a quant = go get the f16), and with `--ctx N` a **run-time pre-flight**: KV cache + total RAM + a go/no-go for **your rig** (`--gpu 5090x4` / `3090x8` / `96`, `--device gpu\|unified\|phone` — a phone only gives an app ~half its RAM) | nothing (sharded GGUFs OK) |
+| 1 | `pollard-calc --model <hf-id \| --gguf file>` | first — will it fit, what size, **what quant you already have** (f16 = ideal source; a quant = go get the f16), and with `--ctx N` a **run-time pre-flight**: KV cache + total RAM + a go/no-go for **your rig** (`--gpu 5090x4` / `3090x8` / `96` / `rubin` / `b300x8` / `nvl72`, `--device gpu\|unified\|phone` — a phone only gives an app ~half its RAM) | nothing (sharded GGUFs OK) |
 | 2 | `llama-imatrix -m f16.gguf -f calib.txt -o m.imatrix` | once per model | an **f16/bf16** source + a calib corpus |
 | 3 | `pollard-sensitivity --gguf f16.gguf --imatrix m.imatrix --eval held.txt --out m.sens.json` | once per model — **this is the win** | f16 source, the imatrix, a held-out eval |
 | 4 | `pollard-fit --gguf f16.gguf --ram N --imatrix m.imatrix --sensitivity m.sens.json` | build | f16 source, imatrix, sensitivity profile |
@@ -452,7 +452,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-fit` · `pollard-automap` · `pollard-fit-dit` | GGUF (memory-fit mix; MoE recipe; any-arch pure-Python) |
 | `pollard-export` · `pollard-gptq` | GPTQ (vLLM/SGLang; full-Hessian error-feedback) |
-| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors: NVFP4/MXFP4 (Blackwell) + W4A16/W8A16 INT (any vLLM GPU) |
+| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors: NVFP4/MXFP4 (Blackwell/Rubin) + W4A16/W8A16 INT (any vLLM GPU) |
 
 **Precondition — compose across every lane**
 | Command | What it does |
@@ -484,6 +484,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 | `pollard-ls` | List your workspace builds — lane, bpw, size, PPL, verified✓ |
 | `pollard-card` | Generate the standard HF model card from a build's manifest (every PollardWeights repo matches) |
 | `pollard-onboard` | Audit a new/custom architecture and emit a PR-ready contribution (`--contribute`) — scales arch coverage |
+| `pollard-runtime --update` | Keeps the managed llama.cpp / ik_llama.cpp trees current from upstream (capture → stage → re-apply patches → build → verify → swap). On CUDA it checks the arch list against the GPU and toolkit in the box: Rubin (cc 10.7) builds `107-real;100f-virtual` and needs CUDA ≥ 13.4; CUDA 13 never gets sm_60/61/70. `--cuda-arch` overrides. GGUF on Rubin uses llama.cpp's generic CUDA path — it has no FP4 tensor-core path for sm_100/107 |
 | `install.sh` | Builds the llama.cpp runtime (Metal on macOS + RPC backend) so the chain runs end-to-end; Pollard builds are standard GGUFs — the whole llama.cpp ecosystem is their runtime |
 
 ## Roadmap

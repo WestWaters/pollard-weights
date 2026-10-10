@@ -22,6 +22,7 @@ the managed trees (runtime/llama.cpp, runtime/ik_llama.cpp) track upstream on th
   pollard-runtime --update                 # llama.cpp (default) ; --update all | ik_llama.cpp
   pollard-runtime --update --check         # only report how far behind upstream each engine is
   pollard-runtime --rollback llama.cpp
+  pollard-runtime --update --cuda-arch '107-real;100f-virtual'   # force the CUDA arch list (wins over detection)
   pollard-runtime --schedule daily         # launchd (macOS) / Task Scheduler (Windows), low priority
 
 Pipelines call update_engine() themselves when a model's architecture is missing (POLLARD_AUTO_UPDATE=0
@@ -126,8 +127,166 @@ def bin_dir(tree):
     return None
 
 
-def cache_flags(tree):
-    """CMake options the live build was configured with, so an update builds the same engine."""
+class CudaArchError(RuntimeError):
+    """The GPU in this box cannot be built for with the CUDA toolkit that is installed."""
+
+
+# Rubin (compute capability 10.7, sm_107) is only known to nvcc from CUDA 13.4 on. An older nvcc
+# fails deep inside the first .cu file with "Unsupported gpu architecture 'compute_107'", an hour
+# into a build -- so it is checked before the build starts, with the fix in the message.
+RUBIN_CC = "10.7"
+RUBIN_MIN_NVCC = (13, 4)
+# CUDA 13 removed offline compilation for everything below compute capability 7.5 (Maxwell,
+# Pascal, Volta). ik_llama's non-native default list is "60;61;70;75;80" (or "50;61;70;75;80"), and
+# a carried-over list from a CUDA 12 build can hold the same entries: both fail to configure on
+# CUDA 13 with "Unsupported gpu architecture 'compute_60'".
+CUDA13_MIN_ARCH = 75
+# What a portable (non-native) CUDA 13 build gets when there is no GPU to read: llama.cpp's own
+# CUDA >= 13 default list.
+CUDA13_PORTABLE = "75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real;121a-real"
+
+
+def _probe(cmd, timeout=20):
+    """stdout of a version/query command, '' when the tool is absent or fails."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def parse_compute_caps(text):
+    """`nvidia-smi --query-gpu=compute_cap --format=csv,noheader` -> sorted distinct ['10.7', '12.0'].
+    One line per GPU; a mixed box lists every capability once. Anything that is not X.Y is ignored
+    (nvidia-smi prints an error line, not a number, when the driver is not loaded)."""
+    caps = {m.group(1) for m in re.finditer(r"(?m)^[ \t]*(\d+\.\d+)[ \t\r]*$", text or "")}
+    return sorted(caps, key=lambda c: tuple(int(x) for x in c.split(".")))
+
+
+def parse_nvcc_version(text):
+    """`nvcc --version` -> (13, 4), None when unreadable."""
+    m = re.search(r"release (\d+)\.(\d+)", text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def parse_cmake_version(text):
+    """`cmake --version` -> (4, 0, 2), None when unreadable."""
+    m = re.search(r"cmake version (\d+)\.(\d+)(?:\.(\d+))?", text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def cmake_parses_f_suffix(ver):
+    """Can this CMake validate a family-specific arch like `100f-virtual`?
+
+    The `f` suffix conflicted with CMake's own arch-validation regex and was fixed in 3.31.8 (3.31.x)
+    and 4.0.2 -- undocumented in the release notes, see Modules/Internal/CMakeCUDAArchitecturesValidate
+    .cmake (llama.cpp's ggml-cuda CMakeLists records the same versions). An older CMake rejects the
+    list at configure time, so the fallback list avoids `f` entirely."""
+    if not ver:
+        return False
+    return (3, 31, 8) <= ver < (4, 0, 0) or ver >= (4, 0, 2)
+
+
+def _nvcc_cmd():
+    """The nvcc CMake will use: CUDACXX wins, then the toolkit CUDA_PATH names (the Visual Studio
+    generator builds with that toolkit, not whatever is first on PATH), then PATH."""
+    if os.environ.get("CUDACXX"):
+        return os.environ["CUDACXX"]
+    cp = os.environ.get("CUDA_PATH")
+    if cp:
+        exe = os.path.join(cp, "bin", "nvcc" + (".exe" if WIN else ""))
+        if os.path.isfile(exe):
+            return exe
+    return shutil.which("nvcc") or "nvcc"
+
+
+def detect_cuda(probe=_probe):
+    """(compute caps of every visible GPU, nvcc version, cmake version) -- each empty/None if unknown."""
+    caps = parse_compute_caps(probe(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"]))
+    return caps, parse_nvcc_version(probe([_nvcc_cmd(), "--version"])), \
+        parse_cmake_version(probe([shutil.which("cmake") or "cmake", "--version"]))
+
+
+def _arch_num(cap):
+    major, minor = cap.split(".")
+    return int(major) * 10 + int(minor)
+
+
+def archs_for_cap(cap, nvcc, cmake):
+    """The arch entries that give one compute capability native code.
+
+    10.7 (Rubin) gets real sm_107 code plus `100f` PTX: Rubin is in the Blackwell datacenter family,
+    so family-portable sm_100f code runs on it -- if a kernel has no sm_107 build, the driver still
+    has something better than the Hopper fallback to JIT. 12.x stays `12Xa-real`, the arch-specific
+    form llama.cpp itself rewrites 12X to (the FP4 tensor-core path is not forward compatible)."""
+    n = _arch_num(cap)
+    if cap == RUBIN_CC:
+        if nvcc is None or nvcc < RUBIN_MIN_NVCC:
+            have = "no nvcc found" if nvcc is None else f"nvcc is {nvcc[0]}.{nvcc[1]}"
+            raise CudaArchError(
+                f"this GPU is Rubin (compute capability {RUBIN_CC}, sm_107) and {have}: sm_107 needs CUDA "
+                f"toolkit >= {RUBIN_MIN_NVCC[0]}.{RUBIN_MIN_NVCC[1]}. Install it (or point CUDACXX / CUDA_PATH at "
+                "it) and rerun, or pass --cuda-arch to build for an arch this toolkit knows.")
+        return ["107-real", "100f-virtual"] if cmake_parses_f_suffix(cmake) else ["107a-real", "90-virtual"]
+    if 120 <= n < 130:
+        return [f"{n}a-real"]
+    return [f"{n}-real"]
+
+
+def _entry_num(entry):
+    m = re.match(r"^(\d+)", entry.strip())
+    return int(m.group(1)) if m else None
+
+
+def _has_real_code(entries, n):
+    """Does the list carry device code (not only PTX) for sm_n? `120a-real`, `120`, `120a` do."""
+    return any(_entry_num(e) == n and not e.strip().endswith("-virtual") for e in entries)
+
+
+def select_cuda_arch(cached, caps, nvcc, cmake, override=None):
+    """CMAKE_CUDA_ARCHITECTURES for this build -> (value or None to leave unset, note or '').
+
+    The update used to carry CMakeCache's value over verbatim. That is right while the box stays the
+    same and wrong the day it does not: a list written for the old GPU has no code for the new one,
+    and a list written under CUDA 12 holds archs CUDA 13 cannot compile. So the cached value is kept
+    only while it still covers every GPU in the box under this toolkit. `native` already resolves
+    against the GPU present at configure time, so it is kept -- the RTX 5070 Ti build box (cc 12.0)
+    builds exactly as before -- except on Rubin, where it is replaced by the explicit list that also
+    carries the Blackwell-family PTX. An `override` (--cuda-arch) wins over all of it."""
+    if override:
+        return override, f"--cuda-arch override: {override}"
+    want = []
+    for cap in caps:                                  # raises for Rubin on a too-old toolkit
+        want += [a for a in archs_for_cap(cap, nvcc, cmake) if a not in want]
+    cuda13 = bool(nvcc and nvcc >= (13, 0))
+    if cached and cached.strip().lower() in ("native", "all", "all-major"):
+        if RUBIN_CC in caps:
+            return ";".join(want), f"'{cached}' replaced on Rubin by {';'.join(want)} (adds sm_100f PTX)"
+        return cached, ""
+    if cached:
+        entries = [e for e in cached.split(";") if e.strip()]
+        kept = [e for e in entries if not (cuda13 and (_entry_num(e) or 0) < CUDA13_MIN_ARCH)]
+        dropped = [e for e in entries if e not in kept]
+        missing = [c for c in caps if not _has_real_code(kept, _arch_num(c))]
+        if missing:
+            return ";".join(want), (f"cached arch list '{cached}' has no code for this box's GPU "
+                                    f"(compute capability {', '.join(missing)}) -- using {';'.join(want)}")
+        if dropped:
+            value = ";".join(kept) or CUDA13_PORTABLE
+            return value, f"dropped {';'.join(dropped)}: CUDA 13 cannot compile below sm_75 -- using {value}"
+        return cached, ""
+    if want:                                          # CUDA build with no arch carried: name the GPU
+        return ";".join(want), f"no arch in the cache -- built for this box's GPU: {';'.join(want)}"
+    if cuda13:                                        # no GPU to read, and the engine default breaks on 13
+        return CUDA13_PORTABLE, f"no GPU detected, CUDA 13 -- portable list {CUDA13_PORTABLE}"
+    return None, ""
+
+
+def cache_flags(tree, cuda_arch=None, detect=None):
+    """CMake options the live build was configured with, so an update builds the same engine.
+
+    On a CUDA build the arch list is re-checked against the GPU and toolkit in the box right now
+    (select_cuda_arch); raises CudaArchError when the toolkit cannot build for the GPU at all."""
     p = os.path.join(tree, "build", "CMakeCache.txt")
     out = {}
     if os.path.isfile(p):
@@ -138,9 +297,16 @@ def cache_flags(tree):
     if not out:                                     # no previous build: pick the platform's accelerator
         if sys.platform == "darwin":
             out["GGML_METAL"] = "ON"
-        elif shutil.which("nvcc") or os.environ.get("CUDA_PATH"):
+        elif shutil.which("nvcc") or os.environ.get("CUDA_PATH") or os.environ.get("CUDACXX"):
             out["GGML_CUDA"] = "ON"
             out["CMAKE_CUDA_ARCHITECTURES"] = "native"
+    if out.get("GGML_CUDA") == "ON":
+        caps, nvcc, cmake = ([], None, None) if cuda_arch else (detect or detect_cuda)()
+        value, note = select_cuda_arch(out.get("CMAKE_CUDA_ARCHITECTURES"), caps, nvcc, cmake, cuda_arch)
+        if value:
+            out["CMAKE_CUDA_ARCHITECTURES"] = value
+        if note:
+            log(f"cuda arch: {note}")
     out.setdefault("LLAMA_CURL", "OFF")
     return out
 
@@ -354,7 +520,7 @@ def dirty_is_declared(tree):
     return have == {f: sorted(v) for f, v in want.items()} and _touched_files(live) == want_files
 
 
-def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None):
+def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None, cuda_arch=None):
     e = ENGINES[name]
     tree, url = e["dir"], e["url"]
     st = live_state(tree)
@@ -365,9 +531,17 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
         log(f"{name}: live {cur} {st.get('date') or ''} | upstream {head} {hdate or ''}"
             + (" | UP TO DATE" if head and st.get("commit") and head.startswith(st["commit"][:7]) else ""))
         return True
-    if st.get("commit") and head and head.startswith(st["commit"][:7]) and not extra:
+    if st.get("commit") and head and head.startswith(st["commit"][:7]) and not extra and not cuda_arch:
         log(f"{name}: already at upstream {head}")
         return True
+    # Flags first, before any clone: a toolkit that cannot build for this GPU (Rubin on CUDA < 13.4)
+    # is known now, not an hour into the build. A fresh tree has no cache, so `tree` and the staging
+    # clone give the same answer. --with CMAKE_CUDA_ARCHITECTURES=... counts as an override too.
+    try:
+        flags = cache_flags(tree, cuda_arch=cuda_arch or (extra or {}).get("CMAKE_CUDA_ARCHITECTURES"))
+    except CudaArchError as exc:
+        log(f"{name}: NOT updating -- {exc}")
+        return False
     if st.get("dirty") and dirty_is_declared(tree):
         log(f"{name}: local changes are exactly the declared patches -- already in runtime-patches/, nothing new to capture")
     elif st.get("dirty"):
@@ -407,7 +581,6 @@ def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, ex
         log(f"{name}: NOT updating -- " + "; ".join(block) + " (rebase the patch, then rerun)")
         return False
     jobs = jobs or max(2, int((os.cpu_count() or 4) * 0.6))       # leave the machine usable (60/40)
-    flags = cache_flags(tree) if st.get("present") else cache_flags(staging)
     flags.update(extra or {})                      # --with K=V; carried into every later update via the cache
     log(f"{name}: building all targets -j{jobs} with {flags}")
     ok, msg = build(staging, flags, jobs)

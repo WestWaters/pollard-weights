@@ -33,8 +33,31 @@ import sys
 
 LANE_TAGS = {"gguf": ["gguf", "llama.cpp", "ik_llama.cpp", "trellis", "imatrix"],
              "gptq": ["gptq", "vllm", "compressed-tensors"],
-             "mx": ["nvfp4", "compressed-tensors", "vllm", "blackwell"],
+             # rubin / vera-rubin / fp8 belong to the mx lane only: Rubin runs the same NVFP4 / MXFP4 / FP8
+             # formats as Blackwell through vLLM. llama.cpp has no FP4 tensor-core path on sm_100/107, so
+             # a GGUF card must never carry a Rubin tag that reads as an optimized build for it.
+             "mx": ["nvfp4", "fp8", "compressed-tensors", "vllm", "blackwell", "rubin", "vera-rubin"],
              "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"]}
+# lane -> the hero's "Pollard shrank this model<...>" phrase
+LANE_WORD = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
+             "mx": " for Blackwell/Rubin (vLLM)", "exl3": " for exllamav3"}
+RUBIN_VLLM_IMAGE = "vllm/vllm-openai:cu134-nightly"
+
+
+def vllm_serve_block(repo, lanes):
+    """The vLLM run lines for the gptq / mx lanes. The mx lane adds Vera Rubin: the nightly CUDA 13.4
+    image and the flags that select its paths. Commands only -- no throughput claim, because no number
+    on a card may be one we did not measure, and Pollard has not run on Rubin."""
+    if "gptq" not in lanes and "mx" not in lanes:
+        return []
+    out = ["```bash", f"vllm serve {repo}", "```", ""]
+    if "mx" in lanes:
+        out += ["On Vera Rubin, use vLLM's CUDA 13.4 nightly image (Rubin support is upstream-nightly):", "",
+                "```bash",
+                f"docker run --gpus all --ipc=host -p 8000:8000 {RUBIN_VLLM_IMAGE} {repo}",
+                "# NVFP4 MoE: add --moe-backend flashinfer_cutedsl   |   FP8 KV cache: add --kv-cache-dtype fp8",
+                "```", ""]
+    return out
 # format size multipliers vs f16 (bytes/param relative to 2.0) -- for the shrink size table
 FMT_BPP = {"Q8_0": 1.06, "Q6_K": 0.82, "Q5_K_M": 0.69, "Q4_K_M": 0.58, "NVFP4": 0.53, "IQ4_XS": 0.55}
 
@@ -596,8 +619,7 @@ def main():
     x = f16_gb / small_gb if small_gb else 0
 
     primary = a.lane or (lanes[0] if lanes else "gguf")
-    lane_word = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
-                 "mx": " for Blackwell/vLLM", "exl3": " for exllamav3"}.get(primary, "")
+    lane_word = LANE_WORD.get(primary, "")
     # ---- frontmatter + hero
     # Both of these name a file that sits at the ROOT of the published repo, so only the basename
     # can ever be correct on the card. Accepting a path and printing it verbatim put
@@ -884,8 +906,7 @@ def main():
                         "cannot run these files.", ""]
     if "mlx" in lanes:
         out += ["```bash", f'mlx_lm.generate --model {repo} --prompt "Hello"', "```", ""]
-    if "gptq" in lanes or "mx" in lanes:
-        out += ["```bash", f"vllm serve {repo}", "```", ""]
+    out += vllm_serve_block(repo, lanes)
 
     # ---- imatrix / calibration: what the allocation was measured on
     if a.imatrix_file:

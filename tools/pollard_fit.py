@@ -27,7 +27,7 @@ import sys
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse,
                           detect_available_ram_gb, read_gguf_tensor_names,
-                          find_llama_bin, imatrix_covered_tensors)
+                          find_llama_bin, imatrix_covered_tensors, parse_mem_gb)
 
 # quant types llama-quantize accepts for --tensor-type overrides, with effective
 # bits/weight (format overhead included) used for budget math.
@@ -429,8 +429,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--gguf", required=True, help="source GGUF (f16/bf16 preferred)")
     ap.add_argument("--ram", required=True,
-                    help="target machine RAM in GB, or 'auto' to measure what is "
-                         "actually available right now")
+                    help="target machine RAM in GB, 'auto' to measure what is actually available "
+                         "right now, or a GPU/rack preset from pollard-calc's card table "
+                         "(e.g. 'rubin', 'b300x8', 'nvl72')")
     ap.add_argument("--out", help="output path (default: <src>-pollard.gguf)")
     ap.add_argument("--imatrix", help="importance matrix from llama-imatrix -- required "
                                       "for IQ-type quality; does NOT decide the allocation")
@@ -486,7 +487,13 @@ def main():
         a.ram = avail
         print(f"[--ram auto] measured available memory: {avail:.1f} GB")
     else:
-        a.ram = float(a.ram)
+        # A preset is the same table pollard-calc --gpu reads, so `--ram rubin` budgets the 288 GB a
+        # Rubin GPU has instead of dying on float('rubin').
+        ram = parse_mem_gb(a.ram)
+        if ram is None:
+            ap.error(f"--ram '{a.ram}': not a number of GB nor a known GPU/rack preset "
+                     "(e.g. 16, auto, rubin, b300x8, nvl72)")
+        a.ram = ram
     if a.allow_1bit and not a.imatrix:
         sys.exit("ERROR: --allow-1bit needs --imatrix -- the 1-bit (iq1) types require a "
                  "calibration matrix to build at all (and substituting them to a non-imatrix "
