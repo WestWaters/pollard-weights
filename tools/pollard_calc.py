@@ -583,7 +583,27 @@ _GPU_VRAM = {"3050": 8, "3060": 12, "3060ti": 8, "3070": 8, "3080": 10, "3090": 
              "a6000": 48, "rtx6000": 48, "rtx6000pro": 96,
              "6000pro": 96, "a40": 48, "l40": 48, "l40s": 48, "v100": 32, "a100": 80,
              "h100": 80, "h200": 141, "b100": 192, "b200": 192, "mi300x": 192,
-             "spark": 128, "gb10": 128, "m4max": 128, "m3ultra": 512}
+             "spark": 128, "gb10": 128, "m4max": 128, "m3ultra": 512,
+             # Blackwell Ultra / Vera Rubin datacenter parts, per-GPU HBM. GB200 is listed at its
+             # 192 GB nameplate; ~186 GB is usable, which the ~6% fit margin already absorbs.
+             "b300": 288, "gb300": 288, "gb200": 192,
+             "rubin": 288, "r100": 288, "vr200": 288,
+             # whole NVL72 racks: 72 GPUs as one NVLink domain (Rubin / GB300: 72 x 288, GB200: 72 x 192)
+             "nvl72": 20736, "vr-nvl72": 20736, "vrnvl72": 20736, "gb300-nvl72": 20736,
+             "gb200-nvl72": 13824}
+# The KV-cache element sizes --kv-quant offers. fp8 = vLLM's --kv-cache-dtype fp8 (E4M3, one byte/elem)
+# on Hopper/Blackwell/Rubin; same bytes as llama.cpp's q8_0 here (its block scale is noise at this scale).
+KV_BYTES = {"f16": 2.0, "fp8": 1.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}
+RUBIN_GB, NVL72_GB = 288, 20736
+
+
+def parse_mem_gb(spec):
+    """--ram value -> GB: a number, or any --gpu style preset ('rubin', 'nvl72', 'b300x8', '24x2').
+    None when it is neither. 'auto' is handled by the caller (it measures, it does not parse)."""
+    try:
+        return float(spec)
+    except (TypeError, ValueError):
+        return parse_gpu(str(spec)) if spec is not None else None
 
 
 def detect_gpu_gb():
@@ -671,14 +691,25 @@ def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"
              ("16 GB  (4080 / 5080)", 16), ("24 GB  (4090 / 3090)", 24),
              ("32 GB  (5090)", 32), ("48 GB  (2x24 / A6000)", 48),
              ("96 GB  (RTX 6000 Pro / 4x24)", 96), ("128 GB (DGX Spark)", 128),
-             ("192 GB (B200 / 6x32)", 192), ("256 GB (2x Spark / 8xA100-40)", 256),
-             ("512 GB (4x Spark / 8xB200)", 512), ("1 TB   (8x Spark, TP/RPC pool)", 1024),
-             ("2 TB   (16x Spark / 8xB200-192)", 2048)]
-    # the ladder is illustrative; it SCALES with the pool -- extend it in powers of 2 until it clears
-    # the model (nodes pooled over TP/RPC are one memory space), and drop in the USER's own rig as a row.
-    while tiers[-1][1] < total_gb:                          # keep doubling until a tier holds the model
-        top = tiers[-1][1] * 2
-        tiers.append((f"{top} GB  ({top // 128}x Spark-class, TP/RPC pool)", top))
+             ("192 GB (B200 / GB200 / 6x32)", 192), ("256 GB (2x Spark / 8xA100-40)", 256),
+             ("288 GB (Rubin R100 / B300, one GPU)", 288),
+             ("512 GB (4x Spark)", 512), ("1 TB   (8x Spark, TP/RPC pool)", 1024),
+             ("1.5 TB (8x B200)", 1536), ("2.3 TB (8x Rubin / 8x B300, one node)", 2304)]
+    # the ladder is illustrative; it SCALES with the pool -- extend it until it clears the model (nodes
+    # pooled over TP/RPC are one memory space), and drop in the USER's own rig as a row. Past one 8-GPU
+    # node the unit is a datacenter GPU, then an NVL72 rack -- "160x Spark-class" described a
+    # 20 TB pool as a pile of desktop boxes nobody would build it from.
+    while tiers[-1][1] < total_gb:
+        top = tiers[-1][1]
+        if top < NVL72_GB:                                  # double the Rubin count, up to a full rack
+            nxt = min(top * 2, NVL72_GB)
+            label = ("20.7 TB (Vera Rubin NVL72 rack, 72x288 GB)" if nxt == NVL72_GB
+                     else f"{nxt / 1000:.1f} TB ({nxt // RUBIN_GB}x Rubin, TP/PP pool)")
+        else:                                               # whole racks
+            racks = top // NVL72_GB * 2
+            nxt = racks * NVL72_GB
+            label = f"{nxt / 1000:.0f} TB ({racks}x Vera Rubin NVL72 racks)"
+        tiers.append((label, nxt))
     if rig_gb and not any(abs(cap - rig_gb) < 1.0 for _, cap in tiers):
         tiers = sorted(tiers + [(f"{rig_gb:.0f} GB  (YOUR rig, --ram)", rig_gb)], key=lambda t: t[1])
     for name, cap in tiers:
@@ -689,7 +720,7 @@ def fit_report(a, weights_gb, ctx, kv_bytes, kv_label, rig_gb=None, device="gpu"
     if kv_bytes >= 2:
         kv_q8 = kv_cache_bytes(a, ctx, 1.0) / 1e9
         if kv_gb - kv_q8 > 0.5:
-            print(f"  tip: --kv-quant q8 halves KV to {kv_q8:.1f} GB "
+            print(f"  tip: --kv-quant q8 (llama.cpp) / fp8 (vLLM) halves KV to {kv_q8:.1f} GB "
                   f"(total {weights_gb + kv_q8 + overhead_gb:.1f} GB)")
 
 
@@ -949,8 +980,8 @@ def main():
     src.add_argument("--gguf", help="path to a local .gguf file (reads its header; "
                                     "uses REAL on-disk bytes, no bpw estimate)")
     p.add_argument("--ram", default="16",
-                   help="system RAM GB, or 'auto' to measure what is actually "
-                        "available right now (default 16)")
+                   help="system RAM GB, 'auto' to measure what is actually available right now, or "
+                        "a GPU/rack preset: 'rubin', 'b300x8', 'nvl72' (default 16)")
     p.add_argument("--flash", type=float, default=3.5,
                    help="sequential flash read GB/s (default 3.5, measured M4 4MB-block)")
     p.add_argument("--rambw", type=float, default=120,
@@ -962,8 +993,9 @@ def main():
     p.add_argument("--ctx", type=int, default=0,
                    help="context length for a 'will it fit?' pre-flight: adds KV-cache "
                         "size + total RAM-to-run + device fit (e.g. --ctx 262144 for 256k)")
-    p.add_argument("--kv-quant", default="f16", choices=["f16", "q8", "q4", "nvfp4"],
-                   help="KV cache precision for the --ctx estimate (default f16; nvfp4 = Blackwell 4-bit KV)")
+    p.add_argument("--kv-quant", default="f16", choices=list(KV_BYTES),
+                   help="KV cache precision for the --ctx estimate (default f16; fp8 = vLLM "
+                        "--kv-cache-dtype fp8; nvfp4 = Blackwell/Rubin 4-bit KV)")
     p.add_argument("--gpu", help="your rig for the fit verdict: 'auto' to read the installed "
                                  "card from nvidia-smi, total VRAM GB, a card name, or "
                                  "CARDxCOUNT -- e.g. 'auto', '96', '16x2', '5090x4', "
@@ -1011,7 +1043,11 @@ def main():
         print(f"[--ram auto] measured available memory: {avail:.1f} GB "
               f"(nameplate lies; this is what you can actually use right now)")
     else:
-        a.ram = float(a.ram)
+        ram = parse_mem_gb(a.ram)
+        if ram is None:
+            p.error(f"--ram '{a.ram}': not a number of GB nor a known GPU/rack preset "
+                    f"(e.g. 16, auto, rubin, b300x8, nvl72)")
+        a.ram = ram
     cache = a.cache if a.cache is not None else max(a.ram - 4, 1)
     qbits = QUANTS[a.quant]
     if cfg.get("_gguf_file_bytes"):
@@ -1032,7 +1068,7 @@ def main():
         print(f"source quant        : {label} (~{qbits:.2f} bpw{shard_note})  "
               f"{'OK' if full else '!'} {advice}\n")
     if cluster:
-        kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}[a.kv_quant]
+        kv_bytes = KV_BYTES[a.kv_quant]
         cluster_report(cluster, arch["total"] * qbits / 8 / 1e9,
                        kv_cache_bytes(arch, a.ctx, kv_bytes) * a.cluster_concurrency / 1e9, a.ctx)
         print(f"KV assumption: {a.cluster_concurrency} sequences at {a.ctx} tokens each.")
@@ -1045,7 +1081,7 @@ def main():
           f"MLX {_fmt_hours(bt['mlx'])}  |  EXL3 {_fmt_hours(bt['exl3'])} (one bpw)  "
           f"-- the cheap->heavy spread: pick your lane before you run")
     if a.ctx and not cluster:
-        kv_bytes = {"f16": 2.0, "q8": 1.0, "q4": 0.5625, "nvfp4": 0.5}[a.kv_quant]
+        kv_bytes = KV_BYTES[a.kv_quant]
         rig_gb = None
         if a.gpu:
             rig_gb = parse_gpu(a.gpu)
