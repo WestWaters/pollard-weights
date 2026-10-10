@@ -228,8 +228,15 @@ def plan_placement(model_id, dev, offload_dir, need=None):
 # LADDER types -> (bpw, RTN bits) so the cheap noise curve keys match pollard-fit.
 LADDER_BITS = [("q6_K", 6), ("q5_K", 5), ("iq4_xs", 4), ("iq3_s", 3),
                ("iq2_s", 2), ("iq2_xxs", 2)]
-GROUP_ATTR = {"ffn": ("mlp", ("gate_proj", "up_proj", "down_proj")),
-              "attn": ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj"))}
+# Each group is a list of (parent module, linears) -- a layer contributes whichever parent it has. "attn" is the
+# SEQUENCE-MIXING group (see GROUP_GGUF below): on a hybrid such as Qwen3.5 most layers mix with `linear_attn`
+# (Gated DeltaNet) instead of `self_attn`. With only self_attn listed, the forward probe scored those layers
+# 0.0 and the allocator crushed their mixers to the floor as "free" -- clef-flash, 2026-10-09: 24 of 32 layers
+# at attn 0.0, every one of their attn_qkv / attn_gate planned iq2_xxs in the IQ3_S rung. The GGUF path
+# already counted them; this is the same set by HF module name.
+GROUP_ATTR = {"ffn": [("mlp", ("gate_proj", "up_proj", "down_proj"))],
+              "attn": [("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+                       ("linear_attn", ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"))]}
 
 # The imatrix path works in GGUF tensor namespace, not HF module names. Both MoE spellings are
 # here because the imatrix covers whatever the GGUF actually contains.
@@ -563,11 +570,13 @@ def _linears(model, layer, group):
     Taking those at face value put a None in the hook list and killed the probe with
     'NoneType has no attribute register_forward_hook' -- after loading 12B of weights. A layer with
     none of a group is legitimate; it simply contributes nothing to that group's cost."""
-    parent, names = GROUP_ATTR[group]
-    mod = getattr(text_layers(model)[layer], parent, None)
-    if mod is None:
-        return []
-    return [m for m in (getattr(mod, n, None) for n in names) if m is not None]
+    blk = text_layers(model)[layer]
+    out = []
+    for parent, names in GROUP_ATTR[group]:
+        mod = getattr(blk, parent, None)
+        if mod is not None:
+            out += [m for m in (getattr(mod, n, None) for n in names) if m is not None]
+    return out
 
 
 class WeightSource:
