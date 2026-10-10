@@ -440,6 +440,12 @@ def decision_section(builds, results):
         rows.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {f('agreement', '{:.0%}')} | "
                     f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |")
     asked = f"the same {n} typed questions" if n else "the same typed questions"
+    qset = next((str((r or {}).get("decision", {}).get("set") or "") for r in results.values()
+                 if isinstance(r, dict) and isinstance(r.get("decision"), dict)), "")
+    if qset.startswith("LocalLLaMA/typed-decisions"):
+        rev = qset.split("@", 1)[1] if "@" in qset else ""
+        asked = (f"the {n} decisions of the [typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions)"
+                 f" benchmark (test split{', revision ' + rev if rev else ''}: 400 states x 5 typed questions)")
     ref = decision_ref(results)
     return ["## Decision fidelity", "",
             "This is a **decision model**: it answers typed questions (choice / score / yes-no) with a "

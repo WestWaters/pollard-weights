@@ -216,11 +216,147 @@ def run(base: str, post, items=None) -> list[dict]:
     return rows
 
 
-def gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None) -> dict:
+TYPED_DATASET = "LocalLLaMA/typed-decisions"
+TYPED_ROWS_URL = ("https://datasets-server.huggingface.co/rows?dataset=LocalLLaMA/typed-decisions"
+                  "&config=all&split=test&offset={off}&length=100")
+
+
+def load_typed(cache=None, fetch=None):
+    """The typed-decisions test split (Apache-2.0): 400 states x 5 typed questions = 2000 decisions, each row
+    already a /v1/systemone request, gold = a soft distribution per question. Fetched once with the stdlib
+    from the Hub's dataset server and cached, with the dataset revision, so every board says what it ran."""
+    home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
+    cache = cache or os.path.join(home, "cache", "typed-decisions-test.json")
+    if os.path.isfile(cache):
+        return json.load(open(cache, encoding="utf-8"))
+    import urllib.request
+    fetch = fetch or (lambda url: json.loads(urllib.request.urlopen(url, timeout=60).read().decode("utf-8")))
+    rows, off = [], 0
+    while True:
+        page = fetch(TYPED_ROWS_URL.format(off=off))
+        for r in page.get("rows", []):
+            r = r["row"]
+            parse = lambda v: json.loads(v) if isinstance(v, str) else v
+            rows.append({"id": r["id"], "workflow": r["workflow"], "state": r["state"],
+                         "questions": parse(r["questions"]), "gold": parse(r["gold"])})
+        off += 100
+        if off >= int(page.get("num_rows_total") or 0) or not page.get("rows"):
+            break
+    try:
+        rev = fetch(f"https://huggingface.co/api/datasets/{TYPED_DATASET}").get("sha", "")
+    except Exception:
+        rev = ""
+    data = {"dataset": TYPED_DATASET, "split": "test", "revision": rev, "rows": rows}
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    json.dump(data, open(cache, "w", encoding="utf-8"))
+    return data
+
+
+def _answer_dist(q, ans):
+    """A /v1/systemone answer as {option: p}, keyed the way typed-decisions' gold is: choice by option name,
+    noul as true/false, score by level index as a string."""
+    t = q.get("type")
+    if t == "noul":
+        p = float((ans or {}).get("noul", 0.5))
+        return {"true": p, "false": 1.0 - p}
+    probs = (ans or {}).get("probabilities") or {}
+    if t == "score":
+        return {str(int(float(k))): float(v) for k, v in probs.items()}
+    return {str(k): float(v) for k, v in probs.items()}
+
+
+def _dist_kl(p, q):
+    keys = set(p) | set(q)
+    return sum(p.get(k, 0.0) * math.log(max(p.get(k, 0.0), 1e-9) / max(q.get(k, 0.0), 1e-9)) for k in keys)
+
+
+def run_typed(base, post, rows):
+    """Every row as one /v1/systemone request (its five questions answered together, as clef decides them)."""
+    out = []
+    for r in rows:
+        got = post(base, "/v1/systemone", {"state": r["state"], "questions": r["questions"]})
+        answers = got.get("answers") or {}
+        for qid, q in r["questions"].items():
+            out.append({"row": r["id"], "workflow": r["workflow"], "qid": qid, "type": q.get("type"),
+                        "dist": _answer_dist(q, answers.get(qid)), "gold": r["gold"].get(qid) or {}})
+    return out
+
+
+def score_typed(rows, ref=None):
+    """The decision board on typed-decisions, in score_rows' shape so verdict() and the card read it unchanged:
+    accuracy / KL against the gold distribution, and -- with a reference -- agreement, option KL and drift."""
+    argmax = lambda d: max(d, key=d.get) if d else None
+    n = len(rows)
+    out = {"n": n, "letter_mass": 1.0, "set": "typed-decisions",
+           "accuracy": sum(1 for r in rows if argmax(r["dist"]) == str(r["gold"].get("label"))) / n,
+           "kl_from_gold": sum(_dist_kl(r["gold"].get("probabilities") or {}, r["dist"]) for r in rows) / n,
+           "p_correct": sum(r["dist"].get(str(r["gold"].get("label")), 0.0) for r in rows) / n}
+    if ref:
+        keys = lambda a, b: sorted(set(a) | set(b))
+        out.update({
+            "ref_letter_mass": 1.0,
+            "ref_accuracy": sum(1 for s in ref if argmax(s["dist"]) == str(s["gold"].get("label"))) / n,
+            "ref_kl_from_gold": sum(_dist_kl(s["gold"].get("probabilities") or {}, s["dist"]) for s in ref) / n,
+            "agreement": sum(1 for r, s in zip(rows, ref) if argmax(r["dist"]) == argmax(s["dist"])) / n,
+            "option_kl": sum(_dist_kl(s["dist"], r["dist"]) for r, s in zip(rows, ref)) / n,
+            "mean_abs_drift": sum(sum(abs(r["dist"].get(k, 0.0) - s["dist"].get(k, 0.0)) for k in keys(r["dist"], s["dist"]))
+                                  / max(len(keys(r["dist"], s["dist"])), 1) for r, s in zip(rows, ref)) / n})
+    return out
+
+
+def _typed_rows_out(rows, ref):
+    """Per workflow x type summary rows for the printed table (2000 single rows would be noise)."""
+    groups = {}
+    for i, r in enumerate(rows):
+        groups.setdefault((r["workflow"], r["type"]), []).append(i)
+    argmax = lambda d: max(d, key=d.get) if d else None
+    out = []
+    for (wf, t), idx in sorted(groups.items()):
+        if ref:
+            ag = sum(1 for i in idx if argmax(rows[i]["dist"]) == argmax(ref[i]["dist"])) / len(idx)
+            kv = sum(_dist_kl(ref[i]["dist"], rows[i]["dist"]) for i in idx) / len(idx)
+            out.append({"prompt": f"{wf}/{t}"[:48], "loop": ag < 0.9, "reason": f"agree {ag:.0%}",
+                        "sample": f"n={len(idx)}  option KL {kv:.4f}"})
+        else:
+            acc = sum(1 for i in idx if argmax(rows[i]["dist"]) == str(rows[i]["gold"].get("label"))) / len(idx)
+            out.append({"prompt": f"{wf}/{t}"[:48], "loop": False, "reason": f"gold acc {acc:.0%}",
+                        "sample": f"n={len(idx)}"})
+    return out
+
+
+def gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
+         limit: int = 0) -> dict:
     """Serve the build (and the reference), run the set on both, return the board + verdict in the
-    same shape pollard-bench prints ("verdict", "rows", "reason")."""
+    same shape pollard-bench prints ("verdict", "rows", "reason").
+
+    qset "typed-decisions" replays the 2000-decision benchmark through /v1/systemone (native decision
+    models only). The 20 built-in questions are easy enough that every clef rung scored 100%; on 2000
+    decisions agreement and option KL separate the rungs."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from pollard_bench import _served, _post
+    if qset == "typed-decisions":
+        data = load_typed()
+        if limit:                                       # a smoke run; a board is only comparable at the full 400
+            data = dict(data, rows=data["rows"][:limit])
+        # clef evaluates a whole prompt in one batch: let it be as large as the context
+        extra = ("-b", str(ctx), "-ub", str(ctx))
+        with _served(model, ngl, ctx, extra=extra) as base:
+            if base is None or not native(base):
+                return {"verdict": "NO_SERVER" if base is None else "UNSUPPORTED", "config": None,
+                        "rows": [{"prompt": "(not run)", "loop": None, "sample": "",
+                                  "reason": "llama-server would not start" if base is None
+                                  else "typed-decisions needs a native decision model (/v1/systemone)"}]}
+            rows = run_typed(base, _post, data["rows"])
+        ref_rows = None
+        if ref:
+            with _served(ref, ngl, ctx, extra=extra) as rbase:
+                if rbase is not None:
+                    ref_rows = run_typed(rbase, _post, data["rows"])
+        board = score_typed(rows, ref_rows)
+        board["set"] = f"{data['dataset']}@{(data.get('revision') or '')[:8]}" + (f" (first {limit} rows)" if limit else "")
+        v, why = verdict(board)
+        return {"verdict": v, "config": "decision", "reason": why, "board": board,
+                "rows": _typed_rows_out(rows, ref_rows), "sampling": ["--temp", "0"]}
     with _served(model, ngl, ctx) as base:
         if base is None:
             return {"verdict": "NO_SERVER", "config": None, "rows": [{"prompt": "(not run)", "loop": None,
@@ -257,8 +393,12 @@ def main() -> None:
     ap.add_argument("--ngl", type=int, default=0)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--set", dest="qset", default="builtin", choices=["builtin", "typed-decisions"],
+                    help="question set: the 20 built-in questions, or the typed-decisions benchmark (2000 "
+                         "decisions, native decision models; fetched once from the Hub and cached)")
+    ap.add_argument("--limit", type=int, default=0, help="typed-decisions: only the first N states (smoke run)")
     a = ap.parse_args()
-    res = gate(a.gguf, a.ngl, a.ctx, a.ref)
+    res = gate(a.gguf, a.ngl, a.ctx, a.ref, a.qset, a.limit)
     if a.json:
         print(json.dumps(res, indent=1)); return
     b = res.get("board", {})
