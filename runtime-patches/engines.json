@@ -13,8 +13,7 @@
   "ik_llama.cpp": {
     "url": "https://github.com/ikawrakow/ik_llama.cpp",
     "patches": [
-      "ik_llama.cpp-k2-horizon-arch",
-      "ik_llama.cpp-msvc-sse2"
+      "ik_llama.cpp-k2-horizon-arch"
     ],
     "why": "trellis IQ*_KT flagship and IQ4_K/IQ5_K types upstream does not have; K2-Horizon on the trellis lane"
   },
