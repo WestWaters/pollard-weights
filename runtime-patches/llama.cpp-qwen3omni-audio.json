@@ -1,0 +1,16 @@
+{
+ "name": "qwen3omni-audio",
+ "tree_slug": "llama.cpp",
+ "tree_path": "runtime/llama.cpp",
+ "remote": "https://github.com/ggml-org/llama.cpp",
+ "base_commit": "1623d8c",
+ "base_describe": "",
+ "base_date": "2026-10-10",
+ "files": [
+  "tools/mtmd/clip.cpp",
+  "tools/mtmd/models/qwen3a.cpp",
+  "tools/mtmd/mtmd-audio.cpp"
+ ],
+ "adds_strings": [],
+ "diff_bytes": 6105
+}

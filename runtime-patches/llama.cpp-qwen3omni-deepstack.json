@@ -1,0 +1,19 @@
+{
+ "name": "qwen3omni-deepstack",
+ "tree_slug": "llama.cpp",
+ "tree_path": "runtime/llama.cpp",
+ "remote": "https://github.com/ggml-org/llama.cpp",
+ "base_commit": "1623d8c",
+ "base_describe": "",
+ "base_date": "2026-10-10",
+ "files": [
+  "conversion/qwen3vl.py",
+  "tools/mtmd/mtmd.cpp"
+ ],
+ "adds_strings": [
+  "thinker.visual.",
+  "thinker_config",
+  "vision_config"
+ ],
+ "diff_bytes": 4305
+}

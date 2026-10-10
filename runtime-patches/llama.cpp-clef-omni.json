@@ -1,0 +1,40 @@
+{
+ "name": "clef-omni",
+ "tree_slug": "llama.cpp",
+ "tree_path": "runtime/llama.cpp",
+ "remote": "https://github.com/ggml-org/llama.cpp",
+ "base_commit": "1623d8c",
+ "base_describe": "",
+ "base_date": "2026-10-10",
+ "files": [
+  "conversion/__init__.py",
+  "conversion/clef.py",
+  "gguf-py/gguf/constants.py",
+  "src/llama-arch.cpp",
+  "src/llama-arch.h",
+  "src/llama-model-saver.cpp",
+  "src/llama-model.cpp",
+  "src/models/clef-omni.cpp",
+  "src/models/clef.cpp",
+  "src/models/models.h",
+  "tests/test-llama-archs.cpp"
+ ],
+ "adds_strings": [
+  "architectures",
+  "attn_norm",
+  "clef",
+  "clef-omni",
+  "decision_fields",
+  "decision_options",
+  "deepstack_out",
+  "ffn_inp",
+  "ffn_moe_out",
+  "ffn_norm",
+  "l_out",
+  "models.h",
+  "result_decision",
+  "result_norm",
+  "self_kq_mask"
+ ],
+ "diff_bytes": 36054
+}

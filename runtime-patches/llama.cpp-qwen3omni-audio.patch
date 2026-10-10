@@ -1,0 +1,119 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index ca38d76..ce39bea 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -4366,10 +4366,10 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
+             } break;
+         case PROJECTOR_TYPE_QWEN3A:
+             {
+-                // chunk_size=100 frames --> 3x stride-2 conv2d --> 13 tokens per chunk
+-                const int chunk_size       = 100;
+-                const int tokens_per_chunk = 13;
+-                n_patches = (img->nx() / chunk_size) * tokens_per_chunk;
++                // chunk_size=100 frames --> 3x stride-2 conv2d --> 13 tokens per chunk, the last chunk may be shorter
++                const int chunk_size = 100;
++                const int n_tail     = img->nx() % chunk_size;
++                n_patches = (img->nx() / chunk_size) * 13 + (n_tail > 0 ? (((n_tail + 1) / 2 + 1) / 2 + 1) / 2 : 0);
+             } break;
+         case PROJECTOR_TYPE_GLMA:
+             {
+diff --git a/tools/mtmd/models/qwen3a.cpp b/tools/mtmd/models/qwen3a.cpp
+index 4de9695..5ba1a48 100644
+--- a/tools/mtmd/models/qwen3a.cpp
++++ b/tools/mtmd/models/qwen3a.cpp
+@@ -6,14 +6,17 @@ ggml_cgraph * clip_graph_qwen3a::build() {
+     // inp_raw: [n_frames, n_mel, 1]  (nx=n_frames, ny=n_mel)
+     ggml_tensor * inp = build_inp_raw(1);
+ 
+-    const int64_t n_frames   = inp->ne[0]; // total frames, padded to multiple of chunk_size
+     const int64_t n_mel      = inp->ne[1]; // 128
+     const int64_t chunk_size = 100;        // n_window * 2 (n_window=50 from model config)
+-    const int64_t n_chunks   = n_frames / chunk_size;
++    const int64_t n_chunks   = (inp->ne[0] + chunk_size - 1) / chunk_size;
++    const int64_t n_tail     = inp->ne[0] % chunk_size;
+ 
+-    GGML_ASSERT(n_frames % chunk_size == 0); // preprocessor should already pad the input
+     GGML_ASSERT(inp->type == GGML_TYPE_F32);
+ 
++    // zero-pad the last chunk to chunk_size, as the reference pads all chunks to the longest one
++    inp = ggml_pad(ctx0, inp, n_chunks * chunk_size - inp->ne[0], 0, 0, 0);
++    const int64_t n_frames = inp->ne[0];
++
+     // View mel spectrogram as batched 100-frame chunks: [chunk_size, n_mel, 1, n_chunks]
+     inp = ggml_view_4d(ctx0, inp,
+         chunk_size, n_mel, 1, n_chunks,
+@@ -69,7 +72,11 @@ ggml_cgraph * clip_graph_qwen3a::build() {
+         inp = ggml_add(ctx0, inp, ggml_repeat(ctx0, pos_tmp, tgt));
+     }
+ 
+-    ggml_tensor * cur = build_vit(inp, n_pos,
++    // drop the outputs of the padding in the last chunk
++    const int64_t n_out = n_pos - (n_tail > 0 ? 13 - (((n_tail + 1) / 2 + 1) / 2 + 1) / 2 : 0);
++    inp = ggml_view_2d(ctx0, inp, inp->ne[0], n_out, inp->nb[1], 0);
++
++    ggml_tensor * cur = build_vit(inp, n_out,
+         NORM_TYPE_NORMAL, hparams.ffn_op,
+         nullptr,  // pos embd already added above
+         nullptr);
+diff --git a/tools/mtmd/mtmd-audio.cpp b/tools/mtmd/mtmd-audio.cpp
+index 1b4ea60..87bf5a0 100644
+--- a/tools/mtmd/mtmd-audio.cpp
++++ b/tools/mtmd/mtmd-audio.cpp
+@@ -627,8 +627,8 @@ bool mtmd_audio_preprocessor_whisper::preprocess(const float *                 s
+ // Matches the Python WhisperFeatureExtractor called with truncation=False:
+ //   - reflection padding of n_fft/2 samples at each end (center=True)
+ //   - Whisper-style log10 + (max-8)/4 normalization applied to full audio
+-//   - output split into ≤30s (3000 mel frames) windows, each padded to a
+-//     multiple of 200 frames (n_window * 2) for the cgraph batch view
++//   - the last STFT frame is dropped, giving n_samples / hop_length frames
++//   - output split into 800-frame (n_window_infer) windows, the cgraph pads the last 100-frame chunk
+ //
+ 
+ void mtmd_audio_preprocessor_qwen3a::initialize() {
+@@ -679,11 +679,16 @@ bool mtmd_audio_preprocessor_qwen3a::preprocess(const float *                 sa
+         return false;
+     }
+ 
+-    // Whisper-style normalization: clamp to (max - 8), scale to [-1, 1]
++    // WhisperFeatureExtractor drops the last STFT frame, keeping n_samples / hop_length frames
++    const int64_t n_eff = std::max<int64_t>(1, std::min(mel_full.n_len - 1, (int64_t)(n_samples / hparams.audio_hop_len)));
++
++    // Whisper-style normalization over the kept frames: clamp to (max - 8), scale to [-1, 1]
+     {
+         double mmax = -1e20;
+-        for (float v : mel_full.data) {
+-            if (v > mmax) mmax = v;
++        for (int64_t m = 0; m < mel_full.n_mel; m++) {
++            for (int64_t t = 0; t < n_eff; t++) {
++                mmax = std::max(mmax, (double)mel_full.data[m * mel_full.n_len + t]);
++            }
+         }
+         mmax -= 8.0;
+         for (float & v : mel_full.data) {
+@@ -691,25 +696,16 @@ bool mtmd_audio_preprocessor_qwen3a::preprocess(const float *                 sa
+         }
+     }
+ 
+-    // The effective frame count: center-padded STFT gives ~n_samples/hop_length frames.
+-    // We take min(mel_full.n_len, n_samples/hop + 1) to avoid including excess frames.
+-    const int64_t n_eff = std::min(mel_full.n_len,
+-                               (int64_t)(n_samples / hparams.audio_hop_len) + 1);
+-
+     // Split into inference windows matching n_window_infer=800 from model config.
+-    // Each window is padded to the next multiple of chunk_size for the cgraph.
+     // The mtmd caller loops over output entries, so long audio is handled automatically.
+-    const int chunk_size  = 100; // conv sub-chunk size (n_window * 2, n_window=50)
+     const int window_size = 800; // mel frames per forward pass (n_window_infer=800)
+ 
+     for (int64_t off = 0; off < n_eff; off += window_size) {
+         const int64_t win_eff  = std::min((int64_t)window_size, n_eff - off);
+-        const int64_t n_chunks  = (win_eff + chunk_size - 1) / chunk_size;
+-        const int64_t n_padded  = n_chunks * chunk_size;
+ 
+         mtmd_audio_mel out;
+         out.n_mel     = mel_full.n_mel;
+-        out.n_len     = n_padded;
++        out.n_len     = win_eff;
+         out.n_len_org = win_eff;
+         out.data.assign((size_t)out.n_mel * (size_t)out.n_len, 0.0f);
+         for (int64_t m = 0; m < out.n_mel; m++) {
