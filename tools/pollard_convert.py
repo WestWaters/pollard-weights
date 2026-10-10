@@ -49,6 +49,17 @@ def _search_paths():
     return cands
 
 
+def _is_file(p) -> bool:
+    """Path.is_file() that answers False instead of raising. On Windows a junction can be untraversable
+    (WinError 448, "untrusted mount point"): is_file() then RAISES, and one stale link in the search list
+    used to crash converter discovery outright -- POLLARD_CONVERTER included, since every candidate is
+    checked before any is used (the box, 2026-10-09: ~/pollard/llama.cpp -> C:/pollard/q35-llama)."""
+    try:
+        return Path(p).is_file()
+    except OSError:
+        return False
+
+
 def model_architectures(model_dir) -> list[str]:
     """The `architectures` a checkpoint declares -- the exact class names a converter registers.
 
@@ -83,7 +94,7 @@ def converter_registers(conv_py, arch: str) -> bool:
     registrations live in `conversion/*.py`. Grepping only the script would call every modern
     converter incapable -- so search the script AND the package beside it."""
     conv_py = Path(conv_py)
-    if not conv_py.is_file():
+    if not _is_file(conv_py):
         return False
     targets = [conv_py]
     pkg = conv_py.parent / "conversion"
@@ -104,7 +115,7 @@ def find_converter(model_dir=None):
     With no model, returns the first converter present -- capability is only meaningful against a
     specific architecture."""
     archs = model_architectures(model_dir) if model_dir else []
-    present = [c for c in _search_paths() if Path(c).is_file()]
+    present = [c for c in _search_paths() if _is_file(c)]
     if not present:
         return None, ("no convert_hf_to_gguf.py found. Point POLLARD_CONVERTER at one, or put a "
                       "llama.cpp checkout beside Pollard (runtime/llama.cpp).")
@@ -142,7 +153,7 @@ def main():
     if a.list:
         archs = model_architectures(a.model) if a.model else []
         for c in _search_paths():
-            if not Path(c).is_file():
+            if not _is_file(c):
                 continue
             known = [x for x in archs if converter_registers(c, x)]
             print(f"  {c}" + (f"   registers: {', '.join(known)}" if known
