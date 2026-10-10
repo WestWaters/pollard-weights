@@ -3,9 +3,9 @@
  "tree_slug": "llama.cpp",
  "tree_path": "/Users/marbit/Desktop/Pollard-Weights/runtime/llama.cpp",
  "remote": "https://github.com/ggml-org/llama.cpp",
- "base_commit": "df03399b8",
- "base_describe": "b10902",
- "base_date": "2026-09-10",
+ "base_commit": "69f201a20",
+ "base_describe": "",
+ "base_date": "2026-10-10",
  "files": [
   "common/CMakeLists.txt",
   "common/arg.cpp",
@@ -45,5 +45,5 @@
   "type",
   "weight_mode"
  ],
- "diff_bytes": 26508
+ "diff_bytes": 26509
 }
