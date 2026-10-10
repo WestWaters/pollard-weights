@@ -78,3 +78,11 @@ def test_clef_checkout_is_a_decision_model(tmp_path):
 def test_clef_gguf_is_a_decision_model():
     assert mk._is_decision("x.gguf", {"general.architecture": "clef", "clef.decision.head_count": 8})
     assert not mk._is_decision("x.gguf", {"general.architecture": "qwen35", "qwen35.block_count": 32})
+
+
+def test_native_ignores_non_dict_model_entries(monkeypatch):
+    """Joey's review: a non-dict entry in /v1/models data raised AttributeError outside the try."""
+    monkeypatch.setattr(pollard_bench, "_get", lambda base, path, timeout=10: {"data": ["junk", None, MODELS_HEAD["data"][0]]})
+    assert pd.native("http://x")
+    monkeypatch.setattr(pollard_bench, "_get", lambda base, path, timeout=10: {"data": ["junk"]})
+    assert not pd.native("http://x")

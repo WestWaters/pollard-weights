@@ -830,7 +830,8 @@ def main():
 
 def _dispatch(a):
     if not a.gguf and not a.hf:
-        ap.error("pass --gguf <file> or --hf <repo-or-dir>")
+        # argparse-style usage error; `ap` lives in main(), so ap.error here was a NameError (Joey's review).
+        sys.exit("pollard: error: pass --gguf <file> or --hf <repo-or-dir>")
 
     # LOCKED gold default: precondition (smooth) the low-bit trellis/error-feedback lanes unless opted out.
     # These lanes silently break on massive-activation outliers without it (EXL3 3090->8.699); smoothing +

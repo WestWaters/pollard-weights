@@ -52,3 +52,22 @@ def test_uncovered_already_at_or_above_floor_is_left_alone():
 def test_embeddings_and_output_are_not_this_guards_business():
     out, n = F.pin_uncovered([], ["token_embd.weight", "output.weight"], set(), "IQ2_XXS")
     assert n == 0
+
+
+def test_explicit_disk_or_tier_choice_is_not_overridden():
+    """Joey's review, F1: pins-first promoted an explicit --disk-type q5_K n-gram table to q6_K."""
+    table = re.escape("blk.0.ngram_table.weight")
+    ov = [(table, "q5_K"), (r"blk\.0\.ffn_up\.weight", "iq2_s")]
+    out, n = F.pin_uncovered(ov, ["blk.0.ngram_table.weight", "blk.0.ffn_up.weight"],
+                             {"blk.0.ffn_up.weight"}, "IQ3_S", explicit={table})
+    assert n == 0 and _first_match(out, "blk.0.ngram_table.weight", "?") == "q5_K"
+
+
+def test_mix_preset_base_names_are_floor_tested():
+    """Joey's review, F2: base "Q5_K_M" / "Q4_K_M" are preset names, not types; they missed the bpw table and pinned
+    nothing, so uncovered tensors (MTP heads, compressors) built at 4.5-5.5 bpw uncalibrated."""
+    for base in ("Q5_K_M", "Q4_K_M", "Q4_K_S", "IQ4_XS"):
+        out, n = F.pin_uncovered([], ["blk.40.nextn.attn_k.weight"], set(), base)
+        assert n == 1 and _first_match(out, "blk.40.nextn.attn_k.weight", "?") == F.EMB_FLOOR, base
+    out, n = F.pin_uncovered([], ["blk.40.nextn.attn_k.weight"], set(), "Q6_K")
+    assert n == 0

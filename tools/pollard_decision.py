@@ -183,7 +183,8 @@ def native(base: str) -> bool:
         models = _get(base, "/v1/models").get("data") or []
     except Exception:
         return False
-    return any("decisions" in ((m.get("architecture") or {}).get("output_modalities") or []) for m in models)
+    return any(isinstance(m, dict) and "decisions" in ((m.get("architecture") or {}).get("output_modalities") or [])
+               for m in models)
 
 
 def ask_systemone(base: str, state: str, question: str, options: list[str], post) -> list[float]:
