@@ -377,6 +377,38 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     return overrides, emb_type, gb, PRESET[base_t], (summary, src)
 
 
+def pin_uncovered(overrides, names, covered, base_preset):
+    """(overrides, n_pinned): every tensor the imatrix does not cover, held at EMB_FLOOR wherever the plan
+    puts it below that, the pins placed FIRST.
+
+    llama-quantize takes the first --tensor-type pattern that matches (ik_llama's custom-q too), and the
+    patterns are unanchored searches: `blk\\.0\\.ffn_down\\.weight` also matches a decision head's
+    `dec.blk.0.ffn_down.weight`. Appended, a pin lost to that pattern and the build crashed anyway
+    (Cloudflare/clef-flash, 2026-10-09: "Missing importance matrix for tensor dec.blk.0.ffn_down.weight").
+    The planned type is read the same first-match way.
+
+    Held whenever planned BELOW the floor, not only when the type would crash: a low-bit type with no
+    imatrix behind it builds silently and badly. That was the clef IQ4_XS rung -- the decision head, the
+    part whose output IS the product, at iq4 uncalibrated. MTP / nextn layers and DeepSeek's compressors
+    are the other uncovered tensors this has always been for."""
+    req = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q2_k_s"}
+    bpw = {k.lower(): v for k, v in BPW.items()}
+    floor = bpw.get(EMB_FLOOR.lower(), 6.56)
+    ovc = [(re.compile(p), str(t).lower()) for p, t in overrides]
+    pins = []
+    for nm in names:
+        if nm in ("token_embd.weight", "output.weight") or nm in covered:
+            continue
+        planned = base_preset.lower()
+        for pat, ty in ovc:
+            if pat.search(nm):
+                planned = ty
+                break
+        if planned in req or bpw.get(planned, floor) < floor:
+            pins.append((re.escape(nm), EMB_FLOOR))
+    return pins + list(overrides), len(pins)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -507,21 +539,11 @@ def main():
     # but are never calibrated). Read the imatrix's REAL coverage and pin any tensor
     # that would take an imatrix-required type but isn't covered. Fall back to the
     # "matches no override" heuristic if the imatrix can't be parsed.
+    # Pins go FIRST and cover low-bit, not just crashing, types -- see pin_uncovered.
     base_pins = 0
-    _REQ = {"iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q2_k_s"}
     handled = ("token_embd.weight", "output.weight")
     if covered is not None:
-        ovc = [(re.compile(p), str(t).lower()) for p, t in overrides]
-        for nm in read_gguf_tensor_names(a.gguf):
-            if nm in handled or nm in covered:
-                continue
-            planned = base_preset.lower()
-            for pat, ty in ovc:
-                if pat.search(nm):
-                    planned = ty
-            if planned in _REQ:
-                overrides.append((re.escape(nm), EMB_FLOOR))
-                base_pins += 1
+        overrides, base_pins = pin_uncovered(overrides, read_gguf_tensor_names(a.gguf), covered, base_preset)
     elif base_preset in IMATRIX_REQUIRED_PRESETS:            # fallback: no imatrix parse
         for nm in read_gguf_tensor_names(a.gguf):
             if nm not in handled and not any(re.search(p, nm) for p, _ in overrides):
