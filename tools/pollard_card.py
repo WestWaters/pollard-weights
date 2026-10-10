@@ -464,6 +464,12 @@ def frontmatter(base_model, lic, lanes, model_type, quantized_by=None,
         if t not in seen:
             seen.add(t); uniq.append(t)
     lines = ["---", f"license: {lic}", f"base_model: {base_model}", "base_model_relation: quantized"]
+    # Say which library the files are for. Left unset, the Hub guesses from the tags: our "trellis" tag (the
+    # ik_llama quant family) made it file every ik repo under Microsoft's TRELLIS 3D library, and a repo
+    # without that tag (clef-flash-Pollard) showed "Downloads are not tracked for this model".
+    library = "gguf" if "gguf" in lanes else "mlx" if "mlx" in lanes else None
+    if library:
+        lines.append(f"library_name: {library}")
     # Better to say nothing than to credit the wrong account: an unattributed card is incomplete,
     # a misattributed one is false.
     if quantized_by:

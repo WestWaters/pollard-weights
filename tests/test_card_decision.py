@@ -54,3 +54,12 @@ def test_decision_usage_is_systemone_not_chat():
 def test_kl_format_keeps_small_values_readable():
     assert C._fmt_kl(4.5e-05) == "4.5e-05" and C._fmt_kl(0.0033) == "0.0033" and C._fmt_kl(0.0324) == "0.032"
     assert C._fmt_kl(None) == "--"
+
+
+def test_library_is_declared_not_guessed():
+    """The Hub guessed the library from tags: "trellis" filed ik repos under Microsoft TRELLIS (3D), and a repo
+    without it (clef-flash-Pollard, 2026-10-10) read "Downloads are not tracked for this model"."""
+    assert "library_name: gguf" in C.frontmatter("x/y", "mit", ["gguf"], "qwen3", None)
+    assert "library_name: gguf" in C.frontmatter("x/y", "mit", ["gguf"], "qwen3", None, decision=True, ik=False)
+    assert "library_name: mlx" in C.frontmatter("x/y", "mit", ["mlx"], "qwen3", None)
+    assert "library_name" not in C.frontmatter("x/y", "mit", ["gptq"], "qwen3", None)
