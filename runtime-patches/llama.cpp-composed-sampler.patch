@@ -1,8 +1,8 @@
 diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
-index 1506bf647..7bed6cf5e 100644
+index 2b307c5..aac7c86 100644
 --- a/common/CMakeLists.txt
 +++ b/common/CMakeLists.txt
-@@ -102,6 +102,8 @@ add_library(${TARGET}
+@@ -104,6 +104,8 @@ add_library(${TARGET}
      reasoning-budget.cpp
      reasoning-budget.h
      sampling.cpp
@@ -12,7 +12,7 @@ index 1506bf647..7bed6cf5e 100644
      speculative.cpp
      speculative.h
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 43052d58d..05e997801 100644
+index 7c1b81e..48a3516 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -9,6 +9,7 @@
@@ -23,10 +23,10 @@ index 43052d58d..05e997801 100644
  #include "speculative.h"
  #include "preset.h"
  
-@@ -2041,6 +2042,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2047,6 +2048,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
          }
-     ).set_sampling());
+     ).set_sampling().set_env("LLAMA_ARG_MIN_P"));
 +    add_opt(common_arg(
 +        {"--composed"}, "SPEC",
 +        "composed decoding on the simplex (arXiv 2609.34992): regularizers as type[:alpha[:key=val]] joined by ','\n"
@@ -43,10 +43,10 @@ index 43052d58d..05e997801 100644
          {"--top-nsigma", "--top-n-sigma"}, "N",
          string_format("top-n-sigma sampling (default: %.2f, -1.0 = disabled)", params.sampling.top_n_sigma),
 diff --git a/common/common.h b/common/common.h
-index 63d0badd0..2a70d1fb0 100644
+index d89f803..f7bc780 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -126,6 +126,7 @@ enum common_sampler_type {
+@@ -129,6 +129,7 @@ enum common_sampler_type {
      COMMON_SAMPLER_TYPE_PENALTIES   = 10,
      COMMON_SAMPLER_TYPE_TOP_N_SIGMA = 11,
      COMMON_SAMPLER_TYPE_ADAPTIVE_P  = 12,
@@ -54,7 +54,7 @@ index 63d0badd0..2a70d1fb0 100644
  };
  
  // dimensionality reduction methods, used by cvector-generator
-@@ -220,6 +221,26 @@ inline bool common_grammar_needs_prefill(const common_grammar & g) {
+@@ -223,6 +224,26 @@ inline bool common_grammar_needs_prefill(const common_grammar & g) {
          || g.type == COMMON_GRAMMAR_TYPE_TOOL_CALLS;
  }
  
@@ -81,7 +81,7 @@ index 63d0badd0..2a70d1fb0 100644
  // sampling parameters
  struct common_params_sampling {
      uint32_t seed = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampler
-@@ -230,6 +251,7 @@ struct common_params_sampling {
+@@ -233,6 +254,7 @@ struct common_params_sampling {
      int32_t top_k              = 40;     // <= 0 to use vocab size
      float   top_p              = 0.95f;  // 1.0 = disabled
      float   min_p              = 0.05f;  // 0.0 = disabled
@@ -91,7 +91,7 @@ index 63d0badd0..2a70d1fb0 100644
      float   typ_p              = 1.00f;  // typical_p, 1.0 = disabled
 diff --git a/common/composed-sampler.cpp b/common/composed-sampler.cpp
 new file mode 100644
-index 000000000..03abda020
+index 0000000..03abda0
 --- /dev/null
 +++ b/common/composed-sampler.cpp
 @@ -0,0 +1,308 @@
@@ -405,7 +405,7 @@ index 000000000..03abda020
 +}
 diff --git a/common/composed-sampler.h b/common/composed-sampler.h
 new file mode 100644
-index 000000000..40d78f6f6
+index 0000000..40d78f6
 --- /dev/null
 +++ b/common/composed-sampler.h
 @@ -0,0 +1,31 @@
@@ -441,7 +441,7 @@ index 000000000..40d78f6f6
 +// temp is the temperature the chain applied before this sampler (1.0 if none)
 +struct llama_sampler * common_sampler_init_composed(const common_composed_params & params, float temp);
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e1c..4e27e81b6 100644
+index 9e16693..a5f7544 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -1,4 +1,5 @@
@@ -450,7 +450,7 @@ index 06dea1e1c..4e27e81b6 100644
  
  #include "common.h"
  #include "fit.h"
-@@ -340,6 +341,7 @@ struct common_sampler * common_sampler_init(
+@@ -344,6 +345,7 @@ struct common_sampler * common_sampler_init(
      if (params.mirostat == 0) {
  
          bool use_adaptive_p = false; // see below
@@ -458,7 +458,7 @@ index 06dea1e1c..4e27e81b6 100644
  
          for (const auto & cnstr : params.samplers) {
              switch (cnstr) {
-@@ -374,6 +376,12 @@ struct common_sampler * common_sampler_init(
+@@ -378,6 +380,12 @@ struct common_sampler * common_sampler_init(
                  case COMMON_SAMPLER_TYPE_TEMPERATURE:
                      samplers.push_back(llama_sampler_init_temp_ext(params.temp, params.dynatemp_range, params.dynatemp_exponent));
                      break;
@@ -471,7 +471,7 @@ index 06dea1e1c..4e27e81b6 100644
                  case COMMON_SAMPLER_TYPE_INFILL:
                      samplers.push_back(llama_sampler_init_infill(vocab));
                      break;
-@@ -391,6 +399,11 @@ struct common_sampler * common_sampler_init(
+@@ -395,6 +403,11 @@ struct common_sampler * common_sampler_init(
                      GGML_ASSERT(false && "unknown sampler type");
              }
          }
@@ -483,7 +483,7 @@ index 06dea1e1c..4e27e81b6 100644
          if (use_adaptive_p) {
              // only if user explicitly included adaptive-p sampler
              samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
-@@ -805,6 +818,7 @@ char common_sampler_type_to_chr(enum common_sampler_type cnstr) {
+@@ -938,6 +951,7 @@ char common_sampler_type_to_chr(enum common_sampler_type cnstr) {
          case COMMON_SAMPLER_TYPE_INFILL:      return 'i';
          case COMMON_SAMPLER_TYPE_PENALTIES:   return 'e';
          case COMMON_SAMPLER_TYPE_ADAPTIVE_P:  return 'a';
@@ -491,7 +491,7 @@ index 06dea1e1c..4e27e81b6 100644
          default : return '?';
      }
  }
-@@ -822,6 +836,7 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr) {
+@@ -955,6 +969,7 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr) {
          case COMMON_SAMPLER_TYPE_INFILL:      return "infill";
          case COMMON_SAMPLER_TYPE_PENALTIES:   return "penalties";
          case COMMON_SAMPLER_TYPE_ADAPTIVE_P:  return "adaptive_p";
@@ -499,7 +499,7 @@ index 06dea1e1c..4e27e81b6 100644
          default : return "";
      }
  }
-@@ -841,7 +856,8 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
+@@ -974,7 +989,8 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
              { "xtc",         COMMON_SAMPLER_TYPE_XTC         },
              { "infill",      COMMON_SAMPLER_TYPE_INFILL      },
              { "penalties",   COMMON_SAMPLER_TYPE_PENALTIES   },
@@ -509,7 +509,7 @@ index 06dea1e1c..4e27e81b6 100644
          };
          std::unordered_map<std::string, common_sampler_type> alias_name_map;
          for (const auto & entry : canonical_name_map) {
-@@ -901,6 +917,7 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
+@@ -1034,6 +1050,7 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
          { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_INFILL),      COMMON_SAMPLER_TYPE_INFILL },
          { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_PENALTIES),   COMMON_SAMPLER_TYPE_PENALTIES },
          { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_ADAPTIVE_P),  COMMON_SAMPLER_TYPE_ADAPTIVE_P },
@@ -518,7 +518,7 @@ index 06dea1e1c..4e27e81b6 100644
  
      std::vector<common_sampler_type> samplers;
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index 64b925129..32f4c18c5 100644
+index 54e126a..c249f85 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
 @@ -1,4 +1,5 @@
@@ -527,7 +527,7 @@ index 64b925129..32f4c18c5 100644
  
  #include "json-schema-to-grammar.h"
  
-@@ -498,6 +499,50 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+@@ -450,6 +451,50 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
              }
          }));
  
