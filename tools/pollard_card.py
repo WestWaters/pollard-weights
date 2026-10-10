@@ -417,16 +417,23 @@ def decision_section(builds, results):
         rows.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {f('agreement', '{:.0%}')} | "
                     f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |")
     asked = f"the same {n} typed questions" if n else "the same typed questions"
+    ref = decision_ref(results)
     return ["## Decision fidelity", "",
             "This is a **decision model**: it answers typed questions (choice / score / yes-no) with a "
-            "probability per option, so it is measured on its decisions, not on text. Each rung and the f16 "
+            f"probability per option, so it is measured on its decisions, not on text. Each rung and the {ref} "
             f"answered {asked} through llama-server's `/v1/systemone`, read the same way "
             "([pollard-decision](https://github.com/WestWaters/pollard-weights)).", "",
-            "| file | size | agrees with f16 | option KL vs f16 | mean prob. drift | accuracy |",
+            f"| file | size | agrees with {ref} | option KL vs {ref} | mean prob. drift | accuracy |",
             "|---|---:|---:|---:|---:|---:|", *rows, "",
-            "_Agrees = the rung picks the same option as the f16. Option KL = how far its option "
-            "probabilities moved from the f16's (0 = identical); it is the number that separates the rungs._",
+            f"_Agrees = the rung picks the same option as the {ref}. Option KL = how far its option "
+            f"probabilities moved from the {ref}'s (0 = identical); it is the number that separates the rungs._",
             ""]
+
+
+def decision_ref(results):
+    """What the decision board was measured against: the f16 unless the results say otherwise. A model too big
+    to serve at f16 on the build machine (Clef 27B: 54 GB) is gated against Q8_0, and the card must say so."""
+    return str((results or {}).get("_decision_ref") or "f16")
 
 
 def decision_usage(exn, newer_arch=None):
@@ -677,7 +684,7 @@ def main():
     out.append(f"| Input support | {inp} |")
     out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if imat else 'no'} |")
     if decision:
-        out.append("| Measured | " + ("**decision fidelity vs f16** through `/v1/systemone` -- "
+        out.append("| Measured | " + (f"**decision fidelity vs {decision_ref(results)}** through `/v1/systemone` -- "
                    "[table below](#decision-fidelity) (perplexity does not apply: a decision model "
                    "answers with probabilities, not text)" if dec_rows else "decision fidelity -- pending") + " |")
     else:
@@ -736,7 +743,7 @@ def main():
     rt_h = " runs in |" if mixed else ""
     rt_s = "---|" if mixed else ""
     if decision:
-        out += [f"| file | size | agrees with f16 | option KL |{rt_h} notes |",
+        out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h} notes |",
                 f"|---|---:|---:|---:|{rt_s}---|"]
     else:
         out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h} notes |",

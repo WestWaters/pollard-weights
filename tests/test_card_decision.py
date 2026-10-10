@@ -63,3 +63,11 @@ def test_library_is_declared_not_guessed():
     assert "library_name: gguf" in C.frontmatter("x/y", "mit", ["gguf"], "qwen3", None, decision=True, ik=False)
     assert "library_name: mlx" in C.frontmatter("x/y", "mit", ["mlx"], "qwen3", None)
     assert "library_name" not in C.frontmatter("x/y", "mit", ["gptq"], "qwen3", None)
+
+
+def test_decision_reference_is_named_on_the_card():
+    """Clef 27B was gated against Q8_0 (the 54 GB f16 cannot be served on the build box); the card said "f16"."""
+    res = dict(RESULTS, _decision_ref="Q8_0")
+    md = "\n".join(C.decision_section(BUILDS, res))
+    assert "agrees with Q8_0" in md and "option KL vs Q8_0" in md and "f16" not in md
+    assert "agrees with f16" in "\n".join(C.decision_section(BUILDS, RESULTS))
