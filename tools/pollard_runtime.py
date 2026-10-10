@@ -507,6 +507,10 @@ def main():
     ap.add_argument("--jobs", type=int, help="with --update: parallel compile jobs (default 60%% of cores)")
     ap.add_argument("--with", dest="with_flags", action="append", default=[], metavar="CMAKE_FLAG=VALUE",
                     help="with --update: add a CMake option (kept on later updates), e.g. GGML_CUDA_FA_ALL_QUANTS=ON")
+    ap.add_argument("--cuda-arch", metavar="ARCHS",
+                    help="with --update: CMAKE_CUDA_ARCHITECTURES to build, winning over GPU/toolkit detection, "
+                         "e.g. '107-real;100f-virtual' (Rubin) or '120a-real'. Default: keep the cached list while it "
+                         "still covers this box's GPU under this toolkit, else pick one from nvidia-smi + nvcc")
     a = ap.parse_args()
 
     if a.update or a.rollback or a.schedule:
@@ -522,7 +526,8 @@ def main():
             print(f"unknown engine {bad}; choose from {list(U.ENGINES)} or all")
             return 2
         extra = dict(f.split("=", 1) for f in a.with_flags if "=" in f)
-        ok = all([U.update_engine(n, check=a.check, jobs=a.jobs, allow_drop=a.allow_drop, extra=extra) for n in names])
+        ok = all([U.update_engine(n, check=a.check, jobs=a.jobs, allow_drop=a.allow_drop, extra=extra,
+                                  cuda_arch=a.cuda_arch) for n in names])
         return 0 if ok else 1
 
     trees = find_trees(a.scan)
