@@ -2,24 +2,36 @@
   "_doc": "Engines pollard-runtime --update keeps current. Each tracks its own source (branch or pull ref) and re-applies its patches; nothing here is hand-built. Add an engine here, not a folder on a machine.",
   "llama.cpp": {
     "url": "https://github.com/ggml-org/llama.cpp",
-    "patches": ["llama.cpp-composed-sampler"],
-    "why": "the K-quant ladder, every new architecture the day upstream adds it; composed decoding sampler"
+    "patches": [
+      "llama.cpp-composed-sampler",
+      "llama.cpp-qwen3omni-deepstack",
+      "llama.cpp-qwen3omni-audio",
+      "llama.cpp-clef-omni"
+    ],
+    "why": "the K-quant ladder, every new architecture the day upstream adds it; composed decoding sampler; Qwen3-Omni deepstack + audio fixes and clef-omni (decision head on Qwen3-Omni), ahead of upstream"
   },
   "ik_llama.cpp": {
     "url": "https://github.com/ikawrakow/ik_llama.cpp",
-    "patches": ["ik_llama.cpp-k2-horizon-arch", "ik_llama.cpp-msvc-sse2"],
+    "patches": [
+      "ik_llama.cpp-k2-horizon-arch",
+      "ik_llama.cpp-msvc-sse2"
+    ],
     "why": "trellis IQ*_KT flagship and IQ4_K/IQ5_K types upstream does not have; K2-Horizon on the trellis lane"
   },
   "llama-stq": {
     "url": "https://github.com/ggml-org/llama.cpp",
     "ref": "pull/22836/head",
-    "patches": ["llama-stq-stq1_0-quants"],
+    "patches": [
+      "llama-stq-stq1_0-quants"
+    ],
     "why": "STQ1_0 ternary type (upstream PR #22836, open) plus our imatrix-aware STQ1_0 encoder"
   },
   "ifm-llama": {
     "url": "https://github.com/MBZUAI-IFM/llama.cpp",
     "ref": "model/K2Horizon",
-    "patches": ["ifm-llama-k2-msvc-regex"],
+    "patches": [
+      "ifm-llama-k2-msvc-regex"
+    ],
     "why": "K2-Horizon pre-tokenizer + chat template from the model's makers; MSVC regex fix for Windows"
   }
 }

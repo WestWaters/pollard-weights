@@ -1,0 +1,88 @@
+diff --git a/conversion/qwen3vl.py b/conversion/qwen3vl.py
+index 638bcbb..70791fb 100644
+--- a/conversion/qwen3vl.py
++++ b/conversion/qwen3vl.py
+@@ -198,7 +198,7 @@ class Qwen3OmniMmprojModel(Qwen3VLVisionModel, Qwen25AudioModel):
+             if not self.has_vision_encoder:
+                 raise ValueError(f"Model does not have vision encoder, but found tensor {name}")
+             # need to transform vision tensor naming, so that modify_tensors() logic can be used correctly
+-            name = name.replace("thinker.visual.", "model.visual.")
++            name = name.replace("thinker.visual.", "visual.")
+             if ".merger_list." in name:
+                 name = name.replace(".merger_list.", ".deepstack_merger_list.")
+                 name = name.replace(".ln_q", ".norm")
+@@ -307,7 +307,10 @@ class Qwen3VLMoeTextModel(Qwen3MoeModel):
+ 
+     def set_gguf_parameters(self):
+         super().set_gguf_parameters()
+-        vision_config = self.hparams.get("vision_config", {})
++        if "thinker_config" in self.hparams:
++            vision_config = self.hparams["thinker_config"].get("vision_config", {})
++        else:
++            vision_config = self.hparams.get("vision_config", {})
+         deepstack_layer_num = len(vision_config.get("deepstack_visual_indexes", []))
+         self.gguf_writer.add_num_deepstack_layers(deepstack_layer_num)
+ 
+@@ -367,10 +370,6 @@ class Qwen3OmniMoeTextModel(Qwen3VLMoeTextModel):
+                     self.gguf_writer.add_eos_token_id(int(token_id))
+                     break
+ 
+-    def set_gguf_parameters(self):
+-        super().set_gguf_parameters()
+-        self.gguf_writer.add_num_deepstack_layers(0)
+-
+ 
+ @ModelBase.register("Qwen3ASRForConditionalGeneration")
+ @ModelBase.example("Qwen/Qwen3-ASR-0.6B-hf")
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index b6e331b..e842e14 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -588,18 +588,18 @@ struct mtmd_context {
+         }
+ 
+         // if both vision and audio mmproj are present, we need to validate their n_embd
++        // vision deepstack (e.g. Qwen3-Omni) appends extra paths, audio embeddings are then zero-padded
+         if (ctx_v && ctx_a) {
+             int n_embd_v = clip_n_mmproj_embd(ctx_v);
+             int n_embd_a = clip_n_mmproj_embd(ctx_a);
+-            if (n_embd_v != n_embd_a) {
++            if (n_embd_v % n_embd_a != 0) {
+                 throw std::runtime_error(string_format(
+                     "mismatch between vision and audio mmproj (n_embd_v = %d, n_embd_a = %d)\n",
+                     n_embd_v, n_embd_a));
+             }
+         }
+ 
+-        // since we already validate n_embd of vision and audio mmproj,
+-        // we can safely assume that they are the same
++        // vision n_embd is a multiple of audio n_embd, so the vision one is the output size
+         int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+         if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
+             throw std::runtime_error(string_format(
+@@ -1854,13 +1854,23 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
+             LOG_ERR("%s: audio tokens batch is placeholder\n", __func__);
+             return 1;
+         }
+-        int n_mmproj_embd = ctx->n_embd_out();
+-        out_embd.resize((size_t)chunk->tokens_audio->n_tokens * n_mmproj_embd);
++        const size_t n_tokens = chunk->tokens_audio->n_tokens;
++        const size_t n_embd_a = clip_n_mmproj_embd(ctx->ctx_a);
++        const size_t n_embd   = ctx->n_embd_out();
++        out_embd.resize(n_tokens * n_embd_a);
+         bool ok = clip_image_batch_encode(
+             ctx->ctx_a,
+             ctx->n_threads,
+             &chunk->tokens_audio->batch_f32,
+             out_embd);
++        // zero-pad the audio rows to the vision width (deepstack paths)
++        if (ok && n_embd_a != n_embd) {
++            out_embd.resize(n_tokens * n_embd);
++            for (size_t i = n_tokens; i-- > 0;) {
++                std::copy_backward(out_embd.begin() + i * n_embd_a, out_embd.begin() + (i + 1) * n_embd_a, out_embd.begin() + i * n_embd + n_embd_a);
++                std::fill(out_embd.begin() + i * n_embd + n_embd_a, out_embd.begin() + (i + 1) * n_embd, 0.0f);
++            }
++        }
+         return ok ? 0 : 1;
+     }
+ 
