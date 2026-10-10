@@ -318,7 +318,7 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
     card: gemma-4-12B-it went out reading "Input support: text" while its 175MB projector sat in
     the same folder, and "imatrix: no" for a build an imatrix produced. What shipped is knowable
     from the model and the build directory, so read it."""
-    facts = {"input": None, "imatrix": None, "params_b": None}
+    facts = {"input": None, "imatrix": None, "params_b": None, "decision": False}
     # classify needs something on disk. A repo id reads nothing, so fall back to a built GGUF
     # (which carries the chat template) or the pulled source in the workspace.
     probe = model_id if os.path.isdir(str(model_id)) else None
@@ -333,6 +333,7 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
     try:
         from pollard_modelkind import classify
         k = classify(probe)
+        facts["decision"] = bool(k.get("decision"))
         mods = [m for m in k.get("modalities", []) if m != "speech_out"]
         # A modality only ships if the projector that carries it ships too.
         # The text GGUF carries no modality signals by construction -- the projector does, and it
@@ -393,14 +394,71 @@ def parse_params_b(params, cfg):
     return round((12 * L * h * h + 2 * v * h) / 1e9, 2) if h and L else 0.0
 
 
+def _fmt_kl(v):
+    """Option KL spans 1e-5 (Q6_K) to 1e-1 (2-bit): two significant figures keep every rung readable."""
+    if v is None:
+        return "--"
+    v = float(v)
+    return "0" if v == 0 else f"{v:.2g}" if v < 0.01 else f"{v:.3f}"
+
+
+def decision_section(builds, results):
+    """The board a decision model is judged on: each rung against the f16, same typed questions, same
+    readout (pollard-decision). Agreement = same answer as the f16; option KL = how far the option
+    probabilities moved; drift = mean absolute change per option."""
+    rows, n = [], None
+    for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
+        r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}
+        d = r.get("decision")
+        if not isinstance(d, dict):
+            continue
+        n = n or d.get("n")
+        f = lambda k, fmt: (fmt.format(float(d[k])) if d.get(k) is not None else "--")
+        rows.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {f('agreement', '{:.0%}')} | "
+                    f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |")
+    asked = f"the same {n} typed questions" if n else "the same typed questions"
+    return ["## Decision fidelity", "",
+            "This is a **decision model**: it answers typed questions (choice / score / yes-no) with a "
+            "probability per option, so it is measured on its decisions, not on text. Each rung and the f16 "
+            f"answered {asked} through llama-server's `/v1/systemone`, read the same way "
+            "([pollard-decision](https://github.com/WestWaters/pollard-weights)).", "",
+            "| file | size | agrees with f16 | option KL vs f16 | mean prob. drift | accuracy |",
+            "|---|---:|---:|---:|---:|---:|", *rows, "",
+            "_Agrees = the rung picks the same option as the f16. Option KL = how far its option "
+            "probabilities moved from the f16's (0 = identical); it is the number that separates the rungs._",
+            ""]
+
+
+def decision_usage(exn, newer_arch=None):
+    lead = (f"This model's architecture (`{newer_arch}`) needs a llama.cpp new enough to carry it. "
+            if newer_arch else "")
+    return [lead + "A decision model is served on **`/v1/systemone`** (no chat or completions):", "",
+            "```bash", f"llama-server -m {exn} -ngl 99 --port 8080",
+            "curl http://127.0.0.1:8080/v1/systemone -H \"Content-Type: application/json\" -d '{",
+            '  "state": "Customer message: I was charged twice for my order last week and nobody has replied.",',
+            '  "questions": {',
+            '    "route":   {"type": "choice", "instructions": "Which team should handle this?",',
+            '                "criteria": {"billing": null, "shipping": null, "technical": null}},',
+            '    "angry":   {"type": "noul",   "instructions": "Is the customer angry?"},',
+            '    "urgency": {"type": "score",  "instructions": "How urgent is this?",',
+            '                "criteria": ["can wait", "this week", "today", "right now"]}',
+            "  }", "}'", "```", "",
+            "Each answer carries the probability of every option. Some decision models evaluate the whole "
+            "prompt in one batch, so a long `state` may need a larger `--ubatch-size`.", ""]
+
+
 def frontmatter(base_model, lic, lanes, model_type, quantized_by=None,
-                pipeline_tag="text-generation"):
+                pipeline_tag="text-generation", decision=False, ik=True):
     tags = ["pollard-weights", "pollard"]
     for ln in lanes:
-        tags += LANE_TAGS.get(ln, [ln])
+        # ik_llama / trellis tags only when a rung actually needs ik_llama: a stock-only ladder
+        # (clef-flash) was tagged with a runtime and a quant family it does not use.
+        tags += [t for t in LANE_TAGS.get(ln, [ln]) if ik or t not in ("ik_llama.cpp", "trellis")]
     if model_type:
         tags.append(model_type)
-    tags += ["quantized", "mixed-precision", "measured-allocation", "conversational"]
+    tags += ["quantized", "mixed-precision", "measured-allocation"]
+    # A decision model answers typed questions with probabilities; it does not chat.
+    tags += ["decision-model", "systemone", "structured-output"] if decision else ["conversational"]
     seen, uniq = set(), []
     for t in tags:
         if t not in seen:
@@ -510,6 +568,12 @@ def main():
     bdir = next((os.path.dirname(b["path"]) for b in builds
                  if isinstance(b, dict) and b.get("path") and os.path.dirname(b["path"])), None)
     facts = detect_card_facts(a.model, bdir, cfg, builds)
+    # A DECISION model (a decision head like clef, or a Jev / OpenJev-style model) is measured on its
+    # decisions, not its text: perplexity does not apply, and a clef server cannot chat at all. Shown
+    # only when detected (pollard-modelkind) or when the results carry a pollard-decision board.
+    dec_rows = {k: v["decision"] for k, v in results.items()
+                if isinstance(v, dict) and isinstance(v.get("decision"), dict)}
+    decision = bool(facts.get("decision") or dec_rows)
     pb = parse_params_b(a.params, cfg) or facts.get("params_b") or 0.0
     f16_gb = pb * 2.0
     builds_sorted = sorted(builds, key=lambda b: -(b.get("bytes") or 0))
@@ -530,8 +594,10 @@ def main():
         a.mmproj = os.path.basename(a.mmproj.rstrip("/\\"))
     if a.imatrix_file:
         a.imatrix_file = os.path.basename(a.imatrix_file.rstrip("/\\"))
-    ptag = detect_pipeline_tag(base_model, cfg, a.pipeline_tag, a.mmproj, a.input_support)
-    out = [frontmatter(base_model, lic, lanes, mtype, account, ptag), "",
+    ptag = ("text-classification" if decision and not a.pipeline_tag else
+            detect_pipeline_tag(base_model, cfg, a.pipeline_tag, a.mmproj, a.input_support))
+    uses_ik = any(runtimes.get(b.get("path")) == "ik_llama" for b in builds)
+    out = [frontmatter(base_model, lic, lanes, mtype, account, ptag, decision, uses_ik), "",
            f"# {name} -- Pollard", ""]
     if f16_gb and small_gb:
         out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) -> {small_gb:.2f} GB** -- "
@@ -604,7 +670,12 @@ def main():
     out.append(f"| Architecture | `{arch}` |")
     out.append(f"| Input support | {inp} |")
     out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if imat else 'no'} |")
-    out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
+    if decision:
+        out.append("| Measured | " + ("**decision fidelity vs f16** through `/v1/systemone` -- "
+                   "[table below](#decision-fidelity) (perplexity does not apply: a decision model "
+                   "answers with probabilities, not text)" if dec_rows else "decision fidelity -- pending") + " |")
+    else:
+        out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
     out.append("")
 
     # ---- Which file should I choose? -- the rung guide, sized off the real bytes
@@ -658,8 +729,12 @@ def main():
     mixed = bool(ik_builds) and len(ik_builds) != len(runtimes)
     rt_h = " runs in |" if mixed else ""
     rt_s = "---|" if mixed else ""
-    out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h} notes |",
-            f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}---|"]
+    if decision:
+        out += [f"| file | size | agrees with f16 | option KL |{rt_h} notes |",
+                f"|---|---:|---:|---:|{rt_s}---|"]
+    else:
+        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h} notes |",
+                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}---|"]
     _ordered = sorted(builds, key=lambda x: (x.get("bytes") or 0))
     _rec = pick_recommended(
         [(i, results.get(b.get("name", ""), results.get(b.get("tag", ""), {})).get("ppl"))
@@ -676,6 +751,13 @@ def main():
                                           b.get("tag", ""), _rec)
         t1 = r.get("top1")
         t1_c = (f" {float(t1):.2f}% |" if t1 else " -- |") if has_top1 else ""
+        if decision:
+            d = r.get("decision") or {}
+            ag = f"{float(d['agreement']):.0%}" if d.get("agreement") is not None else "--"
+            note = r.get("note") or ""
+            out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {ag} | "
+                       f"{_fmt_kl(d.get('option_kl'))} |{rt_c} {note} |")
+            continue
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{_fmt_num(_kld)} |{t1_c}{rt_c} {note} |")
     if has_top1:
@@ -689,8 +771,11 @@ def main():
                    "_tok/s is hardware-specific; the machine it was measured on is stated in the errata._")
     if not results:
         out.append("")
-        out.append("_PPL / Mean-KLD benchmarking pending -- sizes and allocation are final._")
+        out.append("_Decision-fidelity measurement pending -- sizes and allocation are final._" if decision else
+                   "_PPL / Mean-KLD benchmarking pending -- sizes and allocation are final._")
     out.append("")
+    if decision and dec_rows:
+        out += decision_section(builds, results)
 
     # ---- usage
     def _recommended(b):
@@ -742,7 +827,9 @@ def main():
 
     # ---- How to run
     out += ["## How to run", ""]
-    if "gguf" in lanes:
+    if "gguf" in lanes and decision:
+        out += decision_usage(exn, fork_arch if arch_verdict == "newer" else None)
+    elif "gguf" in lanes:
         # The featured command has to name a file that command can actually open. If the
         # recommended rung is ik_llama-only, showing it behind a stock `llama-server -hf` sends
         # people to a load error -- so the stock example moves to a rung that loads, and the
