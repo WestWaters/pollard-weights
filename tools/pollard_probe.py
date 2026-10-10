@@ -775,6 +775,13 @@ def main():
         print(f"   placement: {note}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     if dev == "cpu":
+        # The module-level guard above only sees an explicit --device cpu. Placement lands here too -- a
+        # model bigger than the GPU and about the size of RAM is paged on the CPU -- and fla was then still
+        # importable: clef-flash (Qwen3.5, 17.8GB vs a 16GB GPU, 2026-10-09) died in fla's Triton l2norm,
+        # "Pointer argument cannot be accessed from Triton (cpu tensor?)". The model module is not imported
+        # yet, so hiding them here still sends transformers down its torch path.
+        sys.modules["fla"] = None
+        sys.modules["causal_conv1d"] = None
         # Eager attention on the CPU path. A fused/Triton attention is selected on the strength of
         # CUDA merely LOOKING available -- torch.cuda.is_available() reports the driver, not the
         # visible devices -- and then meets a CPU tensor:
