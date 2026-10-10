@@ -41,11 +41,11 @@ pollard --hf ./my-local-model --run          # ...or a model already on disk (an
 pollard --hf Qwen/Qwen3-8B --format gptq --run   # GPTQ for vLLM/SGLang (from HF weights)
 pollard --hf Qwen/Qwen3-8B --format mlx  --run   # MLX for Apple Silicon
 pollard --hf Qwen/Qwen3-8B --format exl3 --run   # EXL3 (exllamav3) — smoothing + Calib 3.0 gold, one-shot
-pollard --hf Qwen/Qwen3-8B --format mx   --run   # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
+pollard --hf Qwen/Qwen3-8B --format mx   --run   # MX: Blackwell/Rubin NVFP4 / any-GPU W4A16 (compressed-tensors)
 pollard --gguf model-f16.gguf --imatrix model.imatrix --run   # bring your own imatrix (skips auto-calib)
 ```
 Point it at **any input** (HF repo id, local HF dir, or an f16 GGUF) and pick **any output** (`--format
-gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3 · `mx` Blackwell/any-GPU compressed-tensors).
+gguf` default · `gptq` vLLM/SGLang · `mlx` Apple · `exl3` exllamav3 · `mx` Blackwell/Rubin/any-GPU compressed-tensors).
 GPTQ/MLX/EXL3/MX emit straight from HF weights (no GGUF). **All five lanes run the GOLD method one-shot:**
 smoothing is default-ON for the low-bit lanes (GPTQ/EXL3/MX), allocation is auto-measured (`pollard-probe`,
 `--no-measure` to skip) for GPTQ/MLX/MX, and EXL3 packs Calib 3.0 to `-cd` + keeps its native allocator (the
@@ -68,7 +68,7 @@ MoE: pass a lower `--ngl` / compute the imatrix on a Q6_K host — see the cover
   numbers come from the measured path.
 - **Five output lanes** (same Pollard allocation, one command each): **GGUF** (llama.cpp) · **GPTQ**
   (vLLM/SGLang) · **MLX** (Apple Silicon, mixed 4/8; real emit needs `mlx_lm`) · **EXL3** (exllamav3,
-  Blackwell) · **MX** (NVFP4/MXFP4 on Blackwell FP4 cores, via llm-compressor). GGUF is the flagship;
+  Blackwell) · **MX** (NVFP4/MXFP4 on Blackwell/Vera Rubin FP4 cores, via llm-compressor; Rubin serves from vLLM's cu134-nightly image). GGUF is the flagship;
   the rest emit straight from HF weights. For a *specific* model, a one-line load in the target runtime
   is still the sensible final ship check.
 - ✅ **EXL3 low-bit WORKS — with preconditioning.** At low bit, run `pollard-hf-smooth` on the fp16 model
@@ -488,7 +488,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-serve-eval` | A/B a served quantized model against its baseline, on the same traffic | any |
 | `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
 | `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation | any |
-| `pollard-mx` | emit FP4/FP8 for Blackwell (NVFP4 default, MXFP4 export) | any |
+| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4 export; `--kv-fp8`, `--moe-protect-attn-only`) | any |
 | `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
 | `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
