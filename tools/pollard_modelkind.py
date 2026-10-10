@@ -115,8 +115,13 @@ _DECISION_NAME = re.compile(r"(^|[^a-z])(jev|openjev|nanojev|laya|semif)([^a-z]|
 
 
 def _is_decision(model, conf) -> bool:
-    """Card tags first (HF README front-matter or GGUF general.tags), then the names this family
-    ships under. Never from the architecture: OpenJev is a stock qwen35 body."""
+    """A decision HEAD first (clef: joint_head_config.json in the HF dir, a "<arch>.decision.*" block
+    in the GGUF), then card tags (HF README front-matter or GGUF general.tags), then the names this
+    family ships under. Never from the body's architecture alone: OpenJev is a stock qwen35 body."""
+    if os.path.isdir(str(model)) and os.path.isfile(os.path.join(model, "joint_head_config.json")):
+        return True
+    if isinstance(conf, dict) and any(".decision." in str(k) for k in conf):
+        return True
     tags = []
     if isinstance(conf, dict):
         t = conf.get("general.tags")

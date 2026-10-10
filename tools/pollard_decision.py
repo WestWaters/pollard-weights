@@ -173,9 +173,41 @@ def ask(base: str, prompt: str, post) -> dict:
     return {"token": content.get("token", ""), "top": content.get("top_logprobs") or []}
 
 
+def native(base: str) -> bool:
+    """True when the server says the model is a NATIVE decision model (a decision head, e.g. clef):
+    /v1/models lists "decisions" in output_modalities. Such a server only answers /v1/systemone --
+    clef cannot generate text at all, so the letter readout has nothing to read."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from pollard_bench import _get
+    try:
+        models = _get(base, "/v1/models").get("data") or []
+    except Exception:
+        return False
+    return any("decisions" in ((m.get("architecture") or {}).get("output_modalities") or []) for m in models)
+
+
+def ask_systemone(base: str, state: str, question: str, options: list[str], post) -> list[float]:
+    """One typed choice question through /v1/systemone; the option probabilities in option order.
+    One question per request: clef decides the questions of a request jointly, and the board compares
+    each question on its own."""
+    got = post(base, "/v1/systemone",
+               {"state": state, "questions": {"q": {"type": "choice", "instructions": question,
+                                                    "criteria": {o: None for o in options}}}})
+    probs = (((got.get("answers") or {}).get("q") or {}).get("probabilities") or {})
+    p = [float(probs.get(o, 0.0)) for o in options]
+    s = sum(p)
+    return [v / s for v in p] if s > 0 else [1.0 / len(options)] * len(options)
+
+
 def run(base: str, post, items=None) -> list[dict]:
     rows = []
+    head = native(base)
     for state, q, opts, ans in (items or DECISION_SET):
+        if head:
+            # the head's distribution is over the options by construction: there is no letter mass to lose
+            rows.append({"question": q, "options": opts, "answer": ans, "first": "",
+                         "probs": ask_systemone(base, state, q, opts, post), "mass": 1.0})
+            continue
         r = ask(base, build_prompt(state, q, opts), post)
         rows.append({"question": q, "options": opts, "answer": ans, "first": r["token"],
                      "probs": option_probs(letter_logprobs(r["top"]), len(opts)),
