@@ -498,19 +498,30 @@ def dirty_is_declared(tree):
     """True when a tree's uncommitted changes are exactly its live declared patches.
 
     Those are already stored in runtime-patches/, so a pre-update capture of them only writes the same patch
-    again under a new date -- every night, on every box. Any untracked source file, or any change that is
-    not one of the declared patches, still returns False, and is captured before the update as before."""
+    again under a new date -- every night, on every box. An untracked source file that no live patch creates,
+    or any change that is not one of the declared patches, still returns False, and is captured before the
+    update as before."""
     from pollard_runtime import untracked_sources
-    if untracked_sources(tree):
+    patches = [m for m in _patches_for(tree) if patch_is_live(tree, m)]
+    created = set()
+    for m in patches:
+        created |= set(re.findall(r"^diff --git a/.* b/(.*)\n(?:(?:old|new|deleted) mode .*\n)*new file mode",
+                                  open(m["_patch"], encoding="utf-8", errors="replace").read(), re.M))
+    new = untracked_sources(tree)
+    # A declared patch that adds a file (common/composed-sampler.cpp) leaves it untracked when it was applied
+    # directly rather than with --3way, and an untracked source file used to mean "undeclared work": the box
+    # re-captured all four declared llama.cpp patches as a 73 KB pre-update patch (2026-10-10). Files the live
+    # patches themselves create count as declared; intent-to-add puts their content into the diff compared below.
+    if any(f not in created for f in new):
         return False
+    if new:
+        _run(["git", "-C", tree, "add", "-N", "--"] + new, timeout=120)
     live = _run(["git", "-C", tree, "diff", "HEAD"], timeout=600).stdout or ""
     have = _changed_lines(live)
     if not have:
         return False
     want, want_files = {}, set()
-    for m in _patches_for(tree):
-        if not patch_is_live(tree, m):
-            continue
+    for m in patches:
         text = open(m["_patch"], encoding="utf-8", errors="replace").read()
         want_files |= _touched_files(text)
         for f, lines in _changed_lines(text).items():

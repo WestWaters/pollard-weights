@@ -84,3 +84,39 @@ def test_a_mode_only_change_beyond_the_patch_is_still_captured(monkeypatch):
         os.chmod(other, 0o755)
         _declare(monkeypatch, patch)
         assert not U.dirty_is_declared(tree), "a mode change beyond the declared patch must be captured"
+
+
+def _engine_with_new_file(tmp):
+    """A declared patch that edits a tracked file AND adds a new one (like composed-sampler.cpp)."""
+    tree, src, _ = _engine(tmp)
+    new = os.path.join(tree, "src", "sampler-new.cpp")
+    open(new, "w").write("int composed;\n")
+    _git(tree, "add", "-N", "src/sampler-new.cpp")
+    patch = os.path.join(tmp, "engine-new-file.patch")
+    open(patch, "w").write(subprocess.run(["git", "-C", tree, "diff", "HEAD"], capture_output=True, text=True).stdout)
+    _git(tree, "reset", "-q", "--", "src/sampler-new.cpp")          # applied directly: the new file is untracked
+    return tree, new, patch
+
+
+def test_a_new_file_the_declared_patch_creates_is_declared(monkeypatch):
+    """The box re-captured all four llama.cpp patches (73 KB) because composed-sampler.cpp was untracked."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tree, new, patch = _engine_with_new_file(tmp)
+        _declare(monkeypatch, patch)
+        assert U.dirty_is_declared(tree)
+
+
+def test_an_untracked_file_no_patch_creates_is_still_captured(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        tree, new, patch = _engine_with_new_file(tmp)
+        open(os.path.join(tree, "src", "my-work.cpp"), "w").write("int mine;\n")
+        _declare(monkeypatch, patch)
+        assert not U.dirty_is_declared(tree)
+
+
+def test_edits_inside_a_patch_created_file_are_still_captured(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        tree, new, patch = _engine_with_new_file(tmp)
+        open(new, "a").write("int extra_work;\n")
+        _declare(monkeypatch, patch)
+        assert not U.dirty_is_declared(tree)
