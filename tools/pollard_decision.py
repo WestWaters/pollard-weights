@@ -20,7 +20,7 @@ the option letters only, missing letters floored at -30.
 """
 from __future__ import annotations
 
-import argparse, json, math, os, sys
+import argparse, json, math, os, re, sys
 
 LETTERS = [chr(c) for c in range(65, 91)]
 READOUT_T = 1.1          # OpenJev helper default
@@ -114,6 +114,71 @@ def kl(p: list[float], q: list[float]) -> float:
     return sum(pi * math.log(max(pi, 1e-9) / max(qi, 1e-9)) for pi, qi in zip(p, q))
 
 
+CONFIDENT = 0.95       # "over95": a wrong answer given at >= this confidence
+
+
+def _argmax_conf(d: dict):
+    if not d:
+        return None, 0.0
+    k = max(d, key=d.get)
+    return k, float(d[k])
+
+
+def calibration(items, n_bins: int = 10) -> dict:
+    """Calibration of [(dist {option: p}, gold option)] against the gold labels.
+
+    Agreement and option KL say whether a rung moved; they do not say whether its probabilities still MEAN
+    what they say, and a decision model is sold on exactly that ("calibrated probabilities"). A rung can
+    agree with f16 on every argmax while pushing 0.7s to 0.97s -- an app that thresholds on confidence
+    then acts on answers it should have escalated. So, per build:
+
+      ece     10-bin, top-label: |accuracy - mean confidence| per confidence bin, weighted by bin size
+      brier   multi-class: sum over options of (p - onehot)^2, averaged
+      nll     -log p(gold), averaged (floored at 1e-12)
+      over95  of the WRONG answers, the share given at >= 0.95 confidence (the ones a threshold lets through)
+    """
+    n = len(items)
+    if not n:
+        return {}
+    bins = [[0, 0.0, 0.0] for _ in range(n_bins)]          # count, sum confidence, sum correct
+    brier = nll = 0.0
+    wrong = wrong_conf = 0
+    for dist, gold in items:
+        top, conf = _argmax_conf(dist)
+        ok = top is not None and str(top) == str(gold)
+        b = bins[min(int(conf * n_bins), n_bins - 1)]
+        b[0] += 1; b[1] += conf; b[2] += 1.0 if ok else 0.0
+        keys = set(dist) | {str(gold)}
+        brier += sum((float(dist.get(k, 0.0)) - (1.0 if k == str(gold) else 0.0)) ** 2 for k in keys)
+        nll += -math.log(max(float(dist.get(str(gold), 0.0)), 1e-12))
+        if not ok:
+            wrong += 1
+            wrong_conf += conf >= CONFIDENT
+    ece = sum(abs(c_ok - c_conf) for cnt, c_conf, c_ok in bins if cnt) / n
+    return {"ece": ece, "brier": brier / n, "nll": nll / n,
+            "over95": (wrong_conf / wrong) if wrong else 0.0, "over95_n": wrong_conf, "wrong": wrong}
+
+
+def bootstrap_ci(flags, b: int = 1000, seed: int = 0, alpha: float = 0.05):
+    """Paired bootstrap 95% CI for the mean of per-question 0/1 flags (here: rung agrees with the reference).
+    Resampling QUESTIONS keeps each rung/reference pair together -- the pairing is the point. Seeded, so a
+    board is reproducible."""
+    import random
+    n = len(flags)
+    if not n:
+        return (0.0, 0.0)
+    rng = random.Random(seed)
+    means = sorted(sum(flags[rng.randrange(n)] for _ in range(n)) / n for _ in range(b))
+    return (means[int(alpha / 2 * b)], means[min(int((1 - alpha / 2) * b), b - 1)])
+
+
+def _ref_calibration(out: dict, items, ref_items, agree_flags) -> None:
+    """With a reference: its calibration, the rung's ECE change, flips (argmax changes) and the agreement CI."""
+    rc = calibration(ref_items)
+    out.update({"ref_ece": rc.get("ece"), "delta_ece": out["ece"] - rc.get("ece", 0.0),
+                "flips": sum(1 for f in agree_flags if not f), "agreement_ci": list(bootstrap_ci(agree_flags))})
+
+
 def score_rows(rows: list[dict], ref: list[dict] | None = None) -> dict:
     """rows: [{probs, mass, answer}] for the build; ref: same for the f16. Returns the board."""
     n = len(rows)
@@ -131,6 +196,12 @@ def score_rows(rows: list[dict], ref: list[dict] | None = None) -> dict:
                     "option_kl": sum(kl(s["probs"], r["probs"]) for r, s in zip(rows, ref)) / n,
                     "mean_abs_drift": sum(sum(abs(a - b) for a, b in zip(r["probs"], s["probs"])) / len(r["probs"])
                                           for r, s in zip(rows, ref)) / n})
+    as_items = lambda rs: [({str(i): p for i, p in enumerate(r["probs"])}, str(r["answer"])) for r in rs]
+    out.update(calibration(as_items(rows)))
+    if ref:
+        am = lambda p: max(range(len(p)), key=p.__getitem__)
+        _ref_calibration(out, as_items(rows), as_items(ref),
+                         [1 if am(r["probs"]) == am(s["probs"]) else 0 for r, s in zip(rows, ref)])
     return out
 
 
@@ -301,6 +372,12 @@ def score_typed(rows, ref=None):
             "option_kl": sum(_dist_kl(s["dist"], r["dist"]) for r, s in zip(rows, ref)) / n,
             "mean_abs_drift": sum(sum(abs(r["dist"].get(k, 0.0) - s["dist"].get(k, 0.0)) for k in keys(r["dist"], s["dist"]))
                                   / max(len(keys(r["dist"], s["dist"])), 1) for r, s in zip(rows, ref)) / n})
+    # calibration against the gold LABEL (typed-decisions' gold is soft; its label is the argmax of it)
+    items = lambda rs: [(r["dist"], str(r["gold"].get("label"))) for r in rs]
+    out.update(calibration(items(rows)))
+    if ref:
+        _ref_calibration(out, items(rows), items(ref),
+                         [1 if argmax(r["dist"]) == argmax(s["dist"]) else 0 for r, s in zip(rows, ref)])
     return out
 
 
@@ -324,8 +401,81 @@ def _typed_rows_out(rows, ref):
     return out
 
 
+_PPLX = re.compile(r"pplx|decider|(^|[^a-z0-9])d3([^a-z0-9]|$)", re.I)
+
+
+def _source_config(model: str, source: str | None) -> dict | None:
+    """The source checkpoint's config.json: --source (a dir or the file), else one beside the GGUF."""
+    for cand in ([source] if source else []) + [os.path.dirname(os.path.abspath(model))]:
+        if not cand:
+            continue
+        p = os.path.join(cand, "config.json") if os.path.isdir(cand) else cand
+        if os.path.isfile(p):
+            try:
+                return json.load(open(p, encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+    return None
+
+
+def pregate_checks(meta: dict, cfg: dict | None = None) -> list[str]:
+    """Things the GGUF's own metadata says will make the board measure the wrong model. Warnings, not
+    failures: each is a converter/runtime gap, and the gate still runs so the damage is measured.
+
+      * clef-type (a decision head): Unsloth's FastDecisionModel exports the calibrated per-type temperatures
+        as `<arch>.decision.temperature.<type>`. Upstream's converter drops them, the head then answers at
+        T=1, and every probability is off while the argmax -- and so agreement -- can look fine.
+      * pplx-decider / d3-style: the source runs noncausal attention (config `attention_mode`). Upstream
+        llama.cpp runs pplx-decider v1.1 causally unless the GGUF says `<arch>.attention.causal = false`;
+        ~3 of 25 decisions flip.
+    """
+    warns = []
+    arch = str(meta.get("general.architecture", "") or "")
+    names = " ".join(str(meta.get(k, "")) for k in ("general.name", "general.basename", "general.architecture"))
+    head = any(".decision." in str(k) for k in meta)
+    if head or "clef" in names.lower():
+        temps = [k for k in meta if str(k).startswith(f"{arch}.decision.temperature.")]
+        if not temps:
+            warns.append(f"no `{arch}.decision.temperature.*` keys: the calibrated per-type temperatures were "
+                         "dropped in conversion (upstream's converter does; Unsloth FastDecisionModel exports them), "
+                         "so the head answers at T=1 and its probabilities are uncalibrated")
+    if _PPLX.search(names):
+        mode = str((cfg or {}).get("attention_mode", "")).lower().replace("-", "_")
+        noncausal = "noncausal" in mode or "non_causal" in mode or "bidirectional" in mode
+        causal_key = meta.get(f"{arch}.attention.causal",
+                              next((v for k, v in meta.items() if str(k).endswith("causal_attn")), None))
+        if cfg is None:
+            warns.append("pplx-decider / d3-style model and no source config.json to read `attention_mode` from "
+                         "(pass --source): cannot tell whether llama.cpp will run it with the right attention")
+        elif noncausal and causal_key is not False:
+            warns.append(f"source attention_mode is `{cfg.get('attention_mode')}` but the GGUF has no "
+                         f"`{arch}.attention.causal = false`: llama.cpp will run it causally (~3/25 decisions "
+                         "flip on pplx-decider v1.1)")
+    return warns
+
+
+def pregate(model: str, source: str | None = None) -> list[str]:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from pollard_calc import read_gguf_meta
+        meta = read_gguf_meta(model)
+    except Exception:
+        return []
+    return pregate_checks(meta, _source_config(model, source))
+
+
 def gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
-         limit: int = 0) -> dict:
+         limit: int = 0, source: str | None = None) -> dict:
+    """Pre-gate metadata checks, then the board (see _gate). Warnings ride along in the result."""
+    warns = pregate(model, source)
+    res = _gate(model, ngl, ctx, ref, qset, limit)
+    if warns:
+        res["warnings"] = warns
+    return res
+
+
+def _gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
+          limit: int = 0) -> dict:
     """Serve the build (and the reference), run the set on both, return the board + verdict in the
     same shape pollard-bench prints ("verdict", "rows", "reason").
 
@@ -385,6 +535,19 @@ def gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: st
             "sampling": ["--temp", "0"]}
 
 
+def board_calibration_line(b: dict) -> str:
+    """The calibration half of the board, one line."""
+    if "ece" not in b:
+        return ""
+    line = (f"calibration: ECE {b['ece']:.4f}  Brier {b['brier']:.4f}  NLL {b['nll']:.4f}  "
+            f"over95 {b['over95']:.0%} of {b['wrong']} wrong")
+    if "flips" in b:
+        lo, hi = b["agreement_ci"]
+        line += (f"  | vs ref: dECE {b['delta_ece']:+.4f}  flips {b['flips']}/{b['n']}  "
+                 f"agreement 95% CI [{lo:.1%}, {hi:.1%}]")
+    return line
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -397,8 +560,10 @@ def main() -> None:
                     help="question set: the 20 built-in questions, or the typed-decisions benchmark (2000 "
                          "decisions, native decision models; fetched once from the Hub and cached)")
     ap.add_argument("--limit", type=int, default=0, help="typed-decisions: only the first N states (smoke run)")
+    ap.add_argument("--source", help="the source checkpoint (HF dir or its config.json), for the pre-gate checks "
+                    "(attention mode); default: a config.json beside the GGUF")
     a = ap.parse_args()
-    res = gate(a.gguf, a.ngl, a.ctx, a.ref, a.qset, a.limit)
+    res = gate(a.gguf, a.ngl, a.ctx, a.ref, a.qset, a.limit, a.source)
     if a.json:
         print(json.dumps(res, indent=1)); return
     b = res.get("board", {})
@@ -410,6 +575,11 @@ def main() -> None:
             line += (f"  | vs ref: agreement {b['agreement']:.0%}  option KL {b['option_kl']:.4f}  "
                      f"drift {b['mean_abs_drift']:.3f}  (ref accuracy {b['ref_accuracy']:.0%})")
         print("  " + line)
+        cal = board_calibration_line(b)
+        if cal:
+            print("  " + cal)
+    for w in res.get("warnings") or []:
+        print(f"  WARNING: {w}")
     print(f"VERDICT: {res['verdict']} -- {res.get('reason', '')}")
     sys.exit(0 if res["verdict"] == "PASS" else 1)
 

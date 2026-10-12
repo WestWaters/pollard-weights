@@ -12,7 +12,7 @@ advertises something the repo does not ship:
   Prompt format            --prompt-format
   Multimodal               --mmproj
   Fill-in-the-middle       --fim (coder models)
-  Download a specific file  |  How to run
+  Download a specific file  |  How to run  |  Use it in your harness (pollard_harness.HARNESSES)
   imatrix (calibration)    --imatrix-file / --calib-file / --calib-note
   ARM / AVX  |  Errata  |  Credits & license
 
@@ -417,6 +417,22 @@ def parse_params_b(params, cfg):
     return round((12 * L * h * h + 2 * v * h) / 1e9, 2) if h and L else 0.0
 
 
+TOOLCALL_MIN_RATE = 0.75      # pollard-toolcall's own --min-rate default
+
+
+def agent_ready_cell(tc):
+    """'yes (95%)' / 'no (60%)' / '--' from a pollard-toolcall result ({pass, rate} or its score {rate})."""
+    if not isinstance(tc, dict):
+        return "--"
+    rate = tc.get("rate")
+    ok = tc.get("pass")
+    if ok is None and rate is not None:
+        ok = float(rate) >= TOOLCALL_MIN_RATE
+    if ok is None:
+        return "--"
+    return ("yes" if ok else "no") + (f" ({float(rate):.0%})" if rate is not None else "")
+
+
 def _fmt_kl(v):
     """Option KL spans 1e-5 (Q6_K) to 1e-1 (2-bit): two significant figures keep every rung readable."""
     if v is None:
@@ -430,15 +446,21 @@ def decision_section(builds, results):
     readout (pollard-decision). Agreement = same answer as the f16; option KL = how far the option
     probabilities moved; drift = mean absolute change per option."""
     rows, n = [], None
-    for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
-        r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}
-        d = r.get("decision")
+    boards = [(b, (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("decision"))
+              for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
+    # calibration columns only when the boards carry them (pollard-decision since 2026-10-11): older
+    # results files have none, and an all-"--" column would read as "measured, nothing there"
+    has_ece = any(isinstance(d, dict) and d.get("ece") is not None for _, d in boards)
+    has_flips = any(isinstance(d, dict) and d.get("flips") is not None for _, d in boards)
+    for b, d in boards:
         if not isinstance(d, dict):
             continue
         n = n or d.get("n")
         f = lambda k, fmt: (fmt.format(float(d[k])) if d.get(k) is not None else "--")
+        extra = (f" {f('ece', '{:.4f}')} |" if has_ece else "") + \
+                (f" {d['flips']} |" if has_flips and d.get("flips") is not None else (" -- |" if has_flips else ""))
         rows.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {f('agreement', '{:.0%}')} | "
-                    f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |")
+                    f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |{extra}")
     asked = f"the same {n} typed questions" if n else "the same typed questions"
     qset = next((str((r or {}).get("decision", {}).get("set") or "") for r in results.values()
                  if isinstance(r, dict) and isinstance(r.get("decision"), dict)), "")
@@ -452,10 +474,15 @@ def decision_section(builds, results):
             f"probability per option, so it is measured on its decisions, not on text. Each rung and the {ref} "
             f"answered {asked} through llama-server's `/v1/systemone`, read the same way "
             "([pollard-decision](https://github.com/WestWaters/pollard-weights)).", "",
-            f"| file | size | agrees with {ref} | option KL vs {ref} | mean prob. drift | accuracy |",
-            "|---|---:|---:|---:|---:|---:|", *rows, "",
+            f"| file | size | agrees with {ref} | option KL vs {ref} | mean prob. drift | accuracy |"
+            + (" ECE |" if has_ece else "") + (f" flips vs {ref} |" if has_flips else ""),
+            "|---|---:|---:|---:|---:|---:|" + ("---:|" if has_ece else "") + ("---:|" if has_flips else ""),
+            *rows, "",
             f"_Agrees = the rung picks the same option as the {ref}. Option KL = how far its option "
-            f"probabilities moved from the {ref}'s (0 = identical); it is the number that separates the rungs._",
+            f"probabilities moved from the {ref}'s (0 = identical); it is the number that separates the rungs._"
+            + (" _ECE = expected calibration error against the gold labels (10 bins, top label; lower = its "
+               "confidence means what it says)._" if has_ece else "")
+            + (f" _Flips = decisions whose answer differs from the {ref}'s._" if has_flips else ""),
             ""]
 
 
@@ -770,12 +797,19 @@ def main():
     mixed = bool(ik_builds) and len(ik_builds) != len(runtimes)
     rt_h = " runs in |" if mixed else ""
     rt_s = "---|" if mixed else ""
+    # agent-ready: whether the rung still emits valid tool calls (pollard-toolcall), when the results carry
+    # it. A quant can keep its perplexity and lose the narrow band of layers that formats tool calls, and
+    # an agent harness is exactly where that shows -- so it is a column, not a footnote. Never measured here.
+    has_tc = any(isinstance((results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("toolcall"),
+                            dict) for b in builds)
+    tc_h = " agent-ready |" if has_tc else ""
+    tc_s = "---|" if has_tc else ""
     if decision:
         out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h} notes |",
                 f"|---|---:|---:|---:|{rt_s}---|"]
     else:
-        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h} notes |",
-                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}---|"]
+        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h}{tc_h} notes |",
+                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}{tc_s}---|"]
     _ordered = sorted(builds, key=lambda x: (x.get("bytes") or 0))
     _rec = pick_recommended(
         [(i, results.get(b.get("name", ""), results.get(b.get("tag", ""), {})).get("ppl"))
@@ -799,12 +833,16 @@ def main():
             out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {ag} | "
                        f"{_fmt_kl(d.get('option_kl'))} |{rt_c} {note} |")
             continue
+        tc_c = f" {agent_ready_cell(r.get('toolcall'))} |" if has_tc else ""
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{_fmt_num(_kld)} |{t1_c}{rt_c} {note} |")
+                   f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c} {note} |")
     if has_top1:
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
                 "one the f16 would have picked (llama-perplexity's `Same top p`). Higher is closer "
                 "to the original model._"]
+    if has_tc and not decision:
+        out += ["", "_Agent-ready = the rung still writes valid tool calls ([pollard-toolcall]"
+                "(https://github.com/WestWaters/pollard-weights): format validity on its tool-call probes)._"]
     if has_tps:
         hw = results.get("_hw")
         out.append("")
@@ -913,6 +951,17 @@ def main():
     if "mlx" in lanes:
         out += ["```bash", f'mlx_lm.generate --model {repo} --prompt "Hello"', "```", ""]
     out += vllm_serve_block(repo, lanes)
+
+    # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
+    # prints from, so the card and the CLI cannot drift apart
+    if "gguf" in lanes and builds:
+        import pollard_harness as PH
+        rt_ex = runtimes.get(ex.get("path"))
+        stock_rungs = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
+        stock_tag = extag if rt_ex == "stock" else \
+            (max(stock_rungs, key=lambda b: (b.get("bytes") or 0)).get("tag") if stock_rungs else None)
+        needs = {"ik_llama": "ik_llama.cpp", "fork": fork_plain, "newer": "a current llama.cpp"}.get(rt_ex)
+        out += PH.card_section(repo, exn, extag or None, decision=decision, stock_tag=stock_tag, needs=needs)
 
     # ---- imatrix / calibration: what the allocation was measured on
     if a.imatrix_file:

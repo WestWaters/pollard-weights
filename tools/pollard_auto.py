@@ -27,6 +27,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
     pollard tune --base Qwen/Qwen3.5-9B --data cases.csv --out runs/x --ship   # fine-tune + eval + ship (pollard-tune)
+    pollard serve Org/Model:Q4_K_M --harness claude-code       # run a rung for an agent harness (pollard-serve)
 
 EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix -> measured automap mix
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
@@ -749,6 +750,11 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "tune":
         from pollard_tune import main as tune_main
         sys.exit(tune_main(sys.argv[2:]))
+    # `pollard serve ...` -- the build's other half: run a rung for an agent harness (pollard_harness).
+    # Dispatched before argparse, which would otherwise reject the positional as an unknown argument.
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        from pollard_harness import main as serve_main
+        sys.exit(serve_main(sys.argv[2:]))
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
     ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir -- Pollard downloads/converts/"
