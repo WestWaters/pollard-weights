@@ -405,3 +405,17 @@ def test_endpoint_merges_provider_fields():
                     post=lambda url, body: seen.update(body) or {"choices": [{"message": {"content": "legit"}}]})
     assert ep.generate([{"role": "user", "content": "x"}])[0] == "legit"
     assert seen["reasoning_effort"] == "none" and seen["temperature"] == 0
+
+
+def test_ship_keeps_the_rungs_a_failed_flagship_step_left(tmp_path, monkeypatch):
+    """The Mac smoke run: Q6_K built, then the IQ1_KT flagship step died (no ik_llama) and `pollard` exited 1."""
+    a = _prepped(tmp_path)
+    run = tmp_path / "run"
+    json.dump({"merged": str(run / "m"), "base": "b"}, open(run / "train.json", "w"))
+    import pollard_workspace as ws
+    monkeypatch.setattr(ws, "read_manifest", lambda k: {"builds": [{"lane": "gguf", "tag": "Q6_K", "path": "/w/m-Q6_K.gguf"}]})
+    line = T.ship(a, run_cmd=lambda c: 1 if c[0] == "pollard" else 0)
+    assert "/w/m-Q6_K.gguf" in line
+    monkeypatch.setattr(ws, "read_manifest", lambda k: {"builds": []})
+    with pytest.raises(SystemExit, match="built no rung"):
+        T.ship(a, run_cmd=lambda c: 1 if c[0] == "pollard" else 0)

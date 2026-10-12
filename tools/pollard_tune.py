@@ -1259,14 +1259,20 @@ def ship(a, run_cmd=None):
     info = json.load(open(os.path.join(run, "data", "prep.json")))
     report = os.path.join(run, "eval", "report.md")
     run_cmd = run_cmd or (lambda cmd: subprocess.run(_tool(cmd)).returncode)
-    print(f"== pollard-tune ship :: {merged}")
+    print(f"== pollard-tune ship :: {merged}", flush=True)
     # preflight first: seconds, no weights -- the build must not die an hour in on a converter gap
     if run_cmd(["pollard-smoke", "--model", merged]) != 0 and not a.force:
         sys.exit("pollard-smoke says this checkpoint will not build here (above). Fix that, or --force.")
     rc = run_cmd(["pollard", "--hf", merged, "--run", "--ladder"] + (["--force"] if a.force else []))
-    if rc != 0:
-        sys.exit(f"`pollard --hf {merged} --run --ladder` failed (exit {rc})")
     f16 = os.path.join(os.path.dirname(merged), os.path.basename(merged.rstrip("/")) + "-f16.gguf")
+    builds = _workspace_builds(f16)
+    if rc != 0:
+        # The ladder can build its K-quant rungs and then fail on the optional flagship step (the Mac smoke run:
+        # Q6_K built, the IQ1_KT automap mix then died with no ik_llama here). The rungs that exist are shippable.
+        if not builds:
+            sys.exit(f"`pollard --hf {merged} --run --ladder` failed (exit {rc}) and built no rung")
+        print(f"   WARNING: the ladder exited {rc} after building {len(builds)} rung(s) ("
+              + ", ".join(str(b.get('tag') or b.get('name')) for b in builds) + ") -- carding and serving those", flush=True)
     temps = tp.get("temperatures") or {}
     if temps and os.path.exists(f16):
         _check_decision_temps(f16, temps)
@@ -1278,12 +1284,7 @@ def ship(a, run_cmd=None):
         card += ["--license", a.license]
     if run_cmd(card) != 0:
         print("   (card step failed -- the builds are fine; re-run pollard-card with --extra-md eval/report.md)")
-    try:
-        import pollard_workspace as ws
-        builds = ws.read_manifest(f16).get("builds", [])
-    except Exception:
-        builds = []
-    rung = pick_rung(builds)
+    rung = pick_rung(builds or _workspace_builds(f16))
     line = serve_line(rung["path"] if rung else f"<{os.path.basename(merged)} rung>.gguf", a.harness,
                       info["task"] == "decision")
     print("\n   serve it:\n     " + line)
@@ -1292,6 +1293,14 @@ def ship(a, run_cmd=None):
         print(f"   the system prompt it was trained with is in {agent} -- serve with THAT prompt; a different one is a "
               "different agent (and the eval no longer describes it)")
     return line
+
+
+def _workspace_builds(f16):
+    try:
+        import pollard_workspace as ws
+        return [b for b in ws.read_manifest(f16).get("builds", []) if b.get("lane", "gguf") == "gguf"]
+    except Exception:
+        return []
 
 
 def _check_decision_temps(f16, temps):
