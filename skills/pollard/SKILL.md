@@ -288,6 +288,8 @@ pollard-tune ship --out runs/risk --harness claude-code                       # 
 ```
 LoRA/QLoRA on mlx (Apple Silicon), TRL+PEFT or Unsloth (CUDA); the eval compares base vs tuned (vs
 `--compare-url`) on a leak-checked held-out split: per-class P/R/F1, dollar-weighted recall, latency P50/P99.
+`--method grpo` / `sft+grpo` trains with RL on a class-balanced label reward instead of (or after) SFT
+(mlx-lm-lora on a Mac, TRL GRPOTrainer elsewhere); chat data stays SFT-only.
 
 ## Runtime targets (where the build will actually run)
 
@@ -466,7 +468,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-ngram` | n-gram / per-layer embedding tables on the SSD: inspect, launch line, swap watch (`pollard-fit --disk`) | models with a lookup table |
 | `pollard-forge` | make your own model: new architecture, Minitron-style prune, pretrain / distill, lineage card | any decoder-only |
-| `pollard-tune` | fine-tune on YOUR data (LoRA/QLoRA: mlx / TRL / Unsloth), eval base vs tuned vs frontier, ship + serve | any HF causal LM |
+| `pollard-tune` | fine-tune on YOUR data (LoRA/QLoRA SFT and/or GRPO: mlx / TRL / Unsloth), eval base vs tuned vs frontier, ship + serve | any HF causal LM |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
 | `pollard-experts` | measured hot-expert report | **MoE only** |

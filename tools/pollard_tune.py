@@ -23,6 +23,10 @@ prep   -- (a) chat SFT jsonl {messages}, (b) classifier jsonl/csv (input -> labe
 train  -- LoRA / QLoRA SFT. Backends: mlx (mlx-lm, Apple Silicon), trl (TRL + PEFT, CUDA/CPU), unsloth (CUDA;
           for typed-decisions it trains Unsloth's FastDecisionModel clef head). Checkpoints + --resume, loss log,
           then the adapter is merged into a full HF checkpoint with forge.json lineage.
+          --method grpo: RL instead (Coinbase's recipe): sampled answers scored by a deterministic reward -- the
+          parsed label against the gold one, weighted by inverse class frequency so a constant answer cannot win,
+          plus a small format term. mlx-lm-lora on Apple Silicon, TRL GRPOTrainer (+ Unsloth) elsewhere.
+          --method sft+grpo: SFT first, then GRPO from the SFT checkpoint.
 eval   -- base vs tuned (vs --compare-url) on the held-out test split. classify: per-class P/R/F1, confusion,
           weighted recall (--weight-field: Coinbase's dollar-weighted recall), latency P50/P99. chat: exact /
           contains (+ --judge-url). decision: accuracy, KL from the gold distribution, ECE.
@@ -41,6 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TASKS = ("chat", "classify", "decision")
 BACKENDS = ("mlx", "trl", "unsloth")
+METHODS = ("sft", "grpo", "sft+grpo")
 DEFAULT_INSTRUCTIONS = "You review one case and classify it."
 DECISION_SYSTEM = ("You make one typed decision about a state. Answer with exactly one option name and nothing else.")
 INPUT_KEYS = ("input", "text", "prompt", "case", "transaction", "content", "features", "question")
@@ -379,6 +384,9 @@ def prep(a):
     _write_jsonl(os.path.join(dd, "train.jsonl"), [{"messages": e["messages"]} for e in tr])
     _write_jsonl(os.path.join(dd, "valid.jsonl"), [{"messages": e["messages"]} for e in (va or tr[:max(1, len(tr) // 20)])])
     _write_jsonl(os.path.join(dd, "heldout.jsonl"), [_public(e) for e in te])
+    # GRPO scores sampled answers against the label (and weight / gold), which the pure {messages} files drop
+    _write_jsonl(os.path.join(dd, "train-rl.jsonl"), [_public(e) for e in tr])
+    _write_jsonl(os.path.join(dd, "valid-rl.jsonl"), [_public(e) for e in va])
     positive = a.positive
     if task == "classify" and not positive:
         allc = balance_counts(tr + va + te)
@@ -442,9 +450,12 @@ def _cuda():
         return False
 
 
-def pick_backend(want, task, has=_has, cuda=_cuda, platform=sys.platform):
+def pick_backend(want, task, has=_has, cuda=_cuda, platform=sys.platform, method="sft"):
     """auto: a decision set on a CUDA box with Unsloth -> its FastDecisionModel (a clef head with calibrated
-    temperatures); Apple Silicon -> mlx; otherwise TRL+PEFT; Unsloth last for chat/classify (it needs CUDA)."""
+    temperatures); Apple Silicon -> mlx; otherwise TRL+PEFT; Unsloth last for chat/classify (it needs CUDA).
+    method grpo: mlx needs mlx-lm-lora (mlx-lm has no GRPO trainer); trl / unsloth run TRL's GRPOTrainer."""
+    if method != "sft":
+        return _pick_grpo_backend(want, has, cuda, platform)
     if want and want != "auto":
         need = {"mlx": "mlx_lm", "trl": "trl", "unsloth": "unsloth"}[want]
         if not has(need) or (want == "trl" and not has("peft")):
@@ -463,6 +474,24 @@ def pick_backend(want, task, has=_has, cuda=_cuda, platform=sys.platform):
              "   (optional, CUDA: pip install unsloth)")
 
 
+def _pick_grpo_backend(want, has, cuda, platform):
+    need = {"mlx": ("mlx_lm_lora",), "trl": ("trl", "peft"), "unsloth": ("unsloth", "trl")}
+    pip = {"mlx": "mlx-lm-lora", "trl": "trl peft", "unsloth": "unsloth trl"}
+    if want and want != "auto":
+        if not all(has(m) for m in need[want]):
+            sys.exit(f"--backend {want} --method grpo is not installed here: pip install {pip[want]}"
+                     + ("   (mlx-lm has no GRPO trainer; mlx-lm-lora adds one)" if want == "mlx" else ""))
+        return want
+    if platform == "darwin" and has("mlx_lm_lora"):
+        return "mlx"
+    if has("trl") and has("peft"):
+        return "trl"
+    if has("unsloth") and has("trl") and cuda():
+        return "unsloth"
+    sys.exit("no GRPO backend installed. Apple Silicon: pip install mlx-lm-lora   CUDA/CPU/MPS: pip install trl peft"
+             "   (optional, CUDA: pip install unsloth)")
+
+
 def _n_lines(p):
     return sum(1 for l in open(p, encoding="utf-8") if l.strip()) if os.path.exists(p) else 0
 
@@ -472,13 +501,22 @@ def plan_iters(n_train, epochs, batch, iters=None):
 
 
 LOSS_RE = re.compile(r"Iter (\d+): (Train|Val) loss ([0-9.]+|nan)", re.I)
+# mlx-lm >= 0.32 prints a table instead: "     5    1.954 <arrow>       23      0.1k" / "    60    val 0.046    1.48s"
+TABLE_VAL_RE = re.compile(r"^\s*(\d+)\s+val\s+([0-9.]+|nan)\s+[0-9.]+s\s*$")
+TABLE_TRAIN_RE = re.compile(r"^\s*(\d+)\s+([0-9.]+|nan)\s*[\u25bc\u25b2=-]?\s+[0-9.]+\s+[0-9.]+[kKMG]?\s*$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def parse_mlx_line(line):
     m = LOSS_RE.search(line)
-    if not m:
-        return None
-    return {"step": int(m.group(1)), "split": m.group(2).lower(), "loss": float(m.group(3))}
+    if m:
+        return {"step": int(m.group(1)), "split": m.group(2).lower(), "loss": float(m.group(3))}
+    t = ANSI_RE.sub("", line)
+    for rx, split in ((TABLE_VAL_RE, "val"), (TABLE_TRAIN_RE, "train")):
+        m = rx.match(t)
+        if m:
+            return {"step": int(m.group(1)), "split": split, "loss": float(m.group(2))}
+    return None
 
 
 def _spawn(cmd, log_cb=None, env=None):
@@ -523,22 +561,21 @@ def local_model(model):
         return model
 
 
-def train_mlx(a, run, n_train, spawn=_spawn):
-    dd, ad = os.path.join(run, "data"), os.path.join(run, "adapter")
-    os.makedirs(ad, exist_ok=True)
-    total = plan_iters(n_train, a.epochs, a.batch, a.iters)
-    base = local_model(a.base)
-    if a.qlora:
-        # QLoRA on mlx = LoRA on a 4-bit mlx copy of the base, then fuse --dequantize. The merged weights are the
-        # dequantized 4-bit base + the adapter, not the original bf16 -- recorded in lineage so nobody confuses them.
-        qd = os.path.join(run, "base-q4")
-        if not os.path.exists(os.path.join(qd, "config.json")):
-            rc = spawn([sys.executable, "-m", "mlx_lm", "convert", "--hf-path", base, "--mlx-path", qd, "-q"])
-            if rc:
-                sys.exit("mlx_lm convert -q failed")
-        base = qd
-    cfg = os.path.join(run, "lora.yaml")
-    open(cfg, "w").write(f"lora_parameters:\n  rank: {a.rank}\n  scale: {a.alpha / a.rank}\n  dropout: {a.dropout}\n")
+def _mlx_base(a, run, base, spawn, qdir="base-q4"):
+    """QLoRA on mlx = LoRA on a 4-bit mlx copy of the base, then fuse --dequantize. The merged weights are the
+    dequantized 4-bit base + the adapter, not the original bf16 -- recorded in lineage so nobody confuses them."""
+    if not a.qlora:
+        return base
+    qd = os.path.join(run, qdir)
+    if not os.path.exists(os.path.join(qd, "config.json")):
+        rc = spawn([sys.executable, "-m", "mlx_lm", "convert", "--hf-path", base, "--mlx-path", qd, "-q"])
+        if rc:
+            sys.exit("mlx_lm convert -q failed")
+    return qd
+
+
+def _mlx_resume_point(a, ad):
+    """-> (steps done, adapter file to resume from, progress file)."""
     done, ck = _latest_ckpt(ad) if a.resume else (0, None)
     prog = os.path.join(ad, "pollard-progress.json")
     if a.resume and os.path.exists(prog) and os.path.exists(os.path.join(ad, "adapters.safetensors")):
@@ -547,6 +584,22 @@ def train_mlx(a, run, n_train, spawn=_spawn):
         fin = json.load(open(prog)).get("done", 0)
         if fin > done:
             done, ck = fin, os.path.join(ad, "adapters.safetensors")
+    return done, ck, prog
+
+
+def _lora_yaml(a, path, extra=""):
+    open(path, "w").write(f"lora_parameters:\n  rank: {a.rank}\n  scale: {a.alpha / a.rank}\n  dropout: {a.dropout}\n"
+                          + extra)
+
+
+def train_mlx(a, run, n_train, spawn=_spawn):
+    dd, ad = os.path.join(run, "data"), os.path.join(run, "adapter")
+    os.makedirs(ad, exist_ok=True)
+    total = plan_iters(n_train, a.epochs, a.batch, a.iters)
+    base = _mlx_base(a, run, local_model(a.base), spawn)
+    cfg = os.path.join(run, "lora.yaml")
+    _lora_yaml(a, cfg)
+    done, ck, prog = _mlx_resume_point(a, ad)
     left = max(0, total - done)
     log_p = os.path.join(run, "train-log.jsonl")
     losses = []
@@ -703,6 +756,360 @@ def train_unsloth(a, run, n_train, task):
             "adapter": os.path.join(run, "adapter"), "base_used": "unsloth"}
 
 
+# ===================================================================================== GRPO
+# Coinbase's winning fraud model was RL, not SFT: GRPO + LoRA with a deterministic reward computed from historical
+# outcomes, balanced across fraud and legitimate rows so a constant answer cannot win. Here the reward is the same
+# label parser the eval uses, so what is rewarded is exactly what is measured.
+GRPO_CHAT_REFUSAL = ("--method grpo needs a verifiable reward, and chat SFT data has none (a reply is not right or "
+                     "wrong against a label). Use --method sft, or prep a classify / decision set.")
+
+
+def _lnorm(s):
+    return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+
+def class_weights(labels_seen):
+    """Inverse class frequency, scaled so the data-weighted mean weight is 1. Then the expected correctness reward
+    over the prompts is the balanced accuracy (mean per-class recall): 1.0 for a perfect policy, exactly 1/K for
+    any constant answer AND for a uniform random guess -- at a 10% base rate, "always legit" earns 0.5, not 0.9."""
+    c = Counter(labels_seen)
+    n, k = sum(c.values()), len(c)
+    return {lab: n / (k * v) for lab, v in sorted(c.items())} if k else {}
+
+
+def value_multipliers(rows, cap=10.0):
+    """--value-reward: a row's correctness reward scaled by its value (amount) over its CLASS mean, capped. Per-class
+    normalisation keeps each class's mean multiplier at 1, so value weighting does not undo the class balance."""
+    by = {}
+    for r in rows:
+        if r.get("weight") is not None:
+            by.setdefault(r.get("label"), []).append(float(r["weight"]))
+    mean = {k: sum(v) / len(v) for k, v in by.items() if v}
+    return [min(cap, float(r["weight"]) / mean[r.get("label")]) if r.get("weight") is not None and mean.get(r.get("label"))
+            else 1.0 for r in rows]
+
+
+def correct_reward(text, row, cfg):
+    """The verifiable part: parse the label the way eval does. classify -> class weight (x value multiplier) when
+    right, 0 when wrong or unparsed. decision -> the gold probability of the chosen option when the row has soft
+    gold (a 0.7/0.3 case is not all-or-nothing), else 1/0 against the gold label."""
+    opts = row.get("options") or cfg.get("labels") or []
+    p = parse_label(text, opts)
+    if p is None:
+        return 0.0
+    gold = row.get("gold")
+    if isinstance(gold, str):
+        gold = json.loads(gold) if gold else {}
+    if cfg.get("task") == "decision" and gold:
+        return float(gold.get(p, 0.0))
+    if p != row.get("label"):
+        return 0.0
+    return float((cfg.get("class_weights") or {}).get(row.get("label"), 1.0)) * float(row.get("vmult") or 1.0)
+
+
+def format_reward(text, labels, cfg):
+    """+bonus for exactly a label (plus one reason line when the agent was trained with reasons), 0 for a label
+    wrapped in extra text, -2x bonus for an unparseable reply or leaked <think>. Small next to correctness, and
+    the same for every valid label -- so it shapes the output contract without favouring a class."""
+    b = float(cfg.get("format_bonus", 0.1))
+    raw = text or ""
+    if "<think>" in raw or "</think>" in raw:
+        return -2 * b
+    if parse_label(raw, labels) is None:
+        return -2 * b
+    lines = [l for l in raw.strip().splitlines() if l.strip()]
+    ok = {_lnorm(l) for l in labels}
+    if lines and _lnorm(lines[0]) in ok and len(lines) <= (2 if cfg.get("with_reason") else 1):
+        return b
+    return 0.0
+
+
+def expected_reward(rows, answer, cfg):
+    """Mean correctness reward of a policy (row -> reply text) over rows. Used by the tests and the run header."""
+    return sum(correct_reward(answer(r), r, cfg) for r in rows) / max(1, len(rows))
+
+
+def grpo_rows(run, task):
+    """The GRPO prompts: the TRAIN split with its labels (data/train-rl.jsonl from prep). A run prepped before
+    that file existed falls back to train.jsonl, reading a classify label off the answer's first line."""
+    dd = os.path.join(run, "data")
+    p = os.path.join(dd, "train-rl.jsonl")
+    if os.path.exists(p):
+        rows = [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()]
+    elif task == "classify":
+        rows = [{"messages": r["messages"], "label": r["messages"][-1]["content"].splitlines()[0].strip()}
+                for r in (json.loads(l) for l in open(os.path.join(dd, "train.jsonl"), encoding="utf-8") if l.strip())]
+    else:
+        sys.exit("GRPO needs the labelled train rows (data/train-rl.jsonl): re-run `pollard-tune prep`")
+    return _with_prompt(rows)
+
+
+def grpo_valid_rows(run):
+    p = os.path.join(run, "data", "valid-rl.jsonl")
+    return _with_prompt([json.loads(l) for l in open(p, encoding="utf-8") if l.strip()] if os.path.exists(p) else [])
+
+
+def _with_prompt(rows):
+    """classify / decision rows are one system + one user turn: GRPO samples the answer to that."""
+    for r in rows:
+        m = r["messages"]
+        r["system"] = m[0]["content"] if m and m[0]["role"] == "system" else ""
+        r["prompt"] = next(x["content"] for x in reversed(m[:-1]) if x["role"] == "user")
+    return rows
+
+
+def reward_config(rows, task, info, agent, a, balance_via):
+    with_reason = "reason" in str((agent or {}).get("output", ""))
+    cw = class_weights([r["label"] for r in rows]) if task == "classify" else {}
+    return {"task": task, "labels": info.get("labels") or [], "class_weights": cw,
+            "format_bonus": a.format_bonus, "with_reason": with_reason, "balance_via": balance_via,
+            "value_field": info.get("weight_field") if a.value_reward else None}
+
+
+def completion_len(a, cfg):
+    return a.max_completion_length or (8 if cfg["task"] == "decision" else 64 if cfg["with_reason"] else 16)
+
+
+def _grpo_record(step, loss=None, reward=None, correct=None, fmt=None, kl=None, group_std=None):
+    """group_std: the mean within-prompt reward spread. 0 means every sample of a prompt scored the same, so the
+    advantages are all 0 and nothing is learned -- a collapsed policy (or a solved set)."""
+    return {"step": step, "split": "train", "loss": loss, "reward": reward, "correct": correct, "format": fmt, "kl": kl,
+            "group_std": group_std}
+
+
+GRPO_ITER_RE = re.compile(r"(?:^|\s)Iter (\d+):\s*$")
+GRPO_FIELD_RE = {"loss": re.compile(r"^\s*Loss: ([-0-9.e+]+|nan)"),
+                 "reward": re.compile(r"Total Rewards:\s+\S+=([-0-9.e+]+|nan)"),
+                 "kl": re.compile(r"KL Divergence: ([-0-9.e+]+|nan)"),
+                 "group_std": re.compile(r"Group Rewards:\s+\S+=[-0-9.e+]+, \S+=([-0-9.e+]+|nan)"),
+                 "correct": re.compile(r"pollard_correct: \S+=([-0-9.e+]+|nan)"),
+                 "format": re.compile(r"pollard_format: \S+=([-0-9.e+]+|nan)")}
+
+
+class GrpoLogParser:
+    """mlx_lm_lora prints a GRPO report as a block: `Iter N:` alone on a line, then Loss / Total Rewards / KL /
+    one line per reward function. Feed it lines; .records holds one dict per report (val losses too)."""
+
+    def __init__(self, offset=0):
+        self.offset, self.records, self.cur = offset, [], None
+
+    def feed(self, line):
+        v = parse_mlx_line(line)
+        if v:
+            v["step"] += self.offset
+            self.records.append(v)
+            return
+        m = GRPO_ITER_RE.search(line.rstrip("\n"))
+        if m:
+            self.cur = _grpo_record(int(m.group(1)) + self.offset)
+            return
+        if self.cur is None:
+            return
+        for k, rx in GRPO_FIELD_RE.items():
+            f = rx.search(line)
+            if f:
+                self.cur[k] = float(f.group(1))
+                if k == "reward":
+                    self.records.append(self.cur)
+
+
+MLX_REWARD_FILE = '''# written by pollard-tune: the GRPO reward for mlx_lm_lora.train --reward-functions-file
+import json, sys
+sys.path.insert(0, {tools!r})
+import pollard_tune as T
+from mlx_lm_lora.trainer.grpo_reward_functions import register_reward_function
+
+CFG = json.load(open({cfg!r}))
+
+
+def _rows(answer, types):
+    types = types or [None] * len(answer)
+    return [json.loads(t) if isinstance(t, str) and t else {{"label": a}} for a, t in zip(answer, types)]
+
+
+@register_reward_function()
+def pollard_correct(prompts, completions, answer, types=None):
+    return [T.correct_reward(c, r, CFG) for c, r in zip(completions, _rows(answer, types))]
+
+
+@register_reward_function()
+def pollard_format(prompts, completions, answer, types=None):
+    return [T.format_reward(c, r.get("options") or CFG["labels"], CFG) for c, r in zip(completions, _rows(answer, types))]
+'''
+
+
+def _row_info(r):
+    return {"label": r["label"], "options": r.get("options"), "gold": r.get("gold") or {}, "vmult": r.get("vmult", 1.0)}
+
+
+def train_mlx_grpo(a, run, rows, cfg, steps, init=None, spawn=_spawn):
+    """mlx-lm-lora's GRPO trainer (`mlx_lm_lora.train --train-mode grpo`) with our reward loaded through its
+    --reward-functions-file hook, then `mlx_lm fuse` exactly like the SFT path."""
+    gd, ad = os.path.join(run, "data-grpo"), os.path.join(run, "adapter-grpo")
+    os.makedirs(gd, exist_ok=True)
+    os.makedirs(ad, exist_ok=True)
+    as_mlx = lambda r: {"prompt": r["prompt"], "system": r["system"], "answer": r["label"],
+                        "type": json.dumps(_row_info(r))}
+    _write_jsonl(os.path.join(gd, "train.jsonl"), [as_mlx(r) for r in rows])
+    val = grpo_valid_rows(run)[:max(1, a.batch * 2)]
+    if val:
+        _write_jsonl(os.path.join(gd, "valid.jsonl"), [as_mlx(r) for r in val])
+    cfg_p, rf = os.path.join(run, "reward.json"), os.path.join(run, "pollard_reward.py")
+    json.dump(cfg, open(cfg_p, "w"), indent=1)
+    open(rf, "w").write(MLX_REWARD_FILE.format(tools=os.path.dirname(os.path.abspath(__file__)), cfg=cfg_p))
+    start = local_model(init or a.base)
+    base = _mlx_base(a, run, start, spawn, "sft-q4" if init else "base-q4")
+    yml = os.path.join(run, "lora-grpo.yaml")
+    _lora_yaml(a, yml, "fuse: false\n")         # mlx_lm_lora fuses INTO the adapter dir by default; we fuse ourselves
+    done, ck, prog = _mlx_resume_point(a, ad)
+    left = max(0, steps - done)
+    log_p = os.path.join(run, "grpo-log.jsonl")
+    prev = []
+    if a.resume and os.path.exists(log_p):
+        prev = [r for r in (json.loads(l) for l in open(log_p) if l.strip()) if r["step"] <= done]
+    parser = GrpoLogParser(offset=done)
+
+    def flush():
+        open(log_p, "w").write("".join(json.dumps(r) + "\n" for r in prev + parser.records))
+
+    def cb(line):
+        n = len(parser.records)
+        parser.feed(line)
+        if len(parser.records) != n:                # a report's KL / per-function lines land on the next flush
+            flush()
+
+    if left:
+        cmd = [sys.executable, "-m", "mlx_lm_lora.train", "--model", base, "--train", "--train-mode", "grpo",
+               "--data", gd, "--adapter-path", ad, "--iters", str(left), "--batch-size", str(a.batch),
+               "--learning-rate", str(a.grpo_lr), "--num-layers", str(a.lora_layers),
+               "--steps-per-report", str(a.log_every), "--steps-per-eval", str(a.eval_every or max(left, 1)),
+               "--val-batches", "2", "--save-every", str(a.save_every), "--seed", str(a.seed),
+               "--max-seq-length", str(a.max_len), "--group-size", str(a.num_generations),
+               "--max-completion-length", str(completion_len(a, cfg)), "--beta", str(a.beta),
+               "--temperature", str(a.temperature), "--reward-functions-file", rf,
+               "--reward-functions", "pollard_correct,pollard_format", "-c", yml]
+        if a.grad_checkpoint:
+            cmd.append("--grad-checkpoint")
+        if ck:
+            cmd += ["--resume-adapter-file", ck]
+            print(f"   resuming GRPO from {os.path.basename(ck)} (step {done} of {steps})")
+        rc = spawn(cmd, cb)
+        flush()
+        if rc:
+            sys.exit("mlx_lm_lora GRPO failed (see the log above); fix and re-run with --resume")
+        json.dump({"done": steps}, open(prog, "w"))
+    merged = os.path.join(run, a.name)
+    fuse = [sys.executable, "-m", "mlx_lm", "fuse", "--model", base, "--adapter-path", ad, "--save-path", merged]
+    if a.qlora:
+        fuse.append("--dequantize")
+    if spawn(fuse):
+        sys.exit("mlx_lm fuse failed -- the GRPO adapter is intact in " + ad)
+    recs = prev + parser.records
+    # the GRPO "val loss" is the policy objective on the valid prompts, not an LM loss: it stays in grpo-log.jsonl
+    # and out of the lineage's val_loss fields, which the card reads as a language-model loss
+    return {"backend": "mlx", "steps": steps, "losses": [],
+            "rewards": [r for r in recs if r.get("reward") is not None], "adapter": ad, "merged": merged,
+            "base_used": "4-bit mlx copy (QLoRA, dequantized on merge)" if a.qlora else "bf16/fp16 base"}
+
+
+def _completion_text(c):
+    if isinstance(c, list):                          # conversational: [{"role": "assistant", "content": ...}]
+        return (c[-1] or {}).get("content", "") if c else ""
+    if isinstance(c, dict):
+        return c.get("content", "")
+    return c or ""
+
+
+def trl_reward_funcs(cfg):
+    """TRL calls a reward function with the dataset's extra columns as keyword lists; the names become the
+    `rewards/<name>/mean` log keys."""
+    def rows(n, label, options=None, gold=None, vmult=None):
+        return [{"label": label[i], "options": (options[i] if options else None) or None,
+                 "gold": (gold[i] if gold else None) or {}, "vmult": vmult[i] if vmult else 1.0} for i in range(n)]
+
+    def pollard_correct(prompts, completions, label, options=None, gold=None, vmult=None, **kw):
+        return [correct_reward(_completion_text(c), r, cfg)
+                for c, r in zip(completions, rows(len(completions), label, options, gold, vmult))]
+
+    def pollard_format(prompts, completions, label, options=None, gold=None, vmult=None, **kw):
+        return [format_reward(_completion_text(c), r["options"] or cfg["labels"], cfg)
+                for c, r in zip(completions, rows(len(completions), label, options, gold, vmult))]
+    return [pollard_correct, pollard_format]
+
+
+def trl_grpo_dataset(rows):
+    return [{"prompt": ([{"role": "system", "content": r["system"]}] if r["system"] else [])
+             + [{"role": "user", "content": r["prompt"]}], "label": r["label"], "options": r.get("options") or [],
+             "gold": json.dumps(r.get("gold") or {}), "vmult": float(r.get("vmult", 1.0))} for r in rows]
+
+
+def grpo_records_from_history(history):
+    return [_grpo_record(h.get("step"), h.get("loss"), h["reward"], h.get("rewards/pollard_correct/mean"),
+                         h.get("rewards/pollard_format/mean"), h.get("kl")) for h in history if "reward" in h]
+
+
+def train_trl_grpo(a, run, rows, cfg, steps, init=None, unsloth=False):
+    """TRL's GRPOTrainer with a PEFT LoRA (or Unsloth's FastLanguageModel on CUDA). scale_rewards="batch": the
+    default per-group std scaling would divide each prompt's class weight back out, and the weight is the point."""
+    if unsloth:
+        from unsloth import FastLanguageModel      # before trl: Unsloth patches it on import
+    import torch
+    from datasets import Dataset
+    from trl import GRPOConfig, GRPOTrainer
+    start = init or a.base
+    ad = os.path.join(run, "adapter-grpo")
+    cuda = torch.cuda.is_available()
+    from trl.trainer import utils as trl_utils
+    if getattr(trl_utils, "_ChunkedLogProbFunction", "absent") is None:
+        # trl 1.15 routes every GRPO log-prob through a Triton kernel; without Triton (macOS, most CPU boxes) it is
+        # None and the first step dies with "'NoneType' object has no attribute 'apply'" (Mac smoke run, trl 1.15.0)
+        import trl
+        sys.exit(f"trl {trl.__version__}'s GRPOTrainer needs Triton (CUDA/Linux) for its fused log-prob head. On a Mac use "
+                 "--backend mlx (pip install mlx-lm-lora); on CPU/MPS pip install 'trl<1.15' (1.14.0 runs).")
+    peft_cfg = None
+    if unsloth:
+        model, tok = FastLanguageModel.from_pretrained(model_name=start, max_seq_length=a.max_len, load_in_4bit=a.qlora)
+        model = FastLanguageModel.get_peft_model(model, r=a.rank, lora_alpha=a.alpha, lora_dropout=0,
+                                                 use_gradient_checkpointing="unsloth", random_state=a.seed)
+    else:
+        from peft import LoraConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(start)
+        kw = {"dtype": torch.bfloat16 if cuda else torch.float32}
+        if a.qlora:
+            if not cuda:
+                sys.exit("--qlora on the trl backend needs CUDA (bitsandbytes); drop it, or use --backend mlx on a Mac")
+            from transformers import BitsAndBytesConfig
+            kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                                           bnb_4bit_compute_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(start, **kw)
+        peft_cfg = LoraConfig(r=a.rank, lora_alpha=a.alpha, lora_dropout=a.dropout, target_modules="all-linear",
+                              task_type="CAUSAL_LM")
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    g = a.num_generations
+    gcfg = GRPOConfig(output_dir=ad, max_steps=steps, per_device_train_batch_size=a.batch * g, num_generations=g,
+                      max_completion_length=completion_len(a, cfg), beta=a.beta, learning_rate=a.grpo_lr,
+                      temperature=a.temperature, logging_steps=a.log_every, save_steps=a.save_every, seed=a.seed,
+                      report_to="none", scale_rewards="batch", bf16=cuda and torch.cuda.is_bf16_supported(),
+                      gradient_checkpointing=a.grad_checkpoint, chat_template_kwargs={"enable_thinking": False})
+    tr = GRPOTrainer(model=model, reward_funcs=trl_reward_funcs(cfg), args=gcfg, processing_class=tok,
+                     train_dataset=Dataset.from_list(trl_grpo_dataset(rows)), peft_config=peft_cfg)
+    resume = a.resume and bool(glob.glob(os.path.join(ad, "checkpoint-*")))
+    tr.train(resume_from_checkpoint=True if resume else None)
+    recs = grpo_records_from_history(tr.state.log_history)
+    _write_jsonl(os.path.join(run, "grpo-log.jsonl"), recs)
+    merged = os.path.join(run, a.name)
+    if unsloth:
+        model.save_pretrained_merged(merged, tok, save_method="merged_16bit")
+    else:
+        tr.model.save_pretrained(ad)
+        _merge_peft(start, ad, merged, tok)
+    return {"backend": "unsloth" if unsloth else "trl", "steps": steps, "losses": [], "rewards": recs, "adapter": ad,
+            "merged": merged, "base_used": ("unsloth" if unsloth else
+                                            "4-bit NF4 base (QLoRA), merged into a bf16 reload" if a.qlora else "bf16 base")}
+
+
 def clef_temperatures(merged):
     """The calibrated per-type temperatures of a clef-layout model (joint_head_config.json), or {}."""
     p = os.path.join(merged, "joint_head_config.json")
@@ -733,8 +1140,23 @@ def train(a, backends=None):
         sys.exit("--base is required (an HF model id or local dir)")
     a.name = _name(a, run)
     task = info["task"]
+    method = getattr(a, "method", None) or "sft"
+    if method == "sft":
+        return _train_sft(a, run, info, task, backends)
+    if task == "chat":
+        sys.exit(GRPO_CHAT_REFUSAL)
+    init = _sft_stage(a, run, info, task, backends) if method == "sft+grpo" else None
+    return _train_grpo(a, run, info, task, backends, method, init)
+
+
+def _train_sft(a, run, info, task, backends=None, stage=None):
     be = pick_backend(a.backend, task)
-    if task == "decision" and be == "unsloth":
+    utask = task
+    if task == "decision" and be == "unsloth" and stage:
+        # GRPO samples generated option names; a clef head answers through its own head, so the SFT stage before
+        # GRPO stays on the generation path too
+        utask = "generation"
+    elif task == "decision" and be == "unsloth":
         # FastDecisionModel splits per state itself; hand it the raw rows of OUR train/valid split so the
         # test states stay unseen.
         _split_raw_decision(run)
@@ -743,11 +1165,12 @@ def train(a, backends=None):
               "question becomes a chat turn answered with the option name. No clef head, no calibrated temperatures;"
               " eval reads option probabilities from the LM's own likelihoods.")
     n_train = _n_lines(os.path.join(run, "data", "train.jsonl"))
-    print(f"== pollard-tune train :: {a.base} -> {os.path.join(run, a.name)}  [{be}{', QLoRA' if a.qlora else ', LoRA'}"
-          f" r{a.rank} a{a.alpha}, lr {a.lr}, {plan_iters(n_train, a.epochs, a.batch, a.iters)} steps x batch {a.batch}]",
-          flush=True)
-    fns = backends or {"mlx": lambda: train_mlx(a, run, n_train), "trl": lambda: train_trl(a, run, n_train),
-                       "unsloth": lambda: train_unsloth(a, run, n_train, task)}
+    print(f"== pollard-tune train{' (stage 1/2: sft)' if stage else ''} :: {a.base} -> {os.path.join(run, a.name)}  "
+          f"[{be}{', QLoRA' if a.qlora else ', LoRA'} r{a.rank} a{a.alpha}, lr {a.lr}, "
+          f"{plan_iters(n_train, a.epochs, a.batch, a.iters)} steps x batch {a.batch}]", flush=True)
+    fns = {"mlx": lambda: train_mlx(a, run, n_train), "trl": lambda: train_trl(a, run, n_train),
+           "unsloth": lambda: train_unsloth(a, run, n_train, utask)}
+    fns.update(backends or {})
     t0 = time.time()
     res = fns[be]()
     res["seconds"] = round(time.time() - t0, 1)
@@ -759,12 +1182,103 @@ def train(a, backends=None):
     temps = clef_temperatures(merged)
     if temps:
         res["temperatures"] = temps
-    _record_lineage(a, info, res)
+    _record_lineage(a, info, res, {"train_method": "sft+grpo", "stage": "sft"} if stage else None)
     tr = [x["loss"] for x in res["losses"] if x["split"] == "train"]
     va = [x["loss"] for x in res["losses"] if x["split"] == "val"]
     print(f"   done in {res['seconds']}s: train loss {tr[0] if tr else '?'} -> {tr[-1] if tr else '?'}"
           f"; val loss {va[0] if va else '?'} -> {va[-1] if va else '?'}; merged -> {merged}")
-    json.dump({k: v for k, v in res.items() if k != "losses"}, open(os.path.join(run, "train.json"), "w"), indent=1)
+    json.dump({k: v for k, v in res.items() if k != "losses"},
+              open(os.path.join(run, "train-sft.json" if stage else "train.json"), "w"), indent=1)
+    return res
+
+
+def _sft_stage(a, run, info, task, backends):
+    """sft+grpo stage 1: SFT teaches the output contract, GRPO then sharpens the decision from there. A finished
+    stage (stages.json naming a merged checkpoint that exists) is not redone on --resume."""
+    sp = os.path.join(run, "stages.json")
+    st = json.load(open(sp)) if os.path.exists(sp) else {}
+    sft = st.get("sft") or {}
+    if a.resume and sft.get("merged") and os.path.isfile(os.path.join(sft["merged"], "config.json")):
+        print(f"   stage 1/2 (sft) already finished -> {sft['merged']} (--resume: not redone)")
+        return sft["merged"]
+    final = a.name
+    a.name = final + "-sft"
+    try:
+        res = _train_sft(a, run, info, task, backends, stage="sft")
+    finally:
+        a.name = final
+    json.dump({"sft": {"merged": res["merged"], "steps": res["steps"]}}, open(sp, "w"), indent=1)
+    return res["merged"]
+
+
+def _train_grpo(a, run, info, task, backends, method, init=None):
+    be = pick_backend(a.backend, task, method="grpo")
+    if be == "trl" and sys.platform == "darwin" and not _has("mlx_lm_lora"):
+        print("   mlx-lm-lora is not installed: GRPO runs on TRL + PyTorch (MPS). pip install mlx-lm-lora for the mlx path.")
+    rows = grpo_rows(run, task)
+    added = {}
+    if be == "mlx" and task == "classify":
+        # mlx_lm_lora divides every group's rewards by that group's std, which cancels a per-prompt class weight.
+        # Balance the prompts instead (1:1): each class then gets the same share of the gradient.
+        rows, added = oversample(rows, a.seed, 1.0)
+    ap = os.path.join(run, "agent.json")
+    agent = json.load(open(ap)) if os.path.exists(ap) else {}
+    cfg = reward_config(rows, task, info, agent, a, ("sampling" if be == "mlx" else "reward") if task == "classify" else None)
+    if a.value_reward and not info.get("weight_field"):
+        sys.exit("--value-reward needs a --weight-field at prep (the per-row value)")
+    for r, m in zip(rows, value_multipliers(rows) if cfg["value_field"] else [1.0] * len(rows)):
+        r["vmult"] = m
+    if cfg["value_field"] and be == "mlx":
+        print("   NOTE: --value-reward on mlx is a no-op: every completion of a prompt shares its value, and mlx_lm_lora "
+              "scales each group by its own std. Use --backend trl for value-weighted GRPO.")
+    steps = a.grpo_iters or (a.iters if method == "grpo" else None) or plan_iters(len(rows), 1, a.batch)
+    k = len(cfg["labels"]) or 1
+    print(f"== pollard-tune train{' (stage 2/2: grpo)' if init else ''} :: GRPO {a.base}{' + sft stage' if init else ''}"
+          f" -> {os.path.join(run, a.name)}  [{be}{', QLoRA' if a.qlora else ', LoRA'} r{a.rank}, lr {a.grpo_lr}, "
+          f"{steps} steps x {a.batch} prompts x {a.num_generations} samples, beta {a.beta}, "
+          f"max {completion_len(a, cfg)} tokens]", flush=True)
+    if task == "classify":
+        print("   reward: right label x class weight (" + ", ".join(f"{l} {w:.2f}" for l, w in cfg["class_weights"].items())
+              + f"){' x ' + cfg['value_field'] + ' / class mean' if cfg['value_field'] else ''}, format "
+              f"+{a.format_bonus}/-{2 * a.format_bonus}. A constant answer earns {1 / k:.2f} of a perfect 1.00"
+              + ("; prompts balanced 1:1 (" + ", ".join(f"{l} +{n}" for l, n in added.items()) + ")" if added else ""))
+    else:
+        print(f"   reward: gold probability of the chosen option (1/0 without soft gold), format +{a.format_bonus}/"
+              f"-{2 * a.format_bonus}")
+    fns = {"mlx": lambda: train_mlx_grpo(a, run, rows, cfg, steps, init),
+           "trl": lambda: train_trl_grpo(a, run, rows, cfg, steps, init),
+           "unsloth": lambda: train_trl_grpo(a, run, rows, cfg, steps, init, unsloth=True)}
+    fn = (backends or {}).get("grpo:" + be) or fns[be]
+    t0 = time.time()
+    res = fn()
+    res["seconds"] = round(time.time() - t0, 1)
+    res["base"] = a.base
+    merged = res["merged"]
+    if os.path.exists(ap):
+        shutil.copy(ap, merged)
+    rw = res.get("rewards") or []
+    end = lambda key, i: next((r[key] for r in (rw if i == 0 else reversed(rw)) if r.get(key) is not None), None)
+    extra = {"train_method": method, "stage": "grpo", "init": "sft stage" if init else "base", "lr": a.grpo_lr,
+             "num_generations": a.num_generations, "max_completion_length": completion_len(a, cfg), "beta": a.beta,
+             "temperature": a.temperature, "prompts": len(rows),
+             "reward": {"correct": "gold probability of the option" if task == "decision" else
+                        "parsed label == gold, x class weight", "class_weights": cfg["class_weights"],
+                        "format_bonus": cfg["format_bonus"], "value_field": cfg["value_field"],
+                        "balance_via": cfg["balance_via"], "oversampled_prompts": added},
+             "reward_start": end("reward", 0), "reward_end": end("reward", -1),
+             "correct_reward_start": end("correct", 0), "correct_reward_end": end("correct", -1),
+             "format_reward_end": end("format", -1), "kl_end": end("kl", -1), "group_std_end": end("group_std", -1)}
+    _record_lineage(a, info, res, extra, carry_from=init)
+    f3 = lambda v: "?" if v is None else f"{v:.3f}"
+    print(f"   done in {res['seconds']}s: reward {f3(extra['reward_start'])} -> {f3(extra['reward_end'])} (correct "
+          f"{f3(extra['correct_reward_start'])} -> {f3(extra['correct_reward_end'])}, format -> "
+          f"{f3(extra['format_reward_end'])}, KL -> {f3(extra['kl_end'])}); merged -> {merged}")
+    if extra["group_std_end"] == 0:
+        print("   WARNING: at the end every sampled answer to a prompt scored the same (group reward spread 0): no "
+              "learning signal. If the KL is large the policy collapsed to one answer -- lower --grpo-lr, raise --beta "
+              "or --temperature, or start from --method sft+grpo. Read the eval before trusting this checkpoint.")
+    json.dump({**{k: v for k, v in res.items() if k not in ("losses", "rewards")}, "method": method},
+              open(os.path.join(run, "train.json"), "w"), indent=1)
     return res
 
 
@@ -782,22 +1296,27 @@ def _split_raw_decision(run):
     _write_jsonl(os.path.join(dd, "decision-valid.jsonl"), keep[:cut])
 
 
-def _record_lineage(a, info, res):
+def _record_lineage(a, info, res, extra=None, carry_from=None):
+    """One `tune` step. `method` stays the adapter kind (lora / qlora) that pollard-forge's card reads;
+    `train_method` is the objective (sft, grpo, sft+grpo). An sft+grpo model carries the SFT stage's step first."""
     from pollard_forge import _carry_lineage, _lineage
     merged = res["merged"]
-    if os.path.isdir(str(a.base)):
-        _carry_lineage(a.base, merged)
+    src = carry_from or a.base
+    if os.path.isdir(str(src)):
+        _carry_lineage(src, merged)
     tr = [x["loss"] for x in res["losses"] if x["split"] == "train"]
     va = [x["loss"] for x in res["losses"] if x["split"] == "val"]
-    _lineage(merged, {"op": "tune", "from": a.base, "backend": res["backend"], "task": info["task"],
-                      "method": "qlora" if a.qlora else "lora", "rank": a.rank, "alpha": a.alpha, "lr": a.lr,
-                      "steps": res["steps"], "batch": a.batch, "max_len": a.max_len, "seed": a.seed,
-                      "data": [{"source": info["source"], "weight": 1.0}], "splits": info["counts"],
-                      "test_hash": info["test_hash"], "oversampled": info.get("oversampled") or {},
-                      "train_loss_start": tr[0] if tr else None, "train_loss_end": tr[-1] if tr else None,
-                      "val_loss_start": va[0] if va else None, "val_loss_end": va[-1] if va else None,
-                      "base_used": res.get("base_used"), "temperatures": res.get("temperatures"),
-                      "seconds": res.get("seconds")})
+    step = {"op": "tune", "from": a.base, "backend": res["backend"], "task": info["task"], "train_method": "sft",
+            "method": "qlora" if a.qlora else "lora", "rank": a.rank, "alpha": a.alpha, "lr": a.lr,
+            "steps": res["steps"], "batch": a.batch, "max_len": a.max_len, "seed": a.seed,
+            "data": [{"source": info["source"], "weight": 1.0}], "splits": info["counts"],
+            "test_hash": info["test_hash"], "oversampled": info.get("oversampled") or {},
+            "train_loss_start": tr[0] if tr else None, "train_loss_end": tr[-1] if tr else None,
+            "val_loss_start": va[0] if va else None, "val_loss_end": va[-1] if va else None,
+            "base_used": res.get("base_used"), "temperatures": res.get("temperatures"),
+            "seconds": res.get("seconds")}
+    step.update(extra or {})
+    _lineage(merged, step)
 
 
 # ===================================================================================== eval
@@ -1135,9 +1654,14 @@ def report_md(task, results, info, lineage=None):
                 md += [f"Confusion matrix (tuned):", "", confusion_md(r["metrics"]), ""]
     if lineage:
         md += ["## How it was tuned", "", "| | |", "|---|---|"]
-        for k in ("from", "backend", "method", "rank", "alpha", "lr", "steps", "batch", "max_len"):
+        for k in ("from", "train_method", "backend", "method", "rank", "alpha", "lr", "steps", "batch", "max_len",
+                  "num_generations", "beta"):
             if lineage.get(k) is not None:
                 md.append(f"| {k} | {lineage[k]} |")
+        if lineage.get("reward_end") is not None:
+            cw = (lineage.get("reward") or {}).get("class_weights") or {}
+            md.append(f"| GRPO reward (train) | {lineage['reward_start']:.3f} -> {lineage['reward_end']:.3f}"
+                      + (" (class weights " + ", ".join(f"{k} {v:.2f}" for k, v in cw.items()) + ")" if cw else "") + " |")
         sp = lineage.get("splits") or {}
         md.append(f"| data | {info.get('source')} -- train {sp.get('train')} / valid {sp.get('valid')} / test {sp.get('test')} |")
         if lineage.get("val_loss_start") is not None:
@@ -1175,7 +1699,7 @@ def evaluate(a, loaders=None, compare=None):
     results = []
     ed = os.path.join(run, "eval")
     os.makedirs(ed, exist_ok=True)
-    print(f"== pollard-tune eval :: {len(rows)} held-out {task} examples")
+    print(f"== pollard-tune eval :: {len(rows)} held-out {task} examples (tuned with {tp.get('method') or 'sft'})")
     cols = []
     if not a.skip_base:
         cols.append(("base", base_l))
@@ -1198,7 +1722,8 @@ def evaluate(a, loaders=None, compare=None):
     table = comparison_table(task, results, info)
     md = report_md(task, results, info, lineage)
     open(os.path.join(ed, "report.md"), "w").write(md + "\n")
-    summary = {"task": task, "n": len(rows), "columns": {c: r["metrics"] for c, r in results}}
+    summary = {"task": task, "n": len(rows), "method": (lineage or {}).get("train_method") or tp.get("method") or "sft",
+               "columns": {c: r["metrics"] for c, r in results}}
     json.dump(summary, open(os.path.join(ed, "summary.json"), "w"), indent=1)
     if lineage is not None:                          # the eval result belongs in the lineage too
         from pollard_forge import _lineage
@@ -1351,6 +1876,21 @@ def _train_args(p):
     p.add_argument("--log-every", type=int, default=10); p.add_argument("--eval-every", type=int, default=0)
     p.add_argument("--save-every", type=int, default=100); p.add_argument("--resume", action="store_true")
     p.add_argument("--grad-checkpoint", action="store_true")
+    g = p.add_argument_group("method (sft = supervised LoRA; grpo = RL on a verifiable label reward; sft+grpo = both)")
+    g.add_argument("--method", default="sft", choices=METHODS,
+                   help="grpo / sft+grpo need a classify or decision set (chat has no verifiable reward)")
+    g.add_argument("--num-generations", type=int, default=4, help="GRPO: answers sampled per prompt (the group)")
+    g.add_argument("--max-completion-length", type=int, default=0,
+                   help="GRPO: token cap per sampled answer (0: 16 for a label, 64 with a reason line, 8 for decisions)")
+    g.add_argument("--beta", type=float, default=0.04, help="GRPO: KL penalty towards the starting model")
+    g.add_argument("--grpo-lr", type=float, default=1e-5, help="GRPO learning rate (--lr is the SFT one)")
+    g.add_argument("--grpo-iters", type=int, help="GRPO steps (default: --iters with --method grpo, else one pass "
+                                                  "over the train prompts)")
+    g.add_argument("--temperature", type=float, default=1.0, help="GRPO: sampling temperature of the group")
+    g.add_argument("--format-bonus", type=float, default=0.1,
+                   help="GRPO: + for exactly a label, -2x for unparseable / <think> (correctness is worth ~1)")
+    g.add_argument("--value-reward", action="store_true",
+                   help="GRPO: scale the correctness reward by the --weight-field value over its class mean (trl/unsloth)")
     if not any(x.dest == "seed" for x in p._actions):
         p.add_argument("--seed", type=int, default=0)
 
@@ -1378,7 +1918,7 @@ def build_parser():
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n", 1)[1])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prep", help="validate, dedupe, split, leak-check"); _common(p); _prep_args(p)
-    t = sub.add_parser("train", help="LoRA/QLoRA SFT + merge"); _common(t); _train_args(t)
+    t = sub.add_parser("train", help="LoRA/QLoRA SFT and/or GRPO + merge"); _common(t); _train_args(t)
     e = sub.add_parser("eval", help="base vs tuned (vs --compare-url) on the test split"); _common(e); _eval_args(e)
     s = sub.add_parser("ship", help="pollard ladder + card with the eval + serve line"); _common(s); _ship_args(s)
     r = sub.add_parser("run", help="prep -> train -> eval [-> ship]"); _common(r); _prep_args(r); _train_args(r)

@@ -529,10 +529,14 @@ def cmd_card(a):
             d = f"{s['layers']}L x {s['hidden']}, {_n(s['params'])} params, tokenizer {s['tokenizer']}"
         elif s["op"] == "tune":
             sp = s.get("splits") or {}
+            grpo = s.get("stage") == "grpo"
             d = (f"{s.get('method', 'lora').replace('qlora', 'QLoRA').replace('lora', 'LoRA')} r{s.get('rank')} "
-                 f"({s.get('backend')}, {s.get('task')}) on " + ", ".join(_src(x["source"]) for x in s.get("data") or [])
+                 + ("GRPO " if grpo else "SFT " if s.get("train_method", "sft") != "sft" else "")
+                 + f"({s.get('backend')}, {s.get('task')}) on " + ", ".join(_src(x["source"]) for x in s.get("data") or [])
                  + f" from {s.get('from')}: {s.get('steps')} steps, train {sp.get('train')} / valid {sp.get('valid')}"
-                 f" / test {sp.get('test')}; val loss {s.get('val_loss_start')} -> {s.get('val_loss_end')}")
+                 f" / test {sp.get('test')}; "
+                 + (f"reward {s.get('reward_start')} -> {s.get('reward_end')}" if grpo else
+                    f"val loss {s.get('val_loss_start')} -> {s.get('val_loss_end')}"))
         elif s["op"] == "tune-eval":
             d = f"held-out test ({s.get('n')}): " + "; ".join(
                 f"{col} " + ", ".join(f"{k} {v:.3f}" for k, v in m.items() if isinstance(v, (int, float)))
