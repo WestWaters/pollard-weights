@@ -489,7 +489,9 @@ def cmd_card(a):
     log = json.load(open(p))
     cfg = json.load(open(os.path.join(a.model, "config.json")))
     steps = log["steps"]
-    bases = sorted({s.get("teacher") for s in steps if s.get("teacher")})
+    # a fine-tune's base is a base_model as much as a distillation teacher is (pollard-tune writes op "tune")
+    bases = sorted({s.get("teacher") for s in steps if s.get("teacher")}
+                   | {s.get("from") for s in steps if s.get("op") == "tune" and s.get("from")})
     data = []
     for s in steps:
         for d in s.get("data") or []:
@@ -525,6 +527,16 @@ def cmd_card(a):
     for i, s in enumerate(steps, 1):
         if s["op"] == "new":
             d = f"{s['layers']}L x {s['hidden']}, {_n(s['params'])} params, tokenizer {s['tokenizer']}"
+        elif s["op"] == "tune":
+            sp = s.get("splits") or {}
+            d = (f"{s.get('method', 'lora').replace('qlora', 'QLoRA').replace('lora', 'LoRA')} r{s.get('rank')} "
+                 f"({s.get('backend')}, {s.get('task')}) on " + ", ".join(_src(x["source"]) for x in s.get("data") or [])
+                 + f" from {s.get('from')}: {s.get('steps')} steps, train {sp.get('train')} / valid {sp.get('valid')}"
+                 f" / test {sp.get('test')}; val loss {s.get('val_loss_start')} -> {s.get('val_loss_end')}")
+        elif s["op"] == "tune-eval":
+            d = f"held-out test ({s.get('n')}): " + "; ".join(
+                f"{col} " + ", ".join(f"{k} {v:.3f}" for k, v in m.items() if isinstance(v, (int, float)))
+                for col, m in (s.get("results") or {}).items())
         elif s["op"] == "prune":
             d = (f"from {s['teacher']}: {_n(s['params_before'])} -> {_n(s['params_after'])}, "
                  f"dropped layers {s['dropped_layers']}, FFN {s['ffn']}")
