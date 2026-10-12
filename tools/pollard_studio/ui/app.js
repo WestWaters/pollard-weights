@@ -720,6 +720,12 @@ const ADV_SECTIONS = [
        + "thinklean writes a per-tokenizer logit-bias preset that trims a reasoning model's hedging, and "
        + "measures tokens and accuracy with and without it before a card may mention it.",
     tools: ["pollard_composed", "pollard_thinklean"] },
+  { title: "AGENT HARNESSES", icon: "box",
+    why: "A rung that loads is not one an agent can use: Claude Code's prompt alone is ~20k tokens, thinking "
+       + "left in the answer breaks tool-call parsing, and an ik_llama-only rung does not open in Ollama. "
+       + "serve picks the runtime the file needs, sizes the context to the harness (omp, Claude Code, Codex, "
+       + "OpenCode, ...) and prints -- or merges, after a backup -- its config. A decision model goes to OMP's judge role.",
+    tools: ["pollard_harness"] },
   { title: "SOLVER", icon: "wave",
     why: "Full-Hessian error feedback. Pollard trains as well as compresses, and these are the "
        + "solver's own knobs.",
