@@ -168,6 +168,7 @@ def test_mlx_train_command_resume_and_lineage(tmp_path, monkeypatch):
     a = _prepped(tmp_path)
     run = str(tmp_path / "run")
     monkeypatch.setattr(T, "local_model", lambda m: m)
+    monkeypatch.setattr(T, "pick_backend", lambda want, task: "mlx")   # spawn is faked: CI has no mlx-lm
     calls = []
 
     def spawn(cmd, cb=None, env=None):
