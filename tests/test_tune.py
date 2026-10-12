@@ -10,6 +10,7 @@ and a ship step that dies where `pollard serve` is not on main yet.
 from __future__ import annotations
 
 import argparse, csv, json, os, sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,11 @@ def test_mlx_line_parser():
     assert T.parse_mlx_line("Iter 40: Val loss 0.230, Val took 3.386s") == {"step": 40, "split": "val", "loss": 0.23}
     assert T.parse_mlx_line("Iter 10: Train loss 1.252, Learning Rate 1.000e-04")["split"] == "train"
     assert T.parse_mlx_line("Loading pretrained model") is None
+    # mlx-lm 0.32 (what mlx-lm-lora pulls in) prints a coloured table instead
+    assert T.parse_mlx_line("     5    \x1b[1;32m1.954 \u25bc\x1b[0m       23      0.1k\n") == {"step": 5, "split": "train", "loss": 1.954}
+    assert T.parse_mlx_line("    60    \x1b[1;35mval\x1b[0m \x1b[1m0.046\x1b[0m    1.48s\n") == {"step": 60, "split": "val", "loss": 0.046}
+    assert T.parse_mlx_line("  save  0000020_adapters.safetensors") is None
+    assert T.parse_mlx_line("Trainable parameters: 1.187% (5.865M/494.033M)") is None
 
 
 def _prepped(tmp_path, n=120):
@@ -420,3 +426,298 @@ def test_ship_keeps_the_rungs_a_failed_flagship_step_left(tmp_path, monkeypatch)
     monkeypatch.setattr(ws, "read_manifest", lambda k: {"builds": []})
     with pytest.raises(SystemExit, match="built no rung"):
         T.ship(a, run_cmd=lambda c: 1 if c[0] == "pollard" else 0)
+
+
+# ------------------------------------------------------------------ GRPO (--method grpo / sft+grpo)
+def _rl_rows(n_fraud=10, n_legit=90):
+    return [{"label": "fraud", "weight": 100.0 * (i + 1)} for i in range(n_fraud)] + \
+           [{"label": "legit", "weight": 10.0} for _ in range(n_legit)]
+
+
+RL_CFG = {"task": "classify", "labels": ["fraud", "legit"], "format_bonus": 0.1, "with_reason": False}
+
+
+def test_class_balanced_reward_a_constant_answer_cannot_beat_a_coin():
+    rows = _rl_rows()
+    cfg = {**RL_CFG, "class_weights": T.class_weights([r["label"] for r in rows])}
+    assert cfg["class_weights"] == pytest.approx({"fraud": 5.0, "legit": 100 / 180})
+    always_legit = T.expected_reward(rows, lambda r: "legit", cfg)
+    always_fraud = T.expected_reward(rows, lambda r: "fraud", cfg)
+    coin = sum(T.expected_reward(rows, lambda r, l=l: l, cfg) for l in ("fraud", "legit")) / 2   # uniform guess
+    perfect = T.expected_reward(rows, lambda r: r["label"], cfg)
+    # every constant policy, and random, earns exactly 1/K; only telling the classes apart earns more
+    assert always_legit == pytest.approx(0.5) and always_fraud == pytest.approx(0.5) and coin == pytest.approx(0.5)
+    assert perfect == pytest.approx(1.0)
+    # the unweighted reward is what the balancing prevents: 90% for never flagging anything
+    assert T.expected_reward(rows, lambda r: "legit", {**cfg, "class_weights": {}}) == pytest.approx(0.9)
+    # a policy that catches half the fraud and keeps every legit row beats all constant answers
+    half = T.expected_reward(rows, lambda r: "fraud" if r["label"] == "fraud" and r["weight"] > 500 else "legit", cfg)
+    assert half == pytest.approx(0.75)
+
+
+def test_value_reward_keeps_each_class_mean_at_one():
+    rows = _rl_rows()
+    m = T.value_multipliers(rows)
+    fr = [x for x, r in zip(m, rows) if r["label"] == "fraud"]
+    assert sum(fr) / len(fr) == pytest.approx(1.0) and max(fr) > min(fr)
+    assert all(x == pytest.approx(1.0) for x, r in zip(m, rows) if r["label"] == "legit")
+    big = T.value_multipliers([{"label": "a", "weight": 1e6}] + [{"label": "a", "weight": 1.0}] * 99)
+    assert big[0] == 10.0                                # capped: one huge row cannot be the whole gradient
+
+
+def test_format_reward_wants_exactly_a_label():
+    labels, cfg = ["fraud", "legit"], dict(RL_CFG)
+    assert T.format_reward("fraud", labels, cfg) == pytest.approx(0.1)
+    assert T.format_reward(" Legit\n", labels, cfg) == pytest.approx(0.1)
+    assert T.format_reward("The answer is fraud.", labels, cfg) == 0.0                 # parseable, extra text
+    assert T.format_reward("fraud\nnew account, big amount", labels, cfg) == 0.0
+    assert T.format_reward("fraud\nnew account, big amount", labels, {**cfg, "with_reason": True}) == pytest.approx(0.1)
+    assert T.format_reward("<think>hmm</think>fraud", labels, cfg) == pytest.approx(-0.2)  # leaked reasoning
+    assert T.format_reward("I cannot tell", labels, cfg) == pytest.approx(-0.2)
+    # correctness is the label parser eval uses; an unparseable or wrong reply earns nothing
+    cw = {**cfg, "class_weights": {"fraud": 5.0, "legit": 0.5}}
+    assert T.correct_reward("fraud", {"label": "fraud"}, cw) == 5.0
+    assert T.correct_reward("fraud", {"label": "fraud", "vmult": 2.0}, cw) == 10.0
+    assert T.correct_reward("legit", {"label": "fraud"}, cw) == 0.0 and T.correct_reward("??", {"label": "legit"}, cw) == 0.0
+
+
+def test_decision_reward_uses_soft_gold():
+    cfg = {"task": "decision", "labels": [], "format_bonus": 0.1}
+    row = {"label": "ap", "options": ["ap", "fraud"], "gold": json.dumps({"ap": 0.7, "fraud": 0.3})}
+    assert T.correct_reward("fraud", row, cfg) == pytest.approx(0.3) and T.correct_reward("ap", row, cfg) == pytest.approx(0.7)
+    assert T.correct_reward("ap", {**row, "gold": {}}, cfg) == 1.0
+    assert T.format_reward("ap", row["options"], cfg) == pytest.approx(0.1)
+
+
+def test_grpo_refuses_chat_data(tmp_path):
+    p = tmp_path / "c.jsonl"
+    p.write_text("\n".join(json.dumps({"messages": [{"role": "user", "content": f"q{i}"},
+                                                    {"role": "assistant", "content": f"a{i}"}]}) for i in range(30)))
+    a = _args(out=str(tmp_path / "run"), data=str(p), extra=["--method", "grpo"])
+    T.prep(a)
+    with pytest.raises(SystemExit, match="verifiable reward"):
+        T.train(a)
+
+
+def test_backend_choice_with_method():
+    has = lambda mods: (lambda m: m in mods)
+    pick = lambda want, task, mods, cuda=False, plat="linux": T.pick_backend(want, task, has(mods), lambda: cuda, plat,
+                                                                              method="grpo")
+    assert pick("auto", "classify", {"mlx_lm", "mlx_lm_lora"}, plat="darwin") == "mlx"
+    # mlx-lm alone has no GRPO trainer: a Mac with TRL falls to TRL (MPS), a Mac with neither is told what to install
+    assert pick("auto", "classify", {"mlx_lm", "trl", "peft"}, plat="darwin") == "trl"
+    with pytest.raises(SystemExit, match="pip install mlx-lm-lora"):
+        pick("auto", "classify", {"mlx_lm"}, plat="darwin")
+    with pytest.raises(SystemExit, match="pip install mlx-lm-lora"):
+        pick("mlx", "classify", {"mlx_lm"}, plat="darwin")
+    with pytest.raises(SystemExit, match="pip install trl peft"):
+        pick("trl", "classify", {"trl"})
+    assert pick("auto", "classify", {"unsloth", "trl"}, cuda=True) == "unsloth"
+    # a decision set + GRPO goes the generation path (TRL), never the clef-head SFT trainer
+    assert pick("auto", "decision", {"unsloth", "trl", "peft"}, cuda=True) == "trl"
+    # method sft is unchanged
+    assert T.pick_backend("auto", "classify", has({"mlx_lm"}), lambda: False, "darwin") == "mlx"
+
+
+GRPO_REPORT = """
+================================================================================
+Iter {it}:
+--------------------------------------------------------------------------------
+Loss: 0.012
+Total Rewards:  μ={r:.3f}, σ=0.400
+Group Rewards:  μ={r:.3f}, σ=0.300
+KL Divergence: 0.000{it}00000000
+KL saturation: 0.00%
+--------------------------------------------------------------------------------
+Individual Reward Functions:
+  • pollard_correct: μ={c:.3f}, σ=0.500, cov=100.00%
+  • pollard_format: μ=0.050, σ=0.100, cov=100.00%
+================================================================================
+"""
+
+
+def test_grpo_log_parser_reads_mlx_lm_lora_reports():
+    p = T.GrpoLogParser(offset=5)
+    for it, r, c in ((1, 0.2, 0.25), (2, 0.6, 0.55)):
+        for line in GRPO_REPORT.format(it=it, r=r, c=c).splitlines(True):
+            p.feed(line)
+    p.feed("Iter 2: Val loss 0.010, Val took 1.0s\n")
+    p.feed("Iter 2: Saved adapter weights to a and b.\n")
+    tr = [x for x in p.records if x["split"] == "train"]
+    assert [x["step"] for x in tr] == [6, 7] and tr[-1]["reward"] == 0.6 and tr[-1]["correct"] == 0.55
+    assert tr[-1]["format"] == 0.05 and tr[-1]["kl"] == pytest.approx(2e-4) and tr[0]["loss"] == 0.012
+    assert tr[-1]["group_std"] == 0.3
+    assert [x for x in p.records if x["split"] == "val"][0]["loss"] == 0.01
+
+
+def _fake_mlx_grpo_spawn(calls, reward_seq=(0.3, 0.7)):
+    def spawn(cmd, cb=None, env=None):
+        calls.append(cmd)
+        if "mlx_lm_lora.train" in cmd:
+            ad = cmd[cmd.index("--adapter-path") + 1]
+            for it, r in enumerate(reward_seq, 1):
+                for line in GRPO_REPORT.format(it=it, r=r, c=r - 0.05).splitlines(True):
+                    cb(line)
+            open(os.path.join(ad, "adapters.safetensors"), "w").write("x")
+        if "fuse" in cmd:
+            out = cmd[cmd.index("--save-path") + 1]
+            os.makedirs(out, exist_ok=True)
+            json.dump({"model_type": "qwen2"}, open(os.path.join(out, "config.json"), "w"))
+        return 0
+    return spawn
+
+
+def test_mlx_grpo_command_reward_file_and_lineage(tmp_path, monkeypatch):
+    a = _prepped(tmp_path, n=200)
+    run = str(tmp_path / "run")
+    monkeypatch.setattr(T, "local_model", lambda m: m)
+    monkeypatch.setattr(T, "pick_backend", lambda want, task, method="sft", **kw: "mlx")    # CI has no mlx-lm-lora
+    calls = []
+    spawn = _fake_mlx_grpo_spawn(calls)
+    a.name, a.method, a.iters = "m", "grpo", 12
+    res = T.train(a, backends={"grpo:mlx": lambda: T.train_mlx_grpo(
+        a, run, *_grpo_inputs(a, run), spawn=spawn)})
+    g = next(c for c in calls if "mlx_lm_lora.train" in c)
+    flag = lambda f: g[g.index(f) + 1]
+    assert flag("--train-mode") == "grpo" and flag("--group-size") == "4" and flag("--iters") == "12"
+    assert flag("--max-completion-length") == "16" and flag("--reward-functions") == "pollard_correct,pollard_format"
+    assert "fuse: false" in open(flag("-c")).read()
+    rows = [json.loads(l) for l in open(os.path.join(run, "data-grpo", "train.jsonl"))]
+    c = Counter(r["answer"] for r in rows)
+    assert c["fraud"] == c["legit"]                     # mlx: balanced by sampling (its per-group std cancels weights)
+    assert set(rows[0]) == {"prompt", "system", "answer", "type"} and json.loads(rows[0]["type"])["label"] == rows[0]["answer"]
+    t = json.load(open(os.path.join(res["merged"], "forge.json")))["steps"][-1]
+    assert t["train_method"] == "grpo" and t["stage"] == "grpo" and t["method"] == "lora"
+    assert t["reward"]["balance_via"] == "sampling" and t["reward"]["class_weights"] == {"fraud": 1.0, "legit": 1.0}
+    assert t["reward_start"] == 0.3 and t["reward_end"] == 0.7 and t["correct_reward_end"] == pytest.approx(0.65)
+    assert t["kl_end"] == pytest.approx(2e-4) and t["num_generations"] == 4 and t["lr"] == 1e-5
+    assert t["group_std_end"] == 0.3 and t["val_loss_end"] is None      # a GRPO objective is not an LM loss
+    assert json.load(open(os.path.join(run, "train.json")))["method"] == "grpo"
+    assert len([json.loads(l) for l in open(os.path.join(run, "grpo-log.jsonl"))]) == 2
+
+
+def _grpo_inputs(a, run):
+    """What _train_grpo hands the mlx trainer, rebuilt for a direct call."""
+    rows, _ = T.oversample(T.grpo_rows(run, "classify"), a.seed, 1.0)
+    info = json.load(open(os.path.join(run, "data", "prep.json")))
+    cfg = T.reward_config(rows, "classify", info, {}, a, "sampling")
+    return rows, cfg, a.iters
+
+
+def test_mlx_reward_file_runs_without_the_package(tmp_path, monkeypatch):
+    """The file mlx_lm_lora loads: register both functions and score with OUR parser. A fake registry stands in
+    for mlx_lm_lora so this runs on CI."""
+    import types
+    a = _prepped(tmp_path)
+    run = str(tmp_path / "run")
+    monkeypatch.setattr(T, "local_model", lambda m: m)
+    a.name, a.method = "m", "grpo"
+    rows, cfg, _ = _grpo_inputs(a, run)
+    T.train_mlx_grpo(a, run, rows, cfg, 2, spawn=_fake_mlx_grpo_spawn([]))
+    reg = {}
+    mod = types.ModuleType("mlx_lm_lora.trainer.grpo_reward_functions")
+    mod.register_reward_function = lambda name=None: (lambda f: reg.setdefault(name or f.__name__, f))
+    for m in ("mlx_lm_lora", "mlx_lm_lora.trainer"):
+        monkeypatch.setitem(sys.modules, m, types.ModuleType(m))
+    monkeypatch.setitem(sys.modules, "mlx_lm_lora.trainer.grpo_reward_functions", mod)
+    src = open(os.path.join(run, "pollard_reward.py")).read()
+    exec(compile(src, "pollard_reward.py", "exec"), {})
+    types_ = [json.dumps({"label": "fraud"}), json.dumps({"label": "legit"}), None]
+    got = reg["pollard_correct"](["p"] * 3, ["fraud", "fraud", "legit"], ["fraud", "legit", "legit"], types_)
+    assert got == [1.0, 0.0, 1.0]
+    assert reg["pollard_format"](["p"] * 2, ["fraud", "um"], ["fraud", "legit"], None) == [pytest.approx(0.1), pytest.approx(-0.2)]
+
+
+def test_sft_then_grpo_stage_order_and_resume(tmp_path, monkeypatch):
+    a = _prepped(tmp_path)
+    run = str(tmp_path / "run")
+    monkeypatch.setattr(T, "pick_backend", lambda want, task, method="sft", **kw: "mlx")
+    order = []
+
+    def fake(kind):
+        def go():
+            order.append(kind)
+            merged = os.path.join(run, a.name)
+            os.makedirs(merged, exist_ok=True)
+            json.dump({"model_type": "qwen2"}, open(os.path.join(merged, "config.json"), "w"))
+            if kind == "sft":
+                return {"backend": "mlx", "steps": 5, "merged": merged, "losses": [{"step": 5, "split": "val", "loss": 0.1}]}
+            return {"backend": "mlx", "steps": 7, "merged": merged, "losses": [],
+                    "rewards": [T._grpo_record(1, reward=0.2), T._grpo_record(7, reward=0.8)]}
+        return go
+
+    a.name, a.method = "m", "sft+grpo"
+    fakes = {"mlx": fake("sft"), "grpo:mlx": fake("grpo")}
+    res = T.train(a, backends=fakes)
+    assert order == ["sft", "grpo"] and res["merged"] == os.path.join(run, "m")
+    assert json.load(open(os.path.join(run, "stages.json")))["sft"]["merged"] == os.path.join(run, "m-sft")
+    steps = [s for s in json.load(open(os.path.join(run, "m", "forge.json")))["steps"] if s["op"] == "tune"]
+    # the GRPO model carries the SFT stage's step (it started from that checkpoint), then its own
+    assert [(s["train_method"], s["stage"]) for s in steps] == [("sft+grpo", "sft"), ("sft+grpo", "grpo")]
+    assert steps[1]["init"] == "sft stage" and steps[1]["reward_end"] == 0.8 and steps[0]["val_loss_end"] == 0.1
+    assert json.load(open(os.path.join(run, "train.json")))["merged"] == os.path.join(run, "m")
+    order.clear()
+    a.resume = True
+    T.train(a, backends=fakes)
+    assert order == ["grpo"]                            # a finished SFT stage is not redone on --resume
+    order.clear()
+    a.resume = False
+    T.train(a, backends=fakes)
+    assert order == ["sft", "grpo"]
+
+
+def test_mlx_grpo_resume_skips_finished_steps(tmp_path, monkeypatch):
+    a = _prepped(tmp_path)
+    run = str(tmp_path / "run")
+    monkeypatch.setattr(T, "local_model", lambda m: m)
+    ad = os.path.join(run, "adapter-grpo")
+    os.makedirs(ad, exist_ok=True)
+    open(os.path.join(ad, "0000008_adapters.safetensors"), "w").write("x")
+    calls = []
+    a.name, a.method, a.resume = "m", "grpo", True
+    rows, cfg, _ = _grpo_inputs(a, run)
+    T.train_mlx_grpo(a, run, rows, cfg, 12, spawn=_fake_mlx_grpo_spawn(calls))
+    g = next(c for c in calls if "mlx_lm_lora.train" in c)
+    assert g[g.index("--iters") + 1] == "4" and g[g.index("--resume-adapter-file") + 1].endswith("0000008_adapters.safetensors")
+
+
+def test_trl_reward_funcs_and_log_history():
+    cfg = {**RL_CFG, "class_weights": {"fraud": 5.0, "legit": 0.5}}
+    correct, fmt = T.trl_reward_funcs(cfg)
+    assert correct.__name__ == "pollard_correct" and fmt.__name__ == "pollard_format"     # TRL's log keys
+    comps = [[{"role": "assistant", "content": "fraud"}], [{"role": "assistant", "content": "Legit, clearly"}]]
+    kw = {"label": ["fraud", "legit"], "options": [[], []], "gold": ["{}", "{}"], "vmult": [1.0, 2.0]}
+    assert correct(["p", "p"], comps, **kw, trainer_state=None) == [5.0, 1.0]
+    assert fmt(["p", "p"], comps, **kw) == [pytest.approx(0.1), 0.0]
+    ds = T.trl_grpo_dataset([{"system": "S", "prompt": "U", "label": "fraud", "vmult": 1.0}])
+    assert ds[0]["prompt"] == [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+    hist = [{"step": 10, "loss": 0.0, "reward": 0.4, "rewards/pollard_correct/mean": 0.35,
+             "rewards/pollard_format/mean": 0.05, "kl": 0.001}, {"step": 10, "train_runtime": 3.0}]
+    assert T.grpo_records_from_history(hist) == [{"step": 10, "split": "train", "loss": 0.0, "reward": 0.4,
+                                                  "correct": 0.35, "format": 0.05, "kl": 0.001, "group_std": None}]
+
+
+def test_eval_report_names_the_method(tmp_path):
+    lin = {"op": "tune", "from": "b", "train_method": "sft+grpo", "backend": "mlx", "method": "lora", "steps": 7,
+           "reward_start": 0.2, "reward_end": 0.8, "reward": {"class_weights": {"fraud": 1.0, "legit": 1.0}}}
+    res = [("tuned", {"metrics": {"n": 3, "f1": 0.5}})]
+    md = T.report_md("classify", res, {"positive": "fraud"}, lin)
+    assert "| train_method | sft+grpo |" in md and "| GRPO reward (train) | 0.200 -> 0.800" in md
+
+
+def test_grpo_warns_when_the_groups_stop_disagreeing(tmp_path, monkeypatch, capsys):
+    """The first Mac smoke run: lr 5e-5, KL 2.3, every group's samples identical by step 30 -- the tuned model
+    answered `legit` to everything. The run must say so, not just print a reward."""
+    a = _prepped(tmp_path)
+    run = str(tmp_path / "run")
+    monkeypatch.setattr(T, "pick_backend", lambda want, task, method="sft", **kw: "mlx")
+
+    def fake():
+        merged = os.path.join(run, a.name)
+        os.makedirs(merged, exist_ok=True)
+        return {"backend": "mlx", "steps": 2, "merged": merged, "losses": [],
+                "rewards": [T._grpo_record(1, reward=0.7, kl=0.3, group_std=0.2),
+                            T._grpo_record(2, reward=0.85, kl=2.2, group_std=0.0)]}
+    a.name, a.method = "m", "grpo"
+    T.train(a, backends={"grpo:mlx": fake})
+    assert "no learning signal" in capsys.readouterr().out
