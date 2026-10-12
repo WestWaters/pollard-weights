@@ -753,6 +753,11 @@ const ADV_SECTIONS = [
        + "or distillation from the bigger one. Every step is recorded in forge.json and the card, and the "
        + "result goes through the rest of Pollard like any model.",
     tools: ["pollard_forge"] },
+  { title: "FINE-TUNE ON YOUR DATA", icon: "check",
+    why: "LoRA on your own labelled cases (mlx on a Mac, TRL or Unsloth on CUDA), then the part that decides "
+       + "whether it ships: base vs tuned (vs a bigger or frontier model) on a held-out split that is refused if "
+       + "it leaks into train -- precision, recall, dollar-weighted recall and latency. Nothing leaves the machine.",
+    tools: ["pollard_tune"] },
   { title: "NEW ARCHITECTURES", icon: "box",
     why: "Pollard is not a list of supported models. onboard audits an architecture it has never "
        + "seen and writes the profile the allocator then works from, so an unknown model is a "
