@@ -430,15 +430,21 @@ def decision_section(builds, results):
     readout (pollard-decision). Agreement = same answer as the f16; option KL = how far the option
     probabilities moved; drift = mean absolute change per option."""
     rows, n = [], None
-    for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
-        r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}
-        d = r.get("decision")
+    boards = [(b, (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("decision"))
+              for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
+    # calibration columns only when the boards carry them (pollard-decision since 2026-10-11): older
+    # results files have none, and an all-"--" column would read as "measured, nothing there"
+    has_ece = any(isinstance(d, dict) and d.get("ece") is not None for _, d in boards)
+    has_flips = any(isinstance(d, dict) and d.get("flips") is not None for _, d in boards)
+    for b, d in boards:
         if not isinstance(d, dict):
             continue
         n = n or d.get("n")
         f = lambda k, fmt: (fmt.format(float(d[k])) if d.get(k) is not None else "--")
+        extra = (f" {f('ece', '{:.4f}')} |" if has_ece else "") + \
+                (f" {d['flips']} |" if has_flips and d.get("flips") is not None else (" -- |" if has_flips else ""))
         rows.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {f('agreement', '{:.0%}')} | "
-                    f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |")
+                    f"{_fmt_kl(d.get('option_kl'))} | {f('mean_abs_drift', '{:.4f}')} | {f('accuracy', '{:.0%}')} |{extra}")
     asked = f"the same {n} typed questions" if n else "the same typed questions"
     qset = next((str((r or {}).get("decision", {}).get("set") or "") for r in results.values()
                  if isinstance(r, dict) and isinstance(r.get("decision"), dict)), "")
@@ -452,10 +458,15 @@ def decision_section(builds, results):
             f"probability per option, so it is measured on its decisions, not on text. Each rung and the {ref} "
             f"answered {asked} through llama-server's `/v1/systemone`, read the same way "
             "([pollard-decision](https://github.com/WestWaters/pollard-weights)).", "",
-            f"| file | size | agrees with {ref} | option KL vs {ref} | mean prob. drift | accuracy |",
-            "|---|---:|---:|---:|---:|---:|", *rows, "",
+            f"| file | size | agrees with {ref} | option KL vs {ref} | mean prob. drift | accuracy |"
+            + (" ECE |" if has_ece else "") + (f" flips vs {ref} |" if has_flips else ""),
+            "|---|---:|---:|---:|---:|---:|" + ("---:|" if has_ece else "") + ("---:|" if has_flips else ""),
+            *rows, "",
             f"_Agrees = the rung picks the same option as the {ref}. Option KL = how far its option "
-            f"probabilities moved from the {ref}'s (0 = identical); it is the number that separates the rungs._",
+            f"probabilities moved from the {ref}'s (0 = identical); it is the number that separates the rungs._"
+            + (" _ECE = expected calibration error against the gold labels (10 bins, top label; lower = its "
+               "confidence means what it says)._" if has_ece else "")
+            + (f" _Flips = decisions whose answer differs from the {ref}'s._" if has_flips else ""),
             ""]
 
 
