@@ -277,6 +277,18 @@ Keep chat data in the mix for an instruct model (raw web text alone erases chat 
 distilled model inherits its teacher's license terms; the card refuses to guess one. Checkpoints save in bf16
 (`--save-dtype`); mid-run checkpoints stay fp32 so `--resume` is exact.
 
+## Fine-tune on your own data, then ship it (`pollard tune`)
+
+"Fine-tune Qwen for payments risk review" → follow **`skills/pollard/fine-tune-and-serve/SKILL.md`** (data
+checklist, privacy, reading the eval). Short form:
+```bash
+pollard tune --base Qwen/Qwen3.5-9B --data cases.csv --task classify --label-field outcome \
+    --weight-field amount_usd --time-field created_at --out runs/risk          # prep -> LoRA -> merge -> eval
+pollard-tune ship --out runs/risk --harness claude-code                       # ladder + card w/ eval + serve line
+```
+LoRA/QLoRA on mlx (Apple Silicon), TRL+PEFT or Unsloth (CUDA); the eval compares base vs tuned (vs
+`--compare-url`) on a leak-checked held-out split: per-class P/R/F1, dollar-weighted recall, latency P50/P99.
+
 ## Runtime targets (where the build will actually run)
 
 - **llama.cpp / ik_llama.cpp / Ollama / LM Studio** — the GGUF above runs as-is. The
@@ -454,6 +466,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-ngram` | n-gram / per-layer embedding tables on the SSD: inspect, launch line, swap watch (`pollard-fit --disk`) | models with a lookup table |
 | `pollard-forge` | make your own model: new architecture, Minitron-style prune, pretrain / distill, lineage card | any decoder-only |
+| `pollard-tune` | fine-tune on YOUR data (LoRA/QLoRA: mlx / TRL / Unsloth), eval base vs tuned vs frontier, ship + serve | any HF causal LM |
 | `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
 | `pollard-experts` | measured hot-expert report | **MoE only** |
