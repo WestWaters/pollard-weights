@@ -205,23 +205,56 @@ def _build_knows_arch(bin_dir, arch):
     return any(_scan_for(p, needle) for p in files)
 
 
-def lane_report(gguf_path, ik_bin_dir=None):
+def _is_ik_build(bin_dir):
+    """Can this bin dir build the trellis atoms? Only ik_llama.cpp has them: its ggml type table
+    names "iq1_kt", which no stock llama.cpp carries. A llama-quantize alone is not enough -- the
+    stock one on PATH rejects every ik type, and that is how a run that had just said "ik_llama
+    build not found" went on to plan the IQ1_KT mix and die in llama-quantize. The name lives in
+    libggml (or in llama-quantize itself in a static build), so only those files are scanned."""
+    if not bin_dir or not os.path.isdir(bin_dir) or not os.path.isfile(_bin_in(bin_dir, "llama-quantize")):
+        return False
+    try:
+        libs = sorted(n for n in os.listdir(bin_dir) if "ggml" in n.lower())
+    except OSError:
+        return False
+    files = [_bin_in(bin_dir, "llama-quantize")] + [os.path.join(bin_dir, n) for n in libs]
+    return any(os.path.isfile(f) and _scan_for(f, b"iq1_kt") for f in files)
+
+
+#: the ik_llama.cpp build pollard-runtime manages, next to this checkout
+_MANAGED_IK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "runtime", "ik_llama.cpp", "build", "bin")
+
+
+def find_ik_build(ik_bin_dir=None):
+    """The ik_llama.cpp bin dir the trellis flagship will be built with, or None. --bin, then
+    $IK_LLAMA_BIN, then the managed runtime, then wherever pollard-automap would look on its own --
+    each one checked to really be ik_llama, so the plan and the build agree on what is installed."""
+    cands = [ik_bin_dir, os.environ.get("IK_LLAMA_BIN"), _MANAGED_IK]
+    try:
+        from pollard_automap import find_ik_bin
+        cands.append(find_ik_bin(None))
+    except Exception:
+        pass
+    for cand in cands:
+        if _is_ik_build(cand):
+            return cand
+    return None
+
+
+def lane_report(gguf_path, ik_dir=None):
     """Autoaware lane availability: the trellis FLAGSHIP needs ik_llama.cpp, and ik_llama only
     builds architectures it knows. Say so BEFORE planning a flagship that cannot build, and say
-    exactly what is missing so it can be ported instead of silently downgraded."""
+    exactly what is missing so it can be ported instead of silently downgraded. `ik_dir` is the
+    build find_ik_build() found (None = no ik_llama on this machine)."""
     arch = _arch_name(gguf_path)
     if not arch:
         return None
-    known = None
-    managed = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime", "ik_llama.cpp", "build", "bin")
-    for cand in ([ik_bin_dir] if ik_bin_dir else []) + [os.environ.get("IK_LLAMA_BIN"), managed]:
-        known = _build_knows_arch(cand, arch)
-        if known is not None:
-            break
+    known = _build_knows_arch(ik_dir, arch) if ik_dir else None
     print(f"   arch: {arch}")
     if known is None:
-        print("   trellis flagship: ik_llama.cpp build not found -- set IK_LLAMA_BIN to enable the "
-              "IQ*_KT flagship (the K-quant ladder still runs).")
+        print("   trellis flagship: ik_llama.cpp build not found -- set IK_LLAMA_BIN (or --bin) to an "
+              "ik_llama.cpp build/bin to enable the IQ*_KT flagship (the K-quant ladder still runs).")
     elif known:
         print("   trellis flagship: available (ik_llama.cpp knows this arch)")
     else:
@@ -326,7 +359,7 @@ def _build_ladder(a, ik_flagship):
         _run(cmd, a.run)
 
 
-def _automap_mix(a, is_moe):
+def _automap_mix(a, is_moe, ik_dir=None):
     """Emit + (with --run) build the automap mix -- the hand-coded mixed-precision flagship.
     MoE: expert-allocation (crush cold experts, protect router/down/shared/attn). DENSE: the
     IQ1_KT crush-body / protect-attn+down+edges flagship (automap-on-dense, --allow-dense).
@@ -350,8 +383,8 @@ def _automap_mix(a, is_moe):
         am += ["--mix-only", "--no-eval"]                   # plain build = ONE model, no benchmark
     if not getattr(a, "gate", True):
         am += ["--no-gate"]                                 # user opted out of the auto coherence gate
-    if a.bin:
-        am += ["--bin", a.bin]
+    if ik_dir or a.bin:
+        am += ["--bin", ik_dir or a.bin]                    # the build find_ik_build() checked
     _run(am, a.run, cwd=here)
     mode = "3-bar BENCHMARK + PPL" if a.benchmark else "ONE mix model, no eval (fast)"
     print(f"   -> run {os.path.basename(out)} on the box -> {mode}"
@@ -911,7 +944,8 @@ def _dispatch(a):
     size_ladder((arch.get("total") or 0) / 1e9)
 
     # Autoaware: which lanes are actually open for THIS architecture (never plan an impossible build)
-    ik_known = lane_report(a.gguf, ik_bin_dir=getattr(a, "bin", None))
+    ik_dir = find_ik_build(getattr(a, "bin", None))
+    ik_known = lane_report(a.gguf, ik_dir=ik_dir)
 
     # WINNING PATH -- SAME shape for dense AND MoE (no losing fallback):
     #   (1) the imatrix K-quant ladder (pollard-fit) -- the honest, fit-your-RAM baseline, and
@@ -945,9 +979,16 @@ def _dispatch(a):
     if a.imatrix and ik_known is False:
         print(f"   2) (no {flagship} flagship: ik_llama.cpp does not know this architecture -- see above. "
               "The ladder is what ships until it is ported.)")
+    elif a.imatrix and not ik_dir:
+        # Every automap atom (IQ*_KT, iq1_bn, ...) is ik-only: stock llama-quantize rejects them, so
+        # without an ik_llama build the flagship is not planned at all. With --ladder the 2-bit rung
+        # was already given to a stock IQ2 type above (ik_flagship False).
+        print(f"   2) (skipped the {flagship} flagship: no ik_llama.cpp build found, and its trellis atoms are "
+              "ik-only" + (" -- the 2-bit rung is the stock IQ2 above" if a.ladder else "")
+              + ". Build ik_llama.cpp and set IK_LLAMA_BIN (or --bin) to its build/bin to add it.)")
     elif a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
-        _automap_mix(a, is_moe=is_moe)
+        _automap_mix(a, is_moe=is_moe, ik_dir=ik_dir)
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
