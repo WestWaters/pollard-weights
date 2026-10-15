@@ -507,9 +507,15 @@ def _read_chat(got):
     msg = ch.get("message") or {}
     content = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
-    if not reasoning and "</think>" in content:
-        head, _, tail = content.rpartition("</think>")
-        reasoning, content = head.replace("<think>", "").strip(), tail.strip()
+    if not reasoning and content:
+        # any model's delimiters, not just <think> -- [THINK], <seed:think>, harmony channels, ...
+        try:
+            from pollard_modelkind import split_reasoning
+            think, answer, unclosed = split_reasoning(content)
+        except ImportError:                                      # pragma: no cover
+            think, answer, unclosed = "", content, False
+        if think:
+            reasoning, content = think, ("" if unclosed else answer)
     return content, reasoning, (ch.get("finish_reason") or "")
 
 

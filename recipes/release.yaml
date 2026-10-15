@@ -9,6 +9,8 @@ calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300
   self_generate: null          # an OpenAI-compatible URL serving the f16, for target-generated calibration
+  reasoning: auto              # auto | on | off | toggle -- thinking traces in the model's own delimiters
+  reasoning_share: null        # null = 0.35 of the corpus when the model reasons
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
   taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)

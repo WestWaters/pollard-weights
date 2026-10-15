@@ -51,6 +51,8 @@ calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300
   self_generate: null          # an OpenAI-compatible URL serving the f16, for target-generated calibration
+  reasoning: auto              # auto | on | off | toggle -- thinking traces in the model's own delimiters
+  reasoning_share: null        # null = 0.35 of the corpus when the model reasons
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
   taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
@@ -202,6 +204,10 @@ def prep_steps(cfg, c, lanes):
     calib = ["pollard-calib", "--profile", str(cal.get("profile", "auto")), "--model", c["hf_dir"],
              "--per-domain", str(cal.get("per_domain", 300)), "--out", c["calib"], "--held-out", c["heldout"],
              "--record-model", c["src"]]
+    if cal.get("reasoning") not in (None, "auto"):              # auto = pollard-modelkind decides
+        calib += ["--reasoning", str(cal["reasoning"])]
+    if cal.get("reasoning_share") is not None:
+        calib += ["--reasoning-share", str(cal["reasoning_share"])]
     if cal.get("self_generate"):
         calib += ["--self-generate", "--server", str(cal["self_generate"])]
     steps.append(Step(id="prep/calib", lane="prep", kind="prep", requires="any", cmd=calib, out=c["calib"]))

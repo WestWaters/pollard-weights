@@ -17,6 +17,12 @@ prose spends its protected bits on the wrong tensors:
   code         raw code + code-chat turns
   auto         picked from pollard-modelkind (agentic -> agent, coder -> code, translator -> translation)
 
+REASONING models (pollard-modelkind reads it from the template: delimiters, on/off switch, always-on) get a
+reasoning share (--reasoning-share, default 0.35) of thinking traces rendered with the model's OWN delimiters
+-- thinking on for that share and off for the rest when the template has a switch -- and the corpus is NOT
+written if a reasoning model's calibration ends up with no thinking block (--allow-no-think to override).
+`--check corpus.txt --model <m>` audits an existing corpus the same way.
+
 --model <hf-dir-or-id> renders every chat-shaped sample through that model's own tokenizer chat
 template (transformers), so the imatrix sees the exact turn tokens the model will serve with. Without
 it a generic ChatML rendering is used.
@@ -45,12 +51,16 @@ offline seeds therefore yield fewer samples than --per-domain requests.
   pollard-calib --out calib.txt --profile agent --model Qwen/Qwen3-8B
   pollard-calib --out calib.txt --profile auto --model ./my-model --self-generate --server http://127.0.0.1:8080
   pollard-calib --out calib.txt --min-chars 200 --seed 0
+  pollard-calib --check calib.txt --model ./LFM2.5-24B-A2B     # does a reasoning model's corpus think?
 The imatrix/sensitivity COMPUTE (GPU) is a separate step -- this only builds the corpus.
 """
 import argparse, json, math, os, random, re, sys, textwrap, unicodedata
 from pathlib import Path
 
-DOMAINS = ["prose", "code", "codechat", "math", "chat", "multilingual", "translation", "agent"]
+DOMAINS = ["prose", "code", "codechat", "math", "chat", "multilingual", "translation", "agent", "reasoning"]
+
+#: share of the corpus that is reasoning traces when the model reasons (pollard-modelkind says so)
+REASONING_SHARE = 0.35
 
 # Domain weights per profile. --per-domain is the sample count for weight 1.
 PROFILES = {
@@ -118,6 +128,15 @@ _HF = {
               dict(id="NousResearch/hermes-function-calling-v1", config="func_calling",
                    split="train", kind="hermes", field="conversations", license="apache-2.0",
                    revision="dae3e1d28cfbcf4b915c04ea1e072030529b4bda")],
+    # Reasoning traces for thinking models: rendered with the MODEL'S OWN delimiters (pollard-modelkind),
+    # never as the dataset's markup. DeepSeek-R1 traces (R1 is MIT, distillation explicitly allowed);
+    # both datasets Apache-2.0. Streamed with a shuffle buffer so math, code, science and puzzles all show up.
+    "reasoning": [dict(id="open-thoughts/OpenThoughts-114k", config="metadata", split="train", kind="trace",
+                       field=("problem", "deepseek_reasoning", "deepseek_solution"), license="apache-2.0",
+                       revision="bd093c3994fd54d2390985b66988ddf282a55eb6", shuffle=True),
+                  dict(id="open-r1/OpenR1-Math-220k", config="default", split="train", kind="r1gen",
+                       field=("problem", "generations"), license="apache-2.0",
+                       revision="e4e141ec9dea9f8326f4d347be56105859b2bd68")],
 }
 _SMOL_LANGS = ["es", "ja", "ko", "hi", "id", "th", "sw", "fa", "bn", "ta"]
 
@@ -176,6 +195,26 @@ _SEED_CODECHAT = [
      {"role": "assistant", "content": "Arrays are objects, and `==` on objects compares references. Two literals create two distinct arrays, so the references differ."}],
     [{"role": "user", "content": "Fix this SQL: SELECT name FROM users WHERE age > 30 GROUP BY name HAVING COUNT(*) > 1 ORDER BY"},
      {"role": "assistant", "content": "The ORDER BY clause is missing its column:\n```sql\nSELECT name FROM users WHERE age > 30 GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;\n```"}],
+]
+# Reasoning seeds (written for Pollard, Apache-2.0): (question, thinking, answer). Short, but they carry the
+# structure that matters -- a thinking block in the model's own delimiters, closed, then the answer.
+_SEED_REASONING = [
+    ("A shop sells pens at 3 for $2. How much do 12 pens cost?",
+     "12 pens is 12 / 3 = 4 groups of three. Each group costs $2, so 4 * 2 = 8. Check: 3 pens $2, 6 pens $4, "
+     "9 pens $6, 12 pens $8. Consistent.",
+     "12 pens cost $8."),
+    ("Is 221 a prime number?",
+     "Try small primes up to sqrt(221) ~ 14.9: 2 no (odd), 3: 2+2+1 = 5 not divisible, 5 no, 7: 7*31 = 217, "
+     "remainder 4, no. 11: 11*20 = 220, remainder 1, no. 13: 13*17 = 221. Yes, divisible.",
+     "No. 221 = 13 * 17."),
+    ("Write a Python expression that returns the second largest distinct value in a list xs.",
+     "Distinct values first: set(xs). Sort descending and take index 1. Need at least two distinct values, "
+     "otherwise index 1 fails -- mention that. sorted(set(xs), reverse=True)[1] works.",
+     "`sorted(set(xs), reverse=True)[1]` -- it raises IndexError if xs has fewer than two distinct values."),
+    ("If all bloops are razzies and some razzies are lazzies, must some bloops be lazzies?",
+     "All bloops are inside razzies. Some razzies are lazzies, but those could be razzies that are not bloops. "
+     "Counter-example: bloops = {a}, razzies = {a, b}, lazzies = {b}. Premises hold, no bloop is a lazzy.",
+     "No. The lazzies among the razzies need not include any bloop."),
 ]
 # Translation seeds: one "lang<TAB>english<TAB>translation" string per line.
 _SEED_PAIRS = [
@@ -242,26 +281,80 @@ class Renderer:
     """Renders a structured chat record through the target model's own chat template.
 
     The imatrix is a statistic of the activations the model sees; the activations it sees in service
-    begin with its own turn tokens, not a dataset author's `<|user|>`. With no --model (or no
-    transformers) the generic ChatML rendering above is used and the sidecar says so."""
+    begin with its own turn tokens, not a dataset author's `<|user|>`. The tokenizer's template is used
+    through transformers when it loads; otherwise the template is rendered directly with jinja2 (a local
+    HF dir or a GGUF -- no tokenizer download needed); otherwise generic ChatML, and the sidecar says so.
 
-    def __init__(self, model=None, trust_remote_code=False):
-        self.tok, self.model, self.why = None, model, "generic ChatML (no --model)"
-        if not model:
-            return
-        try:
-            from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
-            if getattr(tok, "chat_template", None):
-                self.tok, self.why = tok, f"{model}'s own chat template"
-            else:
-                self.why = f"generic ChatML ({model} ships no chat template)"
-        except Exception as e:                                   # noqa: BLE001
-            self.why = f"generic ChatML (could not load {model}'s tokenizer: {repr(e)[:80]})"
+    A REASONING model (pollard-modelkind) gets its thinking rendered exactly as it emits it: the model's
+    own delimiters, the template's own separators, thinking switched on for reasoning records and off for
+    the rest when the template has a switch."""
 
-    def __call__(self, messages, tools=None):
-        if self.tok is None:
-            return chatml(messages, tools)
+    def __init__(self, model=None, trust_remote_code=False, reasoning="auto"):
+        self.tok, self.ct, self.model, self.why = None, None, model, "generic ChatML (no --model)"
+        self.rinfo = {"reasoning": False, "mode": "none"}
+        self._eot = None
+        tpl = ""
+        if model:
+            try:
+                from transformers import AutoTokenizer
+                tok = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+                if getattr(tok, "chat_template", None):
+                    self.tok, self.why = tok, f"{model}'s own chat template"
+                    tpl = tok.chat_template if isinstance(tok.chat_template, str) else ""
+                else:
+                    self.why = f"generic ChatML ({model} ships no chat template)"
+            except Exception as e:                               # noqa: BLE001
+                self.why = f"generic ChatML (could not load {model}'s tokenizer: {repr(e)[:80]})"
+            if self.tok is None:
+                try:
+                    from pollard_modelkind import ChatTemplate
+                    self.ct = ChatTemplate.from_model(model)
+                except Exception:                                # noqa: BLE001
+                    self.ct = None
+                if self.ct is not None:
+                    tpl = self.ct.source
+                    self.why = f"{model}'s own chat template (jinja2, no tokenizer)"
+        self.rinfo = resolve_reasoning(reasoning, model, tpl)
+
+    # -- template plumbing
+    def kwargs(self, thinking):
+        """Template variables that switch thinking on (True) / off (False); {} when there is no switch
+        or the record does not say (the template's own default)."""
+        t = self.rinfo.get("toggle") or {}
+        if not t or thinking is None:
+            return {}
+        return dict((t.get("on") if thinking else t.get("off")) or {})
+
+    def _apply(self, messages, add_generation_prompt=False, tools=None, **kw):
+        if self.tok is not None:
+            extra = dict(kw)
+            if tools:
+                extra["tools"] = tools
+            if add_generation_prompt:
+                extra["add_generation_prompt"] = True
+            return self.tok.apply_chat_template(messages, tokenize=False, **extra)
+        if self.ct is not None:
+            return self.ct.render(messages, add_generation_prompt=add_generation_prompt, tools=tools, **kw)
+        return chatml(messages, tools) + ("\n<|im_start|>assistant\n" if add_generation_prompt else "")
+
+    def _try(self, messages, add_generation_prompt=False, tools=None, **kw):
+        for attempt in (messages, _flatten_tools(messages)):
+            try:
+                return self._apply(attempt, add_generation_prompt, tools, **kw)
+            except Exception:                                    # noqa: BLE001
+                continue
+        return None
+
+    def end_of_turn(self):
+        """What the template writes after an assistant answer (`<|im_end|>\n`, `<|eot_id|>`, ...)."""
+        if self._eot is None:
+            u, mark = {"role": "user", "content": "UZQX"}, "AZQXANSWER"
+            full = self._try([u, {"role": "assistant", "content": mark}]) or ""
+            self._eot = full[full.rindex(mark) + len(mark):] if mark in full else ""
+        return self._eot
+
+    # -- rendering
+    def __call__(self, messages, tools=None, thinking=None):
         msgs = [dict(m) for m in messages]
         for m in msgs:                                          # templates differ on argument encoding
             for tc in m.get("tool_calls") or []:
@@ -271,13 +364,63 @@ class Renderer:
                         fn["arguments"] = json.loads(fn["arguments"])
                     except ValueError:
                         pass
-        for attempt in (msgs, _flatten_tools(msgs)):
-            try:
-                kw = {"tools": tools} if tools else {}
-                return self.tok.apply_chat_template(attempt, tokenize=False, **kw)
-            except Exception:                                    # noqa: BLE001
-                continue
-        return chatml(messages, tools)
+        last = msgs[-1] if msgs else {}
+        if self.rinfo.get("reasoning") and last.get("role") == "assistant" and last.get("reasoning_content"):
+            return self.render_reasoning(msgs, tools)
+        if self.tok is None and self.ct is None:
+            return chatml(messages, tools)
+        out = self._try(msgs, tools=tools, **self.kwargs(thinking))
+        return out if out is not None else chatml(messages, tools)
+
+    def render_reasoning(self, msgs, tools=None):
+        """The prompt, then the assistant turn exactly as the model emits it: opener, thinking, closer,
+        answer, end of turn. The template's own rendering when it renders the final turn's thinking;
+        otherwise its generation prompt + the delimiters it uses (R1-distill templates strip the block)."""
+        info = self.rinfo
+        last = dict(msgs[-1])
+        r, a = last.get("reasoning_content") or "", last.get("content") or ""
+        on = self.kwargs(True)
+        close = info.get("close") or "</think>"
+        if self.tok is not None or self.ct is not None:
+            m2 = dict(last, thinking=r, reasoning=r)
+            full = self._try(msgs[:-1] + [m2], tools=tools, **on)
+            probe = r[:120]
+            if full and probe in full and close in full[full.index(probe):]:
+                return full
+            prompt = self._try(msgs[:-1], add_generation_prompt=True, tools=tools, **on)
+        else:
+            prompt = None
+        if prompt is None:
+            prompt = chatml(msgs[:-1], tools) + "\n<|im_start|>assistant\n"
+        opener = info.get("open_raw") or ((info.get("open") or "<think>") + "\n")
+        pre = info.get("prefill") or ""
+        if (pre and prompt.rstrip().endswith(pre.strip())) or (info.get("open") and
+                                                                prompt.rstrip().endswith(info["open"].strip())):
+            opener = "\n" if opener.endswith("\n") and not prompt.endswith("\n") else ""
+        mid = info.get("mid") or ("\n" + close + "\n\n")
+        eot = self.end_of_turn() if (self.tok is not None or self.ct is not None) else "<|im_end|>"
+        return prompt + opener + r + mid + a + eot
+
+
+def resolve_reasoning(mode, model, tpl=""):
+    """pollard-modelkind's reasoning verdict for this model, overridden by --reasoning on/off/toggle."""
+    info = {"reasoning": False, "mode": "none", "why": []}
+    if mode == "off":
+        info["why"] = ["--reasoning off"]
+        return info
+    try:
+        from pollard_modelkind import reasoning_info
+        if model or tpl:
+            info = reasoning_info(model or "", tpl or None, None, None)
+    except Exception as e:                                       # noqa: BLE001
+        info = {"reasoning": False, "mode": "none", "why": [f"could not classify ({repr(e)[:60]})"]}
+    if mode in ("on", "toggle") and not info.get("reasoning"):
+        info.update(reasoning=True, mode="always" if mode == "on" else "toggle", style="tag",
+                    open=info.get("open") or "<think>", close=info.get("close") or "</think>")
+        info["open_raw"] = info.get("open_raw") or info["open"] + "\n"
+        info["mid"] = info.get("mid") or "\n" + info["close"] + "\n\n"
+        info["why"] = list(info.get("why") or []) + [f"--reasoning {mode}"]
+    return info
 
 
 def _flatten_tools(messages):
@@ -297,10 +440,10 @@ def _flatten_tools(messages):
 
 
 def render(record, renderer):
-    """A record is plain text (str) or {"messages": [...], "tools": [...]}."""
+    """A record is plain text (str) or {"messages": [...], "tools": [...], "thinking": bool|None}."""
     if isinstance(record, str):
         return record
-    return renderer(record["messages"], record.get("tools"))
+    return renderer(record["messages"], record.get("tools"), thinking=record.get("thinking"))
 
 
 # ----------------------------------------------------------------- dataset extractors
@@ -391,7 +534,36 @@ def _extract(src, ex, min_chars):
         return {"messages": msgs}
     if kind == "hermes":
         return _hermes_record(ex.get(field), ex.get("tools"))
+    if kind == "trace":                                         # (problem, reasoning, answer) columns
+        q, r, ans = (str(ex.get(f) or "").strip() for f in field)
+        return reasoning_record(q, r, ans) if q and r and ans else None
+    if kind == "r1gen":                                         # problem + raw R1 generations with <think>
+        q = str(ex.get(field[0]) or "").strip()
+        gens = ex.get(field[1]) or []
+        gen = next((g for g in gens if isinstance(g, str) and "</think>" in g), None)
+        if not q or not gen:
+            return None
+        r, _, ans = gen.partition("</think>")
+        return reasoning_record(q, r.replace("<think>", "").strip(), ans.strip())
     return None
+
+
+#: a DeepSeek-R1 trace runs to 10-40K chars; one sample that long would dominate a 512-token imatrix
+#: chunk set. The head (how the model starts thinking) and the tail (how it closes and answers) are kept.
+REASONING_MAX_CHARS = 6000
+
+
+def reasoning_record(question, thinking, answer, max_chars=None):
+    """A user turn and an assistant turn carrying its thinking (reasoning_content) and answer. Rendered
+    later with the TARGET model's delimiters -- the dataset's own markup is never kept."""
+    cap = REASONING_MAX_CHARS if max_chars is None else max_chars
+    if cap and len(thinking) > cap:
+        head = thinking[:int(cap * 0.7)]
+        tail = thinking[-int(cap * 0.3):]
+        thinking = head.rsplit("\n", 1)[0] + "\n\n" + tail.split("\n", 1)[-1]
+    return {"messages": [{"role": "user", "content": question},
+                         {"role": "assistant", "content": answer, "reasoning_content": thinking.strip()}],
+            "thinking": True}
 
 
 def _from_hf(domain, need, min_chars):
@@ -439,7 +611,10 @@ def _from_hf(domain, need, min_chars):
                         if got >= per:
                             break
             else:
-                for ex in _stream(load_dataset, src):
+                stream = _stream(load_dataset, src)
+                if src.get("shuffle"):                          # traces are sorted by domain upstream
+                    stream = stream.shuffle(seed=0, buffer_size=500)
+                for ex in stream:
                     r = _extract(src, ex, min_chars)
                     if r is not None:
                         out.append(r)
@@ -470,6 +645,8 @@ def _seed_records(domain):
             lang, en, tr = line.split("\t")
             out += [translation_record("eng_Latn", lang, en, tr), translation_record(lang, "eng_Latn", tr, en)]
         return out
+    if domain == "reasoning":
+        return [reasoning_record(q, r, a) for q, r, a in _SEED_REASONING]
     if domain == "agent":
         out = []
         for i, (q, name, args, result, answer) in enumerate(_SEED_AGENT):
@@ -497,29 +674,47 @@ def build_domain(domain, need, min_chars, rng):
 
 # ----------------------------------------------------------------- self-generation (AngelSlim-style)
 
-def openai_complete(base_url, model="pollard", max_tokens=512, temperature=0.0, timeout=600):
-    """A completion function over any OpenAI-compatible server (llama-server, vLLM, mlx_lm.server)."""
+def openai_complete(base_url, model="pollard", max_tokens=512, temperature=0.0, timeout=600,
+                    template_kwargs=None, reasoning_max_tokens=4096):
+    """A completion function over any OpenAI-compatible server (llama-server, vLLM, mlx_lm.server).
+
+    `template_kwargs(thinking)` -> chat_template_kwargs for the request (thinking on/off on a toggle
+    model). A reasoning request gets `reasoning_max_tokens`: a thinking block cut off by the budget has
+    no answer and no closer, and is worse calibration than the reference it would replace."""
     import urllib.request
 
-    def complete(messages, tools=None):
-        body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+    def complete(messages, tools=None, thinking=None):
+        body = {"model": model, "messages": messages, "temperature": temperature,
+                "max_tokens": max(max_tokens, reasoning_max_tokens) if thinking else max_tokens}
         if tools:
             body["tools"] = tools
+        kw = template_kwargs(thinking) if template_kwargs else {}
+        if kw:
+            body["chat_template_kwargs"] = kw
         req = urllib.request.Request(base_url.rstrip("/") + "/v1/chat/completions",
                                      data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            msg = json.load(r)["choices"][0]["message"]
+            ch = json.load(r)["choices"][0]
+        msg = ch["message"]
         out = {"role": "assistant", "content": msg.get("content") or ""}
+        rc = msg.get("reasoning_content") or msg.get("reasoning")
+        if rc:
+            out["reasoning_content"] = rc
         if msg.get("tool_calls"):
             out["tool_calls"] = msg["tool_calls"]
+        out["_finish"] = ch.get("finish_reason")
         return out
     return complete
 
 
-def self_generate(records, complete, log=None):
+def self_generate(records, complete, log=None, info=None):
     """Replace the LAST assistant turn of every chat record with the model's own answer to the turns
     before it. Plain-text records (prose, raw code) pass through: there is no prompt to answer.
-    A record whose request fails keeps its reference answer, and the count says so."""
+    A record whose request fails keeps its reference answer, and the count says so.
+
+    A reasoning model's thinking is kept: from reasoning_content when the server splits it out, or split
+    off the content with the model's own delimiters when it does not. A thinking block the budget cut
+    off (no closer, no answer) keeps the reference instead."""
     out, done, failed = [], 0, 0
     for r in records:
         if isinstance(r, str) or not r.get("messages"):
@@ -529,7 +724,19 @@ def self_generate(records, complete, log=None):
         if last is None:
             out.append(r); continue
         try:
-            ans = complete([dict(m) for m in msgs[:last]], r.get("tools"))
+            prompt = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in msgs[:last]]
+            ans = (complete(prompt, r.get("tools"), thinking=r["thinking"]) if r.get("thinking") is not None
+                   else complete(prompt, r.get("tools")))
+            finish = ans.pop("_finish", None)
+            if info and info.get("reasoning") and not ans.get("reasoning_content") and ans.get("content"):
+                from pollard_modelkind import split_reasoning
+                think, answer, unclosed = split_reasoning(ans["content"], info)
+                if think:
+                    if unclosed:
+                        raise ValueError("thinking cut off by the token budget")
+                    ans["reasoning_content"], ans["content"] = think, answer
+            if finish == "length" and ans.get("reasoning_content") and not ans.get("content"):
+                raise ValueError("thinking cut off by the token budget")
             if not (ans.get("content") or ans.get("tool_calls")):
                 raise ValueError("empty answer")
             out.append({**r, "messages": msgs[:last] + [ans]})
@@ -539,6 +746,44 @@ def self_generate(records, complete, log=None):
             if log and failed <= 3:
                 log(f"  self-generate: kept the reference answer ({repr(e)[:80]})")
     return out, done, failed
+
+
+# ----------------------------------------------------------------- reasoning sanity
+
+def think_report(samples, info):
+    """How many thinking blocks, in the model's OWN delimiters, the corpus actually contains.
+
+    `samples` = rendered strings (or one whole corpus text). A block is opener ... closer; `blocks` counts
+    the ones with thinking inside, `empty_blocks` the `<think>\n\n</think>` a toggle model's thinking-off
+    prompt prefills."""
+    o, c = (info or {}).get("open"), (info or {}).get("close")
+    rep = {"reasoning_model": bool((info or {}).get("reasoning")), "mode": (info or {}).get("mode"),
+           "open": o, "close": c, "blocks": 0, "empty_blocks": 0, "closers": 0,
+           "samples": len(samples), "samples_with_thinking": 0}
+    if not c:
+        return rep
+    pat = re.compile((re.escape(o) if o else "") + r"(.*?)" + re.escape(c), re.S)
+    for smp in samples:
+        rep["closers"] += smp.count(c)
+        found = pat.findall(smp) if o else [smp.split(c)[0][-400:]] * smp.count(c)
+        full = [b for b in found if b.strip()]
+        rep["blocks"] += len(full)
+        rep["empty_blocks"] += len(found) - len(full)
+        rep["samples_with_thinking"] += bool(full)
+    rep["share"] = round(rep["samples_with_thinking"] / max(1, len(samples)), 4)
+    return rep
+
+
+def think_problem(rep):
+    """None, or why this corpus must not be used for a reasoning model."""
+    if not rep.get("reasoning_model"):
+        return None
+    if rep["blocks"] == 0:
+        return (f"the model reasons ({rep.get('mode')}, {rep.get('open')}...{rep.get('close')}) but the corpus "
+                f"has ZERO thinking blocks in its delimiters -- the imatrix would protect a model that never "
+                f"thinks. Fix the rendering (--model with the real template), or --reasoning off if this "
+                f"model really does not think")
+    return None
 
 
 # ----------------------------------------------------------------- split + provenance
@@ -590,14 +835,20 @@ def resolve_profile(profile, model=None):
         return "general", f"auto: could not classify ({repr(e)[:60]}), general mix"
 
 
-def domain_counts(profile, per_domain, domains=None):
-    """{domain: n samples}. An explicit --domains list keeps the old equal-weight behaviour."""
+def domain_counts(profile, per_domain, domains=None, reasoning_share=0.0):
+    """{domain: n samples}. An explicit --domains list keeps the old equal-weight behaviour.
+    `reasoning_share` > 0 (a reasoning model) adds the reasoning domain so it is that share of the total."""
     if domains:
-        return {d: per_domain for d in domains}
-    return {d: max(1, int(round(per_domain * w))) for d, w in PROFILES[profile].items()}
+        out = {d: per_domain for d in domains}
+    else:
+        out = {d: max(1, int(round(per_domain * w))) for d, w in PROFILES[profile].items()}
+    if reasoning_share and "reasoning" not in out:
+        share = min(max(float(reasoning_share), 0.0), 0.9)
+        out["reasoning"] = max(1, int(round(share / (1 - share) * sum(out.values()))))
+    return out
 
 
-def provenance(profile, why, counts, stats, renderer_why, selfgen=None):
+def provenance(profile, why, counts, stats, renderer_why, selfgen=None, reasoning=None):
     """What this corpus was made of -- written beside it and into the MANIFEST."""
     doms = {}
     for d, src, ntr, nh in stats:
@@ -607,7 +858,7 @@ def provenance(profile, why, counts, stats, renderer_why, selfgen=None):
                               else {"id": "unrecorded"} if src == "hf"
                               else {"id": "pollard-calib bundled seeds", "license": "apache-2.0"})}
     return {"tool": "pollard-calib", "profile": profile, "profile_why": why, "rendering": renderer_why,
-            "self_generated": selfgen, "domains": doms}
+            "self_generated": selfgen, "domains": doms, "reasoning": reasoning}
 
 
 def main():
@@ -630,6 +881,17 @@ def main():
     ap.add_argument("--self-generate-gguf", help="start a local llama-server on this f16 GGUF for --self-generate")
     ap.add_argument("--gen-max-tokens", type=int, default=512)
     ap.add_argument("--ngl", default="0", help="GPU layers for the local llama-server (default 0 = CPU; shared boxes)")
+    ap.add_argument("--reasoning", default="auto", choices=["auto", "on", "off", "toggle"],
+                    help="reasoning traces in the model's own thinking delimiters: auto = when pollard-modelkind "
+                         "says the model reasons (toggle models get thinking-on AND thinking-off samples)")
+    ap.add_argument("--reasoning-share", type=float, default=REASONING_SHARE,
+                    help=f"fraction of the corpus that is reasoning traces for a reasoning model (default {REASONING_SHARE})")
+    ap.add_argument("--reasoning-max-chars", type=int, default=REASONING_MAX_CHARS,
+                    help="trim each thinking block to its head + tail at this length (traces run 10-40K chars)")
+    ap.add_argument("--allow-no-think", action="store_true",
+                    help="write the corpus even when a reasoning model's calibration has no thinking block")
+    ap.add_argument("--check", metavar="CORPUS",
+                    help="audit an EXISTING corpus: count --model's thinking delimiters in it, fail if none")
     ap.add_argument("--record-model", help="workspace model key: log the corpus + its sources in that MANIFEST")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -640,6 +902,22 @@ def main():
     if a.self_generate and not (a.server or a.self_generate_gguf):
         ap.error("--self-generate needs --server URL or --self-generate-gguf f16.gguf")
 
+    globals()["REASONING_MAX_CHARS"] = max(0, a.reasoning_max_chars)     # reasoning_record() reads it
+    if a.check:
+        info = resolve_reasoning(a.reasoning, a.model)
+        text = open(a.check, encoding="utf-8", errors="replace").read()
+        rep = think_report([text], info)
+        print(f"== pollard-calib --check :: {a.check}")
+        print(f"   model reasons : {info.get('reasoning')} ({info.get('mode')})  "
+              f"{info.get('open') or ''} ... {info.get('close') or ''}")
+        print(f"   thinking blocks {rep['blocks']}  |  empty {rep['empty_blocks']}  |  closers {rep['closers']}")
+        bad = think_problem(rep)
+        if bad:
+            sys.exit(f"FAIL: {bad}")
+        print("   OK" if info.get("reasoning") else "   (not a reasoning model -- nothing to check)")
+        return
+    if not math.isfinite(a.reasoning_share) or not 0 <= a.reasoning_share < 0.9:
+        ap.error("--reasoning-share must be in [0, 0.9)")
     rng = random.Random(a.seed)
     doms = None
     if a.domains is not None:
@@ -652,7 +930,10 @@ def main():
     profile, why = resolve_profile(a.profile, a.model)
     if doms:
         profile, why = "custom", f"--domains {','.join(doms)}"
-    counts = domain_counts(profile if not doms else "general", a.per_domain, doms)
+    renderer = Renderer(a.model, a.trust_remote_code, a.reasoning)
+    rinfo = renderer.rinfo
+    counts = domain_counts(profile if not doms else "general", a.per_domain, doms,
+                           reasoning_share=a.reasoning_share if rinfo.get("reasoning") else 0.0)
     if not a.out:
         try:
             import pollard_workspace as ws
@@ -665,24 +946,29 @@ def main():
         if path and os.path.dirname(os.path.abspath(path)):
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
-    renderer = Renderer(a.model, a.trust_remote_code)
     complete, selfgen = None, None
     srv_ctx = None
     if a.self_generate:
         if a.server:
-            complete = openai_complete(a.server, max_tokens=a.gen_max_tokens)
+            complete = openai_complete(a.server, max_tokens=a.gen_max_tokens, template_kwargs=renderer.kwargs)
         else:
             from pollard_taskeval import served
             srv_ctx = served(a.self_generate_gguf, a.ngl, 8099, 8192)
-            complete = openai_complete(srv_ctx.__enter__(), max_tokens=a.gen_max_tokens)
+            complete = openai_complete(srv_ctx.__enter__(), max_tokens=a.gen_max_tokens,
+                                       template_kwargs=renderer.kwargs)
 
     train, held, stats = [], [], []
     rows = []
     try:
         for d, n in counts.items():
             samples, src = build_domain(d, n, a.min_chars, rng)
+            if rinfo.get("mode") == "toggle" and d != "reasoning":
+                # a switchable model is served both ways: the reasoning share thinks, the rest does not
+                samples = [s if isinstance(s, str) or s.get("thinking") else {**s, "thinking": False}
+                           for s in samples]
             if complete is not None:
-                samples, ok, bad = self_generate(samples, complete, log=lambda m: print(m, file=sys.stderr))
+                samples, ok, bad = self_generate(samples, complete, log=lambda m: print(m, file=sys.stderr),
+                                                 info=rinfo)
                 selfgen = selfgen or {"server": a.server or a.self_generate_gguf, "answers": 0, "kept_reference": 0}
                 selfgen["answers"] += ok
                 selfgen["kept_reference"] += bad
@@ -708,6 +994,12 @@ def main():
     rng.shuffle(train)
     rng.shuffle(held)
     chars = sum(len(s) for _, s in train)
+    # The reasoning sanity gate runs BEFORE anything is written: a resumable pipeline treats an existing
+    # corpus as done, so a think-less corpus on disk would be picked up by the next run.
+    think = think_report([s for _, s in train], rinfo)
+    bad = think_problem(think)
+    if bad and not a.allow_no_think:
+        sys.exit(f"ERROR (pollard-calib): {bad}")
     with open(a.out, "w", encoding="utf-8") as f:
         f.write("\n".join(s for _, s in train))
     print(f"== pollard-calib :: Calib 3.0 corpus, profile {profile} ({why})")
@@ -718,11 +1010,20 @@ def main():
     print(f"   wrote {a.out}")
     if selfgen:
         print(f"   self-generated {selfgen['answers']} answers ({selfgen['kept_reference']} kept the reference)")
+    if rinfo.get("reasoning"):
+        print(f"   reasoning model ({rinfo.get('mode')}): {think['blocks']} thinking blocks in "
+              f"{rinfo.get('open') or ''}...{rinfo.get('close') or ''} across {think['samples_with_thinking']} of "
+              f"{think['samples']} samples ({100 * think.get('share', 0):.0f}%)"
+              + (f", {think['empty_blocks']} thinking-off" if think["empty_blocks"] else ""))
+        if bad:
+            print(f"   !! {bad} (written anyway: --allow-no-think)", file=sys.stderr)
     if a.held_out:
         with open(a.held_out, "w", encoding="utf-8") as f:
             f.write("\n".join(s for _, s in held))
         print(f"   wrote {a.held_out} ({len(held)} held-out samples -- overfit check)")
-    prov = provenance(profile, why, counts, stats, renderer.why, selfgen)
+    prov = provenance(profile, why, counts, stats, renderer.why, selfgen,
+                      reasoning={"verdict": {k: v for k, v in rinfo.items() if k != "why"},
+                                 "why": rinfo.get("why"), "report": think})
     prov.update({"path": os.path.abspath(a.out), "held_out": os.path.abspath(a.held_out) if a.held_out else None,
                  "samples": len(train), "chars": chars, "seed": a.seed})
     with open(a.out + ".sources.json", "w", encoding="utf-8") as f:

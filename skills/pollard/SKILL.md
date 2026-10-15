@@ -311,6 +311,25 @@ schemas through the template), `code`, `auto` (from pollard-modelkind; `pollard`
 (`--server URL` or `--self-generate-gguf f16.gguf`) swaps in the f16 model's own answers. Sources are open-licensed
 and pinned; ids/revisions/licences go to `<out>.sources.json` and the MANIFEST.
 
+**Reasoning (thinking) models -- automatic.** `pollard-modelkind` renders the chat template (jinja2, no tokenizer)
+to read the model's OWN thinking delimiters (`<think>`, `<seed:think>`, `[THINK]`, harmony
+`<|channel|>analysis`, `<|START_THINKING|>`, `<mm:think>`, Gemma `<|channel>thought` ...), whether a variable
+switches it (`enable_thinking` / `thinking` / `thinking_mode` / `reasoning_effort` no_think) and whether the
+generation prompt already opens it (always-on); names/tags/config are the fallback (R1-distill templates strip the
+block; `*-Instruct-2507` / `non-thinking` releases are excluded). `pollard-calib` then adds a **reasoning share
+(`--reasoning-share`, default 0.35)** of DeepSeek-R1 traces (OpenThoughts-114k metadata, Apache-2.0, pinned;
+OpenR1-Math fallback; bundled seeds offline) rendered EXACTLY as the model emits them -- the template's own
+rendering when it renders the final turn's thinking, else its generation prompt + delimiters + end-of-turn. A
+toggleable model gets thinking-ON for the reasoning share and thinking-OFF for the rest (template kwargs).
+`--self-generate` keeps the model's own thinking (reasoning_content, or split off inline) and rejects blocks the
+budget cut off. **Sanity gate:** the corpus is NOT written (non-zero exit) if a reasoning model's calibration has
+zero thinking blocks in its delimiters; the counts land in `<out>.sources.json` (`reasoning.report`).
+`pollard-calib --check old.txt --model <m>` audits an existing corpus (the LFM2.5-24B corpus had zero `<think>`).
+`--reasoning on|off|toggle` overrides; `--allow-no-think` writes anyway. Eval side: taskeval / toolcall / the
+coherence gate strip thinking for ANY delimiter style (`pollard_modelkind.split_reasoning`); an unclosed block =
+no answer (`unclosed-think` in pollard-toolcall, which gives reasoning models a 1024-token budget). KL/verify
+keep the thinking: the held-out split carries the same reasoning share, so KL is measured on what the model emits.
+
 ### Retention vs f16 on the card
 `pollard-taskeval --results results.json --rung <tag>` (any suite, plus `--suite mt` = WMT24++ / FLORES+ chrF++ per
 language, optional COMET-22), `pollard-toolcall --results`, `pollard-decision --results` all merge into one
@@ -538,7 +557,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-archfp` | what IS this architecture structurally — and which known one is it a twin of? | any |
 | `pollard-onboard` | audit a NEW architecture and emit a ready-to-submit contribution | any |
 | `pollard-envmatch` | build a custom-arch model in a Python env matched to its converter | any |
-| `pollard-calib` | calibration corpus: Calib 3.0 + `--profile general/translation/agent/code/auto`, model-template rendering, `--self-generate` | any |
+| `pollard-calib` | calibration corpus: Calib 3.0 + `--profile general/translation/agent/code/auto`, model-template rendering, `--self-generate`, automatic reasoning share in the model's own think delimiters + sanity gate (`--check`) | any |
 | `pollard-probes` | task-accuracy probes on a Pollard'd GGUF via llama.cpp's own runner | any |
 | `pollard-taskeval` | task scores + RETENTION vs f16 (lm-eval suites, `--suite mt` chrF++/COMET per language), `--results` for the card | any |
 | `pollard-toolcall` | does the rung still emit valid tool calls (vs the f16), `--results` for the card + gate | any (agent models) |
