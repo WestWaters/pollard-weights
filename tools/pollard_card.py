@@ -628,8 +628,16 @@ def main():
     runtimes = {k: v for k, v in runtimes.items() if not k.startswith("_")}
     # Anything that is not plainly 'stock' has to be said on the card. 'newer' and 'unknown' belong
     # here too: a reader whose llama.cpp cannot open the file does not care why it cannot.
-    NONSTOCK = ("ik_llama", "fork", "newer", "unknown")
+    NONSTOCK = ("ik_llama", "fork", "newer", "unknown", "prism")
     ik_builds = [b for b in builds if runtimes.get(b.get("path")) in NONSTOCK]
+    # online-RHT rungs (prism.hadamard manifest): stock llama.cpp, but only from b11556 (#29600) --
+    # a version requirement, not a fork -- and an older build loads them silently WRONG.
+    prism_builds = [b for b in builds if runtimes.get(b.get("path")) == "prism"]
+    try:
+        from pollard_ggufcompat import PRISM_MIN_BUILD
+    except Exception:                                                    # noqa: BLE001
+        PRISM_MIN_BUILD = "b11556"
+    PRISM_NEED = f"llama.cpp >= {PRISM_MIN_BUILD}"
 
     # Detect first: the parameter count drives f16_gb, which drives the shrink block. Detecting
     # afterwards left a card with no "Pollard shrank this model" hero at all whenever the config
@@ -698,6 +706,13 @@ def main():
         elif not ik_builds:
             out += ["**Standard GGUF -- every file here runs in stock llama.cpp / ik_llama.cpp, "
                     "Ollama, LM Studio.**", ""]
+        elif prism_builds and len(prism_builds) == len(runtimes):
+            out += [f"**These files need {PRISM_NEED}** ([#29600](https://github.com/ggml-org/llama.cpp/pull/29600)). "
+                    "They are online-RHT rungs: the weights are stored Hadamard-folded (W.D.H) and the "
+                    "runtime applies the matching transform to each matmul input. Any llama.cpp from "
+                    f"{PRISM_MIN_BUILD} on runs them -- Ollama and LM Studio once they bundle one that new. "
+                    "**An older llama.cpp loads them without an error and produces garbage**, and "
+                    "ik_llama.cpp is not supported.", ""]
         elif len(ik_builds) == len(runtimes):
             if fork_arch and arch_verdict == "newer":
                 out += [f"**Standard GGUF, but you need a recent llama.cpp.** This model's "
@@ -716,13 +731,23 @@ def main():
                         "places ik_llama-only atoms on this model's sensitive tensors, so stock "
                         "llama.cpp (and therefore Ollama and LM Studio) will not load them.", ""]
         else:
-            need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
-                             sorted(ik_builds, key=lambda x: -(x.get("bytes") or 0)))
-            v_need, _, pron = rung_agreement(len(ik_builds))
-            out += ["**Standard GGUF -- runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, "
-                    f"except where noted.** {need} {v_need} [ik_llama.cpp]({IK_URL}): {pron} "
-                    "allocation puts ik_llama-only atoms on the tensors it protects. The rest run "
-                    "anywhere.", ""]
+            ik_only = [b for b in ik_builds if runtimes.get(b.get("path")) != "prism"]
+            line = "**Standard GGUF -- runs in stock llama.cpp / ik_llama.cpp, Ollama, LM Studio, except where noted.**"
+            if ik_only:
+                need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
+                                 sorted(ik_only, key=lambda x: -(x.get("bytes") or 0)))
+                v_need, _, pron = rung_agreement(len(ik_only))
+                line += (f" {need} {v_need} [ik_llama.cpp]({IK_URL}): {pron} allocation puts "
+                         "ik_llama-only atoms on the tensors it protects.")
+            if prism_builds:
+                need = ", ".join(f"`{b.get('tag') or b.get('name')}`" for b in
+                                 sorted(prism_builds, key=lambda x: -(x.get("bytes") or 0)))
+                v_need, _, _pron = rung_agreement(len(prism_builds))
+                line += (f" {need} {v_need} {PRISM_NEED} "
+                         "([#29600](https://github.com/ggml-org/llama.cpp/pull/29600)) -- online-RHT "
+                         "weights; an older llama.cpp loads them silently wrong, and ik_llama.cpp is "
+                         "not supported.")
+            out += [line + " The rest run anywhere.", ""]
 
     # ---- Model details: the at-a-glance table every good Pollard card opens with
     arch = a.arch or mtype or "--"
@@ -768,6 +793,8 @@ def main():
             rtb = runtimes.get(b.get("path"))
             if rtb == "ik_llama":
                 head += " *(ik_llama.cpp)*"
+            elif rtb == "prism":
+                head += f" *(needs {PRISM_NEED})*"
             elif rtb in ("fork", "newer", "unknown"):
                 head += f" *(needs {fork_plain})*"
             out.append(f"{head} {note[:110]}{rec}" if note else f"{head}{rec}")
@@ -819,7 +846,8 @@ def main():
         tps_c = f" {r.get('tps','--')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
         rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain,
-                  "unknown": "unverified", "stock": "any llama.cpp"}.get(rt, "--")
+                  "unknown": "unverified", "stock": "any llama.cpp",
+                  "prism": PRISM_NEED}.get(rt, "--")
         rt_c = (" " + rt_lbl + " |") if mixed else ""
         _ppl, _kld = r.get("ppl"), r.get("kld")
         note = r.get("note") or auto_note(_i, len(builds), _ppl, results.get("_f16_ppl"),
@@ -932,6 +960,9 @@ def main():
                     f"This model's architecture (`{fork_arch}`) needs "
                     f"{fork_where or 'the vendor llama.cpp fork'}, so every file here runs there"
                     if fork_arch else
+                    f"`{extag or exn}` is an online-RHT rung, so it needs **{PRISM_NEED}** "
+                    "(update first -- an older build loads it silently wrong)"
+                    if runtimes.get(ex.get("path")) == "prism" else
                     f"`{extag or exn}` is built on ik_llama-only atoms, so it runs with "
                     "**[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)**")
             out += [lead + ":", "", "```bash",
@@ -945,6 +976,9 @@ def main():
             elif arch_verdict == "newer":
                 out += ["Ollama and LM Studio will run these once their bundled llama.cpp carries "
                         f"`{fork_arch}`.", ""]
+            elif prism_builds and len(prism_builds) == len(ik_builds):
+                out += [f"Ollama and LM Studio will run these once their bundled llama.cpp is "
+                        f"{PRISM_MIN_BUILD} or newer.", ""]
             else:
                 out += ["No rung in this repo loads in stock llama.cpp, so Ollama and LM Studio "
                         "cannot run these files.", ""]
@@ -960,7 +994,8 @@ def main():
         stock_rungs = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
         stock_tag = extag if rt_ex == "stock" else \
             (max(stock_rungs, key=lambda b: (b.get("bytes") or 0)).get("tag") if stock_rungs else None)
-        needs = {"ik_llama": "ik_llama.cpp", "fork": fork_plain, "newer": "a current llama.cpp"}.get(rt_ex)
+        needs = {"ik_llama": "ik_llama.cpp", "fork": fork_plain, "newer": "a current llama.cpp",
+                 "prism": PRISM_NEED}.get(rt_ex)
         out += PH.card_section(repo, exn, extag or None, decision=decision, stock_tag=stock_tag, needs=needs)
 
     # ---- imatrix / calibration: what the allocation was measured on

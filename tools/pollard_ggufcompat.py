@@ -16,12 +16,20 @@ make a file unloadable in stock llama.cpp:
 
 Either way the fix is the same -- say so on the card.
 
+A third header fact is a VERSION requirement rather than a fork: a `prism.hadamard.*` manifest
+(pollard-rht's online-RHT rungs; llama.cpp PR #29600). The weights are stored folded (W.D.H) and only a
+llama.cpp >= b11556 applies D, H to the matmul input. An older build loads the file WITHOUT error and
+produces garbage (measured: Qwen3-0.6B PPL 17.8 -> 1.4e8), so the requirement must be on the card.
+ik_llama.cpp reads the keys but its default fused up/gate path skips the transform for ordinary atoms
+-- such files are reported ik-incompatible.
+
   pollard-ggufcheck model.gguf [more.gguf ...]      # local files
   pollard-ggufcheck --repo PollardWeights/<Model>   # a published repo, over range requests
   pollard-ggufcheck --json *.gguf                   # machine-readable
   pollard-ggufcheck --offline model.gguf            # never consult upstream (claims less)
 
-Exit code is 1 if any file needs ik_llama, so this works as a pre-publish gate."""
+Exit code is 1 if any file is not plain stock (ik_llama, fork, newer, prism), so this works as a
+pre-publish gate: every such file needs a line on the card."""
 import argparse
 import json
 import os
@@ -212,6 +220,14 @@ def backend_report(counts):
     return out
 
 
+# the stock release that first applies a prism.hadamard manifest (PR #29600, commit a9d27ac, 2026-10-11)
+PRISM_MIN_BUILD = "b11556"
+PRISM_COMMIT = "a9d27ac"
+PRISM_NOTE = (f"online-RHT (prism.hadamard) rungs need llama.cpp >= {PRISM_MIN_BUILD} (#29600, {PRISM_COMMIT}); "
+              "older builds load them silently WRONG; not ik_llama.cpp (its fused up/gate path skips the "
+              "transform); Ollama / LM Studio only once they bundle a llama.cpp that new")
+
+
 def type_name(t):
     return STOCK_NAMES.get(t) or IK_NAMES.get(t) or f"type{t}"
 
@@ -307,6 +323,13 @@ def read_header(path_or_url):
     Raises ValueError when the magic is wrong -- which is itself worth catching, since a file whose
     header is missing will not load anywhere no matter what the card says.
     """
+    arch, counts, _prism = read_header_full(path_or_url)
+    return arch, counts
+
+
+def read_header_full(path_or_url):
+    """read_header() plus the prism.hadamard manifest summary ({} when the file has none):
+    {'version', 'block_size', 'sign_mode', 'weights': n, 'inverse': n}."""
     remote = str(path_or_url).startswith(("http://", "https://"))
     src = _Remote(path_or_url) if remote else _Local(path_or_url)
     try:
@@ -317,9 +340,28 @@ def read_header(path_or_url):
         r.u32()                                     # version
         ntensor, nkv = r.u64(), r.u64()
         arch = ""
+        prism = {}
         for _ in range(nkv):
             key = r.s()
-            val = r.read_value(r.u32())
+            vt = r.u32()
+            if key.startswith("prism.hadamard."):
+                sub = key[len("prism.hadamard."):]
+                if vt == 4:                                   # uint32
+                    prism[sub] = r.u32()
+                elif vt == 7:                                 # bool
+                    prism[sub] = bool(r.take(1)[0])
+                elif vt == 9:                                 # array: keep the count only
+                    et, n = r.u32(), r.u64()
+                    if et == 8:
+                        for _ in range(n):
+                            r.s()
+                    else:
+                        r.take({0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}[et] * n)
+                    prism[sub] = n
+                else:
+                    prism[sub] = r.read_value(vt)
+                continue
+            val = r.read_value(vt)
             if key == "general.architecture" and val:
                 arch = val
         counts = {}
@@ -329,7 +371,11 @@ def read_header(path_or_url):
                 r.u64()                             # dims
             t = r.u32(); r.u64()                     # type, offset
             counts[t] = counts.get(t, 0) + 1
-        return arch, counts
+        if prism:
+            prism = {"version": prism.get("version"), "block_size": prism.get("block_size"),
+                     "sign_mode": prism.get("sign_mode"), "weights": prism.get("weight_names", 0),
+                     "inverse": prism.get("inverse_weight_names", 0)}
+        return arch, counts, prism
     finally:
         src.close()
 
@@ -345,7 +391,10 @@ def fork_only(counts):
 
 
 def runtime_of(path_or_url, archs=None, offline=False):
-    """('stock'|'ik_llama'|'newer'|'fork'|'unknown', reasons) -- what this file needs, and why.
+    """('stock'|'prism'|'ik_llama'|'newer'|'fork'|'unknown', reasons) -- what this file needs, and why.
+
+    'prism' = a prism.hadamard manifest: stock llama.cpp, but >= b11556 (a version requirement, NOT a
+    fork), and not ik_llama. reasons['prism_hadamard'] carries the manifest summary and the note.
 
     Two independent disqualifiers live in a GGUF header and a tensor-type check sees only one:
 
@@ -356,9 +405,12 @@ def runtime_of(path_or_url, archs=None, offline=False):
     The architecture answer takes precedence when it is disqualifying, because no quant type can
     rescue a file whose architecture will not load.
     """
-    arch, counts = read_header(path_or_url)
+    arch, counts, prism = read_header_full(path_or_url)
     reasons = fork_only(counts)
     verdict, detail = arch_support(arch, local=archs, offline=offline)
+    if prism:
+        reasons = dict(reasons)
+        reasons["prism_hadamard"] = dict(prism, min_build=PRISM_MIN_BUILD, note=PRISM_NOTE)
     if verdict != "stock":
         reasons = dict(reasons)
         reasons["architecture"] = arch
@@ -368,7 +420,9 @@ def runtime_of(path_or_url, archs=None, offline=False):
             if where:
                 reasons["supported_by"], reasons["supported_url"] = where
         return verdict, reasons
-    return ("ik_llama" if reasons else "stock"), reasons
+    if fork_only(counts):
+        return "ik_llama", reasons
+    return ("prism" if prism else "stock"), reasons
 
 
 def main():
@@ -424,7 +478,8 @@ def main():
             arch = fo.get("architecture")
             atoms = ", ".join(f"{k} x{v}" for k, v in fo.items()
                               if k not in ("architecture", "supported_by", "supported_url",
-                                           "arch_detail"))
+                                           "arch_detail", "prism_hadamard"))
+            ph = fo.get("prism_hadamard")
             if arch:
                 label = {"newer": "needs newer llama.cpp", "fork": "needs a fork",
                          "unknown": "cannot verify"}.get(rt, "needs a fork")
@@ -437,6 +492,13 @@ def main():
                 why = "  [" + "; ".join(bits) + "]"
             elif atoms:
                 label, why = "needs ik_llama", f"  [{atoms}]"
+                if ph:
+                    why += "  [also a prism.hadamard manifest: ik_llama does not apply it reliably]"
+            elif ph:
+                label = f"llama.cpp>={PRISM_MIN_BUILD}"
+                why = (f"  [online RHT: block {ph.get('block_size')}, {ph.get('weights')} folded weight(s)"
+                       f"{', tied latent embedding' if ph.get('inverse') else ''}; #29600 ({PRISM_COMMIT}); "
+                       "older builds load it silently WRONG; NOT ik_llama.cpp]")
             else:
                 label, why = "stock llama.cpp", ""
             print(f"  {label:<16}  {name}{why}")
@@ -457,6 +519,10 @@ def main():
         if by.get("newer"):
             print("Say so on the card: these need a llama.cpp new enough to carry the architecture. "
                   "That is a version requirement, NOT a fork.")
+        if by.get("prism"):
+            print(f"Say so on the card: these need llama.cpp >= {PRISM_MIN_BUILD} (#29600) -- a version "
+                  "requirement, NOT a fork -- and do not run in ik_llama.cpp. An older llama.cpp loads "
+                  "them without error and produces garbage.")
         if by.get("ik_llama") or by.get("fork"):
             print("Say so on the card: these will not load in stock llama.cpp, Ollama or LM Studio.")
         if by.get("unknown"):
