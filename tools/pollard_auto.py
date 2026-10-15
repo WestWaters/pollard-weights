@@ -28,6 +28,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
     pollard tune --base Qwen/Qwen3.5-9B --data cases.csv --out runs/x --ship   # fine-tune + eval + ship (pollard-tune)
     pollard serve Org/Model:Q4_K_M --harness claude-code       # run a rung for an agent harness (pollard-serve)
+    pollard release --hf Qwen/Qwen3-8B --plan release.yaml     # EVERY lane as a ladder, gated + carded (pollard-release)
 
 EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix -> measured automap mix
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
@@ -508,10 +509,26 @@ def _ensure_calib_text(a, here):
     manual calibration step). Shared by the gptq / mx / exl3 lanes."""
     calib = a.calib or os.path.join(here, "pollard_calib.txt")
     if not a.calib:
-        print(f"   auto-calib (Calib 3.0): pollard-calib --out {os.path.basename(calib)} --held-out {os.path.basename(calib)}.heldout")
+        cmd = ["pollard-calib", "--out", calib, "--held-out", calib + ".heldout"] + _calib_profile_args(a)
+        print(f"   auto-calib (Calib 3.0): {' '.join(os.path.basename(c) if c in (calib, calib + '.heldout') else c for c in cmd)}")
         if a.run and not os.path.exists(calib):
-            _run(["pollard-calib", "--out", calib, "--held-out", calib + ".heldout"], True, cwd=here)
+            _run(cmd, True, cwd=here)
     return calib
+
+
+def _calib_profile_args(a):
+    """--profile for pollard-calib: what the model is FOR decides the calibration mix (a translator
+    calibrated on English prose protects the wrong tensors). 'auto' asks pollard-modelkind; the chat
+    samples are rendered through the model's own template when the HF checkout is at hand."""
+    prof = getattr(a, "calib_profile", "auto") or "auto"
+    src = getattr(a, "_hf_dir", None) or (a.hf if a.hf and os.path.isdir(str(a.hf)) else None) or a.gguf
+    args = ["--profile", prof]
+    if src:
+        args += ["--model", src]
+    key = a.hf or a.gguf
+    if key:
+        args += ["--record-model", key]
+    return args
 
 
 def _ensure_sensitivity(a, hf_dir, calib, here):
@@ -623,14 +640,15 @@ def _ensure_imatrix(a):
     binim = (_bin_in(a.bin, "llama-imatrix") if a.bin
              else find_llama_bin("llama-imatrix")) or "llama-imatrix"
     print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) -- no manual calibration step:")
+    calib_cmd = ["pollard-calib", "--out", calib] + _calib_profile_args(a)
     if not a.calib:
-        print(f"      pollard-calib --out {os.path.basename(calib)}")
+        print(f"      pollard-calib --out {os.path.basename(calib)} {' '.join(calib_cmd[3:])}")
     ngl = _fit_ngl(a.gguf, a.ngl)
     print(f"      {binim} -m {os.path.basename(a.gguf)} -f {os.path.basename(calib)} "
           f"-o {os.path.basename(imat)} -ngl {ngl}")
     if a.run:
         if not a.calib and not os.path.exists(calib):
-            _run(["pollard-calib", "--out", calib], True, cwd=here)
+            _run(calib_cmd, True, cwd=here)
         # --output-format dat, NOT the gguf default. Mainline llama.cpp reads both, but ik_llama --
         # which builds the trellis flagship, the whole reason an imatrix is computed here -- reads
         # only the legacy format and fails with "load_imatrix: failed reading number of values".
@@ -783,6 +801,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "tune":
         from pollard_tune import main as tune_main
         sys.exit(tune_main(sys.argv[2:]))
+    # `pollard release ...` -- every lane, each a ladder of rungs, gated, carded, (optionally) published
+    if len(sys.argv) > 1 and sys.argv[1] == "release":
+        from pollard_release import main as release_main
+        sys.exit(release_main(sys.argv[2:]))
     # `pollard serve ...` -- the build's other half: run a rung for an agent harness (pollard_harness).
     # Dispatched before argparse, which would otherwise reject the positional as an unknown argument.
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
@@ -828,6 +850,9 @@ def main():
                          "'auto' = only when the majors differ; 'off' = always use the current env.")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
+    ap.add_argument("--calib-profile", default="auto", choices=["auto", "general", "translation", "agent", "code"],
+                    help="pollard-calib domain mix for the auto-built corpus. 'auto' (default) picks it from "
+                         "pollard-modelkind: agentic -> agent, coder -> code, translator -> translation, else general")
     ap.add_argument("--ngl", default="auto",
                     help="GPU layers for auto-imatrix. 'auto' (default) offloads the share that "
                          "fits this box and streams the rest; a number forces it.")

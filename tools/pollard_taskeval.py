@@ -12,6 +12,8 @@ and report per-task scores plus RETENTION -- quantized / reference, in percent.
 
   pollard-taskeval --model ./M-Q6_K.gguf --ref ./M-f16.gguf --suite quick
   pollard-taskeval --model <hf-dir> --tasks gsm8k,ifeval --limit 200
+  pollard-taskeval --model ./M-Q6_K.gguf --ref ./M-f16.gguf --suite mt --limit 100
+  pollard-taskeval ... --results results.json --rung Q6_K     # retention onto the card (pollard-card --results)
 
 Two things worth knowing before reading any number it prints:
 
@@ -29,6 +31,11 @@ Suites, chosen for signal per GPU-hour:
   core    + mmlu_redux_generative, gpqa_diamond_zeroshot, humaneval_plus, mbpp_plus, minerva_math500
   vision  charxiv, realworldqa, ok_vqa, ocrbench -- runs through lmms-eval, a separate harness,
           because lm-eval has none of these. `pip install lmms-eval`.
+  mt      translation, one row per language pair: WMT24++ (google/wmt24pp, Apache-2.0, default) or
+          FLORES+ devtest (--mt-set flores; gated CC-BY-SA, needs an HF login), scored with chrF++
+          (sacrebleu) and optionally COMET-22 (--comet; Unbabel/wmt22-comet-da is Apache-2.0 -- the
+          CometKiwi / XCOMET checkpoints are CC-BY-NC-SA and are refused unless named explicitly).
+          `pip install sacrebleu` (+ `unbabel-comet` for --comet).
   agentic tau2-bench and BFCL. NOT wired: both need a live multi-turn tool environment and a user
           simulator, which is a service to stand up rather than a task name to pass. The suite is
           declared here with the exact repos so the gap is explicit and someone can close it, and
@@ -318,6 +325,231 @@ def collect(out_dir: str) -> dict:
     return best
 
 
+# ---------------------------------------------------------------- retention (the card's table)
+
+def retention_table(got: dict, ref: dict, tasks=None) -> dict:
+    """{tasks: {task: {score, ref, retention}}, categories: {cat: pct}, overall: pct} -- the shape
+    pollard-card's "Retention vs f16" table reads. Retention = quantized / reference, in percent; a task
+    the reference scored 0 on has no retention (it cannot be divided by), only a score."""
+    rows, cats = {}, {}
+    for t in (tasks or sorted(set(got) | set(ref))):
+        s, r = got.get(t), ref.get(t)
+        if s is None:
+            continue
+        row = {"score": round(100 * s, 2)}
+        if r:
+            row["ref"] = round(100 * r, 2)
+            row["retention"] = round(100 * s / r, 2)
+            cats.setdefault(CATEGORY.get(t, "Other"), []).append(100 * s / r)
+        rows[t] = row
+    out = {"tasks": rows, "categories": {c: round(sum(v) / len(v), 2) for c, v in sorted(cats.items())}}
+    allv = [v for vals in cats.values() for v in vals]
+    if allv:
+        out["overall"] = round(sum(allv) / len(allv), 2)
+    return out
+
+
+def save_results(path: str, rung: str, patch: dict, meta: dict | None = None) -> None:
+    """Merge one rung's numbers into the results.json pollard-card --results reads."""
+    import pollard_workspace as ws
+    ws.merge_results(path, rung, patch, meta)
+    print(f"   results -> {path}  [{rung}]")
+
+
+# ---------------------------------------------------------------- the mt suite
+
+#: the WMT24++ pairs scored by default -- a spread of scripts and resource levels, en->X like the set
+MT_PAIRS = ["en-de_DE", "en-fr_FR", "en-es_MX", "en-it_IT", "en-pt_BR", "en-ru_RU", "en-zh_CN", "en-ja_JP",
+            "en-ko_KR", "en-ar_EG", "en-hi_IN", "en-tr_TR", "en-pl_PL", "en-uk_UA", "en-sw_KE"]
+MT_SETS = {
+    "wmt24pp": {"id": "google/wmt24pp", "revision": "fd7405c06494bc66a57b25f55d217a72f96e60dc",
+                "license": "apache-2.0", "split": "train"},
+    "flores": {"id": "openlanguagedata/flores_plus", "revision": "e707e62e762a9e2faca3933aa315f4665cc3cd8f",
+               "license": "cc-by-sa-4.0", "split": "devtest"},
+}
+#: FLORES+ config for a WMT24++ target locale, so one --mt-pairs list drives either set
+_FLORES = {"de": "deu_Latn", "fr": "fra_Latn", "es": "spa_Latn", "it": "ita_Latn", "pt": "por_Latn",
+           "ru": "rus_Cyrl", "zh": "cmn_Hani", "ja": "jpn_Jpan", "ko": "kor_Hang", "ar": "arb_Arab",
+           "hi": "hin_Deva", "tr": "tur_Latn", "pl": "pol_Latn", "uk": "ukr_Cyrl", "sw": "swh_Latn",
+           "nl": "nld_Latn", "cs": "ces_Latn", "vi": "vie_Latn", "id": "ind_Latn", "th": "tha_Thai",
+           "fa": "pes_Arab", "he": "heb_Hebr", "el": "ell_Grek", "bn": "ben_Beng", "en": "eng_Latn"}
+_LANG = {"de": "German", "fr": "French", "es": "Spanish", "it": "Italian", "pt": "Portuguese",
+         "ru": "Russian", "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "ar": "Arabic", "hi": "Hindi",
+         "tr": "Turkish", "pl": "Polish", "uk": "Ukrainian", "sw": "Swahili", "nl": "Dutch", "cs": "Czech",
+         "vi": "Vietnamese", "id": "Indonesian", "th": "Thai", "fa": "Persian", "he": "Hebrew",
+         "el": "Greek", "bn": "Bengali", "en": "English"}
+#: COMET checkpoints by licence. Only the DA model is open; the reference-free ones are non-commercial.
+COMET_OPEN = {"Unbabel/wmt22-comet-da": "apache-2.0"}
+COMET_NC = {"Unbabel/wmt22-cometkiwi-da", "Unbabel/wmt23-cometkiwi-da-xl", "Unbabel/XCOMET-XL",
+            "Unbabel/XCOMET-XXL"}
+
+
+def pair_langs(pair: str) -> tuple[str, str]:
+    """'en-de_DE' -> ('en', 'de')."""
+    src, tgt = pair.split("-", 1)
+    return src.split("_")[0].lower(), tgt.split("_")[0].lower()
+
+
+def load_mt_pairs(mt_set: str, pair: str, limit: int, load_dataset=None) -> list[tuple[str, str]]:
+    """[(source, reference)] for one language pair. WMT24++ drops its flagged bad sources (the set's
+    own `is_bad_source`), FLORES+ zips the two language configs by sentence id."""
+    if load_dataset is None:
+        from datasets import load_dataset
+    meta = MT_SETS[mt_set]
+    out = []
+    if mt_set == "wmt24pp":
+        for ex in load_dataset(meta["id"], pair, split=meta["split"], revision=meta["revision"], streaming=True):
+            if ex.get("is_bad_source") or not ex.get("source") or not ex.get("target"):
+                continue
+            out.append((ex["source"], ex["target"]))
+            if limit and len(out) >= limit:
+                break
+        return out
+    s, t = pair_langs(pair)
+    src = {ex["id"]: ex["text"] for ex in load_dataset(meta["id"], _FLORES[s], split=meta["split"],
+                                                       revision=meta["revision"], streaming=True)}
+    for ex in load_dataset(meta["id"], _FLORES[t], split=meta["split"], revision=meta["revision"],
+                           streaming=True):
+        if ex.get("id") in src:
+            out.append((src[ex["id"]], ex["text"]))
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def mt_prompt(text: str, src: str, tgt: str) -> list[dict]:
+    """One fixed instruction for every rung and the reference, so the only variable is the weights."""
+    return [{"role": "user", "content": f"Translate the following {_LANG.get(src, src)} text into "
+                                        f"{_LANG.get(tgt, tgt)}. Reply with the translation only.\n\n{text}"}]
+
+
+def chat_complete(base_url: str, max_tokens: int = 512, timeout: int = 600):
+    """Greedy translation through an OpenAI-compatible server (llama-server / vLLM / mlx_lm.server)."""
+    import urllib.request
+
+    def complete(messages):
+        body = {"model": "pollard", "messages": messages, "max_tokens": max_tokens, "temperature": 0.0}
+        req = urllib.request.Request(base_url.rstrip("/") + "/v1/chat/completions",
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            msg = json.load(r)["choices"][0]["message"]
+        return (msg.get("content") or "").strip()
+    return complete
+
+
+def _strip_thinking(text: str) -> str:
+    import re
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def chrf_pp(hyps: list[str], refs: list[str]) -> float:
+    """corpus chrF++ (sacrebleu CHRF with word_order=2)."""
+    try:
+        from sacrebleu.metrics import CHRF
+    except ImportError:
+        raise SystemExit("the mt suite scores chrF++ with sacrebleu: pip install sacrebleu") from None
+    return float(CHRF(word_order=2).corpus_score(hyps, [refs]).score)
+
+
+def comet_scorer(model_name: str, allow_nc: bool = False, gpus: int = 0):
+    """A COMET scorer, licence-checked first: the open DA model by default, a non-commercial one only
+    when named AND allowed -- a published card should not rest on a metric its readers cannot reuse."""
+    if model_name in COMET_NC and not allow_nc:
+        raise SystemExit(f"{model_name} is CC-BY-NC-SA; pass --comet-allow-nc to use it anyway "
+                         f"(the default {next(iter(COMET_OPEN))} is Apache-2.0)")
+    try:
+        from comet import download_model, load_from_checkpoint
+    except ImportError:
+        raise SystemExit("--comet needs unbabel-comet: pip install unbabel-comet") from None
+    model = load_from_checkpoint(download_model(model_name))
+
+    def score(srcs, hyps, refs):
+        data = [{"src": s, "mt": h, "ref": r} for s, h, r in zip(srcs, hyps, refs)]
+        return float(model.predict(data, batch_size=16, gpus=gpus, progress_bar=False).system_score)
+    return score
+
+
+def translate_all(complete, pairs_data: dict) -> dict:
+    """{pair: [hyp]} -- every source sentence of every pair through one model."""
+    out = {}
+    for pair, rows in pairs_data.items():
+        s, t = pair_langs(pair)
+        hyps = []
+        for src, _ref in rows:
+            try:
+                hyps.append(_strip_thinking(complete(mt_prompt(src, s, t))))
+            except Exception as e:                               # noqa: BLE001
+                print(f"   (!) {pair}: request failed ({repr(e)[:60]}) -- scored as empty", file=sys.stderr)
+                hyps.append("")
+        out[pair] = hyps
+    return out
+
+
+def mt_rows(pairs_data: dict, hyps: dict, ref_hyps: dict | None, chrf=chrf_pp, comet=None) -> dict:
+    """{pair: {n, chrf, ref_chrf, retention, comet, ref_comet}} -- one row per language pair."""
+    rows = {}
+    for pair, data in pairs_data.items():
+        srcs, refs = [d[0] for d in data], [d[1] for d in data]
+        row = {"n": len(data), "chrf": round(chrf(hyps[pair], refs), 2)}
+        if ref_hyps:
+            row["ref_chrf"] = round(chrf(ref_hyps[pair], refs), 2)
+            if row["ref_chrf"]:
+                row["retention"] = round(100 * row["chrf"] / row["ref_chrf"], 2)
+        if comet:
+            row["comet"] = round(comet(srcs, hyps[pair], refs), 4)
+            if ref_hyps:
+                row["ref_comet"] = round(comet(srcs, ref_hyps[pair], refs), 4)
+        rows[pair] = row
+    return rows
+
+
+@contextlib.contextmanager
+def _endpoint(path: str | None, url: str | None, ngl: str, port: int, ctx: int, server: str | None):
+    """A chat endpoint for one model: an explicit --server URL, or a GGUF served for the duration."""
+    if url:
+        yield url
+    elif path and path.endswith(".gguf"):
+        with served(path, ngl, port, ctx, server) as base:
+            yield base
+    else:
+        raise SystemExit(f"the mt suite needs a served model: {path} is not a GGUF -- start it on "
+                         "vLLM / mlx_lm.server / llama-server and pass --server (and --ref-server) URL")
+
+
+def run_mt(a) -> None:
+    pairs = [p.strip() for p in (a.mt_pairs or ",".join(MT_PAIRS)).split(",") if p.strip()]
+    limit = a.limit or 100
+    print(f"\n== pollard-taskeval :: mt suite, {a.mt_set}, {len(pairs)} pair(s), {limit} sentences each\n")
+    data = {p: load_mt_pairs(a.mt_set, p, limit) for p in pairs}
+    data = {p: d for p, d in data.items() if d}
+    with _endpoint(a.model, a.server_url, a.ngl, a.port, a.ctx, a.llama_server) as base:
+        hyps = translate_all(chat_complete(base), data)
+    ref_hyps = None
+    if a.ref or a.ref_server:
+        with _endpoint(a.ref, a.ref_server, a.ngl, a.port + 1, a.ctx, a.llama_server) as base:
+            ref_hyps = translate_all(chat_complete(base), data)
+    comet = comet_scorer(a.comet_model, a.comet_allow_nc) if a.comet else None
+    rows = mt_rows(data, hyps, ref_hyps, comet=comet)
+    print(f"  {'pair':12s} {'n':>4s} {'chrF++':>8s}" + (f" {'ref':>8s} {'retention':>10s}" if ref_hyps else "")
+          + ("  COMET" if comet else ""))
+    for p, r in rows.items():
+        line = f"  {p:12s} {r['n']:4d} {r['chrf']:8.2f}"
+        if ref_hyps:
+            line += f" {r['ref_chrf']:8.2f} {r.get('retention', 0):9.1f}%"
+        if comet:
+            line += f"  {r['comet']:.4f}" + (f" / {r['ref_comet']:.4f}" if 'ref_comet' in r else "")
+        print(line)
+    ret = [r["retention"] for r in rows.values() if "retention" in r]
+    if ret:
+        print(f"  {'OVERALL':12s} {'':4s} {'':8s} {'':8s} {sum(ret)/len(ret):9.1f}%")
+    if a.results:
+        meta = MT_SETS[a.mt_set]
+        save_results(a.results, a.rung or os.path.basename(a.model), {"mt": rows},
+                     {"_mt_suite": {"set": meta["id"], "revision": meta["revision"], "license": meta["license"],
+                                    "split": meta["split"], "limit": limit, "metric": "chrF++ (sacrebleu, word_order=2)",
+                                    "comet": a.comet_model if a.comet else None}})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -325,7 +557,7 @@ def main() -> None:
     ap.add_argument("--model", required=True, help="the build to score: a .gguf or an HF dir/id")
     ap.add_argument("--ref", help="f16 source, to report RETENTION against (strongly recommended: a "
                                   "task score alone says nothing about what quantization cost)")
-    ap.add_argument("--suite", default="quick", choices=sorted(SUITES) + ["agentic"],
+    ap.add_argument("--suite", default="quick", choices=sorted(SUITES) + ["agentic", "mt"],
                     help="which task set. 'vision' runs through lmms-eval; 'agentic' is declared "
                          "but not wired -- it needs a live tool environment, and asking for it "
                          "prints what to stand up rather than failing obscurely.")
@@ -356,7 +588,24 @@ def main() -> None:
                          "otherwise be picked and refuse the file.")
     ap.add_argument("--ctx", type=int, default=4096, help="server context size")
     ap.add_argument("--out", default="taskeval", help="directory for lm-eval's raw output")
+    ap.add_argument("--results", help="merge the per-task retention (or the mt rows) for this rung into this "
+                                      "results.json -- the file pollard-card --results reads")
+    ap.add_argument("--rung", help="the rung's name/tag in --results (default: the model's file name)")
+    ap.add_argument("--mt-set", default="wmt24pp", choices=sorted(MT_SETS),
+                    help="mt suite test set: wmt24pp (Apache-2.0, default) or flores (FLORES+ devtest, gated)")
+    ap.add_argument("--mt-pairs", help=f"comma list of WMT24++ pair names (default: {len(MT_PAIRS)} pairs, "
+                                       "en-de_DE ... en-sw_KE)")
+    ap.add_argument("--server", dest="server_url", help="mt: an already-served build (OpenAI-compatible base URL)")
+    ap.add_argument("--ref-server", help="mt: an already-served reference (OpenAI-compatible base URL)")
+    ap.add_argument("--comet", action="store_true", help="mt: also score COMET-22 (unbabel-comet)")
+    ap.add_argument("--comet-model", default="Unbabel/wmt22-comet-da",
+                    help="mt: COMET checkpoint (default the Apache-2.0 DA model)")
+    ap.add_argument("--comet-allow-nc", action="store_true",
+                    help="mt: allow a CC-BY-NC COMET checkpoint (CometKiwi / XCOMET)")
     a = ap.parse_args()
+
+    if a.suite == "mt" and not a.tasks:
+        return run_mt(a)
 
     if a.suite == "agentic" and not a.tasks:
         print("\n  The agentic category is not runnable from this tool, and pretending otherwise "
@@ -409,6 +658,10 @@ def main() -> None:
         print(f"  {'OVERALL':30s} {sum(allv)/len(allv):9.1f}%")
         print("\n  Retention is against YOUR f16 on these exact tasks and settings. It is not "
               "comparable\n  to a retention figure published against a different suite.")
+    if a.results:
+        save_results(a.results, a.rung or os.path.basename(a.model), {"retention": retention_table(got, ref, tasks)},
+                     {"_retention_suite": {"suite": a.tasks and "custom" or a.suite, "tasks": tasks,
+                                           "limit": a.limit or "full", "harness": harness}})
 
 
 if __name__ == "__main__":

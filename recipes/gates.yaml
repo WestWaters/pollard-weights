@@ -1,0 +1,46 @@
+# pollard-verify --gate: what a rung must show before pollard release uploads it.
+# Resolution: `default`, then `lanes.<lane>`, then every `rungs` entry whose `match` patterns hit the
+# rung tag (fnmatch, case-insensitive), in order -- later entries override earlier ones.
+# A threshold with no measured number FAILS the rung (missing: fail); `missing: skip` relaxes that.
+#   kld_max          mean KLD vs the f16/bf16 source (nats/token)       pollard-verify / pollard-bench
+#   top1_min         top-1 agreement with the source, percent            pollard-verify / pollard-bench
+#   retention_min    task retention vs f16, percent (overall)            pollard-taskeval --results
+#   mt_retention_min mean chrF++ retention over the language pairs       pollard-taskeval --suite mt
+#   toolcall_pass    true = still emits valid tool calls                 pollard-toolcall --results
+#   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
+#   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
+#   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
+missing: fail
+default:
+  kld_max: 0.5
+  top1_min: 75
+lanes:
+  gguf:
+    runtime: stock
+    coherence: true
+  # exl3 has no logit-level KLD path in pollard-verify yet: it is gated on the assembled forward instead
+  exl3:
+    e2e_acc_min: 0.3
+    skip: [kld_max, top1_min]
+rungs:
+  - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
+    kld_max: 0.01
+    top1_min: 97
+  - match: ["Q6_K*", "*6bit*", "*-6.0bpw"]
+    kld_max: 0.02
+    top1_min: 95
+  - match: ["Q5_K*", "*5bit*", "*-5.0bpw"]
+    kld_max: 0.04
+    top1_min: 93
+  - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw"]
+    kld_max: 0.08
+    top1_min: 90
+  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+    kld_max: 0.2
+    top1_min: 85
+  - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw"]
+    kld_max: 0.5
+    top1_min: 75
+  # the trellis flagship is ik_llama-only BY DESIGN -- the gate checks it says so, not that it isn't
+  - match: ["*_KT*", "*KT-*", "PollardMix*"]
+    runtime: ik_llama

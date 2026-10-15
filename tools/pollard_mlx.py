@@ -11,11 +11,30 @@ modules stay high (8-bit) and the tolerant body is crushed (4-bit); router + sha
   pollard-mlx --model <hf> --sensitivity q15b.sensitivity.json --hot-frac 0.35 --plan-only
   # then run on a Mac:  mlx_lm.generate --model ./...-Pollard-MLX --prompt "hi"
 
-MLX group-quant bits are {2,3,4,6,8}; we mix 4/8 (like the GPTQ lane) by default. --plan-only needs no
-deps; the actual convert needs `pip install mlx_lm` on Apple Silicon (this box has `mlx`)."""
+MLX group-quant bits are {2,3,4,5,6,8}; we mix 4/8 (like the GPTQ lane) by default. A LADDER of rungs
+is --bits N per rung: the body at N bits, the measured-hot layers one step up (--high-bits to override),
+--bits 8 = uniform 8-bit. --plan-only needs no deps; the actual convert needs `pip install mlx_lm` on
+Apple Silicon (this box has `mlx`).
+
+  pollard-mlx --model <hf> --sensitivity s.json --bits 3 --out ./M-Pollard-MLX-3bit   # one ladder rung"""
 import argparse, json, re, sys
 
 HIGH, LOW = 8, 4
+MLX_BITS = (2, 3, 4, 5, 6, 8)
+
+
+#: rung body bits -> hot-layer bits: the protected set stays well above the body at the low rungs
+RUNG_HIGH = {2: 4, 3: 6, 4: 8, 5: 8, 6: 8, 8: 8}
+
+
+def rung_bits(bits, high=None):
+    """(low, high) for a ladder rung: the body at `bits`, the measured-hot layers at RUNG_HIGH[bits]."""
+    if bits not in MLX_BITS:
+        raise ValueError(f"MLX quantizes to {MLX_BITS} bits, not {bits}")
+    high = RUNG_HIGH[bits] if high is None else high
+    if high not in MLX_BITS or high < bits:
+        raise ValueError(f"--high-bits must be one of {MLX_BITS} and >= --bits")
+    return bits, high
 
 
 def detect_moe(model_id, layers_hint=0):
@@ -30,9 +49,10 @@ def detect_moe(model_id, layers_hint=0):
         return False, layers_hint
 
 
-def allocate(sens, n_layers, hot_frac, focus=None):
+def allocate(sens, n_layers, hot_frac, focus=None, low=None, high=None):
     """Pollard profile -> {layer: {"attn":bits, "ffn":bits}}. Top `hot_frac` of layers stay HIGH.
     `focus` (layer indices) are forced HIGH regardless of the profile (steer the budget)."""
+    LOW, HIGH = low or globals()["LOW"], high or globals()["HIGH"]
     focus = set(focus or ())
     ffn = {int(k): float(v) for k, v in (sens.get("ffn") or {}).items()}
     attn = {int(k): float(v) for k, v in (sens.get("attn") or {}).items()}
@@ -67,17 +87,18 @@ PROJ_RE = re.compile(r"(multi_modal_projector|mm_projector|mm_proj|\bmerger\b"
                      r"|modality_project|resampler|perceiver|connector)", re.I)
 
 
-def bits_for(path, alloc, is_moe, gsize, vision_bits=None):
+def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
     """Per-module bit-width for MLX (returns a {'bits','group_size'} dict, or False to skip).
     Mirrors the Pollard policy: attn follows the attn profile; the FFN/expert body follows ffn;
     MoE router (`.gate`, not `gate_proj`) and shared experts are pinned HIGH; embeddings kept HIGH.
     The vision/audio tower and the modality projector are held at `vision_bits` (default HIGH) --
     they are matched FIRST, because `vision_tower.encoder.layers.2.` also matches the language
     layer pattern and would otherwise be given a text layer's allocation."""
-    if PROJ_RE.search(path):
-        return {"bits": HIGH, "group_size": gsize}      # modality alignment: never crushed
+    LOW, HIGH = low or globals()["LOW"], high or globals()["HIGH"]
+    if PROJ_RE.search(path):                            # modality alignment: never crushed, any rung
+        return {"bits": globals()["HIGH"], "group_size": gsize}
     if VISION_RE.search(path):
-        return {"bits": vision_bits or HIGH, "group_size": gsize}
+        return {"bits": vision_bits or globals()["HIGH"], "group_size": gsize}
     if "embed" in path or path.endswith("lm_head"):    # embed_tokens (llama) OR embedding (Spark2_5, tied)
         return {"bits": HIGH, "group_size": gsize}      # vocab carriers: keep high
     if is_moe and (re.search(r"\.(mlp|block_sparse_moe)\.gate$", path)
@@ -103,6 +124,10 @@ def main():
     ap.add_argument("--out", help="output MLX model dir (required unless --plan-only)")
     ap.add_argument("--layers", type=int, default=0)
     ap.add_argument("--hot-frac", type=float, default=0.35)
+    ap.add_argument("--bits", type=int, choices=MLX_BITS, default=None,
+                    help="ladder rung: body bits (hot layers one step up; 8 = uniform 8-bit). Default: the 4/8 mix")
+    ap.add_argument("--high-bits", type=int, choices=MLX_BITS, default=None,
+                    help="bits for the measured-hot layers / router / embeddings (default: from --bits)")
     ap.add_argument("--focus-layers", help="force these layers to HIGH (8-bit) regardless of the profile, "
                     "e.g. '3,4,8' or '3-8,16' -- steer the budget to layers you care about")
     ap.add_argument("--group-size", type=int, default=64, help="MLX quant group size (default 64)")
@@ -120,6 +145,7 @@ def main():
     a = ap.parse_args()
 
     sens = json.load(open(a.sensitivity)) if a.sensitivity else {}
+    low, high = rung_bits(a.bits, a.high_bits) if a.bits else (LOW, a.high_bits or HIGH)
     n_layers = a.layers or int(sens.get("layers") or 0)
     auto_moe, det = detect_moe(a.model, n_layers)
     n_layers = n_layers or det
@@ -130,13 +156,13 @@ def main():
     focus = ws.parse_layers(a.focus_layers)
     if focus:
         print(f"   focus-layers: forcing layers {sorted(focus)} to 8-bit (steered budget)")
-    alloc = allocate(sens, n_layers, a.hot_frac, focus=focus)
+    alloc = allocate(sens, n_layers, a.hot_frac, focus=focus, low=low, high=high)
     avg = sum(g["attn"] + g["ffn"] for g in alloc.values()) / (2 * len(alloc))
     kind = "MoE" if is_moe else "dense"
-    print(f"== pollard-mlx :: {a.model}  [{kind}]  {n_layers} layers  |  mix {LOW}/{HIGH}-bit "
+    print(f"== pollard-mlx :: {a.model}  [{kind}]  {n_layers} layers  |  mix {low}/{high}-bit "
           f"avg {avg:.2f}  |  group_size {a.group_size}")
     if is_moe:
-        print("   MoE: router + shared experts pinned 8-bit; cold experts 4-bit")
+        print(f"   MoE: router + shared experts pinned {high}-bit; cold experts {low}-bit")
 
     if a.plan_only:
         # representative module paths for the first 2 layers + the vocab carriers
@@ -151,13 +177,13 @@ def main():
                 samples.append(f"model.layers.{i}.mlp.gate")
         for p in samples:
             print(f"     {p:52s} -> "
-                  f"{bits_for(p, alloc, is_moe, a.group_size, a.vision_bits)['bits']}-bit")
+                  f"{bits_for(p, alloc, is_moe, a.group_size, a.vision_bits, low, high)['bits']}-bit")
         return
 
     if not a.out:                                          # no --out -> organized workspace path
         try:
             import pollard_workspace as ws
-            a.out = ws.resolve_out(a.model, "mlx", tag=f"{LOW}.{HIGH}")
+            a.out = ws.resolve_out(a.model, "mlx", tag=f"{a.bits}bit" if a.bits else f"{low}.{high}")
             print(f"   (no --out) -> workspace: {a.out}")
         except Exception:
             sys.exit("ERROR: --out required unless --plan-only.")
@@ -167,11 +193,11 @@ def main():
         sys.exit("ERROR: mlx_lm not installed. On Apple Silicon: pip install mlx_lm ; then rerun.")
 
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
-        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits)
+        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high)
 
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
-    ckw = dict(mlx_path=a.out, quantize=True, q_bits=LOW, q_group_size=a.group_size, quant_predicate=predicate)
+    ckw = dict(mlx_path=a.out, quantize=True, q_bits=low, q_group_size=a.group_size, quant_predicate=predicate)
     try:
         convert(a.model, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
     except TypeError:
@@ -182,12 +208,13 @@ def main():
         import pollard_workspace as ws
         # record the ACTUAL avg bpw + a distinct tag so each ladder rung is listable on the card
         # (was always "4.8" regardless of the mix, so rungs collided)
-        ws.record_build(a.model, "mlx", a.out, tag=f"mlx-{avg:.1f}bpw", bpw=round(avg, 2))
+        ws.record_build(a.model, "mlx", a.out, tag=(f"MLX-{a.bits}bit" if a.bits else f"mlx-{avg:.1f}bpw"),
+                        bpw=round(avg, 2))
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote MLX model -> {a.out}\n"
           f"  run:  mlx_lm.generate --model {a.out} --prompt \"hello\"\n"
-          f"  (mixed {LOW}/{HIGH}-bit, Pollard-allocated; runs on Apple Silicon via MLX/Metal.)")
+          f"  (mixed {low}/{high}-bit, Pollard-allocated; runs on Apple Silicon via MLX/Metal.)")
 
 
 if __name__ == "__main__":
