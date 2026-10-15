@@ -1070,10 +1070,11 @@ def main():
                 "Use the FIM tokens the base model was trained with, not a chat turn:", "",
                 "```", "<|fim_prefix|>{before}<|fim_suffix|>{after}<|fim_middle|>", "```", ""]
 
-    # ---- Download a specific file
-    out += ["## Download a specific file", "", "```bash",
-            'pip install -U "huggingface_hub[cli]"',
-            f"hf download {repo} \\", f'  --include "{exn}" --local-dir ./', "```", ""]
+    # ---- Download a specific file (a directory lane's rungs are folders: its rungs section says how)
+    if primary == "gguf" or not builds:
+        out += ["## Download a specific file", "", "```bash",
+                'pip install -U "huggingface_hub[cli]"',
+                f"hf download {repo} \\", f'  --include "{exn}" --local-dir ./', "```", ""]
 
     # ---- How to run
     out += ["## How to run", ""]
