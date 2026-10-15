@@ -441,6 +441,46 @@ def _fmt_kl(v):
     return "0" if v == 0 else f"{v:.2g}" if v < 0.01 else f"{v:.3f}"
 
 
+def rung_subfolder(build, lane):
+    """Where a directory-lane rung sits in its repo: the part of its name after -Pollard-<LANE>- (lowercased),
+    e.g. Qwen3-8B-Pollard-MLX-4bit -> 4bit. pollard release uploads to exactly this folder."""
+    name = build.get("name") or os.path.basename(str(build.get("path", "")).rstrip("/\\"))
+    marker = f"-Pollard-{lane.upper()}-"
+    return (name.split(marker, 1)[1] if marker in name else str(build.get("tag") or name)).lower()
+
+
+def rungs_section(builds, lane, repo):
+    """For a directory lane (MLX / GPTQ / MX / EXL3): which subfolder holds which rung, and how to load one."""
+    if lane == "gguf" or not builds:
+        return []
+    run = {"mlx": "mlx_lm.generate --model ./{d} --prompt \"Hello\"", "gptq": "vllm serve ./{d}",
+           "mx": "vllm serve ./{d}", "exl3": "# load ./{d} in exllamav3 / TabbyAPI"}.get(lane, "")
+    rows = [f"| `{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} |"
+            for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
+    pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+    return ["## Rungs in this repo", "",
+            "Each rung is a complete checkpoint in its own folder; the repo root holds the default rung, so "
+            "pointing a runtime at the repo id loads that one.", "",
+            "| folder | size | avg bits |", "|---|---:|---:|", *rows, "",
+            "```bash", f'hf download {repo} --include "{pick}/*" --local-dir .', run.format(d=pick), "```", ""]
+
+
+def gate_verdict(b, results):
+    """True / False if a pollard-verify --gate ran on this rung (MANIFEST first, then results.json), else None."""
+    g = b.get("gate") if isinstance(b, dict) else None
+    if isinstance(g, dict) and "pass" in g:
+        return bool(g["pass"])
+    v = _rung_result(results, b).get("verified")
+    if isinstance(v, dict) and "pass" in v:
+        return bool(v["pass"])
+    return None
+
+
+def verified_cell(b, results):
+    v = gate_verdict(b, results)
+    return " -- |" if v is None else (" yes |" if v else " **no** |")
+
+
 def decision_section(builds, results):
     """The board a decision model is judged on: each rung against the f16, same typed questions, same
     readout (pollard-decision). Agreement = same answer as the f16; option KL = how far the option
@@ -484,6 +524,116 @@ def decision_section(builds, results):
                "confidence means what it says)._" if has_ece else "")
             + (f" _Flips = decisions whose answer differs from the {ref}'s._" if has_flips else ""),
             ""]
+
+
+RETENTION_CATS = ["Knowledge & Reasoning", "Math", "Coding", "Instruction Following", "Vision", "Other"]
+
+
+def _pct(v, nd=1):
+    return f"{float(v):.{nd}f}%" if v is not None else "--"
+
+
+def _rung_result(results, b):
+    return (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {})
+
+
+def retention_section(builds, results):
+    """"Retention vs f16": what each rung keeps of the f16 on real work, from pollard-taskeval (per-category
+    task retention), its mt suite (chrF++ per language), pollard-toolcall (tool-call validity vs the f16's)
+    and pollard-decision (agreement with the f16's decisions). Only columns something measured appear,
+    and a rung nothing measured is left out rather than shown as a row of dashes."""
+    ordered = sorted(builds, key=lambda x: -(x.get("bytes") or 0))
+    rows = [(b, _rung_result(results, b)) for b in ordered]
+    rows = [(b, r) for b, r in rows if any(isinstance(r.get(k), dict) for k in ("retention", "mt", "toolcall", "decision"))]
+    if not rows:
+        return []
+    cats = [c for c in RETENTION_CATS if any(c in ((r.get("retention") or {}).get("categories") or {}) for _, r in rows)]
+    has_mt = any(isinstance(r.get("mt"), dict) and any("retention" in v for v in r["mt"].values() if isinstance(v, dict))
+                 for _, r in rows)
+    has_tc = any(isinstance(r.get("toolcall"), dict) for _, r in rows)
+    has_dec = any(isinstance(r.get("decision"), dict) and r["decision"].get("agreement") is not None for _, r in rows)
+    has_all = any((r.get("retention") or {}).get("overall") is not None for _, r in rows)
+    head = ["file"] + cats + (["Translation (chrF++)"] if has_mt else []) + (["Tool calls"] if has_tc else []) \
+        + (["Decisions (agree)"] if has_dec else []) + (["**Overall**"] if has_all else [])
+    out = ["## Retention vs f16", "",
+           "What each rung keeps of the f16 on real work -- quantized score / f16 score on the same tasks, the same "
+           "settings, the same harness (100% = no loss). Measured against our own f16, so the rungs compare "
+           "directly; it is not comparable to a retention figure published on a different suite.", "",
+           "| " + " | ".join(head) + " |", "|---|" + "---:|" * (len(head) - 1)]
+    for b, r in rows:
+        ret = r.get("retention") or {}
+        cells = [f"`{b.get('name', '-')}`"] + [_pct((ret.get("categories") or {}).get(c)) for c in cats]
+        if has_mt:
+            vals = [v["retention"] for v in (r.get("mt") or {}).values() if isinstance(v, dict) and "retention" in v]
+            cells.append(_pct(sum(vals) / len(vals)) if vals else "--")
+        if has_tc:
+            tc = r.get("toolcall")
+            if not isinstance(tc, dict) or tc.get("rate") is None:
+                cells.append("--")
+            elif tc.get("ref_rate"):
+                cells.append(_pct(100 * float(tc["rate"]) / float(tc["ref_rate"])))
+            else:
+                cells.append(f"{float(tc['rate']):.0%} valid")
+        if has_dec:
+            d = r.get("decision") or {}
+            cells.append(_pct(100 * float(d["agreement"]), 0) if d.get("agreement") is not None else "--")
+        if has_all:
+            cells.append(f"**{_pct(ret.get('overall'))}**" if ret.get("overall") is not None else "--")
+        out.append("| " + " | ".join(cells) + " |")
+    notes = []
+    suite = results.get("_retention_suite") or {}
+    if cats and suite:
+        tasks = ", ".join(f"`{t}`" for t in suite.get("tasks") or [])
+        notes.append(f"_Tasks: {tasks or suite.get('suite', '?')} ({suite.get('harness', 'lm_eval')}, "
+                     f"limit {suite.get('limit', 'full')}), scored by pollard-taskeval._")
+    if has_tc:
+        notes.append("_Tool calls = the rung's tool-call format validity as a share of the f16's "
+                     "([pollard-toolcall](https://github.com/WestWaters/pollard-weights)); \"valid\" when no f16 run was "
+                     "recorded. Decisions = share of typed decisions identical to the f16's._")
+    for n in notes:
+        out += ["", n]
+    out.append("")
+    if has_mt:
+        out += mt_section(rows, results)
+    return out
+
+
+def mt_section(rows, results):
+    """Per-language translation table: one row per pair, chrF++ and retention per rung."""
+    pairs = []
+    for _, r in rows:
+        for p in (r.get("mt") or {}):
+            if p not in pairs:
+                pairs.append(p)
+    mrows = [(b, r) for b, r in rows if isinstance(r.get("mt"), dict)]
+    ref_of = {}
+    for _, r in mrows:
+        for p, v in r["mt"].items():
+            if isinstance(v, dict) and v.get("ref_chrf") is not None:
+                ref_of.setdefault(p, v["ref_chrf"])
+    meta = results.get("_mt_suite") or {}
+    head = ["pair", "f16 chrF++"] + [f"`{b.get('name', '-')}`" for b, _ in mrows]
+    out = ["### Translation, per language", "",
+           f"chrF++ on {('[' + meta['set'] + '](https://huggingface.co/datasets/' + meta['set'] + ')') if meta.get('set') else 'the mt suite'}"
+           + (f" ({meta.get('split')} split, {meta.get('limit')} sentences per pair)" if meta.get("limit") else "")
+           + "; each cell is the rung's chrF++ and, in brackets, its retention of the f16's.", "",
+           "| " + " | ".join(head) + " |", "|---|" + "---:|" * (len(head) - 1)]
+    for p in pairs:
+        cells = [p, f"{ref_of[p]:.1f}" if p in ref_of else "--"]
+        for _, r in mrows:
+            v = r["mt"].get(p)
+            if not isinstance(v, dict):
+                cells.append("--")
+                continue
+            c = f"{float(v['chrf']):.1f}"
+            if v.get("retention") is not None:
+                c += f" ({float(v['retention']):.0f}%)"
+            if v.get("comet") is not None:
+                c += f" / COMET {float(v['comet']):.3f}"
+            cells.append(c)
+        out.append("| " + " | ".join(cells) + " |")
+    out.append("")
+    return out
 
 
 def decision_ref(results):
@@ -565,6 +715,8 @@ def main():
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
+    ap.add_argument("--verified-only", action="store_true",
+                    help="list only rungs that passed pollard-verify --gate (what pollard release publishes)")
     ap.add_argument("--runtime-from-repo", action="store_true",
                     help="for rungs whose local build file is gone, read which runtime they need "
                          "from the copy already published in --repo, over range requests (a few MB "
@@ -608,6 +760,13 @@ def main():
     results = {}
     if a.results and os.path.exists(a.results):
         results = json.load(open(a.results))
+    if a.verified_only:
+        dropped = [b.get("name") for b in builds if gate_verdict(b, results) is not True]
+        builds = [b for b in builds if gate_verdict(b, results) is True]
+        if dropped:
+            print(f"   --verified-only: left off {len(dropped)} rung(s) that did not pass the gate: "
+                  + ", ".join(str(d) for d in dropped), file=sys.stderr)
+        lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or lanes
     eval_str = results.get("_eval", "")
     f16_ppl = results.get("_f16_ppl")
 
@@ -831,12 +990,17 @@ def main():
                             dict) for b in builds)
     tc_h = " agent-ready |" if has_tc else ""
     tc_s = "---|" if has_tc else ""
+    # verified: the pollard-verify --gate verdict, from the MANIFEST (record_gate) or results.json -- only
+    # when a gate actually ran, so a card never implies a check nobody made
+    has_v = any(gate_verdict(b, results) is not None for b in builds)
+    v_h = " verified |" if has_v else ""
+    v_s = "---|" if has_v else ""
     if decision:
-        out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h} notes |",
-                f"|---|---:|---:|---:|{rt_s}---|"]
+        out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h}{v_h} notes |",
+                f"|---|---:|---:|---:|{rt_s}{v_s}---|"]
     else:
-        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h}{tc_h} notes |",
-                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}{tc_s}---|"]
+        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h}{tc_h}{v_h} notes |",
+                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}{tc_s}{v_s}---|"]
     _ordered = sorted(builds, key=lambda x: (x.get("bytes") or 0))
     _rec = pick_recommended(
         [(i, results.get(b.get("name", ""), results.get(b.get("tag", ""), {})).get("ppl"))
@@ -859,15 +1023,20 @@ def main():
             ag = f"{float(d['agreement']):.0%}" if d.get("agreement") is not None else "--"
             note = r.get("note") or ""
             out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {ag} | "
-                       f"{_fmt_kl(d.get('option_kl'))} |{rt_c} {note} |")
+                       f"{_fmt_kl(d.get('option_kl'))} |{rt_c}{verified_cell(b, results) if has_v else ''} {note} |")
             continue
         tc_c = f" {agent_ready_cell(r.get('toolcall'))} |" if has_tc else ""
+        v_c = verified_cell(b, results) if has_v else ""
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c} {note} |")
+                   f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c}{v_c} {note} |")
     if has_top1:
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
-                "one the f16 would have picked (llama-perplexity's `Same top p`). Higher is closer "
-                "to the original model._"]
+                "one the f16 would have picked (llama-perplexity's `Same top p` for GGUF, the same logit "
+                "comparison in pollard-verify for the other lanes). Higher is closer to the original model._"]
+    if has_v:
+        out += ["", "_Verified = the rung passed `pollard-verify --gate`: its KLD / top-1 against the source and "
+                "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
+                "and met. A rung that failed is not published._"]
     if has_tc and not decision:
         out += ["", "_Agent-ready = the rung still writes valid tool calls ([pollard-toolcall]"
                 "(https://github.com/WestWaters/pollard-weights): format validity on its tool-call probes)._"]
@@ -883,6 +1052,8 @@ def main():
     out.append("")
     if decision and dec_rows:
         out += decision_section(builds, results)
+    out += retention_section(builds, results)
+    out += rungs_section(builds, primary, repo)
 
     # ---- usage
     def _recommended(b):
@@ -927,10 +1098,11 @@ def main():
                 "Use the FIM tokens the base model was trained with, not a chat turn:", "",
                 "```", "<|fim_prefix|>{before}<|fim_suffix|>{after}<|fim_middle|>", "```", ""]
 
-    # ---- Download a specific file
-    out += ["## Download a specific file", "", "```bash",
-            'pip install -U "huggingface_hub[cli]"',
-            f"hf download {repo} \\", f'  --include "{exn}" --local-dir ./', "```", ""]
+    # ---- Download a specific file (a directory lane's rungs are folders: its rungs section says how)
+    if primary == "gguf" or not builds:
+        out += ["## Download a specific file", "", "```bash",
+                'pip install -U "huggingface_hub[cli]"',
+                f"hf download {repo} \\", f'  --include "{exn}" --local-dir ./', "```", ""]
 
     # ---- How to run
     out += ["## How to run", ""]
@@ -1079,6 +1251,8 @@ def main():
             "frontier models, small hardware, no compromise.*"]
 
     card = "\n".join(out) + "\n"
+    if os.path.dirname(os.path.abspath(a.out)):
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     open(a.out, "w", encoding="utf-8").write(card)
     print(f"wrote model card -> {a.out}  ({len(builds)} file(s), lanes: {','.join(lanes)})")
     if a.upload:

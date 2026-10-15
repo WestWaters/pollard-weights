@@ -1154,11 +1154,12 @@ SCREENS.brains = () => `
 
 /* The three things you do AROUND a publish: score it, bring an older repo up to the current
    template, and get the disk back once it is live. */
-const PUBLISH_TOOLS = ["pollard_scorecard", "pollard_recard", "pollard_reclaim"];
+const PUBLISH_TOOLS = ["pollard_scorecard", "pollard_recard", "pollard_reclaim", "pollard_release"];
 const PUBLISH_WHY = [
   ["SCORECARD", "the standardized memory-fit low-bit numbers"],
   ["RECARD", "bring an already-published repo onto this template"],
   ["RECLAIM", "free the disk a finished model is still holding"],
+  ["RELEASE", "every lane as a ladder, gated + carded (plan first; --run builds)"],
 ];
 
 SCREENS.publish = () => `

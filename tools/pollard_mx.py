@@ -19,12 +19,19 @@ wrecked (llm-compressor pairs SmoothQuant with NVFP4 for the same reason). Or `p
   pollard-mx --model <hf> --sensitivity sens.json --plan-only                                       # recipe only
   pollard-mx --model <hf> --scheme MXFP4 --hot-frac 0.25 --out ./M-MXFP4                            # OCP MX
   pollard-mx --model <moe> --sensitivity sens.json --calib cal.txt --moe-protect-attn-only --kv-fp8 # MoE, FP8 KV
+  pollard-mx --model <hf> --scheme FP8 --calib cal.txt --out ./M-FP8                                # pure FP8 W8A8
+
+PURE FP8 (--scheme FP8 / FP8_DYNAMIC): every linear at FP8 W8A8 except the MoE routers and lm_head (and the
+vision tower / projector), which stay at the checkpoint's precision -- Cohere's published recipe. No
+hot/cold split: at 8 bits there is nothing to protect FROM, only the selection- and vocab-carrying matrices
+to leave alone. FP8 = static per-tensor activation scales (calibrated, needs --calib); FP8_DYNAMIC =
+per-channel weights + dynamic per-token activations (no calibration). Hopper/Ada/Blackwell/Rubin FP8 cores.
 
 Real emit needs `llm-compressor` on a CUDA box (`pip install llmcompressor`); it writes a
 compressed-tensors checkpoint: `vllm serve ./M-NVFP4` (Rubin: the vllm/vllm-openai:cu134-nightly image).
 `--plan-only` needs nothing and prints the recipe. NVFP4 is vLLM-validated; MXFP4 is experimental upstream
 (flagged at runtime) and runs on Blackwell/Rubin via flashinfer_cutlass (validate before shipping). Verify every build with
-`pollard-verify --model <out> --source <hf> --end-to-end` before shipping.
+`pollard-verify --lane mx --model <out> --source <hf> --eval <heldout.txt> --gate` before shipping.
 """
 import argparse, json, os, sys
 import pollard_workspace as ws
@@ -142,6 +149,10 @@ def serve_hints(out, scheme, kv_fp8=False, moe=False):
     return lines
 
 
+#: pure-FP8 body schemes (W8A8): everything but routers / lm_head / modality towers at FP8
+PURE_FP8 = ("FP8", "FP8_DYNAMIC")
+
+
 def scheme_bits(scheme):
     """Nominal weight bits for a scheme name (FP4/NVFP4/MXFP4/W4A16 -> 4; FP8/W8A16 -> 8)."""
     return 4.0 if "4" in scheme else 8.0
@@ -164,7 +175,7 @@ def main():
                     help="also quantize a vision/audio tower inside the checkpoint (default: left "
                          "at source precision). The modality projector is never quantized. "
                          "Measure the cost with pollard-mmeval before trusting this.")
-    ap.add_argument("--scheme", default="NVFP4", choices=["NVFP4", "MXFP4", "W4A16", "W8A16"],
+    ap.add_argument("--scheme", default="NVFP4", choices=["NVFP4", "MXFP4", "W4A16", "W8A16", "FP8", "FP8_DYNAMIC"],
                     help="body scheme: NVFP4 (Blackwell FP4, vLLM-validated default) / MXFP4 (OCP MX, "
                          "experimental) / W4A16 / W8A16 (INT weight-only compressed-tensors -- runs on any "
                          "vLLM GPU, not just Blackwell)")
@@ -208,17 +219,20 @@ def main():
     focus = ws.parse_layers(a.focus_layers)
     if focus:
         print(f"   focus-layers: forcing layers {sorted(focus)} to FP8 (steered budget)")
-    hot = allocate(sens, n_layers or 32, a.hot_frac, focus=focus)
+    pure_fp8 = a.scheme in PURE_FP8
+    hot = set() if pure_fp8 else allocate(sens, n_layers or 32, a.hot_frac, focus=focus)
+    if pure_fp8 and (sens or focus):
+        print("   pure FP8: every linear is already 8-bit -- the sensitivity profile / focus layers are not used")
     if a.moe_protect_attn_only and a.protect_down:
         print("   --moe-protect-attn-only: ignoring --protect-down (it would put every expert down_proj at "
               f"{a.protect_scheme} and split the MoE backend)")
     if a.moe_protect_attn_only and not moe:
         print("   note: --moe-protect-attn-only on a model whose config shows no experts -- only attention "
               "of hot layers is protected")
-    protect_down = a.protect_down and not a.moe_protect_attn_only
+    protect_down = a.protect_down and not a.moe_protect_attn_only and not pure_fp8
     rec = build_recipe(hot, a.scheme, a.protect_scheme, protect_down, a.quantize_vision,
                        moe_attn_only=a.moe_protect_attn_only, kv_fp8=a.kv_fp8)
-    ab = avg_bits(n_layers or 32, a.hot_frac, protect_down, a.scheme, a.protect_scheme)
+    ab = 8.0 if pure_fp8 else avg_bits(n_layers or 32, a.hot_frac, protect_down, a.scheme, a.protect_scheme)
     is_int = a.scheme in ("W4A16", "W8A16")
 
     if a.scheme == "MXFP4":
@@ -231,8 +245,10 @@ def main():
           f"{'<=' if a.moe_protect_attn_only else '~'}{ab} bpw avg  "
           f"(body {a.scheme}  |  {len(hot)} {what} + {'down_proj ' if protect_down else ''}@ {a.protect_scheme})"
           + ("  KV fp8" if a.kv_fp8 else ""))
-    print(f"   Pollard intent -> compressed-tensors: crush the cold bulk to {a.scheme}, keep measured-hot "
-          f"layers at {a.protect_scheme}, lm_head high-precision."
+    print(("   pure FP8 W8A8 (Cohere's recipe): every linear at FP8; MoE routers, lm_head and modality towers "
+           "left at the checkpoint's precision." if pure_fp8 else
+           f"   Pollard intent -> compressed-tensors: crush the cold bulk to {a.scheme}, keep measured-hot "
+           f"layers at {a.protect_scheme}, lm_head high-precision.")
           + ("  [INT weight-only: runs on any vLLM GPU, not just Blackwell]" if is_int else ""))
     print("   recipe:")
     print(f"     body:    QuantizationModifier(targets='Linear', scheme='{a.scheme}', ignore={rec['ignore'] + rec['protect']})")
@@ -245,7 +261,7 @@ def main():
     if not a.out:
         a.out = ws.resolve_out(a.model, "mx", tag=f"{a.scheme}-{ab}bpw")
         print(f"   (no --out) -> workspace: {a.out}")
-    if not a.calib and not is_int:
+    if not a.calib and not is_int and a.scheme != "FP8_DYNAMIC":
         sys.exit("ERROR: --calib required for real emit (FP4 activation scales need calibration).")
     if a.gptq and not a.calib:
         sys.exit("ERROR: --gptq needs --calib (error feedback is measured on the calibration set).")
@@ -292,7 +308,7 @@ def main():
     ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{ab}bpw", bpw=ab)
     print(f"wrote MX checkpoint -> {a.out}")
     print("\n".join(serve_hints(a.out, a.scheme, kv_fp8=a.kv_fp8, moe=moe)))
-    print(f"  VERIFY:  pollard-verify --model {a.out} --source {a.model} --end-to-end")
+    print(f"  VERIFY:  pollard-verify --lane mx --model {a.out} --source {a.model} --eval <heldout.txt> --gate")
 
 
 if __name__ == "__main__":

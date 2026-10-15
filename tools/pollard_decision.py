@@ -562,8 +562,16 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="typed-decisions: only the first N states (smoke run)")
     ap.add_argument("--source", help="the source checkpoint (HF dir or its config.json), for the pre-gate checks "
                     "(attention mode); default: a config.json beside the GGUF")
+    ap.add_argument("--results", help="merge this rung's decision board into this results.json (pollard-card "
+                                      "--results: the Decision fidelity table and the retention table)")
+    ap.add_argument("--rung", help="the rung's name/tag in --results (default: the GGUF file name)")
     a = ap.parse_args()
     res = gate(a.gguf, a.ngl, a.ctx, a.ref, a.qset, a.limit, a.source)
+    if a.results and res.get("board"):
+        import pollard_workspace as ws
+        board = {k: v for k, v in res["board"].items() if not isinstance(v, (list, dict))}
+        board.update({"verdict": res["verdict"], "set": board.get("set") or a.qset})
+        ws.merge_results(a.results, a.rung or os.path.basename(a.gguf), {"decision": board})
     if a.json:
         print(json.dumps(res, indent=1)); return
     b = res.get("board", {})

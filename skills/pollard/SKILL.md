@@ -264,8 +264,10 @@ Pollard builds models, not only quants of other people's. `pollard-forge` is the
 use (NVIDIA Minitron/Nemotron-style): **new** (a fresh qwen3 / llama / qwen2 architecture at a size preset or exact
 dims; tokenizer copied or trained), **prune** (carve a smaller model out of a teacher: drop the layers with the
 lowest block influence and the FFN channels that fire least, measured on `--calib`), **train** (pretrain,
-continue, or distill from the teacher: CE + temperature-scaled KL; `--data` mixes text / jsonl / `hf:` sources by
-weight; checkpoint + `--resume`; multi-GPU via `torchrun`), **card** (lineage from `forge.json`, license required).
+continue, or distill from the teacher: CE + a distillation loss -- `--loss kl` (temperature-scaled, default) /
+`rkl` / `cakld` (confidence-aware forward/reverse mix) / `kl_top_k`, AngelSlim's set, `--lm-loss-weight` for
+independent weights; `--data` mixes text / jsonl / `hf:` sources by weight; checkpoint + `--resume`; multi-GPU via
+`torchrun`), **card** (lineage from `forge.json`, license required).
 ```bash
 pollard-forge prune --teacher Qwen/Qwen3-4B --calib calib.txt --keep-layers 0.75 --ffn 0.6 --out my-2b
 pollard-forge train --model my-2b --teacher Qwen/Qwen3-4B --kd 0.7 \
@@ -276,6 +278,43 @@ pollard --hf my-2b --run            # GGUF ladder + card like any model
 Keep chat data in the mix for an instruct model (raw web text alone erases chat — measured on STQ1_0). A pruned or
 distilled model inherits its teacher's license terms; the card refuses to guess one. Checkpoints save in bf16
 (`--save-dtype`); mid-run checkpoints stay fp32 so `--resume` is exact.
+
+## Release a model on EVERY lane (`pollard release`)
+
+One plan, every lane, each lane a full LADDER of rungs: GGUF (the publish ladder via `pollard --hf --ladder`, the
+way we build), MLX 2/3/4/5/6/8-bit, GPTQ int2/3/4/8, MX NVFP4/MXFP4/pure FP8 W8A8, EXL3 several bpw. Smoke
+preflight first, serial under the machine lock, resumable (state file + MANIFEST: built+verified rungs are never
+rebuilt), every rung through `pollard-verify --gate`, one card per lane (`pollard-card --verified-only`), upload
+only with `upload: true` in the plan AND `--upload`.
+```bash
+pollard release --init release.yaml --preset moe          # text | vlm | decision | moe (recipes/release*.yaml)
+pollard release --hf Qwen/Qwen3-8B --plan release.yaml    # print the full plan (default)
+pollard release --hf Qwen/Qwen3-8B --plan release.yaml --lanes gguf,mlx --run     # the Mac
+pollard release --hf Qwen/Qwen3-8B --plan release.yaml --lanes gptq,mx,exl3 --run # the CUDA box
+```
+Repos: `<Org>/<M>-Pollard` (GGUF, files `<M>-Pollard-<TAG>.gguf`) and `<Org>/<M>-Pollard-MLX|GPTQ|MX|EXL3` (one
+subfolder per rung, default rung at the root). Lanes this machine cannot build are skipped with the command to run
+them where they can. The EAGLE3 `draft` lane is declared but not wired (no pollard-draft yet).
+
+### The publish gate (`pollard-verify --gate gates.yaml`)
+Per-rung thresholds (default <- `lanes.<lane>` <- matching `rungs` patterns): KLD max, top-1 min, task retention
+min (pollard-taskeval), translation retention, tool-call pass (pollard-toolcall), decision agreement, GGUF runtime
+(stock vs ik_llama from the tensor types -- an `IQ4_XS` whose attn_v got IQ4_K is ik-only and FAILS a `runtime:
+stock` gate) and coherence. An unmeasured threshold FAILS. Every lane is measured on the same scale (mean KLD + top-1
+vs the source): gguf via llama-perplexity, mlx via mlx_lm, gptq/mx via transformers; exl3 is gated on its assembled
+forward. `pollard-verify --print-gates` = the defaults (`recipes/gates.yaml`). Non-zero exit = do not publish.
+
+### Calibration profiles (`pollard-calib --profile`)
+`general` (Calib 3.0), `translation` (parallel pairs through the model's own template), `agent` (tool-call traces +
+schemas through the template), `code`, `auto` (from pollard-modelkind; `pollard` passes it by default,
+`--calib-profile` to override). `--model` renders chat samples with the model's own template; `--self-generate`
+(`--server URL` or `--self-generate-gguf f16.gguf`) swaps in the f16 model's own answers. Sources are open-licensed
+and pinned; ids/revisions/licences go to `<out>.sources.json` and the MANIFEST.
+
+### Retention vs f16 on the card
+`pollard-taskeval --results results.json --rung <tag>` (any suite, plus `--suite mt` = WMT24++ / FLORES+ chrF++ per
+language, optional COMET-22), `pollard-toolcall --results`, `pollard-decision --results` all merge into one
+results.json; `pollard-card --results` renders the "Retention vs f16" table and the per-language translation table.
 
 ## Fine-tune on your own data, then ship it (`pollard tune`)
 
@@ -468,8 +507,9 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-ngram` | n-gram / per-layer embedding tables on the SSD: inspect, launch line, swap watch (`pollard-fit --disk`) | models with a lookup table |
 | `pollard-forge` | make your own model: new architecture, Minitron-style prune, pretrain / distill, lineage card | any decoder-only |
+| `pollard-release` | **every lane as a ladder** (gguf/mlx/gptq/mx/exl3), gated, carded, resumable, upload on double opt-in (also `pollard release`) | any |
 | `pollard-tune` | fine-tune on YOUR data (LoRA/QLoRA SFT and/or GRPO: mlx / TRL / Unsloth), eval base vs tuned vs frontier, ship + serve | any HF causal LM |
-| `pollard-export` | vLLM/SGLang GPTQ (4/8 dynamic) checkpoint | any |
+| `pollard-export` | vLLM/SGLang GPTQ checkpoint (4/8 dynamic; `--bits 2/3/4/8` ladder rungs) | any |
 | `pollard-abliterate` | optional refusal-direction ablation (pre-quant) | any |
 | `pollard-experts` | measured hot-expert report | **MoE only** |
 | `pollard-run` | launch a build (llama-server), VRAM-aware | any |
@@ -485,12 +525,12 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-palette` | PROVEN measured mixed-alphabet allocator (prune/binary/ternary/2b) — beat uniform ternary −22%/−35% | any (torch, small model) |
 | `pollard-flybrain` | **connectome memory** — attach/train a fly brain so a build has no context window | any (torch) |
 | `pollard-ggufcheck` | which runtime can actually load a GGUF — reads ggml types + arch, not filenames | any |
-| `pollard-card` | the master HF model-card template (measured numbers, correct runtime column) | any |
+| `pollard-card` | the master HF model-card template (measured numbers, retention vs f16, verified column, correct runtime column) | any |
 | `pollard-recard` | bring already-published repos onto that template without losing measured numbers | any |
 | `pollard-ls` | list the Pollard workspace so you never hunt for a build | any |
 | `pollard-reclaim` | free disk a finished model still holds, once it is verifiably published | any |
 | `pollard-runtime` | are the llama.cpp builds current, and do they carry our patches? | — |
-| `pollard-verify` | correctness/perf GATE for a converted model — catch bad weights before hours burn | any |
+| `pollard-verify` | the publish GATE: KLD/top-1 vs source on every lane (gguf/mlx/gptq/mx/exl3) + `--gate gates.yaml` per-rung thresholds (retention, tool calls, runtime, coherence) | any |
 | `pollard-refcheck` | prove the reference forward is sane BEFORE measuring anything against it | any |
 | `pollard-doctor` | diagnose/repair a model for low-bit: is this convert healthy, and why not? | any |
 | `pollard-errsrc` | attribute measured quant error to a tensor AND its trigger | any |
@@ -498,12 +538,15 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-archfp` | what IS this architecture structurally — and which known one is it a twin of? | any |
 | `pollard-onboard` | audit a NEW architecture and emit a ready-to-submit contribution | any |
 | `pollard-envmatch` | build a custom-arch model in a Python env matched to its converter | any |
-| `pollard-calib` | build a multi-domain calibration corpus (Calib 3.0) | any |
+| `pollard-calib` | calibration corpus: Calib 3.0 + `--profile general/translation/agent/code/auto`, model-template rendering, `--self-generate` | any |
 | `pollard-probes` | task-accuracy probes on a Pollard'd GGUF via llama.cpp's own runner | any |
+| `pollard-taskeval` | task scores + RETENTION vs f16 (lm-eval suites, `--suite mt` chrF++/COMET per language), `--results` for the card | any |
+| `pollard-toolcall` | does the rung still emit valid tool calls (vs the f16), `--results` for the card + gate | any (agent models) |
+| `pollard-decision` | decision-model board vs f16 (agreement, option KL, calibration), `--results` for the card + gate | decision models |
 | `pollard-serve-eval` | A/B a served quantized model against its baseline, on the same traffic | any |
 | `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
-| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation | any |
-| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4 export; `--kv-fp8`, `--moe-protect-attn-only`) | any |
+| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs) | any |
+| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`) | any |
 | `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
 | `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |

@@ -144,6 +144,24 @@ def _is_decision(model, conf) -> bool:
     return bool(_DECISION_NAME.search(os.path.basename(str(model).rstrip("/"))))
 
 
+_CODER_NAME = re.compile(r"coder|codestral|starcoder|codegen|code[-_]?llama|devstral|codegemma|granite-\d+b-code", re.I)
+_TRANSLATE_NAME = re.compile(r"translat|nllb|madlad|tower(instruct|plus)?|seamless|hy-?mt|opus-mt|(^|[-_])mt(\d|[-_]|$)", re.I)
+
+
+def calib_profile(kind: dict, name: str = "") -> tuple:
+    """(profile, why) -- the pollard-calib domain mix for this kind of model. The imatrix spends its
+    protection where the calibration activations are, so a translator calibrated on English prose
+    or an agent model that never saw a tool call is protected for the wrong job."""
+    base = os.path.basename(str(name).rstrip("/\\"))
+    if _TRANSLATE_NAME.search(base):
+        return "translation", f"name '{base}' reads as a translation model"
+    if _CODER_NAME.search(base):
+        return "code", f"name '{base}' reads as a code model"
+    if kind.get("agentic"):
+        return "agent", "chat template drives tool calls"
+    return "general", "no stronger signal than a general chat/base model"
+
+
 def classify(model) -> dict:
     """What this model is, and what that implies for measuring it."""
     tpl, archs, conf = _template_and_arch(model)
@@ -223,7 +241,7 @@ def classify(model) -> dict:
     # Anything beyond text changes what a "score" even means: a text corpus exercises none of the
     # encoder that makes the model what it is, so a text-only number is partial by construction.
     multimodal = [m for m in modalities if m != "speech_out"]
-    return {
+    out = {
         "instruct": instruct, "thinking": thinking, "agentic": agentic, "vision": vision,
         "diffusion": diffusion, "decision": decision,
         "runtime": "llama-diffusion-cli" if diffusion else "llama-server",
@@ -237,6 +255,14 @@ def classify(model) -> dict:
         "gate_tokens": TOKENS_THINKING if thinking else TOKENS_PLAIN,
         "why": why,
     }
+    names = [str(x) for x in (model, (conf or {}).get("general.name"), (conf or {}).get("_name_or_path")) if x]
+    out["calib_profile"], out["calib_profile_why"] = calib_profile(out, names[0] if names else "")
+    for extra in names[1:]:                                  # a GGUF's general.name can say "coder" too
+        p, w = calib_profile({}, extra)
+        if p != "general" and out["calib_profile"] in ("general", "agent"):
+            out["calib_profile"], out["calib_profile_why"] = p, w
+            break
+    return out
 
 
 def describe(k: dict) -> str:
@@ -264,6 +290,7 @@ def main():
                           " encoder -- any text-only score is partial by construction)",
             "raw-text": ""}
     print(f"   eval corpus : {k['eval']}{note.get(k['eval'], '')}")
+    print(f"   calib mix   : pollard-calib --profile {k['calib_profile']}   ({k['calib_profile_why']})")
     print(f"   gate budget : {k['gate_tokens']} tokens"
           + ("   (thinking block runs first)" if k["thinking"] else ""))
 

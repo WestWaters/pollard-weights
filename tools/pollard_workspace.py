@@ -186,6 +186,82 @@ def record_build(model: str, lane: str, path: str, tag: str = "", bpw=None, ppl=
     return entry
 
 
+def _write_manifest(model: str, man: dict):
+    model_dir(model, create=True)
+    tmp = _manifest_path(model) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(man, f, indent=2)
+    os.replace(tmp, _manifest_path(model))
+
+
+def record_calibration(model: str, corpus: str, sources: dict):
+    """Log a calibration corpus and EXACTLY what it was built from (dataset ids, revisions, licences,
+    profile, self-generation) in the model's MANIFEST -- a build should be able to say what it saw."""
+    man = read_manifest(model)
+    man["model"] = model
+    entry = {"path": os.path.abspath(corpus), **{k: v for k, v in sources.items() if k != "path"},
+             "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    man["calibration"] = [c for c in man.get("calibration", []) if c.get("path") != entry["path"]] + [entry]
+    _write_manifest(model, man)
+    return entry
+
+
+def find_build(build_path: str):
+    """(model key, build entry) for a build path recorded in any MANIFEST, or (None, None)."""
+    build_path = os.path.abspath(build_path.rstrip("/\\"))
+    for slug in list_models():
+        mpath = os.path.join(pollard_home(), "models", slug, "MANIFEST.json")
+        try:
+            man = json.load(open(mpath))
+        except Exception:
+            continue
+        for b in man.get("builds", []):
+            if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
+                return man.get("model") or slug, b
+    return None, None
+
+
+def record_gate(build_path: str, gate: dict) -> bool:
+    """Stamp a pollard-verify --gate verdict (pass/fail + every check) onto a build in its MANIFEST.
+    `verified` follows the gate, so pollard-ls, pollard-release's resume and the card all agree."""
+    build_path = os.path.abspath(build_path.rstrip("/\\"))
+    model, entry = find_build(build_path)
+    if not model:
+        return False
+    man = read_manifest(model)
+    for b in man.get("builds", []):
+        if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
+            b["verified"] = bool(gate.get("pass"))
+            b["gate"] = gate
+    _write_manifest(model, man)
+    return True
+
+
+def merge_results(path: str, rung: str, patch: dict, meta: dict | None = None) -> dict:
+    """Merge measured numbers for one rung into a results.json (the file pollard-card --results reads:
+    {rung: {ppl, kld, top1, toolcall, decision, retention, mt, ...}, _meta keys...}). Nested dicts are
+    merged, not replaced, so taskeval / toolcall / verify can each add their part to the same rung."""
+    try:
+        res = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+    except Exception:
+        res = {}
+    cur = res.setdefault(rung, {}) if rung else res
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(cur.get(k), dict):
+            cur[k] = {**cur[k], **v}
+        else:
+            cur[k] = v
+    for k, v in (meta or {}).items():
+        res[k] = v
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=2)
+    os.replace(tmp, path)
+    return res
+
+
 def mark_verified(build_path: str, ok: bool, ppl=None):
     """Find the build with this path in any model's MANIFEST and stamp its verified flag (+ ppl).
     No-op if the build isn't in the workspace (e.g. user built to an explicit --out elsewhere)."""
