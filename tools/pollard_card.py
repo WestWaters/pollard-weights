@@ -486,6 +486,116 @@ def decision_section(builds, results):
             ""]
 
 
+RETENTION_CATS = ["Knowledge & Reasoning", "Math", "Coding", "Instruction Following", "Vision", "Other"]
+
+
+def _pct(v, nd=1):
+    return f"{float(v):.{nd}f}%" if v is not None else "--"
+
+
+def _rung_result(results, b):
+    return (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {})
+
+
+def retention_section(builds, results):
+    """"Retention vs f16": what each rung keeps of the f16 on real work, from pollard-taskeval (per-category
+    task retention), its mt suite (chrF++ per language), pollard-toolcall (tool-call validity vs the f16's)
+    and pollard-decision (agreement with the f16's decisions). Only columns something measured appear,
+    and a rung nothing measured is left out rather than shown as a row of dashes."""
+    ordered = sorted(builds, key=lambda x: -(x.get("bytes") or 0))
+    rows = [(b, _rung_result(results, b)) for b in ordered]
+    rows = [(b, r) for b, r in rows if any(isinstance(r.get(k), dict) for k in ("retention", "mt", "toolcall", "decision"))]
+    if not rows:
+        return []
+    cats = [c for c in RETENTION_CATS if any(c in ((r.get("retention") or {}).get("categories") or {}) for _, r in rows)]
+    has_mt = any(isinstance(r.get("mt"), dict) and any("retention" in v for v in r["mt"].values() if isinstance(v, dict))
+                 for _, r in rows)
+    has_tc = any(isinstance(r.get("toolcall"), dict) for _, r in rows)
+    has_dec = any(isinstance(r.get("decision"), dict) and r["decision"].get("agreement") is not None for _, r in rows)
+    has_all = any((r.get("retention") or {}).get("overall") is not None for _, r in rows)
+    head = ["file"] + cats + (["Translation (chrF++)"] if has_mt else []) + (["Tool calls"] if has_tc else []) \
+        + (["Decisions (agree)"] if has_dec else []) + (["**Overall**"] if has_all else [])
+    out = ["## Retention vs f16", "",
+           "What each rung keeps of the f16 on real work -- quantized score / f16 score on the same tasks, the same "
+           "settings, the same harness (100% = no loss). Measured against our own f16, so the rungs compare "
+           "directly; it is not comparable to a retention figure published on a different suite.", "",
+           "| " + " | ".join(head) + " |", "|---|" + "---:|" * (len(head) - 1)]
+    for b, r in rows:
+        ret = r.get("retention") or {}
+        cells = [f"`{b.get('name', '-')}`"] + [_pct((ret.get("categories") or {}).get(c)) for c in cats]
+        if has_mt:
+            vals = [v["retention"] for v in (r.get("mt") or {}).values() if isinstance(v, dict) and "retention" in v]
+            cells.append(_pct(sum(vals) / len(vals)) if vals else "--")
+        if has_tc:
+            tc = r.get("toolcall")
+            if not isinstance(tc, dict) or tc.get("rate") is None:
+                cells.append("--")
+            elif tc.get("ref_rate"):
+                cells.append(_pct(100 * float(tc["rate"]) / float(tc["ref_rate"])))
+            else:
+                cells.append(f"{float(tc['rate']):.0%} valid")
+        if has_dec:
+            d = r.get("decision") or {}
+            cells.append(_pct(100 * float(d["agreement"]), 0) if d.get("agreement") is not None else "--")
+        if has_all:
+            cells.append(f"**{_pct(ret.get('overall'))}**" if ret.get("overall") is not None else "--")
+        out.append("| " + " | ".join(cells) + " |")
+    notes = []
+    suite = results.get("_retention_suite") or {}
+    if cats and suite:
+        tasks = ", ".join(f"`{t}`" for t in suite.get("tasks") or [])
+        notes.append(f"_Tasks: {tasks or suite.get('suite', '?')} ({suite.get('harness', 'lm_eval')}, "
+                     f"limit {suite.get('limit', 'full')}), scored by pollard-taskeval._")
+    if has_tc:
+        notes.append("_Tool calls = the rung's tool-call format validity as a share of the f16's "
+                     "([pollard-toolcall](https://github.com/WestWaters/pollard-weights)); \"valid\" when no f16 run was "
+                     "recorded. Decisions = share of typed decisions identical to the f16's._")
+    for n in notes:
+        out += ["", n]
+    out.append("")
+    if has_mt:
+        out += mt_section(rows, results)
+    return out
+
+
+def mt_section(rows, results):
+    """Per-language translation table: one row per pair, chrF++ and retention per rung."""
+    pairs = []
+    for _, r in rows:
+        for p in (r.get("mt") or {}):
+            if p not in pairs:
+                pairs.append(p)
+    mrows = [(b, r) for b, r in rows if isinstance(r.get("mt"), dict)]
+    ref_of = {}
+    for _, r in mrows:
+        for p, v in r["mt"].items():
+            if isinstance(v, dict) and v.get("ref_chrf") is not None:
+                ref_of.setdefault(p, v["ref_chrf"])
+    meta = results.get("_mt_suite") or {}
+    head = ["pair", "f16 chrF++"] + [f"`{b.get('name', '-')}`" for b, _ in mrows]
+    out = ["### Translation, per language", "",
+           f"chrF++ on {('[' + meta['set'] + '](https://huggingface.co/datasets/' + meta['set'] + ')') if meta.get('set') else 'the mt suite'}"
+           + (f" ({meta.get('split')} split, {meta.get('limit')} sentences per pair)" if meta.get("limit") else "")
+           + "; each cell is the rung's chrF++ and, in brackets, its retention of the f16's.", "",
+           "| " + " | ".join(head) + " |", "|---|" + "---:|" * (len(head) - 1)]
+    for p in pairs:
+        cells = [p, f"{ref_of[p]:.1f}" if p in ref_of else "--"]
+        for _, r in mrows:
+            v = r["mt"].get(p)
+            if not isinstance(v, dict):
+                cells.append("--")
+                continue
+            c = f"{float(v['chrf']):.1f}"
+            if v.get("retention") is not None:
+                c += f" ({float(v['retention']):.0f}%)"
+            if v.get("comet") is not None:
+                c += f" / COMET {float(v['comet']):.3f}"
+            cells.append(c)
+        out.append("| " + " | ".join(cells) + " |")
+    out.append("")
+    return out
+
+
 def decision_ref(results):
     """What the decision board was measured against: the f16 unless the results say otherwise. A model too big
     to serve at f16 on the build machine (Clef 27B: 54 GB) is gated against Q8_0, and the card must say so."""
@@ -855,6 +965,7 @@ def main():
     out.append("")
     if decision and dec_rows:
         out += decision_section(builds, results)
+    out += retention_section(builds, results)
 
     # ---- usage
     def _recommended(b):

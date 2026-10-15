@@ -195,6 +195,9 @@ def main():
     ap.add_argument("--min-rate", type=float, default=0.75,
                     help="fail below this format-validity rate (default 0.75)")
     ap.add_argument("--out", help="write the full result here as JSON")
+    ap.add_argument("--results", help="merge {pass, rate, ref_rate} for this rung into this results.json "
+                                      "(what pollard-card --results reads: agent-ready + retention columns)")
+    ap.add_argument("--rung", help="the rung's name/tag in --results (default: the GGUF file name)")
     a = ap.parse_args()
 
     cli = a.llama_cli
@@ -211,6 +214,7 @@ def main():
         print(f"  failures: {s['modes']}")
 
     verdict = s["rate"] >= a.min_rate
+    rs = None
     if a.ref:
         ref_rows = run(cli, a.ref, a.ngl, a.threads)
         rs = score(ref_rows)
@@ -224,7 +228,13 @@ def main():
                   "instead of raising the bit-width everywhere.")
         verdict = verdict and drop <= 0.1
     if a.out:
-        json.dump({"score": s, "rows": rows}, open(a.out, "w"), indent=2)
+        json.dump({"score": s, "rows": rows, "ref_score": rs}, open(a.out, "w"), indent=2)
+    if a.results:
+        import pollard_workspace as ws
+        tc = {"pass": bool(verdict), "rate": s["rate"], "n": s["n"], "modes": s["modes"]}
+        if rs is not None:
+            tc.update({"ref_rate": rs["rate"], "drop": round(rs["rate"] - s["rate"], 4)})
+        ws.merge_results(a.results, a.rung or os.path.basename(a.gguf), {"toolcall": tc})
     print(f"\n{'PASS' if verdict else 'FAIL'}")
     raise SystemExit(0 if verdict else 1)
 
