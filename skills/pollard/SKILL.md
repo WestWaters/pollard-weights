@@ -304,12 +304,55 @@ stock` gate) and coherence. An unmeasured threshold FAILS. Every lane is measure
 vs the source): gguf via llama-perplexity, mlx via mlx_lm, gptq/mx via transformers; exl3 is gated on its assembled
 forward. `pollard-verify --print-gates` = the defaults (`recipes/gates.yaml`). Non-zero exit = do not publish.
 
+### MLX range search (`pollard-mlx --range search|minmax`)
+Default `search`: each group-of-64's scale/bias is chosen by GPQ's shrink-grid search + weighted LS refit,
+scored on error weighted by the input channel's activation energy (`--imatrix`: llama.cpp .dat/.gguf with
+llama-family names mapped, or .npz/.safetensors keyed by module path; without it, plain weight error). MLX's own
+min/max is always a candidate, so no group gets worse. Output = standard MLX affine (same packing, same
+scale/bias tensors) -- mlx-lm loads it unchanged. Synthetic: weighted error ~0.35x of `mx.quantize` at 3/4-bit;
+GPQ measured ~2x lower KL at 4-bit. Real KL A/B still pending (`notes/mlx-range-search.md`). `pollard --format
+mlx` passes `--imatrix` through when given.
+
+### EXL3 recipe bridge (`pollard-exl3 --recipe none|pollard|exl3|FILE`)
+ExLlamaV3 >= 1.6 (MIT) converts from a per-tensor `-rcp recipe.yaml`. `--recipe pollard` emits one from Pollard's
+measured sensitivity (`--sensitivity`) at `--bpw`: EXL3's own tensor list (exllamav3 graph on the box, safetensors
+headers elsewhere), sc_optimize's KL law `S_t * 4^(p-K)`, greedy marginal-KL-per-bit at the budget, fused
+q/k/v + gate/up tied; checked against EXL3's parser (v1.6.2 vendored in tests). `exl3` = EXL3's own sc_optimize
+recipe (`--exl3-recipe`, or prints the sc_* pipeline). DEFAULT stays `none` (the gold path) until the head-to-head
+(`notes/exl3-recipe-bridge.md`: budgeted vs Pollard recipe vs sc_optimize, same bpw, KL on held-out) says otherwise.
+
+### NVFP4 Four Over Six (`pollard-mx --fp4-scale 6|4over6`)
+Four Over Six (MIT HAN Lab, arXiv 2512.02010, MIT licence): each NVFP4 block's E4M3 scale maps the block max to
+4 OR 6 (tensor scale against 256, not 448), keeping whichever block reconstructs better -- Pollard scores it by
+imatrix-weighted error (`--imatrix`), MSE without one. Post-pass over llm-compressor's checkpoint; output stays
+standard NVFP4 (compressed-tensors layout, fused q/k/v + gate/up keep one shared global scale). Synthetic:
+~0.75x weighted error vs plain. Default stays `6` until the box A/B (`notes/nvfp4-four-over-six.md`).
+
 ### Calibration profiles (`pollard-calib --profile`)
 `general` (Calib 3.0), `translation` (parallel pairs through the model's own template), `agent` (tool-call traces +
 schemas through the template), `code`, `auto` (from pollard-modelkind; `pollard` passes it by default,
 `--calib-profile` to override). `--model` renders chat samples with the model's own template; `--self-generate`
 (`--server URL` or `--self-generate-gguf f16.gguf`) swaps in the f16 model's own answers. Sources are open-licensed
 and pinned; ids/revisions/licences go to `<out>.sources.json` and the MANIFEST.
+
+**Reasoning (thinking) models -- automatic.** `pollard-modelkind` renders the chat template (jinja2, no tokenizer)
+to read the model's OWN thinking delimiters (`<think>`, `<seed:think>`, `[THINK]`, harmony
+`<|channel|>analysis`, `<|START_THINKING|>`, `<mm:think>`, Gemma `<|channel>thought` ...), whether a variable
+switches it (`enable_thinking` / `thinking` / `thinking_mode` / `reasoning_effort` no_think) and whether the
+generation prompt already opens it (always-on); names/tags/config are the fallback (R1-distill templates strip the
+block; `*-Instruct-2507` / `non-thinking` releases are excluded). `pollard-calib` then adds a **reasoning share
+(`--reasoning-share`, default 0.35)** of DeepSeek-R1 traces (OpenThoughts-114k metadata, Apache-2.0, pinned;
+OpenR1-Math fallback; bundled seeds offline) rendered EXACTLY as the model emits them -- the template's own
+rendering when it renders the final turn's thinking, else its generation prompt + delimiters + end-of-turn. A
+toggleable model gets thinking-ON for the reasoning share and thinking-OFF for the rest (template kwargs).
+`--self-generate` keeps the model's own thinking (reasoning_content, or split off inline) and rejects blocks the
+budget cut off. **Sanity gate:** the corpus is NOT written (non-zero exit) if a reasoning model's calibration has
+zero thinking blocks in its delimiters; the counts land in `<out>.sources.json` (`reasoning.report`).
+`pollard-calib --check old.txt --model <m>` audits an existing corpus (the LFM2.5-24B corpus had zero `<think>`).
+`--reasoning on|off|toggle` overrides; `--allow-no-think` writes anyway. Eval side: taskeval / toolcall / the
+coherence gate strip thinking for ANY delimiter style (`pollard_modelkind.split_reasoning`); an unclosed block =
+no answer (`unclosed-think` in pollard-toolcall, which gives reasoning models a 1024-token budget). KL/verify
+keep the thinking: the held-out split carries the same reasoning share, so KL is measured on what the model emits.
 
 ### Retention vs f16 on the card
 `pollard-taskeval --results results.json --rung <tag>` (any suite, plus `--suite mt` = WMT24++ / FLORES+ chrF++ per
@@ -538,16 +581,16 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-archfp` | what IS this architecture structurally — and which known one is it a twin of? | any |
 | `pollard-onboard` | audit a NEW architecture and emit a ready-to-submit contribution | any |
 | `pollard-envmatch` | build a custom-arch model in a Python env matched to its converter | any |
-| `pollard-calib` | calibration corpus: Calib 3.0 + `--profile general/translation/agent/code/auto`, model-template rendering, `--self-generate` | any |
+| `pollard-calib` | calibration corpus: Calib 3.0 + `--profile general/translation/agent/code/auto`, model-template rendering, `--self-generate`, automatic reasoning share in the model's own think delimiters + sanity gate (`--check`) | any |
 | `pollard-probes` | task-accuracy probes on a Pollard'd GGUF via llama.cpp's own runner | any |
 | `pollard-taskeval` | task scores + RETENTION vs f16 (lm-eval suites, `--suite mt` chrF++/COMET per language), `--results` for the card | any |
 | `pollard-toolcall` | does the rung still emit valid tool calls (vs the f16), `--results` for the card + gate | any (agent models) |
 | `pollard-decision` | decision-model board vs f16 (agreement, option KL, calibration), `--results` for the card + gate | decision models |
 | `pollard-serve-eval` | A/B a served quantized model against its baseline, on the same traffic | any |
 | `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
-| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs) | any |
-| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`) | any |
-| `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
+| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs); `--range search` (default) = imatrix-weighted per-group scale/bias search (`--imatrix`), still standard MLX affine | any |
+| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`, `--fp4-scale 4over6` Four Over Six block scales) | any |
+| `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation; `--recipe pollard` writes an EXL3 `-rcp` recipe from the measured sensitivity, `--recipe exl3` uses sc_optimize's | any |
 | `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
 

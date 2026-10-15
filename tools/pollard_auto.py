@@ -607,6 +607,8 @@ def _emit_nongguf(a):
         cmd = ["pollard-mlx", "--model", hf_dir, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
+        if getattr(a, "imatrix", None) and os.path.exists(a.imatrix):
+            cmd += ["--imatrix", a.imatrix]                # activation-weighted range search (--range search)
     print(f"   {a.format.upper()} export (Pollard method -- smoothing default + measured allocation):")
     _run(cmd, a.run)
     _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate",

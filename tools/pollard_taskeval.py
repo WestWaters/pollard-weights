@@ -438,8 +438,16 @@ def chat_complete(base_url: str, max_tokens: int = 512, timeout: int = 600):
 
 
 def _strip_thinking(text: str) -> str:
-    import re
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    """The answer only. Any reasoning model's delimiters (<think>, [THINK], <seed:think>, harmony
+    analysis/final ...), via pollard-modelkind -- a translation scored with its thinking still in it
+    measures the thinking. A block the budget cut off leaves no answer: scored as empty."""
+    try:
+        from pollard_modelkind import split_reasoning
+        _, answer, unclosed = split_reasoning(text)
+        return "" if unclosed else answer
+    except ImportError:                                          # pragma: no cover
+        import re
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
 def chrf_pp(hyps: list[str], refs: list[str]) -> float:

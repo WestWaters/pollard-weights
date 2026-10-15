@@ -13,6 +13,7 @@ one, and it is the part that fails first.
 
 What counts as a failure here, in the order they actually happen:
 
+    unclosed-think a reasoning model was still thinking when the budget ran out
     no-call        the model answered in prose instead of calling anything
     not-json       it emitted something call-shaped that does not parse
     wrong-tool     valid JSON, wrong function name
@@ -88,8 +89,29 @@ def extract_call(text):
     return None
 
 
+#: generation budget: a reasoning model thinks before it calls, and a call cut off mid-thought is a
+#: budget failure, not a format failure
+N_PREDICT_PLAIN, N_PREDICT_REASONING = 160, 1024
+
+
+def _split_think(text):
+    """(thinking, answer, unclosed) with any model's delimiters (pollard-modelkind)."""
+    try:
+        from pollard_modelkind import split_reasoning
+        return split_reasoning(text)
+    except ImportError:                                          # pragma: no cover
+        return "", text or "", False
+
+
 def check_call(text, tool, expect=None):
-    """Grade one generation against one tool schema. Returns (ok, failure, detail)."""
+    """Grade one generation against one tool schema. Returns (ok, failure, detail).
+
+    A reasoning model's thinking is removed first: JSON it sketches while thinking is not the call, and a
+    thinking block that never closed means the budget ran out before any call was made."""
+    think, answer, unclosed = _split_think(text)
+    if unclosed:
+        return False, "unclosed-think", "thinking block never closed within the budget -- no call emitted"
+    text = answer if think else text
     looks_like = bool(re.search(r"[{}]|tool_call|function", text or "", re.I))
     obj = extract_call(text)
     if obj is None:
@@ -173,10 +195,20 @@ def generate(cli_bin, model, prompt, ngl, n_predict=160, threads=None):
     return (r.stdout or "").strip()
 
 
-def run(cli_bin, model, ngl, threads=None):
+def n_predict_for(model):
+    """The generation budget for this model: room to think first when it is a reasoning model."""
+    try:
+        from pollard_modelkind import classify
+        return N_PREDICT_REASONING if classify(model).get("thinking") else N_PREDICT_PLAIN
+    except Exception:                                            # noqa: BLE001
+        return N_PREDICT_PLAIN
+
+
+def run(cli_bin, model, ngl, threads=None, n_predict=0):
     out = []
+    n_predict = n_predict or n_predict_for(model)
     for probe in PROBES:
-        gen = generate(cli_bin, model, _prompt_for(probe), ngl, threads=threads)
+        gen = generate(cli_bin, model, _prompt_for(probe), ngl, n_predict=n_predict, threads=threads)
         ok, failure, detail = check_call(gen, probe["tool"], probe.get("expect"))
         out.append({"tool": probe["tool"]["name"], "ok": ok, "failure": failure,
                     "detail": detail, "sample": gen.replace("\n", " ")[:110]})
@@ -198,10 +230,14 @@ def main():
     ap.add_argument("--results", help="merge {pass, rate, ref_rate} for this rung into this results.json "
                                       "(what pollard-card --results reads: agent-ready + retention columns)")
     ap.add_argument("--rung", help="the rung's name/tag in --results (default: the GGUF file name)")
+    ap.add_argument("--n-predict", type=int, default=0,
+                    help=f"generation budget (default: {N_PREDICT_PLAIN}, or {N_PREDICT_REASONING} for a "
+                         "reasoning model, which thinks before it calls)")
     a = ap.parse_args()
 
     cli = a.llama_cli
-    rows = run(cli, a.gguf, a.ngl, a.threads)
+    budget = {"n_predict": a.n_predict} if a.n_predict else {}
+    rows = run(cli, a.gguf, a.ngl, a.threads, **budget)
     s = score(rows)
     print(f"== pollard-toolcall :: {os.path.basename(a.gguf)}")
     for r in rows:
@@ -216,7 +252,7 @@ def main():
     verdict = s["rate"] >= a.min_rate
     rs = None
     if a.ref:
-        ref_rows = run(cli, a.ref, a.ngl, a.threads)
+        ref_rows = run(cli, a.ref, a.ngl, a.threads, **budget)
         rs = score(ref_rows)
         drop = rs["rate"] - s["rate"]
         print(f"  reference       {rs['valid']}/{rs['n']}  ({rs['rate']:.0%})"

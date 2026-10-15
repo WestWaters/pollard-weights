@@ -20,6 +20,11 @@ wrecked (llm-compressor pairs SmoothQuant with NVFP4 for the same reason). Or `p
   pollard-mx --model <hf> --scheme MXFP4 --hot-frac 0.25 --out ./M-MXFP4                            # OCP MX
   pollard-mx --model <moe> --sensitivity sens.json --calib cal.txt --moe-protect-attn-only --kv-fp8 # MoE, FP8 KV
   pollard-mx --model <hf> --scheme FP8 --calib cal.txt --out ./M-FP8                                # pure FP8 W8A8
+  pollard-mx --model <hf> --sensitivity s.json --calib cal.txt --fp4-scale 4over6 --imatrix m.imatrix --out ./M-NVFP4-4o6
+
+FOUR OVER SIX (--fp4-scale 4over6; MIT HAN Lab, arXiv 2512.02010, MIT licence): each NVFP4 block's E4M3 scale maps
+the block max to 4 OR 6, whichever reconstructs it better -- scored by Pollard's imatrix-weighted error (--imatrix),
+not plain MSE. Applied after llm-compressor writes the checkpoint; still standard NVFP4 (vLLM loads it unchanged).
 
 PURE FP8 (--scheme FP8 / FP8_DYNAMIC): every linear at FP8 W8A8 except the MoE routers and lm_head (and the
 vision tower / projector), which stay at the checkpoint's precision -- Cohere's published recipe. No
@@ -149,6 +154,204 @@ def serve_hints(out, scheme, kv_fp8=False, moe=False):
     return lines
 
 
+# ----------------------------------------------------------------- Four Over Six (NVFP4 block scales)
+#
+# NVFP4 = E2M1 values {0, .5, 1, 1.5, 2, 3, 4, 6} x an FP8 E4M3 scale per block of 16 x an FP32 scale per tensor.
+# The usual block scale maps the block's max to 6 -- and E2M1 has nothing between 4 and 6, so values near 5/6 of
+# the max round badly. "Four Over Six" (Cook et al., arXiv 2512.02010, MIT HAN Lab, github.com/mit-han-lab/
+# fouroversix, MIT licence) ALSO tries mapping the block max to 4 (a finer grid near the top, 6 left unused) and
+# keeps whichever reconstructs the block better. To leave room for the x1.5 larger scale that "4" needs, the tensor
+# scale is computed against an E4M3 max of 256 instead of 448 (6/4 * 256 = 384 <= 448). Clean-room from the
+# paper/reference; the output is STANDARD NVFP4 -- same packed FP4, same E4M3 block scales, same FP32 global
+# scale -- so vLLM / compressed-tensors load it unchanged.
+#
+# Pollard's version picks per block by the error WEIGHTED by each input channel's activation energy (the
+# imatrix: --imatrix), not plain MSE: a block's error matters as much as the activations that multiply it.
+
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E4M3_MAX, E4M3_MAX_FOUROVERSIX = 448.0, 256.0
+FP4_SCALE_RULES = ("6", "4over6")
+NVFP4_BLOCK = 16
+
+
+def round_e4m3(x):
+    """Round float32 to the nearest FP8 E4M3 (fn) value, as float32 (numpy; subnormals, saturating at 448)."""
+    import numpy as np
+    x = np.asarray(x, np.float32)
+    a = np.minimum(np.abs(x), E4M3_MAX)
+    e = np.floor(np.log2(np.maximum(a, 2.0 ** -9)))
+    e = np.maximum(e, -6.0)                                     # below 2^-6: subnormal step 2^-9
+    step = 2.0 ** (e - 3)
+    r = np.rint(a / step) * step
+    return (np.sign(x) * np.minimum(r, E4M3_MAX)).astype(np.float32)
+
+
+def fp4_codes(y):
+    """E2M1 code (sign bit 3, magnitude index 0..7) of the nearest representable value, ties to even index."""
+    import numpy as np
+    vals = np.asarray(E2M1_VALUES, np.float32)
+    a = np.minimum(np.abs(y), 6.0)
+    d = np.abs(a[..., None] - vals)
+    idx = np.argmin(d + (np.arange(8) % 2) * 1e-7, axis=-1)     # exact ties -> the even (mantissa 0) code
+    sign = ((y < 0) & (idx > 0)).astype(np.uint8) << 3
+    return (idx.astype(np.uint8) | sign)
+
+
+def fp4_values(codes):
+    import numpy as np
+    vals = np.asarray(E2M1_VALUES, np.float32)
+    c = np.asarray(codes, np.uint8)
+    v = vals[c & 7]
+    return np.where(c & 8, -v, v)
+
+
+def pack_fp4(codes):
+    """[N, K] codes -> [N, K/2] uint8, element 2i in the LOW nibble (compressed-tensors / vLLM layout)."""
+    import numpy as np
+    c = np.asarray(codes, np.uint8)
+    return (c[..., 0::2] | (c[..., 1::2] << 4)).astype(np.uint8)
+
+
+def unpack_fp4(packed):
+    import numpy as np
+    p = np.asarray(packed, np.uint8)
+    out = np.empty(p.shape[:-1] + (p.shape[-1] * 2,), np.uint8)
+    out[..., 0::2], out[..., 1::2] = p & 0xF, p >> 4
+    return out
+
+
+def nvfp4_decode(packed, scales, global_scale):
+    """compressed-tensors convention: w = fp4 * (weight_scale / weight_global_scale)."""
+    import numpy as np
+    v = fp4_values(unpack_fp4(packed))
+    N, K = v.shape
+    s = np.asarray(scales, np.float32) / np.float32(global_scale)
+    return (v.reshape(N, K // NVFP4_BLOCK, NVFP4_BLOCK) * s[..., None]).reshape(N, K)
+
+
+def nvfp4_encode(w, rule="6", imp=None, global_scale=None):
+    """Weight [N, K] -> standard NVFP4 (packed uint8 [N, K/2], E4M3-exact scales [N, K/16] as float32,
+    global_scale float32, mask of blocks that took the "4" scale).
+
+    rule "6": every block max -> 6 (plain NVFP4, global = 448*6/amax). rule "4over6": per block, max -> 6 or
+    -> 4, whichever has the lower sum(imp * err^2) (global = 256*6/amax). `global_scale` overrides the tensor
+    scale (a fused q/k/v or gate/up group must share one: vLLM reads one per fused layer)."""
+    import numpy as np
+    w = np.asarray(w, np.float32)
+    N, K = w.shape
+    if K % NVFP4_BLOCK:
+        raise ValueError(f"K={K} is not a multiple of the NVFP4 block ({NVFP4_BLOCK})")
+    if rule not in FP4_SCALE_RULES:
+        raise ValueError(f"--fp4-scale is one of {FP4_SCALE_RULES}")
+    amax = float(np.abs(w).max()) or 1.0
+    g = np.float32(global_scale if global_scale is not None else
+                   (E4M3_MAX if rule == "6" else E4M3_MAX_FOUROVERSIX) * 6.0 / amax)
+    blk = w.reshape(N, K // NVFP4_BLOCK, NVFP4_BLOCK)
+    bmax = np.abs(blk).max(-1)
+    I = None
+    if imp is not None:
+        I = np.asarray(imp, np.float32).reshape(1, K // NVFP4_BLOCK, NVFP4_BLOCK)
+
+    def at(top):
+        sc = round_e4m3(g * bmax / top)                           # stored E4M3 block scale
+        eff = np.where(sc > 0, sc / g, 1.0)[..., None]
+        codes = fp4_codes(np.where(sc[..., None] > 0, blk / eff, 0.0))
+        err = (blk - fp4_values(codes) * np.where(sc > 0, sc / g, 0.0)[..., None]) ** 2
+        if I is not None:
+            err = err * I
+        return codes, sc, err.sum(-1)
+    c6, s6, e6 = at(6.0)
+    four = np.zeros_like(e6, dtype=bool)
+    codes, sc = c6, s6
+    if rule == "4over6":
+        c4, s4, e4 = at(4.0)
+        four = e4 < e6
+        codes = np.where(four[..., None], c4, c6)
+        sc = np.where(four, s4, s6)
+    return pack_fp4(codes.reshape(N, K)), sc.astype(np.float32), g, four
+
+
+def nvfp4_weighted_error(w, packed, scales, global_scale, imp=None):
+    import numpy as np
+    w = np.asarray(w, np.float32)
+    e = (w - nvfp4_decode(packed, scales, global_scale)) ** 2
+    if imp is not None:
+        e = e * np.asarray(imp, np.float32)[None, :]
+    return float(e.sum())
+
+
+def _source_tensor(handles, key):
+    """The source weight for a compressed key, exact name first, then by suffix (VLM prefixes differ)."""
+    for h in handles:
+        if key in h.keys():
+            return h.get_tensor(key)
+    tail = key.split(".", 1)[-1]
+    for h in handles:
+        for k in h.keys():
+            if k.endswith(tail) and k.split(".")[-1] == "weight":
+                return h.get_tensor(k)
+    return None
+
+
+def apply_four_over_six(out_dir, source_dir, importance=None, log=print):
+    """Re-encode every NVFP4 weight of a compressed-tensors checkpoint with Four Over Six block scales.
+
+    Fused groups keep sharing one global scale: each tensor's global scale is llm-compressor's times 256/448,
+    which is exactly 256*6/amax_group for the group amax llm-compressor already shared. Activation scales are
+    untouched. Rewrites the shards in place; returns stats."""
+    import glob, numpy as np, torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+    importance = importance or {}
+    src = [safe_open(f, framework="pt") for f in sorted(glob.glob(os.path.join(source_dir, "*.safetensors")))]
+    if not src:
+        raise SystemExit(f"Four Over Six: no source safetensors in {source_dir}")
+    st = {"tensors": 0, "blocks": 0, "four": 0, "weighted": 0, "skipped": [], "err_before": 0.0, "err_after": 0.0}
+    for shard in sorted(glob.glob(os.path.join(out_dir, "*.safetensors"))):
+        sd = load_file(shard)
+        changed = False
+        for key in [k for k in sd if k.endswith(".weight_packed")]:
+            base = key[:-len(".weight_packed")]
+            sk, gk = base + ".weight_scale", base + ".weight_global_scale"
+            if sk not in sd or gk not in sd or sd[sk].dtype != torch.float8_e4m3fn:
+                continue                                          # not NVFP4 (MXFP4 / INT packs)
+            w = _source_tensor(src, base + ".weight")
+            if w is None:
+                st["skipped"].append(base)
+                continue
+            w = w.float().numpy()
+            if w.shape != (sd[key].shape[0], sd[key].shape[1] * 2):
+                st["skipped"].append(base)
+                continue
+            g_old = float(sd[gk].float().reshape(-1)[0])
+            imp = importance.get(base)
+            if imp is not None and np.asarray(imp).size != w.shape[1]:
+                imp = None
+            before = nvfp4_weighted_error(w, sd[key].numpy(), sd[sk].float().numpy(), g_old, imp)
+            packed, sc, g, four = nvfp4_encode(w, "4over6", imp, global_scale=g_old * E4M3_MAX_FOUROVERSIX / E4M3_MAX)
+            after = nvfp4_weighted_error(w, packed, sc, g, imp)
+            sd[key] = torch.from_numpy(packed)
+            sd[sk] = torch.from_numpy(sc).to(torch.float8_e4m3fn)
+            sd[gk] = torch.full_like(sd[gk], float(g), dtype=sd[gk].dtype)
+            st["tensors"] += 1
+            st["blocks"] += four.size
+            st["four"] += int(four.sum())
+            st["weighted"] += imp is not None
+            st["err_before"] += before
+            st["err_after"] += after
+            changed = True
+        if changed:
+            save_file(sd, shard, metadata={"format": "pt"})
+    if st["tensors"]:
+        log(f"   Four Over Six: {st['tensors']} NVFP4 tensors re-scaled ({st['weighted']} imatrix-weighted), "
+            f"{100 * st['four'] / max(1, st['blocks']):.1f}% of blocks took the 4-scale; weighted error "
+            f"{st['err_after'] / max(st['err_before'], 1e-30):.3f}x of plain NVFP4")
+    if st["skipped"]:
+        log(f"   Four Over Six: {len(st['skipped'])} tensors left as llm-compressor wrote them (no source match), "
+            f"e.g. {st['skipped'][:3]}")
+    return st
+
+
 #: pure-FP8 body schemes (W8A8): everything but routers / lm_head / modality towers at FP8
 PURE_FP8 = ("FP8", "FP8_DYNAMIC")
 
@@ -162,6 +365,11 @@ def avg_bits(n_layers, hot_frac, protect_down, scheme="NVFP4", protect_scheme="F
     body = scheme_bits(scheme)
     frac_protected = min(1.0, hot_frac + (0.14 if protect_down else 0.0))   # down_proj ~1/7 of linears
     return round(body * (1 - frac_protected) + scheme_bits(protect_scheme) * frac_protected, 2)
+
+
+def _snapshot(model_id):
+    from huggingface_hub import snapshot_download
+    return snapshot_download(model_id, allow_patterns=["*.safetensors", "*.json"])
 
 
 def main():
@@ -195,6 +403,12 @@ def main():
     ap.add_argument("--kv-fp8", action="store_true",
                     help="also calibrate an FP8 KV cache (kv_cache_scheme) -- serve with "
                          "`vllm serve --kv-cache-dtype fp8`. Off by default; needs --calib")
+    ap.add_argument("--fp4-scale", default="6", choices=FP4_SCALE_RULES,
+                    help="NVFP4 block scales: '6' = plain (block max -> 6); '4over6' = Four Over Six (MIT, arXiv "
+                         "2512.02010): per block max -> 4 or 6, whichever has the lower imatrix-weighted error. "
+                         "Output stays standard NVFP4")
+    ap.add_argument("--imatrix", help="activation importance for --fp4-scale 4over6 (llama.cpp imatrix, llama-family "
+                    "names mapped, or .npz/.safetensors keyed by module path); without it, plain MSE")
     ap.add_argument("--layers", type=int, default=0, help="n decoder layers (else read from config)")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs like Spark2_5); 'auto' = only if "
@@ -235,6 +449,8 @@ def main():
     ab = 8.0 if pure_fp8 else avg_bits(n_layers or 32, a.hot_frac, protect_down, a.scheme, a.protect_scheme)
     is_int = a.scheme in ("W4A16", "W8A16")
 
+    if a.fp4_scale == "4over6" and a.scheme != "NVFP4":
+        print(f"   --fp4-scale 4over6 applies to NVFP4 (E4M3 block scales); {a.scheme} keeps its own scales")
     if a.scheme == "MXFP4":
         print(" !! MXFP4 is EXPERIMENTAL upstream (MXFP4PackedCompressor); it runs on Blackwell/Rubin via "
               "flashinfer_cutlass (validate). NVFP4 is the vLLM-validated default.")
@@ -250,6 +466,10 @@ def main():
            f"   Pollard intent -> compressed-tensors: crush the cold bulk to {a.scheme}, keep measured-hot "
            f"layers at {a.protect_scheme}, lm_head high-precision.")
           + ("  [INT weight-only: runs on any vLLM GPU, not just Blackwell]" if is_int else ""))
+    if a.fp4_scale == "4over6" and a.scheme == "NVFP4":
+        print("   block scales: Four Over Six (arXiv 2512.02010, MIT) -- per block max -> 4 or 6 by "
+              + ("imatrix-weighted error" if a.imatrix else "MSE (pass --imatrix for the weighted choice)")
+              + "; applied after llm-compressor writes the checkpoint")
     print("   recipe:")
     print(f"     body:    QuantizationModifier(targets='Linear', scheme='{a.scheme}', ignore={rec['ignore'] + rec['protect']})")
     if rec["protect"]:
@@ -305,7 +525,23 @@ def main():
         _oneshot(model=a.model, recipe=mods, dataset=cal, output_dir=a.out)
     else:                                          # INT weight-only RTN: no calibration set required
         _oneshot(model=a.model, recipe=mods, output_dir=a.out)
-    ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{ab}bpw", bpw=ab)
+    if a.fp4_scale == "4over6" and a.scheme == "NVFP4":
+        imp = {}
+        if a.imatrix:
+            from pollard_mlx import load_importance
+            imp = load_importance(a.imatrix)
+        st = apply_four_over_six(a.out, a.model if os.path.isdir(a.model) else _snapshot(a.model), imp)
+        try:                                              # say so in the checkpoint, for the card
+            cfgp = os.path.join(a.out, "config.json")
+            cfg = json.load(open(cfgp))
+            cfg.setdefault("quantization_config", {})["pollard_fp4_scale"] = {
+                "rule": "4over6", "tensors": st["tensors"], "four_share": round(st["four"] / max(1, st["blocks"]), 4),
+                "reference": "Four Over Six, arXiv 2512.02010 (MIT HAN Lab, MIT licence)"}
+            json.dump(cfg, open(cfgp, "w"), indent=2)
+        except Exception as e:                            # noqa: BLE001
+            print(f"   (could not note 4over6 in config.json: {e})")
+    ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{ab}bpw" + ("-4o6" if a.fp4_scale == "4over6" else ""),
+                    bpw=ab)
     print(f"wrote MX checkpoint -> {a.out}")
     print("\n".join(serve_hints(a.out, a.scheme, kv_fp8=a.kv_fp8, moe=moe)))
     print(f"  VERIFY:  pollard-verify --lane mx --model {a.out} --source {a.model} --eval <heldout.txt> --gate")
