@@ -119,3 +119,91 @@ def llama_bin(name):
             if os.path.isfile(p):
                 return p
     return None
+
+
+# ------------------------------------------------------------------------------------------------
+# STQ1_0 lives only in Pollard's patched tree (runtime-patches/llama-stq-stq1_0-quants.patch), whose
+# prebuilt libggml can lag its source. The reference is compiled from that tree's ggml-quants.c with the
+# same -O3 the runtime uses, cached by source hash; skipped when no tree or no C compiler is present.
+# ------------------------------------------------------------------------------------------------
+STQ_TREES = ("~/pollard-stq/llama.cpp", "C:/pollard/llama-stq")
+STQ_ROW = {"qs": 32, "sign": 8, "d": 2}
+
+
+def _stq_tree():
+    for c in [os.environ.get("POLLARD_STQ_SRC")] + list(STQ_TREES):
+        if c and os.path.isfile(os.path.join(os.path.expanduser(c), "ggml", "src", "ggml-quants.c")):
+            src = os.path.join(os.path.expanduser(c), "ggml", "src", "ggml-quants.c")
+            if "quantize_row_stq1_0_imatrix" in open(src, encoding="utf-8", errors="replace").read():
+                return os.path.expanduser(c)
+    return None
+
+
+class STQRef:
+    """quantize_stq1_0 / dequantize_row_stq1_0 from a compiled copy of the patched ggml-quants.c."""
+    row_bytes = 42                                     # qs[32] + sign[8] + fp16 d per 256 weights
+
+    def __init__(self, path):
+        self.lib = ctypes.CDLL(path)
+        self.lib.quantize_stq1_0.restype = ctypes.c_size_t
+        self.lib.quantize_stq1_0.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                                             ctypes.c_void_p]
+        self.lib.dequantize_row_stq1_0.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64]
+
+    def quantize(self, x, imatrix=None):
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        rows, n = x.shape
+        out = ctypes.create_string_buffer(rows * (n // 256) * self.row_bytes)
+        im = None if imatrix is None else np.ascontiguousarray(imatrix, dtype=np.float32)
+        self.lib.quantize_stq1_0(x.ctypes.data, out, rows, n, None if im is None else im.ctypes.data)
+        return out.raw
+
+    def dequant(self, data, rows, n):
+        y = np.empty((rows, n), dtype=np.float32)
+        src = ctypes.create_string_buffer(bytes(data), len(data))
+        self.lib.dequantize_row_stq1_0(ctypes.cast(src, ctypes.c_void_p), y.ctypes.data, rows * n)
+        return y
+
+
+def stq_reference():
+    import hashlib
+    import shutil
+    import subprocess
+    import tempfile
+    env = os.environ.get("POLLARD_STQ_GGML_LIB")
+    if env and os.path.isfile(env):
+        return STQRef(env)
+    tree, base = _stq_tree(), load()
+    # the CommandLineTools clang first: /usr/bin/clang is an xcrun shim that refuses to run until the Xcode
+    # licence is accepted, even when the CLT toolchain itself works
+    cc = next((c for c in (os.environ.get("POLLARD_CC"), "/Library/Developer/CommandLineTools/usr/bin/clang",
+                           shutil.which("clang"), shutil.which("cc")) if c and os.path.exists(c)), None)
+    if tree is None or base is None or cc is None:
+        return None
+    ctypes.CDLL(base.path, mode=ctypes.RTLD_GLOBAL)        # ggml_abort & co. resolve against the runtime
+    src = os.path.join(tree, "ggml", "src", "ggml-quants.c")
+    tag = hashlib.sha256(open(src, "rb").read()).hexdigest()[:16]
+    ext = ".dylib" if os.uname().sysname == "Darwin" else ".so"
+    out = os.path.join(tempfile.gettempdir(), "pollard-fq-ref", f"stq-{tag}{ext}")
+    if not os.path.isfile(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        # ggml_row_size would resolve against the runtime's libggml, which has no type 43 -- give this
+        # translation unit its own (STQ1_0 rows only; nothing else in it is called)
+        wrap = out + ".c"
+        with open(wrap, "w") as f:
+            f.write('#define ggml_row_size pollard_stq_row_size\n#include "ggml-quants.c"\n'
+                    "size_t pollard_stq_row_size(enum ggml_type type, int64_t ne) { (void) type; "
+                    "return (size_t) (ne / 256) * 42; }\n")
+        cmd = [cc, "-O3", "-DNDEBUG", "-DGGML_BUILD", "-std=gnu11", "-fPIC", "-shared",
+               "-I", os.path.join(tree, "ggml", "src"), "-I", os.path.join(tree, "ggml", "include"), wrap, "-o", out]
+        if ext == ".dylib":
+            cmd[1:1] = ["-arch", "arm64", "-undefined", "dynamic_lookup", "-D_DARWIN_C_SOURCE", "-D_XOPEN_SOURCE=600"]
+            sdk = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+            if os.path.isdir(sdk):
+                cmd[1:1] = ["-isysroot", sdk]
+        if subprocess.run(cmd, capture_output=True).returncode != 0:
+            return None
+    try:
+        return STQRef(out)
+    except OSError:
+        return None
