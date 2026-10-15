@@ -697,7 +697,7 @@ const ADV_SECTIONS = [
     why: "Which preconditioner wins is a property of the model, not of the method -- rotation is "
        + "right for codebook quants where per-channel smoothing actively hurts, and the reverse "
        + "holds elsewhere. precondition measures it rather than assuming.",
-    tools: ["pollard_precondition", "pollard_rotate", "pollard_smooth", "pollard_hf_smooth"] },
+    tools: ["pollard_precondition", "pollard_rotate", "pollard_rht", "pollard_smooth", "pollard_hf_smooth"] },
   { title: "BELOW TWO BITS", icon: "layers",
     why: "Under the 2-bit floor a different ALPHABET beats a smaller number of bits. palette "
        + "chooses per tensor on top of GPTQ reconstruction; trellis spends fractional bits on "

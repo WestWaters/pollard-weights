@@ -15,6 +15,16 @@ Candidates (auto-filtered by target family):
   smooth          AWQ-style diagonal (SCALAR targets only -- hurts IQ)
   rot-block32     block-diagonal rotation (keeps imatrix; best at the low-bit frontier)
   rot-dense       dense rotation (strongest incoherence; best ~2.5-bit)
+  rht-B64/128/256 ONLINE block RHT (pollard-rht): W.D.H folded per weight, the runtime applies
+                  H.D to the matmul input (llama.cpp >= b11556, #29600). Every q/k/v/o/gate/up/
+                  down + the LM head. Archs: llama, qwen3(moe), qwen35(moe), qwen3next.
+  rht-down-only   the same, ffn_down only (block 128; rht-down-B<n> for another block)
+  rht-attn-B<n> / rht-ffn-B<n>   attention-only / FFN-only
+
+The rht candidates run only when the llama.cpp in use carries #29600 (--bin, else auto-found) --
+an older build loads the folded weights WITHOUT the transform and scores garbage -- and the
+imatrix for them is computed ON THE FOLDED MODEL, where the runtime hook feeds llama-imatrix the
+rotated inputs. Their rungs need llama.cpp >= b11556 to run; pollard-ggufcheck says so.
 
 Disk-careful: each candidate's transformed f16 + imatrix are deleted right after it's
 scored, so only the small quantized files persist.
@@ -44,7 +54,12 @@ def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def find_bin(name):
+def find_bin(name, bin_dir=None):
+    if bin_dir:
+        for c in (os.path.join(bin_dir, name), os.path.join(bin_dir, name + ".exe")):
+            if os.path.exists(c):
+                return os.path.abspath(c)
+        sys.exit(f"ERROR: {name} not in --bin {bin_dir}")
     for c in (os.path.join(HERE, "..", "runtime", "llama.cpp", "build", "bin", name),):
         if os.path.exists(c):
             return os.path.abspath(c)
@@ -55,9 +70,29 @@ def find_bin(name):
     return p
 
 
-def kl_mean(perplexity_bin, model, eval_f, base_kld, ngl):
-    r = sh([perplexity_bin, "-m", model, "-f", eval_f, "-c", "2048",
-            "--kl-divergence-base", base_kld, "--kl-divergence", "-ngl", str(ngl)])
+RHT_RE = re.compile(r"^rht(?:-(down|attn|ffn))?(?:-only)?(?:-B(\d+))?$")
+
+
+def rht_spec(cand):
+    """'rht-B128' -> ('all', 128); 'rht-down-only' -> ('down', 128); None if not an rht candidate."""
+    m = RHT_RE.match(cand)
+    if not m:
+        return None
+    return (m.group(1) or "all"), int(m.group(2) or 128)
+
+
+def gguf_arch(path):
+    try:
+        from gguf import GGUFReader
+        f = GGUFReader(path).fields.get("general.architecture")
+        return str(bytes(f.parts[-1]), "utf-8") if f else ""
+    except Exception:
+        return ""
+
+
+def kl_mean(perplexity_bin, model, eval_f, base_kld, ngl, extra=(), ctx=2048):
+    r = sh([perplexity_bin, "-m", model, "-f", eval_f, "-c", str(ctx),
+            "--kl-divergence-base", base_kld, "--kl-divergence", "-ngl", str(ngl)] + list(extra))
     m = re.search(r"Mean\s+KLD:\s*([0-9.]+)", r.stdout + r.stderr)
     t = re.search(r"Same top p:\s*([0-9.]+)", r.stdout + r.stderr)
     if not m:
@@ -78,22 +113,42 @@ def main():
     ap.add_argument("--out", help="write the winning build here")
     ap.add_argument("--candidates", help="comma list; default auto by target family")
     ap.add_argument("--ngl", type=int, default=99)
+    ap.add_argument("--bin", help="llama.cpp build/bin to use for every step (needs >= b11556 for rht-*)")
+    ap.add_argument("--ctx", type=int, default=2048,
+                    help="KL context per chunk (the base-logits file is tokens x vocab x 2 bytes -- "
+                         "a 152k-vocab model writes ~0.3 MB per token, so keep the eval slice small)")
+    ap.add_argument("--threads", type=int, help="CPU threads for imatrix/perplexity (box: 19)")
     ap.add_argument("--keep", action="store_true", help="keep every candidate build, not just the winner")
     a = ap.parse_args()
 
     for f in (a.gguf, a.imatrix, a.calib, a.eval):
         if not os.path.exists(f):
             sys.exit(f"ERROR: not found: {f}")
-    quantize = find_bin("llama-quantize")
-    imatrix = find_bin("llama-imatrix")
-    perplexity = find_bin("llama-perplexity")
+    quantize = find_bin("llama-quantize", a.bin)
+    imatrix = find_bin("llama-imatrix", a.bin)
+    perplexity = find_bin("llama-perplexity", a.bin)
     py = sys.executable
     scalar = bool(SCALAR.match(a.target))
+    thr = ["-t", str(a.threads)] if a.threads else []
 
+    # online RHT needs a runtime that applies the manifest, on an arch it accepts it for
+    sys.path.insert(0, HERE)
+    import pollard_rht
+    rht_ok_bins = all(pollard_rht.binary_supports_prism(b) for b in (imatrix, perplexity))
+    arch = gguf_arch(a.gguf)
+    rht_ok_arch = arch in pollard_rht.ARCHS
     if a.candidates:
         cands = [c.strip() for c in a.candidates.split(",") if c.strip()]
     else:
         cands = ["none", "rot-block32", "rot-dense"] + (["smooth"] if scalar else [])
+        if rht_ok_bins and rht_ok_arch:
+            cands += ["rht-B128", "rht-down-only"]
+    if any(rht_spec(c) for c in cands) and not (rht_ok_bins and rht_ok_arch):
+        why = (f"arch '{arch}' is not one #29600 applies the transform for" if not rht_ok_arch else
+               f"{perplexity} predates llama.cpp {pollard_rht.RUNTIME_MIN} (#29600) -- it would load the "
+               "folded weights WITHOUT the transform; pass --bin <newer build/bin>")
+        print(f"   note: dropping the rht candidates: {why}")
+        cands = [c for c in cands if not rht_spec(c)]
     if "smooth" in cands and not scalar:
         print("   note: 'smooth' distorts IQ codebook quants -- dropping it for this IQ target.")
         cands = [c for c in cands if c != "smooth"]
@@ -107,8 +162,8 @@ def main():
     # KL reference from the f16 base (once)
     if not (os.path.exists(base_kld) and os.path.getsize(base_kld) > 1024):
         print("   building KL base logits from f16 ...")
-        r = sh([perplexity, "-m", a.gguf, "-f", a.eval, "-c", "2048",
-                "--kl-divergence-base", base_kld, "-ngl", str(a.ngl)])
+        r = sh([perplexity, "-m", a.gguf, "-f", a.eval, "-c", str(a.ctx),
+                "--kl-divergence-base", base_kld, "-ngl", str(a.ngl)] + thr)
         if not (os.path.exists(base_kld) and os.path.getsize(base_kld) > 1024):
             sys.exit("ERROR: could not build KL base logits:\n" +
                      "\n".join((r.stdout + r.stderr).splitlines()[-8:]))
@@ -132,6 +187,10 @@ def main():
                 elif cand == "rot-dense":
                     cmd = [py, os.path.join(HERE, "pollard_rotate.py"), "--gguf", a.gguf,
                            "--kind", "orthogonal", "--out", tmp_f16]
+                elif rht_spec(cand):
+                    scope, blk = rht_spec(cand)
+                    cmd = [py, os.path.join(HERE, "pollard_rht.py"), "fold", "--gguf", a.gguf,
+                           "--scope", scope, "--block", str(blk), "--out", tmp_f16]
                 else:
                     print(f"   unknown candidate '{cand}' -- skipping"); continue
                 r = sh(cmd)
@@ -139,9 +198,10 @@ def main():
                     print("   transform FAILED:\n     " +
                           "\n     ".join((r.stdout + r.stderr).splitlines()[-4:]))
                     continue
-                # fresh imatrix on the transformed weights (basis/scale changed)
+                # fresh imatrix on the transformed weights (basis/scale changed). For rht the
+                # runtime hook hands llama-imatrix H.D.x, so this IS the rotated-basis imatrix.
                 tmp_imat = f"{stem}.{cand}.imatrix"
-                sh([imatrix, "-m", tmp_f16, "-f", a.calib, "-o", tmp_imat, "-ngl", str(a.ngl)])
+                sh([imatrix, "-m", tmp_f16, "-f", a.calib, "-o", tmp_imat, "-ngl", str(a.ngl)] + thr)
                 if not (os.path.exists(tmp_imat) and os.path.getsize(tmp_imat) > 1024):
                     print("   imatrix build FAILED -- skipping candidate"); continue
                 f16, imat = tmp_f16, tmp_imat
@@ -152,7 +212,7 @@ def main():
                 print("   quantize FAILED:\n     " +
                       "\n     ".join((rq.stdout + rq.stderr).splitlines()[-4:]))
                 continue
-            kl, top1, err = kl_mean(perplexity, out_q, a.eval, base_kld, a.ngl)
+            kl, top1, err = kl_mean(perplexity, out_q, a.eval, base_kld, a.ngl, thr, a.ctx)
             if kl is None:
                 print(f"   {err}"); continue
             size = os.path.getsize(out_q)
