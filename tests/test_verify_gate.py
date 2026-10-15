@@ -42,7 +42,7 @@ def test_default_gates_parse_and_resolve_per_rung():
     mlx = V.thresholds_for(g, "MLX-4bit", "mlx")
     assert mlx["kld_max"] == 0.08 and "runtime" not in mlx
     assert V.thresholds_for(g, "MX-FP8", "mx")["top1_min"] == 97
-    assert V.thresholds_for(g, "EXL3-2.5bpw", "exl3")["kld_max"] == 0.5
+    assert V.thresholds_for(g, "GPTQ-int2", "gptq")["kld_max"] == 0.5
 
 
 def test_gate_fails_unmeasured_thresholds_and_wrong_runtime():
@@ -145,3 +145,9 @@ def test_shipped_gates_file_is_the_builtin_default():
         pytest.skip("recipes/ not in this source tree")
     assert shipped.read_text(encoding="utf-8") == V.DEFAULT_GATES, \
         "recipes/gates.yaml drifted: regenerate with pollard-verify --print-gates > recipes/gates.yaml"
+
+
+def test_exl3_lane_is_gated_on_the_forward_not_on_a_kld_it_cannot_measure():
+    th = V.thresholds_for(V.load_gates(None), "M-Pollard-EXL3-4.0bpw", "exl3")
+    assert "kld_max" not in th and "top1_min" not in th and th["e2e_acc_min"] == 0.3
+    assert V.evaluate_gate({"e2e_acc": 0.6}, th)["pass"]

@@ -661,6 +661,9 @@ def main():
             a.out = "calib-3.0.txt"
     if a.held_out and same_output(a.out, a.held_out):
         ap.error("calibration and held-out paths must be different files")
+    for path in (a.out, a.held_out):
+        if path and os.path.dirname(os.path.abspath(path)):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
     renderer = Renderer(a.model, a.trust_remote_code)
     complete, selfgen = None, None

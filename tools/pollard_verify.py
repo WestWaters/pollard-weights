@@ -300,6 +300,10 @@ lanes:
   gguf:
     runtime: stock
     coherence: true
+  # exl3 has no logit-level KLD path in pollard-verify yet: it is gated on the assembled forward instead
+  exl3:
+    e2e_acc_min: 0.3
+    skip: [kld_max, top1_min]
 rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01
@@ -344,6 +348,10 @@ def thresholds_for(gates, rung, lane=None):
         pats = [pats] if isinstance(pats, str) else pats
         if rung and any(fnmatch.fnmatch(str(rung).lower(), str(p).lower()) for p in pats):
             th.update({k: v for k, v in entry.items() if k != "match"})
+    # a lane can opt out of a check it has no way to measure (exl3: no logit-level KLD path yet)
+    for k in ((gates.get("lanes") or {}).get(lane or "", {}) or {}).get("skip") or []:
+        th.pop(k, None)
+    th.pop("skip", None)
     return th
 
 

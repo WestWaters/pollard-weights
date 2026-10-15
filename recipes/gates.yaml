@@ -18,6 +18,10 @@ lanes:
   gguf:
     runtime: stock
     coherence: true
+  # exl3 has no logit-level KLD path in pollard-verify yet: it is gated on the assembled forward instead
+  exl3:
+    e2e_acc_min: 0.3
+    skip: [kld_max, top1_min]
 rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01

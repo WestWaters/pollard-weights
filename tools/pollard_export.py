@@ -19,11 +19,18 @@ Hard runtime constraints baked in (verified Aug 2026):
     pollard-export --model Qwen/Qwen2.5-7B-Instruct --sensitivity qwen7b.sensitivity.json \\
         --calib calib.txt --out ./Qwen2.5-7B-Instruct-Pollard-GPTQ
     # then: vllm serve ./...-Pollard-GPTQ --quantization gptq
+
+LADDER rungs: --bits {2,3,4,8} sets the body (hot layers at --high-bits, default 8; --bits 8 = uniform
+int8). 4 and 8 run on Marlin; 2- and 3-bit GPTQ load in vLLM through its plain GPTQ (exllama) kernels --
+slower, and SGLang does not take them -- so they are the small-VRAM rungs, not the fast ones.
+
+    pollard-export --model <hf> --sensitivity s.json --calib calib.txt --bits 3 --out ./M-Pollard-GPTQ-int3
 """
 import argparse, json, os, re, sys
 import pollard_workspace as ws
 
 HIGH, LOW = 8, 4                       # Marlin supports only these
+GPTQ_BITS = (2, 3, 4, 8)               # what gptqmodel packs and vLLM's GPTQ path loads
 # module groups within a decoder layer. q/k/v are ONE fused unit; gate/up are ONE fused unit.
 FUSED = {"attn_qkv": ["q_proj", "k_proj", "v_proj"], "gate_up": ["gate_proj", "up_proj"]}
 FREE = {"attn_o": ["o_proj"], "ffn_down": ["down_proj"]}
@@ -61,10 +68,11 @@ def detect_mla(model_id):
 parse_layers = ws.parse_layers   # shared layer-spec parser
 
 
-def allocate(sens, n_layers, hot_frac, focus=None):
+def allocate(sens, n_layers, hot_frac, focus=None, low=None, high=None):
     """Pollard profile -> {layer: {group: bits}}. The most-sensitive `hot_frac` of layers
     keep their group at 8-bit; the rest go 4-bit. Fused groups get ONE bit-width (constraint).
     'attn' sensitivity drives q/k/v+o; 'ffn' sensitivity drives gate/up+down."""
+    LOW, HIGH = low or globals()["LOW"], high or globals()["HIGH"]
     focus = set(focus or ())                       # user-chosen layers to force HIGH (steer the budget)
     ffn = {int(k): float(v) for k, v in (sens.get("ffn") or {}).items()}
     attn = {int(k): float(v) for k, v in (sens.get("attn") or {}).items()}
@@ -88,10 +96,11 @@ ATTN_PROJ = r"self_attn\.[a-z_]*proj[a-z0-9_]*"
 FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.\d+)?\.(?:gate|up|down)_proj"
 
 
-def dynamic_config(alloc):
+def dynamic_config(alloc, high=None):
     """gptqmodel `dynamic` regex map. Base is LOW (4-bit); we add 8-bit overrides for the
     hot groups. q/k/v+o (or MLA's a/b projections) share the attn bit; gate/up+down share the
     ffn bit (fused-safe). Projection names are matched arch-agnostically (see ATTN_PROJ/FFN_PROJ)."""
+    HIGH = high or globals()["HIGH"]
     dyn = {}
     # Head-wise attention output gate (Spark2_5 `self_attn.g_proj`): selection-critical, always high.
     # No-op for arches without it. Placed first so it holds regardless of per-layer attn allocation.
@@ -104,13 +113,14 @@ def dynamic_config(alloc):
     return dyn
 
 
-def moe_dynamic_config(alloc):
+def moe_dynamic_config(alloc, high=None):
     """MoE `dynamic` map (Qwen-MoE / Mixtral / DeepSeek naming). The Pollard MoE policy carried
     into the GPTQ lane: base LOW (4-bit) crushes the cold experts; the ROUTER and SHARED experts
     are ALWAYS protected at HIGH (8-bit) -- crushing the router scrambles expert selection -- and the
     experts of the most-sensitive (`ffn`-hot) layers go HIGH. Attention follows the `attn` profile.
     Router = `mlp.gate` (Qwen) / `block_sparse_moe.gate` (Mixtral) -- matched with `\\.gate$` so it
     never catches an expert's `gate_proj`."""
+    HIGH = high or globals()["HIGH"]
     dyn = {}
     # ALWAYS protect the router (selection integrity) and the shared expert (every-token path).
     # `shared_experts?` covers Qwen-MoE's singular `shared_expert` and DeepSeek/GLM's plural `shared_experts`.
@@ -185,6 +195,10 @@ def main():
                     "sensitivity profile -- steer the budget to layers you care about, e.g. '3,4,8' or "
                     "'3-8,16'. Unions into the measured hot set (works even with no profile).")
     ap.add_argument("--group-size", type=int, default=128)
+    ap.add_argument("--bits", type=int, choices=GPTQ_BITS, default=None,
+                    help="ladder rung: body bits (default 4). 8 = uniform int8; 2/3 load on vLLM's slower GPTQ kernel")
+    ap.add_argument("--high-bits", type=int, choices=(4, 8), default=None,
+                    help="bits for the measured-hot groups / router / shared experts (default 8)")
     ap.add_argument("--uniform", action="store_true", help="plain uniform W4 (for SGLang mixed-bit fragility)")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs like Spark2_5). 'auto' enables it "
@@ -216,18 +230,25 @@ def main():
     focus = parse_layers(a.focus_layers)
     if focus:
         print(f"   focus-layers: forcing layers {sorted(focus)} to HIGH (steered budget)")
-    alloc = allocate(sens, n_layers, a.hot_frac, focus=focus)
-    dyn = {} if a.uniform else (moe_dynamic_config(alloc) if is_moe else dynamic_config(alloc))
-    ab = LOW if a.uniform else avg_bits(alloc)
+    low = a.bits or LOW
+    high = max(a.high_bits or HIGH, low)
+    uniform = a.uniform or low == high
+    alloc = allocate(sens, n_layers, a.hot_frac, focus=focus, low=low, high=high)
+    dyn = {} if uniform else (moe_dynamic_config(alloc, high) if is_moe else dynamic_config(alloc, high))
+    ab = low if uniform else avg_bits(alloc)
+    tag = f"int{low}" if uniform else f"int{low}" + (f"-{high}" if high != HIGH else "")
+    if low in (2, 3):
+        print(f"   NOTE: {low}-bit GPTQ is outside Marlin (4/8): vLLM loads it on its plain GPTQ kernel "
+              "(slower); SGLang will not. This is the small-VRAM rung.")
     kind = "MoE" if is_moe else "dense"
     print(f"== pollard-export :: {a.model}  [{kind}{' auto' if a.moe is None else ''}]")
-    print(f"   {n_layers} layers  |  {'UNIFORM W4 (SGLang-safe)' if a.uniform else f'4/8 dynamic mix, avg {ab:.2f} bits'}"
+    print(f"   {n_layers} layers  |  {f'UNIFORM W{low}' + (' (SGLang-safe)' if low == 4 else '') if uniform else f'{low}/{high} dynamic mix, avg {ab:.2f} bits'}"
           f"  |  group_size {a.group_size}  |  desc_act False  |  sym True")
-    if is_moe and not a.uniform:
-        print("   MoE: router + shared experts pinned 8-bit (selection integrity); cold experts 4-bit")
-    if detect_mla(a.model) and not a.uniform:
+    if is_moe and not uniform:
+        print(f"   MoE: router + shared experts pinned {high}-bit (selection integrity); cold experts {low}-bit")
+    if detect_mla(a.model) and not uniform:
         print("   MLA attention detected (q_a/q_b/kv_a/kv_b_proj) -- allocation matches it arch-agnostically")
-    print(f"   8-bit modules: {len(dyn)} groups (sensitivity-ranked hot set)")
+    print(f"   {high}-bit modules: {len(dyn)} groups (sensitivity-ranked hot set)")
     print(f"   NOTE (KV/memory): {kv_note(a.model)}")
     if a.plan_only:
         print("   dynamic map:")
@@ -247,13 +268,13 @@ def main():
     if not a.calib:
         sys.exit("ERROR: --calib is required to build (use --plan-only / --shard-plan for planning only).")
     calib = [ln.strip() for ln in open(a.calib, encoding="utf-8") if ln.strip()]
-    qcfg = QuantizeConfig(bits=LOW, group_size=a.group_size, desc_act=False, sym=True,
+    qcfg = QuantizeConfig(bits=low, group_size=a.group_size, desc_act=False, sym=True,
                           dynamic=(dyn or None))
     trc = resolve_trust_remote_code(a.model, a.trust_remote_code)
     model = GPTQModel.load(a.model, qcfg, trust_remote_code=trc)
     model.quantize(calib)
     if not a.out:
-        a.out = ws.resolve_out(a.model, "gptq", tag="int4")
+        a.out = ws.resolve_out(a.model, "gptq", tag=tag)
         print(f"   (no --out) -> workspace: {a.out}")
     model.save(a.out)
     # allocation-as-config: drop the exact bit plan beside the checkpoint. A/B'ing a different
@@ -262,12 +283,12 @@ def main():
         pass  # os is imported at module scope
         cfg_path = os.path.join(a.out, "pollard-allocation.json")
         json.dump({"model": a.model, "kind": kind, "layers": n_layers, "group_size": a.group_size,
-                   "low_bits": LOW, "high_bits": HIGH, "uniform": bool(a.uniform),
+                   "low_bits": low, "high_bits": high, "uniform": bool(uniform),
                    "avg_bits": round(ab, 3), "dynamic": dyn}, open(cfg_path, "w"), indent=2)
         print(f"   allocation recorded -> {cfg_path}")
     except Exception as e:
         print(f"   (could not write allocation sidecar: {e})")
-    ws.record_build(a.model, "gptq", a.out, tag="int4")
+    ws.record_build(a.model, "gptq", a.out, tag=f"GPTQ-{tag}", bpw=round(ab, 2))
     print(f"wrote GPTQ checkpoint -> {a.out}\n"
           f"  vLLM:   vllm serve {a.out} --quantization gptq\n"
           f"  SGLang: python -m sglang.launch_server --model-path {a.out} --quantization gptq\n"

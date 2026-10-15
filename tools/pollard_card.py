@@ -441,6 +441,30 @@ def _fmt_kl(v):
     return "0" if v == 0 else f"{v:.2g}" if v < 0.01 else f"{v:.3f}"
 
 
+def rung_subfolder(build, lane):
+    """Where a directory-lane rung sits in its repo: the part of its name after -Pollard-<LANE>- (lowercased),
+    e.g. Qwen3-8B-Pollard-MLX-4bit -> 4bit. pollard release uploads to exactly this folder."""
+    name = build.get("name") or os.path.basename(str(build.get("path", "")).rstrip("/\\"))
+    marker = f"-Pollard-{lane.upper()}-"
+    return (name.split(marker, 1)[1] if marker in name else str(build.get("tag") or name)).lower()
+
+
+def rungs_section(builds, lane, repo):
+    """For a directory lane (MLX / GPTQ / MX / EXL3): which subfolder holds which rung, and how to load one."""
+    if lane == "gguf" or not builds:
+        return []
+    run = {"mlx": "mlx_lm.generate --model ./{d} --prompt \"Hello\"", "gptq": "vllm serve ./{d}",
+           "mx": "vllm serve ./{d}", "exl3": "# load ./{d} in exllamav3 / TabbyAPI"}.get(lane, "")
+    rows = [f"| `{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} |"
+            for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
+    pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+    return ["## Rungs in this repo", "",
+            "Each rung is a complete checkpoint in its own folder; the repo root holds the default rung, so "
+            "pointing a runtime at the repo id loads that one.", "",
+            "| folder | size | avg bits |", "|---|---:|---:|", *rows, "",
+            "```bash", f'hf download {repo} --include "{pick}/*" --local-dir .', run.format(d=pick), "```", ""]
+
+
 def gate_verdict(b, results):
     """True / False if a pollard-verify --gate ran on this rung (MANIFEST first, then results.json), else None."""
     g = b.get("gate") if isinstance(b, dict) else None
@@ -691,6 +715,8 @@ def main():
     ap.add_argument("--repo", help="HF repo id (for ollama/usage lines; default from base name)")
     ap.add_argument("--out", default="README.md")
     ap.add_argument("--upload", help="HF repo id to push the card to (needs HF login / HF_TOKEN)")
+    ap.add_argument("--verified-only", action="store_true",
+                    help="list only rungs that passed pollard-verify --gate (what pollard release publishes)")
     ap.add_argument("--runtime-from-repo", action="store_true",
                     help="for rungs whose local build file is gone, read which runtime they need "
                          "from the copy already published in --repo, over range requests (a few MB "
@@ -734,6 +760,13 @@ def main():
     results = {}
     if a.results and os.path.exists(a.results):
         results = json.load(open(a.results))
+    if a.verified_only:
+        dropped = [b.get("name") for b in builds if gate_verdict(b, results) is not True]
+        builds = [b for b in builds if gate_verdict(b, results) is True]
+        if dropped:
+            print(f"   --verified-only: left off {len(dropped)} rung(s) that did not pass the gate: "
+                  + ", ".join(str(d) for d in dropped), file=sys.stderr)
+        lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or lanes
     eval_str = results.get("_eval", "")
     f16_ppl = results.get("_f16_ppl")
 
@@ -970,8 +1003,8 @@ def main():
                    f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c}{v_c} {note} |")
     if has_top1:
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
-                "one the f16 would have picked (llama-perplexity's `Same top p`). Higher is closer "
-                "to the original model._"]
+                "one the f16 would have picked (llama-perplexity's `Same top p` for GGUF, the same logit "
+                "comparison in pollard-verify for the other lanes). Higher is closer to the original model._"]
     if has_v:
         out += ["", "_Verified = the rung passed `pollard-verify --gate`: its KLD / top-1 against the source and "
                 "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
@@ -992,6 +1025,7 @@ def main():
     if decision and dec_rows:
         out += decision_section(builds, results)
     out += retention_section(builds, results)
+    out += rungs_section(builds, primary, repo)
 
     # ---- usage
     def _recommended(b):
@@ -1181,6 +1215,8 @@ def main():
             "frontier models, small hardware, no compromise.*"]
 
     card = "\n".join(out) + "\n"
+    if os.path.dirname(os.path.abspath(a.out)):
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     open(a.out, "w", encoding="utf-8").write(card)
     print(f"wrote model card -> {a.out}  ({len(builds)} file(s), lanes: {','.join(lanes)})")
     if a.upload:
