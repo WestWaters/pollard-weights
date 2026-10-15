@@ -265,8 +265,9 @@ use (NVIDIA Minitron/Nemotron-style): **new** (a fresh qwen3 / llama / qwen2 arc
 dims; tokenizer copied or trained), **prune** (carve a smaller model out of a teacher: drop the layers with the
 lowest block influence and the FFN channels that fire least, measured on `--calib`), **train** (pretrain,
 continue, or distill from the teacher: CE + a distillation loss -- `--loss kl` (temperature-scaled, default) /
-`rkl` / `cakld` (confidence-aware forward/reverse mix) / `kl_top_k`, AngelSlim's set, `--lm-loss-weight` for
-independent weights; `--data` mixes text / jsonl / `hf:` sources by weight; checkpoint + `--resume`; multi-GPU via
+`rkl` / `cakld` (confidence-aware forward/reverse mix) / `kl_top_k`, AngelSlim's set, or `jaccard` (weighted
+Jaccard 1 − Σmin(ps,pt)/Σmax(ps,pt) at T=1, NVIDIA Bolt's QAD loss -- `--kd 1` reproduces their no-CE recipe),
+`--lm-loss-weight` for independent weights; `--data` mixes text / jsonl / `hf:` sources by weight; checkpoint + `--resume`; multi-GPU via
 `torchrun`), **card** (lineage from `forge.json`, license required).
 ```bash
 pollard-forge prune --teacher Qwen/Qwen3-4B --calib calib.txt --keep-layers 0.75 --ffn 0.6 --out my-2b

@@ -20,6 +20,7 @@ prune  -- Minitron-style structured pruning from a teacher: drop the layers that
           teacher's tokenizer, so it can be distilled from it.
 train  -- pretraining, continued pretraining, or distillation (--teacher: CE + a distillation loss on the
           teacher's logits -- --loss kl (temperature-scaled, default) / rkl / cakld / kl_top_K, AngelSlim's set,
+          or jaccard (weighted Jaccard, NVIDIA Bolt's QAD loss; --kd 1 = Bolt's no-CE recipe),
           weighted by --kd and --lm-loss-weight). --data mixes sources by weight; keep chat data in the mix for an instruct model
           (QAT/distill on raw web text alone erases chat behaviour -- measured on STQ1_0). Checkpoints every
           --save-every steps and resumes with --resume. Multi-GPU: torchrun --nproc_per_node N pollard_forge.py train ...
@@ -359,7 +360,7 @@ def batches(sources, tok, seq, batch, seed, rank=0, world=1):
 # temperature-scaled forward KL (identical to AngelSlim's `kl` at T=1, its `kd` otherwise); the top-k
 # size comes from the name (kl_top_100) or `topk` (AngelSlim's default 1000).
 
-LOSSES = ("kl", "rkl", "cakld", "kl_top_k", "r_kl_top_k")
+LOSSES = ("kl", "rkl", "cakld", "kl_top_k", "r_kl_top_k", "jaccard")
 
 
 def _kl_from_logps(log_p_src, log_p_tgt):
@@ -386,8 +387,11 @@ def kd_loss(student_logits, teacher_logits, T=1.0, loss="kl", labels=None, topk=
                   confidence-aware KLD): reverse where the teacher is sure, forward where it is not
       kl_top_K    forward KL over the teacher's top-K tokens only (renormalised) -- cheap at big vocabs
       r_kl_top_K  reverse KL over the student's top-K tokens
+      jaccard     weighted Jaccard distance 1 - sum(min(ps, pt)) / sum(max(ps, pt)) over the full vocab
+                  (NVIDIA Nemotron-3.5-Bolt tech report section 5: beat KL / rKL / JSD for their 2-bit QAD;
+                  used there with no CE term -- forge: --kd 1). Bounded in [0, 1], 0 iff ps == pt
 
-    rkl / cakld / top-k are computed at T=1, as AngelSlim does; T applies to `kl` only. `labels` [B, S]
+    rkl / cakld / top-k / jaccard are computed at T=1 (AngelSlim; Bolt uses T=1); T applies to `kl` only. `labels` [B, S]
     (the next tokens) are needed for cakld."""
     import torch  # the losses need torch only, not transformers
     F = torch.nn.functional
@@ -407,6 +411,11 @@ def kd_loss(student_logits, teacher_logits, T=1.0, loss="kl", labels=None, topk=
             raise ValueError("cakld weights each token by the teacher's confidence on its label: pass labels")
         conf = torch.gather(lt.exp(), -1, labels.reshape(-1, 1).clamp(max=V - 1)).squeeze(-1)
         return (conf * bkl + (1.0 - conf) * _kl_from_logps(ls, lt)).mean()
+    if loss == "jaccard":
+        ps, pt = F.softmax(s, dim=-1), F.softmax(t, dim=-1)
+        inter = torch.minimum(ps, pt).sum(dim=-1)
+        union = torch.maximum(ps, pt).sum(dim=-1)
+        return (1.0 - inter / union.clamp_min(1e-12)).mean()
     if loss.startswith("r_kl_top") or loss.startswith("rkl_top"):
         top_s, idx = s.topk(_topk_of(loss, topk, V), dim=-1, sorted=False)
         top_t = t.gather(-1, idx)
@@ -681,7 +690,8 @@ def main():
     t.add_argument("--temperature", type=float, default=2.0, help="softmax temperature for --loss kl")
     t.add_argument("--loss", type=_loss_name, default="kl",
                    help="distillation loss: kl (forward, default) | rkl (reverse) | cakld (confidence-aware mix) | "
-                        "kl_top_k / r_kl_top_k (over the top-K tokens; or kl_top_100 to name K). AngelSlim's set")
+                        "kl_top_k / r_kl_top_k (over the top-K tokens; or kl_top_100 to name K) -- AngelSlim's set -- | "
+                        "jaccard (weighted Jaccard, T=1; NVIDIA Bolt's QAD loss -- use with --kd 1 for no CE)")
     t.add_argument("--loss-topk", type=int, default=None, help="K for the top-k losses (default 1000)")
     t.add_argument("--lm-loss-weight", type=float, default=None,
                    help="weight on the LM (cross-entropy) loss; with it, loss = lm_w*CE + kd*KD (AngelSlim's form). "
