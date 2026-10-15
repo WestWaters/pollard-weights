@@ -24,7 +24,7 @@ Real emit needs `llm-compressor` on a CUDA box (`pip install llmcompressor`); it
 compressed-tensors checkpoint: `vllm serve ./M-NVFP4` (Rubin: the vllm/vllm-openai:cu134-nightly image).
 `--plan-only` needs nothing and prints the recipe. NVFP4 is vLLM-validated; MXFP4 is experimental upstream
 (flagged at runtime) and runs on Blackwell/Rubin via flashinfer_cutlass (validate before shipping). Verify every build with
-`pollard-verify --model <out> --source <hf> --end-to-end` before shipping.
+`pollard-verify --lane mx --model <out> --source <hf> --eval <heldout.txt> --gate` before shipping.
 """
 import argparse, json, os, sys
 import pollard_workspace as ws
@@ -292,7 +292,7 @@ def main():
     ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{ab}bpw", bpw=ab)
     print(f"wrote MX checkpoint -> {a.out}")
     print("\n".join(serve_hints(a.out, a.scheme, kv_fp8=a.kv_fp8, moe=moe)))
-    print(f"  VERIFY:  pollard-verify --model {a.out} --source {a.model} --end-to-end")
+    print(f"  VERIFY:  pollard-verify --lane mx --model {a.out} --source {a.model} --eval <heldout.txt> --gate")
 
 
 if __name__ == "__main__":

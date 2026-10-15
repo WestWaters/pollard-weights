@@ -441,6 +441,22 @@ def _fmt_kl(v):
     return "0" if v == 0 else f"{v:.2g}" if v < 0.01 else f"{v:.3f}"
 
 
+def gate_verdict(b, results):
+    """True / False if a pollard-verify --gate ran on this rung (MANIFEST first, then results.json), else None."""
+    g = b.get("gate") if isinstance(b, dict) else None
+    if isinstance(g, dict) and "pass" in g:
+        return bool(g["pass"])
+    v = _rung_result(results, b).get("verified")
+    if isinstance(v, dict) and "pass" in v:
+        return bool(v["pass"])
+    return None
+
+
+def verified_cell(b, results):
+    v = gate_verdict(b, results)
+    return " -- |" if v is None else (" yes |" if v else " **no** |")
+
+
 def decision_section(builds, results):
     """The board a decision model is judged on: each rung against the f16, same typed questions, same
     readout (pollard-decision). Agreement = same answer as the f16; option KL = how far the option
@@ -914,12 +930,17 @@ def main():
                             dict) for b in builds)
     tc_h = " agent-ready |" if has_tc else ""
     tc_s = "---|" if has_tc else ""
+    # verified: the pollard-verify --gate verdict, from the MANIFEST (record_gate) or results.json -- only
+    # when a gate actually ran, so a card never implies a check nobody made
+    has_v = any(gate_verdict(b, results) is not None for b in builds)
+    v_h = " verified |" if has_v else ""
+    v_s = "---|" if has_v else ""
     if decision:
-        out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h} notes |",
-                f"|---|---:|---:|---:|{rt_s}---|"]
+        out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h}{v_h} notes |",
+                f"|---|---:|---:|---:|{rt_s}{v_s}---|"]
     else:
-        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h}{tc_h} notes |",
-                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}{tc_s}---|"]
+        out += [f"| file | PPL | size |{tps_h} Mean KLD |{t1_h}{rt_h}{tc_h}{v_h} notes |",
+                f"|---|---:|---:|{tps_s}---:|{t1_s}{rt_s}{tc_s}{v_s}---|"]
     _ordered = sorted(builds, key=lambda x: (x.get("bytes") or 0))
     _rec = pick_recommended(
         [(i, results.get(b.get("name", ""), results.get(b.get("tag", ""), {})).get("ppl"))
@@ -941,15 +962,20 @@ def main():
             ag = f"{float(d['agreement']):.0%}" if d.get("agreement") is not None else "--"
             note = r.get("note") or ""
             out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {ag} | "
-                       f"{_fmt_kl(d.get('option_kl'))} |{rt_c} {note} |")
+                       f"{_fmt_kl(d.get('option_kl'))} |{rt_c}{verified_cell(b, results) if has_v else ''} {note} |")
             continue
         tc_c = f" {agent_ready_cell(r.get('toolcall'))} |" if has_tc else ""
+        v_c = verified_cell(b, results) if has_v else ""
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
-                   f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c} {note} |")
+                   f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c}{v_c} {note} |")
     if has_top1:
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
                 "one the f16 would have picked (llama-perplexity's `Same top p`). Higher is closer "
                 "to the original model._"]
+    if has_v:
+        out += ["", "_Verified = the rung passed `pollard-verify --gate`: its KLD / top-1 against the source and "
+                "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
+                "and met. A rung that failed is not published._"]
     if has_tc and not decision:
         out += ["", "_Agent-ready = the rung still writes valid tool calls ([pollard-toolcall]"
                 "(https://github.com/WestWaters/pollard-weights): format validity on its tool-call probes)._"]
