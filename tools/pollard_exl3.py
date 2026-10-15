@@ -26,12 +26,15 @@ beat the gold recipe, the gold path is smoothing + Calib 3.0 + native allocator.
 
 Two allocation modes:
   * budgeted (DEFAULT, the gold path): EXL3's allocator via --bits + --head_bits/--mtp_bits + --hq.
-  * recipe (--recipe): EXPERIMENTAL per-tensor bitrate YAML -- R&D only. Don't port a GGUF role map here;
-    only use a recipe measured in EXL3's atom space and shown to beat the gold recipe.
+  * recipe (--recipe pollard|exl3|FILE): per-tensor bitrate YAML for EXL3's -rcp -- R&D only. `pollard` emits one
+    from Pollard's measured sensitivity at --bpw (EXL3's tensor list, fused groups tied); `exl3` uses EXL3's own
+    sc_optimize recipe. Don't port a GGUF role map here; the head-to-head decides (notes/exl3-recipe-bridge.md).
 
   pollard-exl3 --model Qwen/Qwen3-8B --out ./Qwen3-8B-Pollard-EXL3 --bpw 3.0   # budgeted (recommended)
   pollard-exl3 --model <hf> --out <dir> --plan-only          # print the exllamav3 command, build nothing
   pollard-exl3 --model <hf> --out <dir> --recipe plan.yaml   # EXPERIMENTAL explicit per-tensor plan
+  pollard-exl3 --model <dir> --out <dir> --bpw 3.0 --recipe pollard --sensitivity s.json   # Pollard -> EXL3 recipe
+  pollard-exl3 --model <dir> --out <dir> --bpw 3.0 --recipe exl3 --exl3-recipe recipe_3.00bpw.yaml
 
 Needs exllamav3 installed AND its CUDA ext loadable (a bleeding-edge GPU like Blackwell may need a
 source build -- the pip wheel's prebuilt ext can fail with 'DLL load failed importing exllamav3_ext')."""
@@ -83,6 +86,241 @@ def pack_calib(model, text_path, out_path, rows=256, cols=2048):
     return out_path, rows
 
 
+# ----------------------------------------------------------------- EXL3 recipe bridge (pollard -> -rcp YAML)
+#
+# ExLlamaV3 (MIT) >= 1.6 converts from a per-tensor bitrate recipe: `convert.py -rcp recipe.yaml`, a YAML with
+# `tensors: {<module key>: <int bits 1-8 | 16 | 1.5/2.5/3.5>}` covering EXACTLY the budgeted ("bits") Linears,
+# plus target_bpw/achieved_bpw and head_bits (doc/optimize.md; parser in conversion/convert_model.py +
+# allocation.create_q_strategy_from_recipe). EXL3's own sc_optimize fills it from noise-injected KLD. This bridge
+# fills it from POLLARD's measured allocation, so the two allocators can be compared on EXL3's own atoms at the
+# same bpw (notes/exl3-recipe-bridge.md).
+#
+# Allocation model (the one sc_optimize uses): kld(t, K) = S_t * 4^(p - K) -- error amplitude halves per bit, KL
+# is quadratic in it. S_t is the measured group sensitivity (pollard-probe/-sensitivity: attn / ffn per layer, at
+# p = probe bits) split across the group's tensors by size. Solved exactly at the bit budget by greedy marginal
+# KL per stored bit (convex curves), with EXL3's fused groups tied to one bitrate.
+
+#: EXL3 sc_optimize's default ties: fused GEMMs in its inference paths must share a bitrate
+EXL3_TIE = "q_proj+k_proj+v_proj,gate_proj+up_proj,in_proj_qkv+in_proj_z"
+_ROUTER_RE = r"(\.(mlp|block_sparse_moe|feed_forward|moe)\.(gate|router)|shared_expert_gate|\.e_score_correction)$"
+_NOT_BUDGETED = r"(norm|embed|lm_head|rotary|visual|vision|audio|mm_proj|projector|merger|(^|\.)mtp\.|conv1d)"
+
+
+def _safetensors_headers(model_dir):
+    """{tensor name: shape} from the safetensors headers alone -- no weights read, no deps."""
+    import glob, json as _j, struct
+    out = {}
+    for f in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+        with open(f, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = _j.loads(fh.read(n))
+        out.update({k: v["shape"] for k, v in hdr.items() if k != "__metadata__"})
+    return out
+
+
+def _numel(shape):
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return n
+
+
+def exl3_budgeted_keys(model_dir, prefer_exl3=True):
+    """[(module key, numel)] of the tensors EXL3 budgets with --bits (qbits_key "bits", qmap set).
+
+    Exact when exllamav3 imports (it builds the model graph from config.json and walks it the way
+    create_q_strategy_from_recipe does); otherwise read off the safetensors headers: every 2-D Linear weight in
+    a decoder layer, routers / norms / embeddings / towers / MTP excluded, fused expert tensors
+    (experts.gate_up_proj / experts.down_proj) expanded per expert -- the names EXL3 gives them."""
+    if prefer_exl3:
+        try:
+            from exllamav3 import Config, Model
+            from exllamav3.modules.linear import Linear
+            model = Model.from_config(Config.from_directory(model_dir))
+            out = []
+
+            def walk(m):
+                if isinstance(m, Linear) and m.qmap is not None and m.qbits_key == "bits":
+                    out.append((m.key, int(m.weights_numel())))
+                for sm in m.modules:
+                    walk(sm)
+            for m in model.modules:
+                walk(m)
+            if out:
+                return out, "exllamav3"
+        except Exception:                                   # noqa: BLE001 -- no CUDA ext here: headers
+            pass
+    import re as _re
+    out = []
+    for name, shape in _safetensors_headers(model_dir).items():
+        if not name.endswith(".weight") or not _re.search(r"\.layers\.\d+\.", name):
+            continue
+        key = name[:-len(".weight")]
+        if _re.search(_ROUTER_RE, key) or _re.search(_NOT_BUDGETED, key, _re.I):
+            continue
+        if len(shape) == 2:
+            out.append((key, _numel(shape)))
+        elif len(shape) == 3 and _re.search(r"experts\.(gate_up_proj|down_proj|gate_proj|up_proj)$", key):
+            E, a, b = (int(x) for x in shape)
+            base, kind = key.rsplit(".", 1)
+            if kind == "gate_up_proj":
+                for i in range(E):
+                    out += [(f"{base}.{i}.gate_proj", a * b // 2), (f"{base}.{i}.up_proj", a * b // 2)]
+            else:
+                out += [(f"{base}.{i}.{kind}", a * b) for i in range(E)]
+    for name, shape in _safetensors_headers(model_dir).items():          # gate_up_proj stored with .weight-less names
+        if _re.search(r"experts\.(gate_up_proj|down_proj)$", name) and len(shape) == 3:
+            E, a, b = (int(x) for x in shape)
+            base, kind = name.rsplit(".", 1)
+            if kind == "gate_up_proj":
+                for i in range(E):
+                    out += [(f"{base}.{i}.gate_proj", a * b // 2), (f"{base}.{i}.up_proj", a * b // 2)]
+            else:
+                out += [(f"{base}.{i}.down_proj", a * b) for i in range(E)]
+    return out, "safetensors headers"
+
+
+def _group_of(key):
+    """Pollard's sensitivity group for a tensor: sequence mixing ("attn") or channel mixing ("ffn")."""
+    import re as _re
+    if _re.search(r"(self_attn|\.attn\.|attention|linear_attn|mixer|\.conv\.|token_mix|time_mix)", key):
+        return "attn"
+    return "ffn"
+
+
+def _layer_of(key):
+    import re as _re
+    m = _re.search(r"\.layers\.(\d+)\.", key)
+    return int(m.group(1)) if m else None
+
+
+def _ties(keys, tie=EXL3_TIE):
+    """Tie groups: keys whose last part is in one tie set AND share a parent module."""
+    sets = [set(p.split("+")) for p in tie.split(",") if p.strip()] if tie else []
+    groups, index = [], {}
+    for k in keys:
+        parent, leaf = k.rsplit(".", 1) if "." in k else ("", k)
+        tid = next((i for i, st in enumerate(sets) if leaf in st), None)
+        if tid is None:
+            groups.append([k])
+            continue
+        gk = (parent, tid)
+        if gk not in index:
+            index[gk] = len(groups)
+            groups.append([])
+        groups[index[gk]].append(k)
+    return groups
+
+
+def pollard_recipe(budgeted, sens, target_bpw, head_bits=6, min_bits=2, max_bits=8, tie=EXL3_TIE,
+                   probe_bits=None, alpha=2.0):
+    """EXL3 recipe dict from Pollard's sensitivity profile at `target_bpw` (same accounting as convert --bits:
+    mean bits over the budgeted tensors)."""
+    import heapq, math, re as _re
+    if not budgeted:
+        raise ValueError("no budgeted tensors")
+    if not (min_bits <= target_bpw <= max_bits):
+        raise ValueError(f"target {target_bpw} bpw outside [{min_bits}, {max_bits}]")
+    numel = dict(budgeted)
+    keys = [k for k, _ in budgeted]
+    if probe_bits is None:
+        m = _re.search(r"(\d+)", str((sens or {}).get("probe", "rtn4")))
+        probe_bits = int(m.group(1)) if m else 4
+    grp = {g: {int(k): float(v) for k, v in ((sens or {}).get(g) or {}).items()} for g in ("attn", "ffn")}
+    allv = sorted(v for d in grp.values() for v in d.values())
+    fallback = allv[len(allv) // 2] if allv else 1.0
+    gsize = {}
+    for k in keys:
+        gsize[(_group_of(k), _layer_of(k))] = gsize.get((_group_of(k), _layer_of(k)), 0) + numel[k]
+    S = {}
+    for k in keys:
+        g, li = _group_of(k), _layer_of(k)
+        sg = grp[g].get(li, grp["ffn" if g == "attn" else "attn"].get(li, fallback)) if li is not None else fallback
+        S[k] = max(sg, 0.0) * numel[k] / max(gsize[(g, li)], 1)
+    groups = _ties(keys, tie)
+    total = sum(numel.values())
+    budget = target_bpw * total
+    bits = {i: min_bits for i in range(len(groups))}
+    used = min_bits * total
+    kl = lambda gi, K: sum(S[k] * 2.0 ** (alpha * (probe_bits - K)) for k in groups[gi])
+    heap = []
+    for gi in range(len(groups)):
+        cost = sum(numel[k] for k in groups[gi])
+        if min_bits < max_bits:
+            heapq.heappush(heap, (-(kl(gi, min_bits) - kl(gi, min_bits + 1)) / cost, gi))
+    while heap:
+        _, gi = heapq.heappop(heap)
+        cost = sum(numel[k] for k in groups[gi])
+        if used + cost > budget + 1e-6:
+            continue                                          # this group no longer fits; smaller ones may
+        bits[gi] += 1
+        used += cost
+        if bits[gi] < max_bits:
+            K = bits[gi]
+            heapq.heappush(heap, (-(kl(gi, K) - kl(gi, K + 1)) / cost, gi))
+    tensors = {k: int(bits[gi]) for gi, g in enumerate(groups) for k in g}
+    pred = sum(kl(gi, bits[gi]) for gi in range(len(groups)))
+    return {"model": None, "source": "pollard", "target_bpw": float(target_bpw),
+            "achieved_bpw": round(used / total, 4), "predicted_kld": round(pred, 6), "head_bits": head_bits,
+            "tie": tie, "tensors": {k: tensors[k] for k in keys}}
+
+
+def write_recipe(recipe, path):
+    """Plain YAML in sc_optimize's layout; strings JSON-quoted (valid YAML), tensor keys bare (dots only)."""
+    import json as _j
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Quantization recipe generated by pollard-exl3 (Pollard measured allocation)\n")
+        for k, v in recipe.items():
+            if k == "tensors":
+                f.write("tensors:\n")
+                for key, b in v.items():
+                    f.write(f"  {_j.dumps(key) if any(c in key for c in '*?[:# ') else key}: {b}\n")
+            elif v is None:
+                f.write(f"{k}: null\n")
+            elif isinstance(v, str):
+                f.write(f"{k}: {_j.dumps(v)}\n")
+            else:
+                f.write(f"{k}: {v}\n")
+    return path
+
+
+def check_recipe(recipe, budgeted_keys):
+    """The checks EXL3's convert applies to -rcp (v1.6.2), as a list of problems ([] = it will load)."""
+    import fnmatch, re as _re
+    errs = []
+    t = recipe.get("tensors") if isinstance(recipe, dict) else None
+    if not isinstance(t, dict) or not t:
+        return ["Recipe must contain a non-empty 'tensors' mapping"]
+    ok = lambda v: (not isinstance(v, bool) and isinstance(v, (int, float))
+                    and ((float(v).is_integer() and (1 <= v <= 8 or v == 16)) or float(v) in (1.5, 2.5, 3.5)))
+    bad = [k for k, v in t.items() if not ok(v)]
+    if bad:
+        errs.append(f"bitrates must be integers 1-8, 16 or 1.5/2.5/3.5: {bad[:5]}")
+    if not (recipe.get("achieved_bpw") or recipe.get("target_bpw")):
+        errs.append("no target_bpw/achieved_bpw")
+    budgeted = set(budgeted_keys)
+    pats = [(k, _re.compile(fnmatch.translate(k))) for k in t if any(c in k for c in "*?[")]
+    exact = {k for k in t if not any(c in k for c in "*?[")}
+    missing = [k for k in budgeted if k not in exact and not any(rx.match(k) for _, rx in pats)]
+    if missing:
+        errs.append(f"missing {len(missing)} budgeted tensors, e.g. {sorted(missing)[:5]}")
+    unknown = [k for k in exact if k not in budgeted] + [k for k, rx in pats if not any(rx.match(b) for b in budgeted)]
+    if unknown:
+        errs.append(f"{len(unknown)} keys match no budgeted tensor, e.g. {unknown[:5]}")
+    return errs
+
+
+def exl3_sc_commands(model, out_dir, bpw, head_bits=6, devices="0"):
+    """EXL3's own measured-recipe pipeline (doc/optimize.md, run from an exllamav3 checkout)."""
+    w = out_dir.rstrip("/\\") + "_sc"
+    return [
+        f"python sc_trace.py -m <a 6.0bpw EXL3 of {model}> -o {w}/cal_trace.json -co {w}/cal_trace.safetensors -cs 262144 -ambs 32",
+        f"python sc_rfn_probe.py -mq <a 2.0bpw EXL3 of {model}> -mr {model} -d {devices} -o {w}/rfn_2.00bpw.json",
+        f"python sc_measure.py -m {model} -d {devices} --shaped -tr {w}/cal_trace.safetensors -rr {w}/rfn_2.00bpw.json -rs 1.0,0.5 -o {w}/noise_attrib.json",
+        f"python sc_optimize.py -m {w}/noise_attrib.json -rr {w}/rfn_2.00bpw.json -b {bpw} -hb {head_bits} -al 2.0 -o {w}/recipe_{bpw}bpw.yaml",
+    ]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -92,9 +330,17 @@ def main():
     ap.add_argument("--bpw", type=float, default=3.0, help="target average bits/weight (EXL3 budgeted)")
     ap.add_argument("--head-bits", type=int, default=6, help="output/head layer bits (protected)")
     ap.add_argument("--mtp-bits", type=int, default=4, help="MTP layer bits (GLM/DeepSeek MTP head)")
-    ap.add_argument("--recipe", help="EXPERIMENTAL per-tensor bitrate recipe (YAML) -- overrides budgeted. "
-                    "A GGUF-style role map LOSES to budgeted on EXL3 (measured); use only a recipe measured "
-                    "in EXL3's atom space that beats budgeted at <= same bpw.")
+    ap.add_argument("--recipe", default="none",
+                    help="per-tensor bitrate recipe for EXL3's -rcp: 'none' (default, the gold path: EXL3's budgeted "
+                         "allocator), 'pollard' (emit one from --sensitivity at --bpw), 'exl3' (EXL3's own sc_optimize "
+                         "recipe: --exl3-recipe FILE, or print its pipeline), or a path to a recipe YAML")
+    ap.add_argument("--sensitivity", help="Pollard sensitivity.json (pollard-probe/-sensitivity) for --recipe pollard")
+    ap.add_argument("--exl3-recipe", help="an sc_optimize recipe.yaml for --recipe exl3")
+    ap.add_argument("--recipe-out", help="where --recipe pollard writes its YAML (default <out>.pollard-recipe.yaml)")
+    ap.add_argument("--min-bits", type=int, default=2, help="--recipe pollard: lowest per-tensor bitrate")
+    ap.add_argument("--max-bits", type=int, default=8, help="--recipe pollard: highest per-tensor bitrate")
+    ap.add_argument("--tie", default=EXL3_TIE, help="--recipe pollard: fused groups sharing one bitrate "
+                    "(EXL3's default; '' = independent)")
     ap.add_argument("--hq", dest="hq", action="store_true", default=None,
                     help="bump bitrate of select layers (MoE) -- default: auto-on for MoE")
     ap.add_argument("--no-hq", dest="hq", action="store_false")
@@ -143,6 +389,40 @@ def main():
                 print(f"   [cal] packed Calib 3.0 -> {a.cal_data} ({rows}x{a.cal_cols} real tokens, -cd)")
             except Exception as e:
                 print(f"   [cal] could not pack --calib-text ({repr(e)[:70]}); using EXL3's bundled cal")
+    a.recipe_mode = a.recipe if a.recipe in ("none", "pollard", "exl3") else "file"
+    if a.recipe_mode == "none":
+        a.recipe = None
+    elif a.recipe_mode == "pollard":
+        if not a.sensitivity or not os.path.exists(a.sensitivity):
+            sys.exit("--recipe pollard needs --sensitivity <pollard sensitivity.json> (pollard-probe / -sensitivity)")
+        if not os.path.isdir(a.model):
+            sys.exit("--recipe pollard reads the checkpoint's tensor list: --model must be a local directory")
+        import json as _j
+        keys, how = exl3_budgeted_keys(a.model)
+        rec = pollard_recipe(keys, _j.load(open(a.sensitivity)), a.bpw, a.head_bits, a.min_bits, a.max_bits,
+                             a.tie)
+        rec["model"] = a.model
+        a.recipe = a.recipe_out or ((a.out.rstrip("/\\") + ".pollard-recipe.yaml") if a.out
+                                    else "pollard-exl3-recipe.yaml")
+        write_recipe(rec, a.recipe)
+        problems = check_recipe(rec, [k for k, _ in keys])
+        hist = {}
+        for b in rec["tensors"].values():
+            hist[b] = hist.get(b, 0) + 1
+        print(f"   [recipe] Pollard allocation -> {a.recipe}: {len(keys)} budgeted tensors ({how}), target "
+              f"{a.bpw} -> achieved {rec['achieved_bpw']} bpw, bits {dict(sorted(hist.items()))}")
+        if problems:
+            sys.exit("   [recipe] would not load in EXL3: " + "; ".join(problems))
+        if how != "exllamav3":
+            print("   [recipe] tensor list read from safetensors headers (exllamav3 not importable here); "
+                  "EXL3 aborts on a missing/unknown key, so a mismatch fails fast at convert")
+    elif a.recipe_mode == "exl3":
+        if not a.exl3_recipe:
+            print("   --recipe exl3: EXL3's measured recipe comes from its sc_* pipeline (exllamav3 checkout, GPU):")
+            for c in exl3_sc_commands(a.model, a.out or "out", a.bpw, a.head_bits, a.devices):
+                print("     $ " + c)
+            sys.exit("   then rerun with --recipe exl3 --exl3-recipe <recipe.yaml>")
+        a.recipe = a.exl3_recipe
     is_moe, _ = detect_moe(a.model)
     hq = is_moe if a.hq is None else a.hq
     kind = "MoE" if is_moe else "dense"
@@ -170,9 +450,12 @@ def main():
         cmd += ["-vb", str(a.vision_bits)]
     cmd += ["-d", a.devices]
 
-    if a.recipe:
-        print(" !! EXPERIMENTAL --recipe: a GGUF/K-quant role map LOSES to EXL3-budgeted (measured: "
+    if a.recipe and a.recipe_mode == "file":
+        print(" !! EXPERIMENTAL --recipe FILE: a GGUF/K-quant role map LOSES to EXL3-budgeted (measured: "
               "17.15 vs 14.30 PPL at more bits). Only use a recipe measured in EXL3's atom space.")
+    elif a.recipe:
+        print(f"   recipe: {a.recipe_mode} (per-tensor -rcp; head {a.head_bits}) -- R&D until the head-to-head "
+              "beats the gold path (notes/exl3-recipe-bridge.md)")
     print(f"== pollard-exl3 :: {a.model}  [{kind}]  "
           + (f"recipe {os.path.basename(a.recipe)}" if a.recipe
              else f"{a.bpw} bpw  |  head {a.head_bits}  |  mtp {a.mtp_bits}"

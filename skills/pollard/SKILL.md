@@ -313,6 +313,14 @@ scale/bias tensors) -- mlx-lm loads it unchanged. Synthetic: weighted error ~0.3
 GPQ measured ~2x lower KL at 4-bit. Real KL A/B still pending (`notes/mlx-range-search.md`). `pollard --format
 mlx` passes `--imatrix` through when given.
 
+### EXL3 recipe bridge (`pollard-exl3 --recipe none|pollard|exl3|FILE`)
+ExLlamaV3 >= 1.6 (MIT) converts from a per-tensor `-rcp recipe.yaml`. `--recipe pollard` emits one from Pollard's
+measured sensitivity (`--sensitivity`) at `--bpw`: EXL3's own tensor list (exllamav3 graph on the box, safetensors
+headers elsewhere), sc_optimize's KL law `S_t * 4^(p-K)`, greedy marginal-KL-per-bit at the budget, fused
+q/k/v + gate/up tied; checked against EXL3's parser (v1.6.2 vendored in tests). `exl3` = EXL3's own sc_optimize
+recipe (`--exl3-recipe`, or prints the sc_* pipeline). DEFAULT stays `none` (the gold path) until the head-to-head
+(`notes/exl3-recipe-bridge.md`: budgeted vs Pollard recipe vs sc_optimize, same bpw, KL on held-out) says otherwise.
+
 ### NVFP4 Four Over Six (`pollard-mx --fp4-scale 6|4over6`)
 Four Over Six (MIT HAN Lab, arXiv 2512.02010, MIT licence): each NVFP4 block's E4M3 scale maps the block max to
 4 OR 6 (tensor scale against 256, not 448), keeping whichever block reconstructs better -- Pollard scores it by
@@ -582,7 +590,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
 | `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs); `--range search` (default) = imatrix-weighted per-group scale/bias search (`--imatrix`), still standard MLX affine | any |
 | `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`, `--fp4-scale 4over6` Four Over Six block scales) | any |
-| `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
+| `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation; `--recipe pollard` writes an EXL3 `-rcp` recipe from the measured sensitivity, `--recipe exl3` uses sc_optimize's | any |
 | `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
 
