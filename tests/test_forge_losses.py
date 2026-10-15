@@ -89,7 +89,7 @@ def test_cli_validates_loss_names():
 def test_distill_cli_records_the_loss_in_the_lineage(tmp_path):
     import json
     import os
-    from transformers import AutoTokenizer
+    AutoTokenizer = pytest.importorskip("transformers").AutoTokenizer
     tok = "HuggingFaceTB/SmolLM2-135M-Instruct"
     try:
         AutoTokenizer.from_pretrained(tok, local_files_only=True)

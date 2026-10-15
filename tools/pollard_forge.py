@@ -389,7 +389,7 @@ def kd_loss(student_logits, teacher_logits, T=1.0, loss="kl", labels=None, topk=
 
     rkl / cakld / top-k are computed at T=1, as AngelSlim does; T applies to `kl` only. `labels` [B, S]
     (the next tokens) are needed for cakld."""
-    torch = _torch()
+    import torch  # the losses need torch only, not transformers
     F = torch.nn.functional
     loss = str(loss).lower()
     V = min(student_logits.shape[-1], teacher_logits.shape[-1])     # a padded vocab on either side
