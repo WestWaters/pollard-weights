@@ -423,7 +423,12 @@ def reasoning_info(model, tpl=None, archs=None, conf=None) -> dict:
             probe = _safe(_probe_template, ct)
     harmony = "<|channel|>" in tpl and "analysis" in low
     s_open, s_close = _static_pair(low, tpl)
-    vars_named = [v for v in TOGGLE_VARS + EFFORT_VARS if re.search(r"\b%s\b" % v, tpl)]
+    # without rendering: variables the template TESTS (bare "think"/"thinking"/"reasoning" are words in tags
+    # and prose -- `</think>` is not a switch -- so those count only in a jinja test)
+    vars_named = [v for v in TOGGLE_VARS + EFFORT_VARS if len(v) > 9 and re.search(r"(?<![\w<>/|:])%s(?![\w>|])" % v, tpl)]
+    vars_named += [v for v in ("thinking", "reasoning") if re.search(
+        r"\b(if|elif|and|or|not)\s+(not\s+)?%s\b(?!\s*\.)|(?<![.\w])%s\s+is\s+(not\s+)?defined|(?<![.\w])%s\s*[!=]="
+        % (v, v, v), tpl)]
 
     if harmony:
         info.update(style="harmony", open="<|channel|>analysis<|message|>", close="<|end|>",
