@@ -313,6 +313,13 @@ scale/bias tensors) -- mlx-lm loads it unchanged. Synthetic: weighted error ~0.3
 GPQ measured ~2x lower KL at 4-bit. Real KL A/B still pending (`notes/mlx-range-search.md`). `pollard --format
 mlx` passes `--imatrix` through when given.
 
+### NVFP4 Four Over Six (`pollard-mx --fp4-scale 6|4over6`)
+Four Over Six (MIT HAN Lab, arXiv 2512.02010, MIT licence): each NVFP4 block's E4M3 scale maps the block max to
+4 OR 6 (tensor scale against 256, not 448), keeping whichever block reconstructs better -- Pollard scores it by
+imatrix-weighted error (`--imatrix`), MSE without one. Post-pass over llm-compressor's checkpoint; output stays
+standard NVFP4 (compressed-tensors layout, fused q/k/v + gate/up keep one shared global scale). Synthetic:
+~0.75x weighted error vs plain. Default stays `6` until the box A/B (`notes/nvfp4-four-over-six.md`).
+
 ### Calibration profiles (`pollard-calib --profile`)
 `general` (Calib 3.0), `translation` (parallel pairs through the model's own template), `agent` (tool-call traces +
 schemas through the template), `code`, `auto` (from pollard-modelkind; `pollard` passes it by default,
@@ -574,7 +581,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-serve-eval` | A/B a served quantized model against its baseline, on the same traffic | any |
 | `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
 | `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs); `--range search` (default) = imatrix-weighted per-group scale/bias search (`--imatrix`), still standard MLX affine | any |
-| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`) | any |
+| `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`, `--fp4-scale 4over6` Four Over Six block scales) | any |
 | `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
 | `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |
 | `pollard-health` | cross-vendor accelerator degradation check | — |
