@@ -313,6 +313,9 @@ def capture(tree, name, out_dir=PATCH_DIR):
         diff = r.stdout or ""
     except Exception as e:                                                 # noqa: BLE001
         return None, f"git diff failed: {e}"
+    if r.returncode != 0 and "dubious ownership" in (r.stderr or ""):
+        # not "no changes": git refused to look (a tree owned by another account, e.g. the SYSTEM task)
+        return None, f"git refuses {tree} (dubious ownership) -- nothing was captured"
     if not diff.strip():
         return None, "no uncommitted changes to capture"
 
