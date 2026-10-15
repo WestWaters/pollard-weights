@@ -18,8 +18,9 @@ new    -- a fresh architecture (qwen3 / llama / qwen2 family) at a size preset o
 prune  -- Minitron-style structured pruning from a teacher: drop the layers that change the hidden state least
           (block influence, measured on --calib) and the FFN channels that fire least. The student keeps the
           teacher's tokenizer, so it can be distilled from it.
-train  -- pretraining, continued pretraining, or distillation (--teacher: CE + temperature-scaled KL on the
-          teacher's logits). --data mixes sources by weight; keep chat data in the mix for an instruct model
+train  -- pretraining, continued pretraining, or distillation (--teacher: CE + a distillation loss on the
+          teacher's logits -- --loss kl (temperature-scaled, default) / rkl / cakld / kl_top_K, AngelSlim's set,
+          weighted by --kd and --lm-loss-weight). --data mixes sources by weight; keep chat data in the mix for an instruct model
           (QAT/distill on raw web text alone erases chat behaviour -- measured on STQ1_0). Checkpoints every
           --save-every steps and resumes with --resume. Multi-GPU: torchrun --nproc_per_node N pollard_forge.py train ...
 card   -- README.md with the lineage (every forge step, its data and its measured losses) and the license.
@@ -335,11 +336,94 @@ def batches(sources, tok, seq, batch, seed, rank=0, world=1):
         yield torch.tensor(rows, dtype=torch.long)
 
 
-def kd_loss(student_logits, teacher_logits, T):
+# ----------------------------- distillation losses -----------------------------
+# rkl / cakld / kl_top_K / r_kl_top_K below are ported from AngelSlim
+# (https://github.com/Tencent/AngelSlim, angelslim/compressor/distill/loss.py, DistillLoss.compute):
+#
+#   Copyright 2025 Tencent Inc. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# Modified for Pollard: a function rather than a class; forge's batches are already shifted (logits at t
+# predict y[t]) and carry no -100 masks, so the shift and mask are dropped; `kl` keeps forge's
+# temperature-scaled forward KL (identical to AngelSlim's `kl` at T=1, its `kd` otherwise); the top-k
+# size comes from the name (kl_top_100) or `topk` (AngelSlim's default 1000).
+
+LOSSES = ("kl", "rkl", "cakld", "kl_top_k", "r_kl_top_k")
+
+
+def _kl_from_logps(log_p_src, log_p_tgt):
+    """Per-token KL(tgt || src) from log-probs, gradient-safe (AngelSlim)."""
+    return (log_p_tgt.exp() * (log_p_tgt - log_p_src)).sum(dim=-1)
+
+
+def _topk_of(loss, topk, vocab):
+    k = topk
+    if k is None and loss.rsplit("_", 1)[-1].isdigit():
+        k = int(loss.rsplit("_", 1)[-1])
+    k = 1000 if k is None else int(k)
+    if k <= 0:
+        raise ValueError(f"top-k must be positive, got {k}")
+    return min(k, vocab)
+
+
+def kd_loss(student_logits, teacher_logits, T=1.0, loss="kl", labels=None, topk=None):
+    """Distillation loss per token, averaged.
+
+      kl          forward KL(teacher || student), temperature-scaled by T (x T^2) -- forge's original loss
+      rkl         reverse KL(student || teacher): mode-seeking, the student commits to the teacher's peaks
+      cakld       per-token mix of the two by the teacher's confidence on the label (BitDistiller's
+                  confidence-aware KLD): reverse where the teacher is sure, forward where it is not
+      kl_top_K    forward KL over the teacher's top-K tokens only (renormalised) -- cheap at big vocabs
+      r_kl_top_K  reverse KL over the student's top-K tokens
+
+    rkl / cakld / top-k are computed at T=1, as AngelSlim does; T applies to `kl` only. `labels` [B, S]
+    (the next tokens) are needed for cakld."""
     torch = _torch()
-    s = torch.nn.functional.log_softmax(student_logits.float() / T, dim=-1)
-    t = torch.nn.functional.log_softmax(teacher_logits.float() / T, dim=-1)
-    return torch.nn.functional.kl_div(s, t, log_target=True, reduction="batchmean") * (T * T) / student_logits.shape[1]
+    F = torch.nn.functional
+    loss = str(loss).lower()
+    V = min(student_logits.shape[-1], teacher_logits.shape[-1])     # a padded vocab on either side
+    s = student_logits[..., :V].float().flatten(0, -2)
+    t = teacher_logits[..., :V].float().flatten(0, -2)
+    if loss == "kl":
+        ls, lt = F.log_softmax(s / T, dim=-1), F.log_softmax(t / T, dim=-1)
+        return _kl_from_logps(ls, lt).mean() * (T * T)
+    if loss in ("rkl", "cakld"):
+        ls, lt = F.log_softmax(s, dim=-1), F.log_softmax(t, dim=-1)
+        bkl = _kl_from_logps(lt, ls)
+        if loss == "rkl":
+            return bkl.mean()
+        if labels is None:
+            raise ValueError("cakld weights each token by the teacher's confidence on its label: pass labels")
+        conf = torch.gather(lt.exp(), -1, labels.reshape(-1, 1).clamp(max=V - 1)).squeeze(-1)
+        return (conf * bkl + (1.0 - conf) * _kl_from_logps(ls, lt)).mean()
+    if loss.startswith("r_kl_top") or loss.startswith("rkl_top"):
+        top_s, idx = s.topk(_topk_of(loss, topk, V), dim=-1, sorted=False)
+        top_t = t.gather(-1, idx)
+        return _kl_from_logps(F.log_softmax(top_t, dim=-1), F.log_softmax(top_s, dim=-1)).mean()
+    if loss.startswith("kl_top"):
+        top_t, idx = t.topk(_topk_of(loss, topk, V), dim=-1, sorted=False)
+        top_s = s.gather(-1, idx)
+        return _kl_from_logps(F.log_softmax(top_s, dim=-1), F.log_softmax(top_t, dim=-1)).mean()
+    raise ValueError(f"unknown distillation loss {loss!r}: {', '.join(LOSSES)} (or kl_top_<K> / r_kl_top_<K>)")
+
+
+def _loss_name(v):
+    v = str(v).lower()
+    ok = v in LOSSES or ((v.startswith("kl_top_") or v.startswith("r_kl_top_")) and v.rsplit("_", 1)[-1].isdigit())
+    if not ok:
+        raise argparse.ArgumentTypeError(f"choose from {', '.join(LOSSES)} or kl_top_<K> / r_kl_top_<K>")
+    return v
 
 
 def cmd_train(a):
@@ -401,7 +485,9 @@ def cmd_train(a):
     if main_proc:
         print(f"== pollard-forge train :: {a.model} -> {out}  ({dev}{', bf16' if bf16 else ''}{f', {world} ranks' if ddp else ''})")
         print(f"   {_params(core)/1e6:.1f}M params, {steps} steps x {tok_per_step:,} tokens = {steps*tok_per_step/1e6:.1f}M tokens"
-              + (f", distilling from {a.teacher} (kd {a.kd}, T {a.temperature})" if teacher else ""), flush=True)
+              + (f", distilling from {a.teacher} ({a.loss}, kd {a.kd}"
+                 + (f", lm {a.lm_loss_weight}" if a.lm_loss_weight is not None else "")
+                 + (f", T {a.temperature}" if a.loss == "kl" else "") + ")" if teacher else ""), flush=True)
 
     def evaluate():
         core.eval(); tot = 0.0
@@ -431,8 +517,11 @@ def cmd_train(a):
                 if teacher is not None:
                     with torch.no_grad():
                         tl = teacher(x, use_cache=False).logits
-                    kd = kd_loss(logits, tl, a.temperature)
-                    loss = (1 - a.kd) * ce + a.kd * kd
+                    kd = kd_loss(logits, tl, a.temperature, a.loss, y, a.loss_topk)
+                    # AngelSlim combines the two with independent weights; without --lm-loss-weight forge
+                    # keeps its original convex mix
+                    loss = (a.lm_loss_weight * ce + a.kd * kd) if a.lm_loss_weight is not None \
+                        else (1 - a.kd) * ce + a.kd * kd
                     kd_acc += float(kd.detach()) / a.accum
             (loss / a.accum).backward()
             ce_acc += float(ce.detach()) / a.accum
@@ -461,6 +550,7 @@ def cmd_train(a):
         if os.path.abspath(out) != os.path.abspath(a.model):
             _carry_lineage(a.model, out)
         _lineage(out, {"op": "distill" if teacher else "train", "from": a.model, "teacher": a.teacher, "kd": a.kd if teacher else None,
+                       "loss": a.loss if teacher else None, "lm_loss_weight": a.lm_loss_weight if teacher else None,
                        "data": [{"source": s["spec"], "weight": s["weight"]} for s in sources], "steps": steps,
                        "tokens": steps * tok_per_step, "seq": a.seq, "lr": a.lr, "eval_loss_start": first_eval,
                        "eval_loss_end": round(final_eval, 4), "eval_ppl_end": round(math.exp(min(final_eval, 50)), 2),
@@ -588,7 +678,14 @@ def main():
                    help="file.txt | file.jsonl (text or messages) | hf:org/name[:config][:split]; repeat to mix, @weight to weight")
     t.add_argument("--eval-data", metavar="SRC", help="held-out source (default: a fixed sample of --data)")
     t.add_argument("--teacher", help="distill from this model (same tokenizer)"); t.add_argument("--kd", type=float, default=0.5)
-    t.add_argument("--temperature", type=float, default=2.0)
+    t.add_argument("--temperature", type=float, default=2.0, help="softmax temperature for --loss kl")
+    t.add_argument("--loss", type=_loss_name, default="kl",
+                   help="distillation loss: kl (forward, default) | rkl (reverse) | cakld (confidence-aware mix) | "
+                        "kl_top_k / r_kl_top_k (over the top-K tokens; or kl_top_100 to name K). AngelSlim's set")
+    t.add_argument("--loss-topk", type=int, default=None, help="K for the top-k losses (default 1000)")
+    t.add_argument("--lm-loss-weight", type=float, default=None,
+                   help="weight on the LM (cross-entropy) loss; with it, loss = lm_w*CE + kd*KD (AngelSlim's form). "
+                        "Default: forge's (1-kd)*CE + kd*KD")
     t.add_argument("--tokens", default="1e8", help="training budget in tokens (default 1e8); or --steps")
     t.add_argument("--steps", type=int); t.add_argument("--seq", type=int, default=2048); t.add_argument("--batch", type=int, default=8)
     t.add_argument("--accum", type=int, default=1); t.add_argument("--lr", type=float, default=3e-4)
