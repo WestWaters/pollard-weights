@@ -304,6 +304,15 @@ stock` gate) and coherence. An unmeasured threshold FAILS. Every lane is measure
 vs the source): gguf via llama-perplexity, mlx via mlx_lm, gptq/mx via transformers; exl3 is gated on its assembled
 forward. `pollard-verify --print-gates` = the defaults (`recipes/gates.yaml`). Non-zero exit = do not publish.
 
+### MLX range search (`pollard-mlx --range search|minmax`)
+Default `search`: each group-of-64's scale/bias is chosen by GPQ's shrink-grid search + weighted LS refit,
+scored on error weighted by the input channel's activation energy (`--imatrix`: llama.cpp .dat/.gguf with
+llama-family names mapped, or .npz/.safetensors keyed by module path; without it, plain weight error). MLX's own
+min/max is always a candidate, so no group gets worse. Output = standard MLX affine (same packing, same
+scale/bias tensors) -- mlx-lm loads it unchanged. Synthetic: weighted error ~0.35x of `mx.quantize` at 3/4-bit;
+GPQ measured ~2x lower KL at 4-bit. Real KL A/B still pending (`notes/mlx-range-search.md`). `pollard --format
+mlx` passes `--imatrix` through when given.
+
 ### Calibration profiles (`pollard-calib --profile`)
 `general` (Calib 3.0), `translation` (parallel pairs through the model's own template), `agent` (tool-call traces +
 schemas through the template), `code`, `auto` (from pollard-modelkind; `pollard` passes it by default,
@@ -564,7 +573,7 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-decision` | decision-model board vs f16 (agreement, option KL, calibration), `--results` for the card + gate | decision models |
 | `pollard-serve-eval` | A/B a served quantized model against its baseline, on the same traffic | any |
 | `pollard-hf-smooth` | activation-aware SmoothQuant preconditioning for an HF model | any |
-| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs) | any |
+| `pollard-mlx` | emit an MLX (Apple Silicon) mixed-bit model with Pollard's allocation (`--bits 2/3/4/5/6/8` rungs); `--range search` (default) = imatrix-weighted per-group scale/bias search (`--imatrix`), still standard MLX affine | any |
 | `pollard-mx` | emit FP4/FP8 for Blackwell/Rubin (NVFP4 default, MXFP4, pure FP8 W8A8 `--scheme FP8`; `--kv-fp8`, `--moe-protect-attn-only`) | any |
 | `pollard-exl3` | emit an EXL3 model carrying Pollard's allocation | any |
 | `pollard-exl3-band` | band-parallel EXL3 conversion for models that do not fit one GPU | any |

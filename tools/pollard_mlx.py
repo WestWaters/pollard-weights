@@ -16,7 +16,11 @@ is --bits N per rung: the body at N bits, the measured-hot layers one step up (-
 --bits 8 = uniform 8-bit. --plan-only needs no deps; the actual convert needs `pip install mlx_lm` on
 Apple Silicon (this box has `mlx`).
 
-  pollard-mlx --model <hf> --sensitivity s.json --bits 3 --out ./M-Pollard-MLX-3bit   # one ladder rung"""
+  pollard-mlx --model <hf> --sensitivity s.json --bits 3 --out ./M-Pollard-MLX-3bit   # one ladder rung
+  pollard-mlx --model <hf> --bits 4 --imatrix model.imatrix --out ./M-MLX-4bit          # weighted range search
+
+--range search (default) picks each group's scale/bias by an imatrix-weighted range search instead of min/max;
+the files are standard MLX affine (mlx-lm loads them unchanged). --range minmax = MLX's own choice."""
 import argparse, json, re, sys
 
 HIGH, LOW = 8, 4
@@ -116,6 +120,311 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
     return {"bits": LOW, "group_size": gsize}
 
 
+# ----------------------------------------------------------------- range search (imatrix-weighted)
+#
+# MLX affine group quant stores, per group of 64 weights, a scale and a bias: w ~= scale * q + bias, q in
+# [0, 2^bits). mx.quantize takes them from the group's min and max. That spends the grid on the extremes: one
+# outlier stretches the range and every other weight in the group lands on a coarser grid. The GPQ experiment
+# (Graft, 2026-10-15, Qwen3-0.6B) measured a per-group range SEARCH -- shrink the low and high ends over a small
+# grid, keep the pair with the least error WEIGHTED by each input channel's activation energy (the imatrix) --
+# at about half the KL of min/max at 4 bits (0.147-0.178 vs 0.322).
+#
+# This is that search, clean-room for this lane: the OUTPUT is unchanged standard MLX affine (uint32 codes in
+# MLX's little-endian bitstream, scale/bias per group in the model dtype), so mlx-lm loads it as any other
+# quantized model -- only which scale and bias each group gets is different. MLX's own min/max answer is
+# always one of the candidates, so no group ever ends up worse than mx.quantize on the weighted error.
+
+#: fractions of the group's range shaved off the low / high end (GPQ's grid; 0 = min/max itself)
+SHRINK = (0.0, 0.02, 0.04, 0.07, 0.10, 0.14, 0.19, 0.25)
+RANGE_MODES = ("search", "minmax")
+
+
+def _round_store(x, dtype, xp):
+    """Round to the dtype the scales/biases are stored in -- the error has to be measured on what ships."""
+    name = str(dtype).split(".")[-1]
+    if xp.__name__.startswith("mlx"):
+        return x.astype(getattr(xp, name)).astype(xp.float32) if name != "float32" else x
+    import numpy as np
+    if name == "float16":
+        return x.astype(np.float16).astype(np.float32)
+    if name == "bfloat16":                                        # numpy has no bf16: round-to-nearest-even
+        u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+        u = (u + np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))) & np.uint32(0xFFFF0000)
+        return u.view(np.float32)
+    return x.astype(np.float32)
+
+
+def _codes(g, s, b, n, xp):
+    q = xp.round((g - b[..., None]) / s[..., None])
+    return xp.clip(q, 0, n)
+
+
+def _err(g, q, s, b, imp):
+    e = g - (q * s[..., None] + b[..., None])
+    e = e * e
+    if imp is not None:
+        e = e * imp
+    return e.sum(-1)
+
+
+def search_groups(g, bits, imp=None, store="float32", xp=None, grid=SHRINK, refits=2, init=None):
+    """Per-group (scale, bias) for g [..., G] (float32) minimising sum(imp * (w - (s*q + b))^2).
+
+    Candidates: every (lo, hi) shrink pair on `grid`, plus `init` (MLX's own min/max scale/bias) when given;
+    then `refits` rounds of weighted least squares for (s, b) at the chosen codes, kept only where they
+    lower the error. Scales/biases are rounded to `store` before scoring. Returns (q, s, b, err)."""
+    import numpy as np
+    xp = xp or np
+    n = 2 ** bits - 1
+    mn, mxv = g.min(-1), g.max(-1)
+    R = xp.maximum(mxv - mn, 1e-12)
+    best = None
+    cands = [(a, b_) for a in grid for b_ in grid]
+    for a, b_ in cands:
+        lo, hi = mn + a * R, mxv - b_ * R
+        s = _round_store(xp.maximum((hi - lo) / n, 1e-12), store, xp)
+        b = _round_store(lo, store, xp)
+        q = _codes(g, s, b, n, xp)
+        e = _err(g, q, s, b, imp)
+        if best is None:
+            best = [q, s, b, e]
+            continue
+        m = e < best[3]
+        best = [xp.where(m[..., None], q, best[0]), xp.where(m, s, best[1]), xp.where(m, b, best[2]),
+                xp.where(m, e, best[3])]
+        if hasattr(xp, "eval"):                                   # MLX is lazy: keep the graph one step deep
+            xp.eval(*best)
+    if init is not None:                                          # MLX's own answer is always on the table
+        s0, b0 = (_round_store(x.astype(xp.float32), store, xp) for x in init)
+        s0 = xp.where(s0 == 0, 1e-12, s0)
+        q0 = _codes(g, s0, b0, n, xp)
+        e0 = _err(g, q0, s0, b0, imp)
+        m = e0 < best[3]
+        best = [xp.where(m[..., None], q0, best[0]), xp.where(m, s0, best[1]), xp.where(m, b0, best[2]),
+                xp.where(m, e0, best[3])]
+    w = imp if imp is not None else 1.0
+    for _ in range(refits):                                       # weighted LS refit at the chosen codes
+        q = best[0]
+        wq = w * q
+        Sw = (w * xp.ones_like(g)).sum(-1)
+        Sq, Sqq = wq.sum(-1), (wq * q).sum(-1)
+        Sg, Sqg = (w * g).sum(-1), (wq * g).sum(-1)
+        det = Sw * Sqq - Sq * Sq
+        ok = xp.abs(det) > 1e-20
+        safe = xp.where(ok, det, 1.0)
+        s = xp.where(ok, (Sw * Sqg - Sq * Sg) / safe, best[1])
+        b = xp.where(ok, (Sg - s * Sq) / xp.maximum(Sw, 1e-30), best[2])
+        s = _round_store(xp.where(s > 1e-12, s, best[1]), store, xp)
+        b = _round_store(b, store, xp)
+        q = _codes(g, s, b, n, xp)
+        e = _err(g, q, s, b, imp)
+        m = e < best[3]
+        best = [xp.where(m[..., None], q, best[0]), xp.where(m, s, best[1]), xp.where(m, b, best[2]),
+                xp.where(m, e, best[3])]
+    return best
+
+
+def pack_mlx(q, bits):
+    """uint8/int codes [..., K] -> MLX's packed uint32 [..., K*bits/32]: a little-endian bitstream (element 0
+    in the lowest bits of word 0), the layout mx.quantize writes for every width 2/3/4/5/6/8."""
+    import numpy as np
+    q = np.asarray(q).astype(np.uint32)
+    lead, K = q.shape[:-1], q.shape[-1]
+    if (K * bits) % 32:
+        raise ValueError(f"K={K} at {bits} bits does not fill whole uint32 words")
+    bitsarr = ((q[..., None] >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
+    packed = np.packbits(bitsarr.reshape(*lead, K * bits), axis=-1, bitorder="little")
+    return np.ascontiguousarray(packed).view(np.uint32).reshape(*lead, K * bits // 32)
+
+
+def unpack_mlx(packed, bits, K):
+    """The inverse of pack_mlx (for tests and audits)."""
+    import numpy as np
+    p = np.ascontiguousarray(np.asarray(packed, dtype=np.uint32))
+    lead = p.shape[:-1]
+    b = np.unpackbits(p.view(np.uint8).reshape(*lead, -1), axis=-1, bitorder="little")[..., :K * bits]
+    b = b.reshape(*lead, K, bits).astype(np.uint32)
+    return (b << np.arange(bits, dtype=np.uint32)).sum(-1)
+
+
+def encode_affine(w, bits, group_size=64, imp=None, method="search", store=None, xp=None, init=None,
+                  max_elems=1 << 22):
+    """Quantize w [..., K] to standard MLX affine: (packed uint32 [..., K*bits/32], scales, biases [..., K/G]).
+
+    method "minmax" = the classic min/max grid; "search" = the imatrix-weighted range search. `imp` = per input
+    channel importance [K] (activation E[x^2], an imatrix row), or [..., K] per row block. Works on numpy or,
+    with xp=mlx.core, on the GPU; rows are processed in chunks of ~max_elems weights."""
+    import numpy as np
+    xp = xp or np
+    if bits not in MLX_BITS:
+        raise ValueError(f"MLX affine takes {MLX_BITS} bits, not {bits}")
+    store = store or str(getattr(w, "dtype", "float32")).split(".")[-1]
+    shape = tuple(w.shape)
+    K = shape[-1]
+    if K % group_size:
+        raise ValueError(f"last dim {K} not divisible by group_size {group_size}")
+    rows = 1
+    for d in shape[:-1]:
+        rows *= d
+    W = w.reshape(rows, K // group_size, group_size).astype(xp.float32)
+    I = None
+    if imp is not None:
+        I = xp.array(imp) if xp is not np else np.asarray(imp, dtype=np.float32)
+        I = I.astype(xp.float32)
+        if I.size == K:
+            I = I.reshape(1, K // group_size, group_size)
+        elif I.size == rows * K:
+            I = I.reshape(rows, K // group_size, group_size)
+        elif I.size % K == 0 and rows % (I.size // K) == 0:      # per expert [E, K] over [E, out, K] rows
+            e = I.size // K
+            I = xp.repeat(I.reshape(e, 1, K // group_size, group_size), rows // e, axis=1).reshape(
+                rows, K // group_size, group_size)
+        else:
+            raise ValueError(f"importance has {I.size} values; weight needs {K} (per channel)")
+        I = xp.maximum(I, 0.0) + 1e-8 * (I.mean() if I.size else 1.0)
+    if init is not None:
+        s0, b0 = init
+        init = (s0.reshape(rows, K // group_size), b0.reshape(rows, K // group_size))
+    step = max(1, max_elems // max(1, K))
+    qs, ss, bs = [], [], []
+    for r in range(0, rows, step):
+        g = W[r:r + step]
+        ii = None if I is None else (I if I.shape[0] == 1 else I[r:r + step])
+        if method == "minmax":
+            q, s_, b_, _ = search_groups(g, bits, ii, store, xp, grid=(0.0,), refits=0)
+        else:
+            q, s_, b_, _ = search_groups(g, bits, ii, store, xp,
+                                         init=None if init is None else (init[0][r:r + step],
+                                                                         init[1][r:r + step]))
+        qs.append(np.asarray(q.astype(xp.uint8)) if xp is not np else q.astype(np.uint8))
+        ss.append(s_)
+        bs.append(b_)
+    q = np.concatenate(qs, 0).reshape(*shape[:-1], K)
+    cat = (lambda a: xp.concatenate(a, 0)) if xp is not np else (lambda a: np.concatenate(a, 0))
+    s = cat(ss).reshape(*shape[:-1], K // group_size)
+    b = cat(bs).reshape(*shape[:-1], K // group_size)
+    return pack_mlx(q, bits), s, b
+
+
+def weighted_error(w, packed, scales, biases, bits, group_size=64, imp=None):
+    """sum(imp * (w - dequant)^2) of a standard-MLX encoding, in numpy (for tests and the plan report)."""
+    import numpy as np
+    w = np.asarray(w, dtype=np.float32)
+    K = w.shape[-1]
+    q = unpack_mlx(packed, bits, K).astype(np.float32).reshape(*w.shape[:-1], K // group_size, group_size)
+    deq = q * np.asarray(scales, np.float32)[..., None] + np.asarray(biases, np.float32)[..., None]
+    e = (w.reshape(deq.shape) - deq) ** 2
+    if imp is not None:
+        e = e * np.asarray(imp, np.float32).reshape(1, K // group_size, group_size)
+    return float(e.sum())
+
+
+# GGUF imatrix names -> the HF / mlx-lm module path they describe (llama-family layout)
+_GGUF_TO_HF = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
+               "attn_output": "self_attn.o_proj", "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj",
+               "ffn_down": "mlp.down_proj", "ffn_gate_exps": "mlp.switch_mlp.gate_proj",
+               "ffn_up_exps": "mlp.switch_mlp.up_proj", "ffn_down_exps": "mlp.switch_mlp.down_proj"}
+
+
+def gguf_name_to_path(name):
+    """blk.3.attn_q.weight -> model.layers.3.self_attn.q_proj ; output.weight -> lm_head ; else None."""
+    n = name[:-len(".weight")] if name.endswith(".weight") else name
+    if n == "output":
+        return "lm_head"
+    m = re.match(r"blk\.(\d+)\.(\w+)$", n)
+    if m and m.group(2) in _GGUF_TO_HF:
+        return f"model.layers.{m.group(1)}.{_GGUF_TO_HF[m.group(2)]}"
+    return None
+
+
+def _read_imatrix(path):
+    """GGUF tensor name -> mean x^2 per input channel, from EITHER llama.cpp imatrix format (torch-free)."""
+    import numpy as np
+    try:                                                    # legacy .dat (ik_llama's and ours)
+        from pollard_calc import read_imatrix_legacy
+        raw = read_imatrix_legacy(path)
+        return {n: np.asarray(e["values"], np.float64) / max(e["ncall"], 1) for n, e in raw.items() if e["values"]}
+    except Exception:                                       # noqa: BLE001
+        pass
+    from gguf import GGUFReader                             # llama.cpp's GGUF imatrix
+    rd = GGUFReader(path)
+    sums = {t.name[:-len(".in_sum2")]: t for t in rd.tensors if t.name.endswith(".in_sum2")}
+    cnts = {t.name[:-len(".counts")]: t for t in rd.tensors if t.name.endswith(".counts")}
+    out = {}
+    for n, t in sums.items():
+        c = float(cnts[n].data.reshape(-1)[0]) if n in cnts else 1.0
+        out[n] = t.data.reshape(-1).astype(np.float64) / max(c, 1.0)
+    return out
+
+
+def load_importance(path):
+    """{module path: per-input-channel E[x^2]} from a llama.cpp imatrix (legacy .dat or GGUF; GGUF tensor
+    names mapped to module paths) or an .npz / .safetensors keyed by module path."""
+    import numpy as np
+    if path.endswith(".npz"):
+        z = np.load(path)
+        return {k: np.asarray(z[k], np.float32) for k in z.files}
+    if path.endswith(".safetensors"):
+        from safetensors.numpy import load_file
+        return {k: np.asarray(v, np.float32) for k, v in load_file(path).items()}
+    out = {}
+    for name, vals in _read_imatrix(path).items():
+        p = gguf_name_to_path(name)
+        if p:
+            out[p] = np.asarray(vals, np.float32)
+    return out
+
+
+class RangeSearchQuantize:
+    """Context manager: while active, mlx-lm's quantization goes through encode_affine (method "search").
+
+    mlx-lm calls quant_predicate(path, module) and then module.to_quantized(), which calls mx.quantize on that
+    module's weight -- so the predicate records the path (and the weight shape, to be sure) and the patched
+    mx.quantize looks up that path's imatrix row. Everything else (mode != affine, a shape that does not match)
+    falls through to MLX unchanged; the files mlx-lm writes are standard MLX affine either way."""
+
+    def __init__(self, importance=None, method="search"):
+        self.importance, self.method = importance or {}, method
+        self.current, self.current_w = None, None
+        self.stats = {"searched": 0, "weighted": 0, "passthrough": 0}
+
+    def note(self, path, module):
+        w = getattr(module, "weight", None)
+        self.current = (path, tuple(w.shape) if w is not None else None)
+        self.current_w = w
+
+    def __enter__(self):
+        import mlx.core as mx
+        self._orig = mx.quantize
+
+        def quantize(w, group_size=None, bits=None, mode="affine", **kw):
+            gs, b = group_size or 64, bits or 4
+            if mode != "affine" or kw.get("global_scale") is not None or b not in MLX_BITS:
+                self.stats["passthrough"] += 1
+                return self._orig(w, group_size, bits, mode=mode, **kw)
+            # QuantizedLinear.__init__ quantizes a RANDOM placeholder before from_linear quantizes the real
+            # weight: only the module's own weight array is worth searching
+            if w is not getattr(self, "current_w", None):
+                self.stats["passthrough"] += 1
+                return self._orig(w, group_size, bits, mode=mode, **kw)
+            path, shape = self.current or (None, None)
+            imp = self.importance.get(path) if (path and shape == tuple(w.shape)) else None
+            if imp is not None and imp.size not in (w.shape[-1], w.size) and imp.size % w.shape[-1]:
+                imp = None
+            init = self._orig(w, gs, b)[1:]
+            packed, s, bb = encode_affine(w, b, gs, imp=imp, method=self.method, xp=mx, init=init)
+            self.stats["searched"] += 1
+            self.stats["weighted"] += imp is not None
+            return mx.array(packed), s.astype(w.dtype), bb.astype(w.dtype)
+        mx.quantize = quantize
+        return self
+
+    def __exit__(self, *exc):
+        import mlx.core as mx
+        mx.quantize = self._orig
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -141,6 +450,12 @@ def main():
     ap.add_argument("--moe", dest="moe", action="store_true", default=None,
                     help="force MoE policy (default: auto-detect)")
     ap.add_argument("--dense", dest="moe", action="store_false", help="force dense policy")
+    ap.add_argument("--range", default="search", choices=RANGE_MODES,
+                    help="per-group scale/bias: 'search' (default) = imatrix-weighted range search, never worse "
+                         "than min/max per group; 'minmax' = MLX's own. Output is standard MLX affine either way")
+    ap.add_argument("--imatrix", help="activation importance for --range search: a llama.cpp imatrix (.dat/.gguf, "
+                    "llama-family names mapped) or .npz/.safetensors keyed by module path. Without it the "
+                    "search minimises plain weight error")
     ap.add_argument("--plan-only", action="store_true", help="print the per-module bit plan, build nothing")
     a = ap.parse_args()
 
@@ -192,24 +507,38 @@ def main():
     except Exception:
         sys.exit("ERROR: mlx_lm not installed. On Apple Silicon: pip install mlx_lm ; then rerun.")
 
+    rs = None
+    if a.range == "search":
+        imp = load_importance(a.imatrix) if a.imatrix else {}
+        rs = RangeSearchQuantize(imp, "search")
+        print(f"   range: imatrix-weighted search ({len(imp)} module rows from {a.imatrix})" if imp else
+              "   range: search on weight error (no --imatrix; pass one for the activation-weighted search)")
+
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
+        if rs is not None:
+            rs.note(path, module)                          # the next mx.quantize is this module's weight
         return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high)
 
+    import contextlib
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     ckw = dict(mlx_path=a.out, quantize=True, q_bits=low, q_group_size=a.group_size, quant_predicate=predicate)
-    try:
-        convert(a.model, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
-    except TypeError:
-        if trc:
-            print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
-        convert(a.model, **ckw)
+    with (rs if rs is not None else contextlib.nullcontext()):
+        try:
+            convert(a.model, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
+        except TypeError:
+            if trc:
+                print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
+            convert(a.model, **ckw)
+    if rs is not None:
+        print(f"   range search: {rs.stats['searched']} tensors searched "
+              f"({rs.stats['weighted']} imatrix-weighted)")
     try:
         import pollard_workspace as ws
         # record the ACTUAL avg bpw + a distinct tag so each ladder rung is listable on the card
         # (was always "4.8" regardless of the mix, so rungs collided)
         ws.record_build(a.model, "mlx", a.out, tag=(f"MLX-{a.bits}bit" if a.bits else f"mlx-{avg:.1f}bpw"),
-                        bpw=round(avg, 2))
+                        bpw=round(avg, 2))     # same files/tag either --range: the encoding is the same format
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote MLX model -> {a.out}\n"
