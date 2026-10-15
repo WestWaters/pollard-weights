@@ -423,6 +423,83 @@ def pin_uncovered(overrides, names, covered, base_preset, explicit=()):
     return pins + list(overrides), len(pins)
 
 
+def _resolve_quantize(a, cfg):
+    arch_name = cfg.get("_gguf_arch")
+    resolved = find_llama_bin(a.llama_quantize, arch=arch_name)
+    if resolved is None:
+        sys.exit(f"ERROR: no llama-quantize that knows the '{arch_name}' architecture was found -- pass "
+                 f"--llama-quantize /path/to/llama-quantize (a build new enough for this model).")
+    return resolved
+
+
+def _fit_passthrough(a, pt, src_tensors, arch, cfg, sensitivity, covered, tiers, out):
+    """pollard-fit on an already-quantized source: the passthrough policy (see pollard_passthrough)."""
+    classes = tuple(c.strip() for c in a.passthrough_classes.split(",") if c.strip())
+    bad = [c for c in classes if c not in pt.CLASSES]
+    if bad:
+        sys.exit(f"--passthrough-classes: unknown class {bad} (choose from {', '.join(pt.CLASSES)})")
+    budget = (a.ram * 0.85 - a.reserve) * 1e9
+    if budget <= 0:
+        sys.exit(f"ERROR: RAM budget {a.ram}GB minus {a.reserve}GB activation reserve leaves nothing for weights.")
+    try:
+        plan = pt.plan_passthrough(src_tensors, budget, sensitivity, classes, imatrix_ok=bool(a.imatrix),
+                                   covered=covered, pins=tiers)
+    except pt.PassthroughError as e:
+        sys.exit(f"ERROR: {e}")
+    print(f"== pollard-fit :: {a.gguf}  [PASSTHROUGH -- source is already quantized]")
+    from collections import Counter
+    src_types = Counter(t["type"] for t in src_tensors if t["ndim"] >= 2)
+    print(f"source              : {plan['source_bytes']/1e9:.2f} GB  ("
+          + ", ".join(f"{n}x {t}" for t, n in src_types.most_common(6)) + ")")
+    print(f"machine budget      : {a.ram:.0f} GB RAM ({a.reserve:.0f} GB reserved) -> {budget/1e9:.1f} GB for weights")
+    print(f"passthrough build   : {pt.describe(plan)}")
+    print(f"changeable classes  : {', '.join(classes)}  (everything else is copied byte-for-byte)")
+    print("sensitivity source  : " + ("measured profile" + (" (passthrough, vs this file)" if (sensitivity or {}).get("passthrough") else
+                                       " (f16-based -- run pollard-sensitivity --passthrough for one measured on this file)")
+                                       if sensitivity else "uniform (no --sensitivity profile)"))
+    if not plan["fits"]:
+        floor = pt.floor_bytes(src_tensors, classes, bool(a.imatrix), covered)
+        sys.exit(f"ERROR: cannot reach {budget/1e9:.2f} GB by downgrading {', '.join(classes)} alone (floor "
+                 f"{floor/1e9:.2f} GB{'' if a.imatrix else ' without an imatrix -- the 1-bit and IQ2 rungs need one'}). "
+                 f"Raise --ram or widen --passthrough-classes.")
+    if plan["changed"] and not a.imatrix:
+        print("NOTE: no --imatrix -- the IQ2 / 1-bit rungs are off; downgrades use q2_K and above only.")
+    if plan["changed"]:
+        print("NOTE: downgraded tensors are requantized from the SOURCE's dequantized values, not the original "
+              "bf16 (two roundings).\n      For a QAT source that is the right input; for a plain PTQ file a "
+              "rung from bf16 usually wins.")
+    lines, flags, stats = pt.quantize_plan(src_tensors, plan["assign"])
+    tt_file = out + ".tensor-types.txt"
+    cmd = pt.build_command(a.llama_quantize, a.gguf, out, tt_file, flags,
+                           a.imatrix if plan["changed"] else None, a.threads)
+    print(f"tensor map          : {stats['copy']} copied verbatim ({stats['copy_bytes']/1e9:.2f} GB), "
+          f"{stats['requant']} requantized")
+    print()
+    if a.plan_only:
+        print(f"plan only -- {len(lines)} exact-name tensor overrides; command that would run:")
+        print("  " + " ".join(cmd))
+        return
+    cmd[0] = _resolve_quantize(a, cfg)
+    with open(tt_file, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("building...")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    if a.verify:
+        rep = pt.verify_build(src_tensors, out, plan["assign"])
+        if not rep["ok"]:
+            sys.exit("ERROR: passthrough verification FAILED -- " + "; ".join((rep["mismatch"] + rep["missing"])[:6]))
+        print(f"verified: {rep['identical']} tensor(s) byte-identical to the source, {rep['requantized']} requantized as planned")
+    try:
+        import pollard_workspace as ws
+        bpw = round(os.path.getsize(out) * 8.0 / arch["total"], 2) if arch.get("total") else None
+        ws.record_build(a.gguf, "gguf", out, tag="passthrough", bpw=bpw)
+    except Exception as e:
+        print(f"   (warning: could not record build to the workspace manifest: {e})")
+    print(f"\ndone: {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -466,6 +543,16 @@ def main():
                     help="extend the floor to 1-bit (iq1_m/iq1_s) for models that won't "
                          "fit at iq2_xxs -- heavy quality loss, but giant MoEs absorb it. "
                          "Only used where the budget forces it.")
+    ap.add_argument("--passthrough", default="auto", choices=["auto", "on", "off"],
+                    help="ALREADY-QUANTIZED source (e.g. a vendor QAT GGUF): copy every tensor whose type does not "
+                         "change byte-for-byte, requantize only the tensors the measured allocation moves DOWN, and "
+                         "never upgrade one. 'auto' (default) turns it on when most of the source's weight bytes are "
+                         "already block-quantized. See tools/pollard_passthrough.py for the requant-source caveat.")
+    ap.add_argument("--passthrough-classes", default="bulk", metavar="CLASS[,CLASS]",
+                    help="which tensor classes a passthrough build may downgrade: bulk (routed experts + dense FFN, "
+                         "default), attn, shexp (shared experts), emb, other. Everything else is copied as-is.")
+    ap.add_argument("--no-verify", dest="verify", action="store_false",
+                    help="passthrough: skip the post-build byte check that copied tensors are identical to the source")
     a = ap.parse_args()
 
     tiers = {}
@@ -476,7 +563,7 @@ def main():
         k, v = k.strip().lower(), v.strip()
         if k not in ("attn", "bulk", "emb"):
             sys.exit(f"--tier class must be attn, bulk or emb; got '{k}'")
-        if v not in BPW:
+        if v not in BPW and not (a.passthrough != "off" and v.lower() in ("q8_0", "q4_k", "q2_k", "nvfp4", "mxfp4")):
             sys.exit(f"--tier type '{v}' is not a known quant type (see the ladder)")
         tiers[k] = v
 
@@ -508,6 +595,30 @@ def main():
     # cost is a slightly larger embedding and the alternative is a hard crash mid-build.
     covered = imatrix_covered_tensors(a.imatrix) if a.imatrix else None
     emb_imatrix_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
+    # PASSTHROUGH -- an already-quantized source keeps what it has: copy unchanged tensors verbatim,
+    # requantize only measured downgrades, refuse upgrades (pollard_passthrough). Its own planner works
+    # from the real per-tensor types, so the f16-oriented planner and guards below never run for it.
+    if a.passthrough != "off":
+        import pollard_passthrough as pt
+        try:
+            src_tensors = pt.read_tensors(a.gguf)
+        except Exception as e:                          # unreadable by gguf-py: only fatal when asked for
+            if a.passthrough == "on":
+                sys.exit(f"ERROR: --passthrough on, but the source's tensor table could not be read: {e}")
+            src_tensors = []
+        if src_tensors and (a.passthrough == "on" or pt.is_quantized_source(src_tensors)):
+            out = a.out
+            if not out:
+                try:
+                    import pollard_workspace as ws
+                    out = ws.resolve_out(a.gguf, "gguf", tag="passthrough", ext=".gguf")
+                    print(f"   (no --out) -> workspace: {out}")
+                except Exception:
+                    out = a.gguf.rsplit(".gguf", 1)[0] + "-pollard-pt.gguf"
+            return _fit_passthrough(a, pt, src_tensors, arch, cfg, sensitivity, covered, tiers, out)
+    for k, v in tiers.items():
+        if v not in BPW:
+            sys.exit(f"--tier type '{v}' is not a known quant type (see the ladder)")
     from pollard_ngram import disk_plan
     disk = disk_plan(meta, a.disk, a.disk_type)
     overrides, emb_type, gb, base_preset, (summary, src), explicit = plan_allocation(

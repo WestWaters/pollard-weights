@@ -159,6 +159,32 @@ Optional flagship extreme rung: an **automap 1-bit trellis mix** (the "gold-card
 
 ---
 
+## Already-quantized source (vendor QAT GGUF) — passthrough
+
+A QAT release (NVIDIA Nemotron-3.5-Bolt-24GB-GGUF: experts IQ2_XXS trained in, Mamba NVFP4, attention/embeddings
+Q8_0) must NOT be requantized wholesale — that dequantizes the QAT codes and rounds them again. Pollard's
+**passthrough** policy (`tools/pollard_passthrough.py`, auto-on when most weight bytes are already block-quantized):
+- a tensor whose assigned type == its current type is **copied byte-for-byte** (llama-quantize writes the source
+  bytes when target == current; pollard-fit re-hashes every copied tensor after the build and fails on any diff);
+- a tensor assigned a **lower** type is requantized (`--allow-requantize`) from its current data;
+- **no upgrades** — a plan or `--tier` asking for more bits than the tensor has is refused.
+- Only `--passthrough-classes` may move (default `bulk` = routed experts + dense FFN; also attn / shexp / emb /
+  other). Each quantizable tensor gets its own anchored line (`^blk\.1\.ffn_up_exps\.weight$=iq1_s`), base preset
+  Q8_0 decides nothing — first-match-wins cannot bite.
+```bash
+pollard --gguf Bolt-24GB.gguf --ladder --run          # imatrix + sensitivity ON THIS FILE, rungs PT25/50/75/100
+pollard-sensitivity --gguf Bolt-24GB.gguf --imatrix b.imatrix --eval held.txt --passthrough --out b.sens.json
+pollard-fit --gguf Bolt-24GB.gguf --ram 24 --reserve 0 --imatrix b.imatrix --sensitivity b.sens.json
+```
+`pollard-sensitivity --passthrough`: the quantized file is its own reference (no f16 exists), each probe crushes one
+layer's changeable tensors to the lowest legal type (iq1_s for IQ2_XXS + imatrix), the noise curve is measured
+relative to the file. Below IQ2_XXS only the 1-bit types exist and they need an imatrix — without one nothing in an
+IQ2 source can move. **Requant-source caveat:** a downgraded tensor is quantized from dequant(current), two
+roundings; right for QAT codes, but for an ordinary PTQ file a rung from bf16 usually wins. No trellis flagship on
+this path (automap requantizes everything). Runtime must load the arch (Bolt: llama.cpp ≥ cd0a5b6, #30520).
+
+---
+
 ## MoE path
 
 ### MoE QUALITY win — the MEASURED allocator (this is the proven one; do NOT reinvent it)

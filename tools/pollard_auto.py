@@ -360,6 +360,69 @@ def _build_ladder(a, ik_flagship):
         _run(cmd, a.run)
 
 
+def _passthrough_source(gguf):
+    """The source's tensor table when it is ALREADY quantized (a vendor QAT GGUF), else None."""
+    try:
+        import pollard_passthrough as pt
+        ts = pt.read_tensors(gguf)
+        return ts if pt.is_quantized_source(ts) else None
+    except Exception:
+        return None
+
+
+def _rung_out(gguf, label):
+    stem = os.path.splitext(os.path.basename(gguf))[0]
+    return os.path.join(os.path.dirname(os.path.abspath(gguf)) or ".", f"{stem}-{label}.gguf")
+
+
+def _build_ladder_passthrough(a, tensors):
+    """The publish ladder for an already-quantized source: rungs between the file as it is and its
+    floor (every changeable tensor at its lowest legal type), each built by pollard-fit's passthrough
+    policy -- untouched tensors copied byte-for-byte, the measured allocation choosing what drops."""
+    import pollard_passthrough as pt
+    from pollard_calc import imatrix_covered_tensors
+    covered = imatrix_covered_tensors(a.imatrix) if a.imatrix and os.path.exists(a.imatrix) else None
+    rungs = pt.ladder_targets(tensors, imatrix_ok=bool(a.imatrix), covered=covered)
+    src = sum(t["n_bytes"] for t in tensors)
+    print(f"   1) the passthrough ladder ({src/1e9:.2f} GB source -> "
+          f"{', '.join(f'{lb} ~{b/1e9:.2f} GB' for lb, b in rungs) or 'nothing reachable'}):")
+    if not rungs:
+        print("      nothing in the changeable classes can go lower" +
+              ("" if a.imatrix else " without an imatrix (the 1-bit / IQ2 rungs need one)") + ".")
+        return
+    binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
+    for label, target in rungs:
+        cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", f"{(target + 1) / 0.85e9:.9f}", "--reserve", "0",
+               "--passthrough", "on", "--out", _rung_out(a.gguf, label)]
+        if a.imatrix: cmd += ["--imatrix", a.imatrix]
+        if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]
+        if binq: cmd += ["--llama-quantize", binq]
+        if not a.run: cmd += ["--plan-only"]
+        _run(cmd, a.run)
+
+
+def _ensure_passthrough_sensitivity(a):
+    """Measured allocation for a passthrough ladder: pollard-sensitivity --passthrough, on the quantized
+    file as its own host (imatrix from the same host, held-out slice of Calib 3.0 as the eval)."""
+    if a.sensitivity or not a.measure or not a.imatrix:
+        if not a.sensitivity:
+            print("   (passthrough: no measured profile -- uniform importance across the changeable layers)")
+        return a.sensitivity
+    here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+    calib = a.calib or os.path.join(here, "pollard_calib.txt")
+    evalf = calib + ".heldout" if os.path.exists(calib + ".heldout") or not a.run else calib
+    prof = os.path.join(here, os.path.splitext(os.path.basename(a.gguf))[0] + ".passthrough.sensitivity.json")
+    cmd = ["pollard-sensitivity", "--gguf", a.gguf, "--imatrix", a.imatrix, "--eval", evalf,
+           "--passthrough", "--out", prof]
+    if str(a.ngl) != "auto":
+        cmd += ["--ngl", str(a.ngl)]
+    if getattr(a, "allow_slow", False):
+        cmd += ["--allow-slow"]
+    print("   measured allocation on the quantized host (pollard-sensitivity --passthrough):")
+    _run(cmd, a.run)
+    return prof
+
+
 def _automap_mix(a, is_moe, ik_dir=None):
     """Emit + (with --run) build the automap mix -- the hand-coded mixed-precision flagship.
     MoE: expert-allocation (crush cold experts, protect router/down/shared/attn). DENSE: the
@@ -643,6 +706,8 @@ def _ensure_imatrix(a):
              else find_llama_bin("llama-imatrix")) or "llama-imatrix"
     print("   0) auto-imatrix (Calib 3.0 -> llama-imatrix) -- no manual calibration step:")
     calib_cmd = ["pollard-calib", "--out", calib] + _calib_profile_args(a)
+    if getattr(a, "_passthrough", False):                # the passthrough sweep needs a held-out eval slice
+        calib_cmd[3:3] = ["--held-out", calib + ".heldout"]
     if not a.calib:
         print(f"      pollard-calib --out {os.path.basename(calib)} {' '.join(calib_cmd[3:])}")
     ngl = _fit_ngl(a.gguf, a.ngl)
@@ -866,6 +931,9 @@ def main():
                     help="build the whole publish ladder (Q6_K / IQ4_XS / IQ3_S / 2-bit) instead of one "
                          "--ram build: budgets are found by pollard-fit's own planner, the 2-bit rung is the "
                          "IQ*_KT flagship where ik_llama can build it and a stock IQ2 type where it cannot")
+    ap.add_argument("--allow-slow", action="store_true",
+                    help="let the passthrough sensitivity sweep run on a big model (it is one quantize + KL pass "
+                         "per layer; pollard-sensitivity refuses multi-hour sweeps without this)")
     ap.add_argument("--out", help="output path (dense build)")
     ap.add_argument("--eval", default="wikitext2_test.txt")
     ap.add_argument("--bin", help="llama.cpp bin dir (for the MoE dry-run/build)")
@@ -970,6 +1038,14 @@ def _dispatch(a):
     # (actual built size is reported by the build step; this is where Pollard will land)
     size_ladder((arch.get("total") or 0) / 1e9)
 
+    # ALREADY-QUANTIZED source (a vendor QAT GGUF): the passthrough policy. Its QAT tensors are copied
+    # byte-for-byte; the imatrix and the sensitivity sweep run on this file as host; the measured
+    # allocation only decides which tensors drop. No f16 ladder, no trellis flagship (both would
+    # requantize everything).
+    pt_tensors = _passthrough_source(a.gguf)
+    if pt_tensors is not None:
+        return _dispatch_passthrough(a, pt_tensors)
+
     # Autoaware: which lanes are actually open for THIS architecture (never plan an impossible build)
     ik_dir = find_ik_build(getattr(a, "bin", None))
     ik_known = lane_report(a.gguf, ik_dir=ik_dir)
@@ -1019,6 +1095,34 @@ def _dispatch(a):
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
+    if a.run and getattr(a, "card", True):
+        _emit_card(a)
+    if not a.run:
+        print("\n   plan only -- re-run with --run to execute.")
+
+
+def _dispatch_passthrough(a, tensors):
+    from collections import Counter
+    types = Counter(t["type"] for t in tensors if t["ndim"] >= 2)
+    print("   source is ALREADY QUANTIZED (" + ", ".join(f"{n}x {t}" for t, n in types.most_common(5)) + ")")
+    print("   path: PASSTHROUGH -- untouched tensors copied byte-for-byte, measured downgrades only, no upgrades;"
+          " imatrix + sensitivity measured on this file as host")
+    if not a.imatrix and a.auto_imatrix:
+        a._passthrough = True
+        a.imatrix = _ensure_imatrix(a)
+    a.sensitivity = _ensure_passthrough_sensitivity(a)
+    if a.ladder:
+        _build_ladder_passthrough(a, tensors)
+    else:
+        cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram), "--passthrough", "on"]
+        if a.imatrix: cmd += ["--imatrix", a.imatrix]
+        if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]
+        if a.out: cmd += ["--out", a.out]
+        if a.bin: cmd += ["--llama-quantize", _bin_in(a.bin, "llama-quantize")]
+        if not a.run: cmd += ["--plan-only"]
+        print("   1) one passthrough build that fits --ram:")
+        _run(cmd, a.run)
+    print("   2) (no trellis flagship for a quantized source: automap would requantize every tensor, QAT ones included)")
     if a.run and getattr(a, "card", True):
         _emit_card(a)
     if not a.run:
