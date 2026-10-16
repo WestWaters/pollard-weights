@@ -100,7 +100,8 @@ def test_dry_run_prints_everything_and_runs_nothing(model, monkeypatch):
     assert not ran
     text = "\n".join(lines)
     assert "(per rung) verify: $ pollard-verify --lane gguf" in text
-    assert "NOT wired" in text, "the draft lane says what it is"
+    assert "$ pollard-draft find --target" in text and "(per rung) measure: $ pollard-draft measure" in text, \
+        "the draft lane plans find -> convert -> measure + gate per drafter rung"
     assert set(st.values()) <= {"planned", "note"}
 
 

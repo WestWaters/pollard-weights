@@ -35,6 +35,9 @@ forge = ["torch", "transformers", "safetensors", "datasets", "tokenizers"]
 # fine-tune on your own data (pollard-tune): TRL+PEFT on CUDA/CPU; on Apple Silicon `pip install mlx-lm` instead
 tune = ["torch", "transformers", "safetensors", "datasets", "trl", "peft"]
 hf = ["huggingface-hub", "hf-transfer"]                            # publishing to the Hub
+# speculative drafters (pollard-draft): find/measure are stdlib + llama.cpp; convert pulls from the Hub. Serving
+# them elsewhere is the runtime's own install (vllm, dflash-mlx); training is `pip install speculators` on a CUDA box
+draft = ["huggingface-hub"]
 all = ["torch", "transformers", "safetensors", "exllamav3", "datasets", "gptqmodel",
        "mlx-lm", "llmcompressor", "huggingface-hub", "hf-transfer", "matplotlib"]
 # the connectome memory lane: attaches a fly brain to a frozen model (pollard-flybrain)
@@ -128,6 +131,8 @@ pollard-onboard = "pollard_onboard:main"
 pollard-envmatch = "pollard_envmatch:main"
 # every lane as a full ladder of rungs, gated, carded and (on request) published -- also `pollard release`
 pollard-release = "pollard_release:main"
+# a speculative-decoding drafter matched to the quantized target: find / convert / measure / card / train recipe
+pollard-draft = "pollard_draft:main"
 
 [tool.setuptools]
 package-dir = { "" = "tools" }
@@ -142,7 +147,7 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "p
     "pollard_runtime", "pollard_runtime_update", "pollard_kvbench", "pollard_passthrough", "pollard_fq",
     # declared as entry points but never listed here, so `pollard-trellis` and friends installed
     # as a command with no module behind it
-    "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis"]
+    "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis", "pollard_draft"]
 
 # the window's own HTML/CSS/JS and the bear it puts in the dock
 [tool.setuptools.package-data]
