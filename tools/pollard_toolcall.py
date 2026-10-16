@@ -1181,7 +1181,8 @@ def preflight_inprocess(backend, model, kind=None):
     # hf
     if not (_has_module("transformers") and _has_module("torch")):
         raise NotMeasured("transformers + torch are not installed here")
-    meth = quant_method(model)
+    import pollard_mxfp6                                         # a pollard-mx MXFP6 / mix rung: decoded, no loader
+    meth = "" if pollard_mxfp6.read_meta(model) else quant_method(model)
     if meth:
         if meth not in HF_QUANT_NEEDS or HF_QUANT_NEEDS[meth] is None:
             raise NotMeasured(_HF_NO_LOADER.get(meth, f"transformers has no loader for a '{meth}' checkpoint here"))
@@ -1290,10 +1291,14 @@ class HFEngine:
         kw = {"trust_remote_code": trc}
         if device == "cuda":
             kw["device_map"] = "cuda"
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto", **kw)
-        except TypeError:                                        # transformers 4.x spelling
-            self.model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto", **kw)
+        import pollard_mxfp6
+        if pollard_mxfp6.read_meta(model):                       # pollard-mx MXFP6 / mix: its own bytes, decoded
+            self.model = pollard_mxfp6.load_hf_model(model, "cuda" if device == "cuda" else "cpu", trc)
+        else:
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto", **kw)
+            except TypeError:                                    # transformers 4.x spelling
+                self.model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto", **kw)
         if device in ("cpu", "mps"):
             self.model = self.model.to(device)
         self.model.eval()
@@ -1558,12 +1563,17 @@ def _ref_cache_path(ref, key):
     return os.path.join(d, f"{os.path.basename(ref)}.toolcall-{key}.json")
 
 
-def effective_backend(backend, server=None):
+def effective_backend(backend, server=None, model=None):
     """(backend, note): vLLM where a usable one is installed; where it is not (Windows' kernel-less source build, not
-    installed) the in-process transformers backend measures the same checkpoint instead, and the note says why."""
+    installed) the in-process transformers backend measures the same checkpoint instead, and the note says why. A
+    pollard-mx MXFP6 / mix rung this vLLM cannot load goes in-process too (decoded from its own bytes)."""
     if backend != "vllm":
         return backend, None
     ok, why = vllm_status(server)
+    if ok and model and os.path.isdir(str(model)):
+        import pollard_mxfp6
+        why = pollard_mxfp6.vllm_load_problem(model)
+        ok = not why
     if ok:
         return backend, None
     return "hf", f"{why} -- measured in-process with transformers instead"
@@ -1580,7 +1590,7 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
             kind = classify(model)
         except (Exception, SystemExit):                          # noqa: BLE001
             kind = {}
-    backend, note = effective_backend(backend, server)
+    backend, note = effective_backend(backend, server, model)
     extra = preflight(backend, model, ngl, kind, server) if backend != "url" else {}
     thinking = bool(kind.get("thinking"))
     budget = max_tokens or (N_PREDICT_REASONING if thinking and not no_think else 384)
@@ -1618,7 +1628,7 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
     """The reference's rows, cached: every rung of a ladder is compared to the same reference, so it runs once."""
     if backend == "url":
         return run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend, url=url)
-    backend, _ = effective_backend(backend, server)             # key the cache on what actually runs
+    backend, _ = effective_backend(backend, server, ref)        # key the cache on what actually runs
     key = suite_hash(probes, f"{fingerprint(ref)}:{max_tokens}:{no_think}:{backend}")
     path = _ref_cache_path(ref, key)
     if not refresh and os.path.isfile(path):

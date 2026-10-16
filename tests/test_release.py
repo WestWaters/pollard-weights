@@ -38,7 +38,7 @@ def test_template_parses_and_presets_merge():
     assert cfg["preset"] == "text" and cfg["upload"] is False and cfg["ngl"] == 0
     assert cfg["lanes"]["mlx"]["rungs"] == [2, 3, 4, 5, 6, 8]
     assert cfg["lanes"]["gptq"]["rungs"] == [2, 3, 4, 8]
-    assert cfg["lanes"]["mx"]["rungs"] == ["nvfp4", "mxfp4", "fp8"]
+    assert cfg["lanes"]["mx"]["rungs"] == ["nvfp4", "mxfp4", "fp8", "mxfp6_e2m3", "mxfp6_e3m2", "mix4.5", "mix5", "mix5.5"]
     assert cfg["lanes"]["draft"]["enabled"] is False
     moe = R.load_plan(None, "moe")
     assert moe["lanes"]["gptq"]["rungs"] == [4, 8] and moe["lanes"]["mx"]["moe_protect_attn_only"] is True
@@ -70,7 +70,8 @@ def test_every_lane_is_a_ladder_with_build_then_verify_per_rung(model):
     assert got.index("prep/calib") < got.index("prep/probe") < got.index("gguf/ladder")
     assert got.index("prep/smooth") < got.index("gptq/int2/build")
     for lane, tags in {"mlx": ["2bit", "3bit", "4bit", "5bit", "6bit", "8bit"], "gptq": ["int2", "int3", "int4", "int8"],
-                       "mx": ["NVFP4", "MXFP4", "FP8"], "exl3": ["2.5bpw", "3.0bpw", "4.0bpw", "5.0bpw", "6.0bpw"]}.items():
+                       "mx": ["NVFP4", "MXFP4", "FP8", "MXFP6-E2M3", "MXFP6-E3M2", "MIX-4.5bpw", "MIX-5bpw", "MIX-5.5bpw"],
+                       "exl3": ["2.5bpw", "3.0bpw", "4.0bpw", "5.0bpw", "6.0bpw"]}.items():
         for t in tags:
             assert got.index(f"{lane}/{t}/build") + 1 == got.index(f"{lane}/{t}/verify")
         assert got.index(f"{lane}/{tags[-1]}/verify") < got.index(f"{lane}/card") < got.index(f"{lane}/upload")

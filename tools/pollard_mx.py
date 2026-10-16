@@ -37,6 +37,13 @@ compressed-tensors checkpoint: `vllm serve ./M-NVFP4` (Rubin: the vllm/vllm-open
 `--plan-only` needs nothing and prints the recipe. NVFP4 is vLLM-validated; MXFP4 is experimental upstream
 (flagged at runtime) and runs on Blackwell/Rubin via flashinfer_cutlass (validate before shipping). Verify every build with
 `pollard-verify --lane mx --model <out> --source <hf> --eval <heldout.txt> --gate` before shipping.
+
+MXFP6 + MEASURED MIXES (pollard_mxfp6; model-free, weight-only, CPU, no llm-compressor):
+  pollard-mx --model <hf> --format mxfp6-e2m3 --out ./M-MXFP6-E2M3     # 6.25 bpw, compressed-tensors (Graft loads it)
+  pollard-mx --model <hf> --format mxfp6-e3m2 --out ./M-MXFP6-E3M2     # 6.25 bpw, Quark layout (vLLM main loads it)
+  pollard-mx --model <hf> --mix 5.5 --sensitivity s.json --out ./M-MIX # FP8 / MXFP6 / FP4 per fused layer, <= 5.5 bpw
+The mix measures every linear at every atom and spends the bit budget where the sensitivity profile says it pays;
+see tools/pollard_mxfp6.py for the formats, layouts and which runtimes load each.
 """
 import argparse, json, os, sys
 import pollard_workspace as ws
@@ -372,6 +379,37 @@ def _snapshot(model_id):
     return snapshot_download(model_id, allow_patterns=["*.safetensors", "*.json"])
 
 
+def mx6_main(a):
+    """--format mxfp6-* / --mix: the model-free MX encoder (pollard_mxfp6)."""
+    import pollard_mxfp6 as M6
+    if a.format and a.mix is not None:
+        sys.exit("ERROR: --format and --mix are separate rungs; pass one")
+    src = a.model if os.path.isdir(a.model) else _snapshot(a.model)
+    sens = {}
+    if a.sensitivity and os.path.exists(a.sensitivity):
+        sens = json.load(open(a.sensitivity))
+        sens = sens.get("layers", sens) if isinstance(sens, dict) else {}
+    imp = {}
+    if a.imatrix:
+        from pollard_mlx import load_importance
+        imp = load_importance(a.imatrix)
+    tag = (a.format or f"mix-{a.mix:g}bpw").upper()
+    out = a.out or ws.resolve_out(a.model, "mx", tag=tag)
+    print(f"== pollard-mx :: {a.model}  {a.format or f'measured mix <= {a.mix:g} bpw'}  (model-free, weight-only)")
+    meta = M6.build(src, out, fmt=a.format, mix=a.mix, layout=a.layout, fp6=a.fp6, fp4=a.fp4, rule=a.scale_rule,
+                    importance=imp, sens=sens, focus=ws.parse_layers(a.focus_layers),
+                    quantize_vision=a.quantize_vision, plan_only=a.plan_only)
+    if a.plan_only:
+        return
+    ws.record_build(a.model, "mx", out, tag=tag, bpw=meta["bpw"])
+    print(f"wrote MX checkpoint -> {out}  ({meta['layout']}, {meta['bpw']} bpw)")
+    for rt, status, how in meta["runtimes"]:
+        print(f"   {rt:18s} {status:8s} {how}")
+    for line in M6.serve_lines(meta, out):
+        print(f"  run:  {line}")
+    print(f"  VERIFY:  pollard-verify --lane mx --model {out} --source {a.model} --eval <heldout.txt> --gate")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -414,7 +452,25 @@ def main():
                     help="run a model's own modeling code (custom archs like Spark2_5); 'auto' = only if "
                          "config.json has an auto_map")
     ap.add_argument("--plan-only", action="store_true", help="print the recipe + avg bits, build nothing")
+    ap.add_argument("--format", choices=["mxfp6-e3m2", "mxfp6-e2m3"],
+                    help="a uniform OCP MXFP6 rung (every decoder linear at 6.25 bpw; routers / lm_head / embeddings / "
+                         "towers kept at source precision). Model-free, CPU, no calibration")
+    ap.add_argument("--mix", type=float, metavar="BPW",
+                    help="a measured MX mix under this average bits/weight (scales included): each fused layer gets "
+                         "MXFP8 / MXFP6 / FP4 by measured error x the --sensitivity profile")
+    ap.add_argument("--layout", default="auto", choices=["auto", "quark", "compressed-tensors"],
+                    help="--format/--mix on-disk layout: auto = compressed-tensors for uniform E2M3 (Graft, "
+                         "compressed-tensors), quark otherwise (vLLM main; the only layout with E3M2)")
+    ap.add_argument("--fp6", default="auto", choices=["auto", "e2m3", "e3m2"],
+                    help="--mix: the FP6 element; auto = whichever reconstructs each layer better")
+    ap.add_argument("--fp4", choices=["mxfp4", "nvfp4"],
+                    help="--mix: the FP4 atom (default: nvfp4 for compressed-tensors, mxfp4 for quark)")
+    ap.add_argument("--scale-rule", default="search", choices=["ocp", "search"],
+                    help="--format/--mix E8M0 scale: 'ocp' = the spec's floor(log2 amax) - emax; 'search' = that or "
+                         "one step either side, lowest (imatrix-weighted) error. Output is standard MX either way")
     a = ap.parse_args()
+    if a.format or a.mix is not None:
+        return mx6_main(a)
 
     n_layers, moe = a.layers, False
     try:
