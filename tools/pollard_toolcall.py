@@ -23,7 +23,8 @@ server parser reads it:
       exl3  exllamav3                                              EXL3
       hf    transformers                                           GPTQ / AWQ / FP8 / compressed-tensors where no
                                                                    usable vLLM is (Windows, not installed); the bf16
-                                                                   reference of an EXL3 / in-process rung
+                                                                   reference of an EXL3 / in-process rung; an
+                                                                   EXLR8 rung (its reference decode, pollard-exlr8)
 
 Every path ends in the same grader (grade_reply): a served reply and an in-process one are graded by one function.
 --backend auto (default) picks the backend from the file, the workspace MANIFEST lane or config.json; a GPTQ / MX
@@ -739,7 +740,10 @@ BACKENDS = ("gguf", "mlx", "vllm", "exl3", "hf", "url")
 #: the backends that run the model inside this process (no server, Pollard's own reader)
 INPROCESS = ("exl3", "hf")
 #: build lane -> the backend that serves it (a vllm lane falls back to hf where no usable vLLM is installed)
-LANE_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "awq": "vllm", "mx": "vllm", "exl3": "exl3"}
+LANE_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "awq": "vllm", "mx": "vllm", "exl3": "exl3",
+                # an EXLR8 rung runs in transformers on its reference decode (GR8 serves GLM-5.3 only; vLLM cannot
+                # load EXLR8 files): the hf engine loads it through pollard_exlr8.load_model
+                "exlr8": "hf"}
 #: the backend -> how the card and the logs name it
 BACKEND_SERVER = {"gguf": "llama-server --jinja", "mlx": "mlx_lm.server", "vllm": "vllm serve",
                   "exl3": "exllamav3 (in-process)", "hf": "transformers (in-process)",
@@ -788,6 +792,8 @@ def lane_of(path):
         return "gguf"
     if not p or not os.path.isdir(p):
         return None
+    if os.path.isfile(os.path.join(p, "pollard-exlr8.json")):     # an EXLR8 rung carries its marker
+        return "exlr8"
     try:
         import pollard_workspace as ws
         _, b = ws.find_build(p)
@@ -1157,6 +1163,15 @@ def reader_family(kind):
     raise NotMeasured(f"no in-process reader for the '{fam}' call syntax here (serve it with --backend url)")
 
 
+def exlr8_decoded_gb(rung):
+    """bf16 GB of an EXLR8 rung once decoded (what the engine will hold), from the safetensors headers alone."""
+    try:
+        import pollard_exlr8 as X
+        return X.decoded_bytes(rung) / 1e9
+    except Exception:                                            # noqa: BLE001 -- unreadable: size on disk
+        return model_gb(rung)
+
+
 def _gpu_or_none():
     try:
         return gpu_free_gb()
@@ -1167,7 +1182,7 @@ def _gpu_or_none():
 def preflight_inprocess(backend, model, kind=None):
     """exl3 / hf: what this machine can run in this process, and on which device. Returns {"device": ...} (the run
     reads it, the request does not). Memory first, then the shared-GPU rule, as for the served backends."""
-    need = model_gb(model)
+    need = exlr8_decoded_gb(model) if lane_of(model) == "exlr8" else model_gb(model)
     reader_family(kind)
     if backend == "exl3":
         if _gpu_or_none() is None:
@@ -1292,7 +1307,10 @@ class HFEngine:
         if device == "cuda":
             kw["device_map"] = "cuda"
         import pollard_mxfp6
-        if pollard_mxfp6.read_meta(model):                       # pollard-mx MXFP6 / mix: its own bytes, decoded
+        if lane_of(model) == "exlr8":                            # EXLR8: the weights the stored codes decode to
+            import pollard_exlr8 as X
+            self.model = X.load_model(model, device, trust_remote_code=trc)
+        elif pollard_mxfp6.read_meta(model):                     # pollard-mx MXFP6 / mix: its own bytes, decoded
             self.model = pollard_mxfp6.load_hf_model(model, "cuda" if device == "cuda" else "cpu", trc)
         else:
             try:

@@ -22,4 +22,11 @@ lanes:
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
   mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
-  draft: {enabled: false}      # EAGLE3 draft head per rung -- not wired yet
+  # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
+  exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
+  draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128,
+          prefer_own: false, train: {kind: eagle3, rung: Q4_K_M, taps: rung, samples: null, max_steps: null}}
+                               # speculative drafter (pollard-draft): drafter = auto (search the Hub) or a repo id;
+                               # measured against `targets` (all = every GGUF rung of this release, or a list of tags).
+                               # Nothing redistributable published (or prefer_own) -> Pollard trains its own head on a
+                               # CUDA box, quant-aware vs train.rung, measured vs the rungs AND f16

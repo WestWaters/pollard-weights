@@ -37,10 +37,11 @@ LANE_TAGS = {"gguf": ["gguf", "llama.cpp", "ik_llama.cpp", "trellis", "imatrix"]
              # formats as Blackwell through vLLM. llama.cpp has no FP4 tensor-core path on sm_100/107, so
              # a GGUF card must never carry a Rubin tag that reads as an optimized build for it.
              "mx": ["nvfp4", "fp8", "mxfp6", "compressed-tensors", "vllm", "blackwell", "rubin", "vera-rubin"],
-             "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"]}
+             "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"], "exlr8": ["exlr8", "trellis"]}
 # lane -> the hero's "Pollard shrank this model<...>" phrase
 LANE_WORD = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
-             "mx": " for Blackwell/Rubin (vLLM)", "exl3": " for exllamav3"}
+             "mx": " for Blackwell/Rubin (vLLM)", "exl3": " for exllamav3",
+             "exlr8": " in EXLR8 (one trellis encode, every rung a manifest)"}
 RUBIN_VLLM_IMAGE = "vllm/vllm-openai:cu134-nightly"
 
 
@@ -507,6 +508,10 @@ def tool_serve_lines(tools, lanes, repo, example_file):
         out.append(f"- **vLLM**{what}: `vllm serve {target} {tools['vllm_flags']}`{note}")
     else:
         out.append("- **vLLM**: no `--tool-call-parser` reads this syntax; parse the calls client-side.")
+    if "exlr8" in lanes:
+        parser = f" {tools['vllm_flags']}" if tools.get("vllm_parser") else ""
+        out.append(f"- **EXLR8**: decode a rung (`pollard-exlr8 --decode <rung folder> --out ./bf16`), then "
+                   f"`vllm serve ./bf16{parser}` -- the decode is bit-exact to the stored codes.")
     if "exl3" in lanes:
         out.append(f"- **ExLlamaV3** (EXL3): serve a rung folder with [TabbyAPI](https://github.com/theroyallab/tabbyAPI) "
                    "(`python main.py --model-dir . --model-name <rung folder>`) and pass `tools` in "
@@ -557,7 +562,8 @@ def rungs_section(builds, lane, repo):
     if lane == "gguf" or not builds:
         return []
     run = {"mlx": "mlx_lm.generate --model ./{d} --prompt \"Hello\"", "gptq": "vllm serve ./{d}",
-           "mx": "vllm serve ./{d}", "exl3": "# load ./{d} in exllamav3 / TabbyAPI"}.get(lane, "")
+           "mx": "vllm serve ./{d}", "exl3": "# load ./{d} in exllamav3 / TabbyAPI",
+           "exlr8": "pollard-exlr8 --decode ./{d} --out ./{d}-bf16 && vllm serve ./{d}-bf16"}.get(lane, "")
     rows = [f"| `{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} |"
             for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
     pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
@@ -607,6 +613,44 @@ def mx_rungs_section(builds, repo, pick):
     out += ["```bash", f'hf download {repo} --include "{pick}/*" --local-dir .']
     out += [s for s in dict.fromkeys(serve) if f"./{pick}" in s] or [f"vllm serve ./{pick}"]
     return out + ["```", ""]
+
+
+#: the one architecture GR8 (kindlingai/gr8) serves today -- GLM-5.3 on 3/4/6 DGX Spark (GB10) boxes
+GR8_ARCHS = ("GlmMoeDsaForCausalLM",)
+
+
+def exlr8_section(builds, repo, cfg=None):
+    """How an EXLR8 rung runs, said plainly. GR8 (the EXLR8 engine) serves GLM-5.3 on GB10 boxes, from its release
+    layout: per-unit routed-expert files (experts/exlr8-layer-LLL.kK) next to the dense records. A rung gets the GR8
+    command only when it IS that model AND ships those files; every other rung -- today all of pollard-exlr8's,
+    which writes dense records -- runs through the reference decode, and the card says so."""
+    if not builds:
+        return []
+    arch = ((cfg or {}).get("architectures") or [None])[0]
+    pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), "exlr8")
+    gr8 = arch in GR8_ARCHS and all(os.path.isdir(os.path.join(str(b.get("path") or ""), "experts")) for b in builds)
+    out = ["## Running EXLR8 rungs", "",
+           "Each rung folder is an EXLR8 v2 fileset (`dense/exlr8-dense-LLL.safetensors` trellis records, "
+           "`dense/exlr8-vocab.safetensors`, `manifests/exlr8-manifest-<rung>.json`). Every rung comes from ONE "
+           "encode of each tensor at K = 2-6 bits; the manifest records the width each tensor got -- an exact "
+           "knapsack on Pollard's measured sensitivity under the rung's byte budget.", ""]
+    if gr8:
+        out += ["[GR8](https://github.com/kindlingai/gr8) serves this architecture on DGX Spark (GB10) boxes with an "
+                "OpenAI-compatible API on the head node:", "",
+                "```bash", f"./gr8 glm53 up --tp 4 --peers <ip1>,<ip2>,<ip3>,<ip4> --model https://huggingface.co/{repo}",
+                "```", ""]
+    else:
+        why = f"not `{arch}`" if arch and arch not in GR8_ARCHS else "and loads routed experts from per-unit expert " \
+            "files these rungs do not carry"
+        out += [f"[GR8](https://github.com/kindlingai/gr8), the EXLR8 engine, serves one model today (GLM-5.3 on DGX "
+                f"Spark boxes), {why}. Run these rungs through the reference decode, which is bit-exact to the "
+                "stored codes and is what the numbers on this card measured:", ""]
+    out += ["```bash", 'pip install "pollard-weights[exlr8]"',
+            f'hf download {repo} --include "{pick}/*" --local-dir .',
+            f"pollard-exlr8 --decode ./{pick} --out ./{pick}-bf16",
+            f"vllm serve ./{pick}-bf16        # or transformers: AutoModelForCausalLM.from_pretrained('./{pick}-bf16')",
+            "```", ""]
+    return out
 
 
 def gate_verdict(b, results):
@@ -883,6 +927,9 @@ def main():
     ap.add_argument("--credits", action="append", default=[],
                     help="extra credit bullet (repeatable); base model + llama.cpp + Pollard are automatic")
     ap.add_argument("--base-owner", help="who published the base model, for Credits")
+    ap.add_argument("--draft-results", help="results-draft.json from pollard-draft measure: adds a Speculative "
+                    "decoding section (matched drafter, measured tokens per target pass, this lane's serve line)")
+    ap.add_argument("--draft-repo", help="the drafter repo (<M>-Pollard-DRAFT) the section points at")
     ap.add_argument("--extra-md", help="markdown file of EXTRA `## ` sections for this model -- the "
                     "per-model prose the template cannot know (a measured comparison, an arch note, a "
                     "quirk). Inserted after Available files, in file order, so regenerating a card "
@@ -1304,8 +1351,16 @@ def main():
     if "mlx" in lanes:
         out += ["```bash", f'mlx_lm.generate --model {repo} --prompt "Hello"', "```", ""]
     out += vllm_serve_block(repo, lanes)
+    if "exlr8" in lanes:
+        out += exlr8_section(builds, repo, cfg)
     if not decision:
         out += tool_serving_section(facts.get("tools"), lanes, repo, exn)
+    # ---- Speculative decoding: the matched drafter (pollard-draft), measured against these quantized rungs
+    if a.draft_results and os.path.exists(a.draft_results) and a.draft_repo:
+        import pollard_draft as PD
+        org = repo.split("/")[0] if "/" in repo else (account or PLACEHOLDER_OWNER)
+        trepos = {**PD.target_repos_for(org, base_model, lanes), primary: repo}
+        out += PD.card_section(json.load(open(a.draft_results, encoding="utf-8")), a.draft_repo, trepos, primary)
 
     # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
     # prints from, so the card and the CLI cannot drift apart

@@ -24,6 +24,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --hf Qwen/Qwen3-8B --format mlx --run   # MLX for Apple Silicon
     pollard --hf Qwen/Qwen3-8B --format exl3 --run  # EXL3 (exllamav3 -- heavy trellis)
     pollard --hf Qwen/Qwen3-8B --format mx --run    # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
+    pollard --hf Qwen/Qwen3-8B --format exlr8 --run # EXLR8: one trellis encode, the whole bpw ladder as manifests
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
     pollard tune --base Qwen/Qwen3.5-9B --data cases.csv --out runs/x --ship   # fine-tune + eval + ship (pollard-tune)
@@ -135,7 +136,8 @@ def _resolve_tool(cmd):
     clean convert because `pollard-calib` was "not found" on a box that had the module right here. If
     the launcher is missing, run the module behind it with this interpreter instead."""
     import shutil
-    if not cmd or not str(cmd[0]).startswith("pollard-") or shutil.which(str(cmd[0])):
+    name = str(cmd[0]) if cmd else ""
+    if not cmd or not (name == "pollard" or name.startswith("pollard-")) or shutil.which(name):
         return cmd
     here = os.path.dirname(os.path.abspath(__file__))
     try:
@@ -343,6 +345,14 @@ def pick_ladder(points, f16_gb, ik_flagship=False):
     return out
 
 
+def _wanted_rungs(a):
+    """--rung LABEL (repeatable / comma list): build only these ladder labels (`flagship` = the automap mix).
+    None = the whole ladder + flagship. `pollard release --free-after-upload` builds one rung at a time with it, so
+    a box with less free disk than the whole ladder can still publish every rung."""
+    want = [x.strip() for r in (getattr(a, "rung", None) or []) for x in str(r).split(",") if x.strip()]
+    return {w.upper() if w.lower() != "flagship" else "flagship" for w in want} or None
+
+
 def _build_ladder(a, ik_flagship):
     pts = ladder_points(a.gguf, a.imatrix, a.sensitivity)
     f16_gb = os.path.getsize(a.gguf) / 1e9
@@ -350,6 +360,10 @@ def _build_ladder(a, ik_flagship):
     print(f"   1) the publish ladder ({', '.join(picks) or 'nothing reachable'}):")
     for label, (ram, preset, gb) in picks.items():
         print(f"      {label:<7} --ram {ram:<5} -> {preset} ~{gb:.1f} GB")
+    want = _wanted_rungs(a)
+    if want is not None:
+        picks = {k: v for k, v in picks.items() if k.upper() in want}
+        print(f"      --rung: building {', '.join(picks) or 'no ladder rung'} this run")
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, (ram, preset, gb) in picks.items():
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0"]
@@ -390,6 +404,10 @@ def _build_ladder_passthrough(a, tensors):
         print("      nothing in the changeable classes can go lower" +
               ("" if a.imatrix else " without an imatrix (the 1-bit / IQ2 rungs need one)") + ".")
         return
+    want = _wanted_rungs(a)
+    if want is not None:
+        rungs = [(lb, t) for lb, t in rungs if lb.upper() in want]
+        print(f"      --rung: building {', '.join(lb for lb, _ in rungs) or 'no passthrough rung'} this run")
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, target in rungs:
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", f"{(target + 1) / 0.85e9:.9f}", "--reserve", "0",
@@ -450,10 +468,31 @@ def _automap_mix(a, is_moe, ik_dir=None):
     if ik_dir or a.bin:
         am += ["--bin", ik_dir or a.bin]                    # the build find_ik_build() checked
     _run(am, a.run, cwd=here)
+    if a.run and not a.benchmark:
+        _record_flagship(a, here)
     mode = "3-bar BENCHMARK + PPL" if a.benchmark else "ONE mix model, no eval (fast)"
     print(f"   -> run {os.path.basename(out)} on the box -> {mode}"
           + ("" if a.benchmark else "  (add --benchmark for the gold-card numbers)"))
     return out
+
+
+def _record_flagship(a, here, body=None):
+    """Put the automap mix in the MANIFEST beside the ladder rungs, so pollard-release measures, gates, cards and
+    publishes it like any other rung. automap writes `<stem>-mix.gguf` next to the f16; the tag is its body atom
+    (iq1_kt by default with an imatrix -> IQ1_KT, the name the published flagships use)."""
+    stem = os.path.splitext(os.path.basename(a.gguf))[0]
+    mix = os.path.join(here, f"{stem}-mix.gguf")
+    if not os.path.isfile(mix):
+        return None
+    try:
+        import pollard_workspace as ws
+        arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
+        bpw = round(os.path.getsize(mix) * 8.0 / arch["total"], 2) if arch.get("total") else None
+        return ws.record_build(a.gguf, "gguf", mix, tag=str(body or "iq1_kt").upper(), bpw=bpw,
+                               extra={"flagship": True})
+    except Exception as e:                                               # noqa: BLE001
+        print(f"   (warning: could not record the flagship in the workspace manifest: {e})")
+        return None
 
 
 def _find_convert(hf_dir=None):
@@ -512,7 +551,7 @@ def _smooth_calib(a, hf_dir):
     """The corpus SmoothQuant measures its activation scales on: the same Calib 3.0 corpus the export lane then
     calibrates on (built here, first, when the lane is an export lane) -- so an agentic model's smoothing sees its
     tool-call traces rendered through its own template, not a bland built-in sentence."""
-    if getattr(a, "format", "gguf") not in ("gptq", "mx", "exl3", "mlx"):
+    if getattr(a, "format", "gguf") not in ("gptq", "mx", "exl3", "exlr8", "mlx"):
         return None
     here = os.path.dirname(os.path.abspath(a.output)) if a.output else os.getcwd()
     prev = getattr(a, "_hf_dir", None)
@@ -678,6 +717,16 @@ def _emit_nongguf(a):
         cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
+    elif a.format == "exlr8":
+        # one encode (Hessians from the same Calib 3.0 corpus) -> every rung of the ladder as a manifest chosen by
+        # the measured sensitivity; --output is the parent of the rung folders
+        calib = _ensure_calib_text(a, here)
+        sens = _ensure_sensitivity(a, hf_dir, calib, here)
+        from pollard_exlr8 import DEFAULT_LADDER
+        cmd = ["pollard-exlr8", "--model", hf_dir, "--calib", calib, "--out", out,
+               "--ladder", ",".join(str(b) for b in DEFAULT_LADDER)]
+        if sens:
+            cmd += ["--sensitivity", sens]
     elif a.format == "exl3":
         # GOLD EXL3 = smoothing (applied in _resolve_hf) + Calib 3.0 (-cd) + EXL3's native allocator.
         calib = _ensure_calib_text(a, here)
@@ -693,8 +742,12 @@ def _emit_nongguf(a):
     print(f"   {a.format.upper()} export (Pollard method -- smoothing default + measured allocation):")
     _run(cmd, a.run)
     _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate",
-           "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)"}
+           "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)",
+           "exlr8": "pollard-exlr8 --decode <rung> -> vllm serve / transformers"}
     print(f"   -> {out}  ({_rt.get(a.format, '')})")
+    if a.format == "exlr8":                                 # the ladder's parent: the tool gate takes the 4.0 rung
+        from pollard_exlr8 import bpw_tag
+        return os.path.join(out, f"{os.path.basename(hf_dir.rstrip('/'))}-Pollard-EXLR8-{bpw_tag(4.0)}")
     return out
 
 
@@ -991,10 +1044,10 @@ def main():
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
     ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir -- Pollard downloads/converts/"
                     "routes it (so a user can one-shot straight from a repo or a model already on disk)")
-    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3", "mx"],
+    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3", "mx", "exlr8"],
                     help="output lane: gguf (llama.cpp/Ollama, default)  |  gptq (vLLM/SGLang)  |  mlx (Apple) "
                     " |  exl3 (exllamav3 -- the heavy trellis lane)  |  mx (Blackwell NVFP4 / any-GPU W4A16, "
-                    "compressed-tensors)")
+                    "compressed-tensors)  |  exlr8 (one trellis encode, the whole bpw ladder as manifests)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
     ap.add_argument("--results", help="measured numbers (pollard-bench --out) to put on the card")
     ap.add_argument("--no-card", dest="card", action="store_false",
@@ -1041,6 +1094,9 @@ def main():
                     help="build the whole publish ladder (Q6_K / IQ4_XS / IQ3_S / 2-bit) instead of one "
                          "--ram build: budgets are found by pollard-fit's own planner, the 2-bit rung is the "
                          "IQ*_KT flagship where ik_llama can build it and a stock IQ2 type where it cannot")
+    ap.add_argument("--rung", action="append", metavar="LABEL",
+                    help="with --ladder: build only this rung (Q6_K / IQ4_XS / IQ3_S / IQ2 / flagship); repeatable "
+                         "or a comma list. Default: every rung + the flagship")
     ap.add_argument("--allow-slow", action="store_true",
                     help="let the passthrough sensitivity sweep run on a big model (it is one quantize + KL pass "
                          "per layer; pollard-sensitivity refuses multi-hour sweeps without this)")
@@ -1098,12 +1154,12 @@ def _dispatch(a):
     # These lanes silently break on massive-activation outliers without it (EXL3 3090->8.699); smoothing +
     # our Calib 3.0 is the measured EXL3 win (8.670 < exl3-default 8.699). GGUF has its own smoothing; MLX not needed.
     if a.smooth is None:
-        a.smooth = a.format in ("exl3", "gptq", "mx")
+        a.smooth = a.format in ("exl3", "exlr8", "gptq", "mx")
         if a.smooth:
             print(f"   [{a.format}] LOCKED default: preconditioning ON (--no-smooth to skip)")
 
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights -- route and done.
-    if a.format in ("gptq", "mlx", "exl3", "mx"):
+    if a.format in ("gptq", "mlx", "exl3", "mx", "exlr8"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
         # Auto-version onboarding: a custom-arch model saved with an older transformers major will crash
         # its remote code under the current one. Build the whole lane in a cached env pinned to the model's
@@ -1192,7 +1248,8 @@ def _dispatch(a):
         here = os.path.dirname(os.path.abspath(a.gguf)) or "."
         calib = a.calib or os.path.join(here, "pollard_calib.txt")
         a.sensitivity = _ensure_sensitivity(a, hf_dir, calib, here)
-    if a.ladder:
+    want = _wanted_rungs(a)
+    if a.ladder and (want is None or want - {"flagship"}):
         _build_ladder(a, ik_flagship=bool(a.imatrix) and ik_known is True)
     else:
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
@@ -1212,6 +1269,8 @@ def _dispatch(a):
         print(f"   2) (skipped the {flagship} flagship: no ik_llama.cpp build found, and its trellis atoms are "
               "ik-only" + (" -- the 2-bit rung is the stock IQ2 above" if a.ladder else "")
               + ". Build ik_llama.cpp and set IK_LLAMA_BIN (or --bin) to its build/bin to add it.)")
+    elif a.imatrix and want is not None and "flagship" not in want:
+        print(f"   2) (the {flagship} flagship is not in --rung this run)")
     elif a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
         _automap_mix(a, is_moe=is_moe, ik_dir=ik_dir)

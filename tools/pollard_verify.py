@@ -26,6 +26,7 @@ Lanes (end-to-end fidelity vs the source, measured the same way for every lane: 
   gptq   transformers: the GPTQ checkpoint vs the source (gptqmodel/optimum to load it)
   mx     transformers: the compressed-tensors checkpoint vs the source
   exl3   per-tensor decode vs source + the assembled forward (the original lane)
+  exlr8  transformers: the rung's reference decode (pollard-exlr8, bit-exact to its codes) vs the source
 
 PUBLISH GATE: --gate gates.yaml applies per-rung thresholds -- KLD max, top-1 min, task retention min
 (pollard-taskeval), tool-call pass (pollard-toolcall), decision agreement (pollard-decision), GGUF runtime
@@ -246,7 +247,8 @@ def measure_mlx(model, source, eval_path, length=512, chunks=8):
     return kld_top1(ref.astype(np.float32), q)
 
 
-def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False):
+def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False,
+               loader=None):
     """transformers: the GPTQ / compressed-tensors (MX) checkpoint vs the source, same chunks. The source's
     logits are computed once, cached as fp16 in the workspace, and the source is freed before the
     quantized model loads, so the two never sit in memory together."""
@@ -260,9 +262,11 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     parts = _chunks(tok(_eval_text(eval_path))["input_ids"], length, chunks)
     cache = _ref_cache(source, eval_path, length, chunks, "hf")
 
-    def logits(path):
+    def logits(path, load=None):
         import pollard_mxfp6 as M6
-        if M6.read_meta(path):
+        if load:
+            m = load(path)
+        elif M6.read_meta(path):
             # a pollard-mx MXFP6 / mix rung: the source architecture with every quantized linear replaced by the
             # rung's own bytes decoded exactly (weight-only, so this IS the math any runtime does with them)
             m = AutoModelForCausalLM.from_pretrained(source, torch_dtype="auto", device_map=device,
@@ -287,7 +291,15 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     else:
         ref = logits(source)
         np.save(cache, ref.astype(np.float16))
-    return kld_top1(ref, logits(model))
+    return kld_top1(ref, logits(model, loader))
+
+
+def measure_exlr8(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False):
+    """An EXLR8 rung: its weights decoded by the reference loader (bit-exact to the stored trellis codes) into the
+    source architecture, then the same KLD / top-1 as the other transformers lanes."""
+    import pollard_exlr8 as X
+    return measure_hf(model, source, eval_path, device, length, chunks, trust_remote_code,
+                      loader=lambda p: X.load_model(p, device, trust_remote_code=trust_remote_code))
 
 
 # ----------------------------------------------------------------------- the publish gate
@@ -308,6 +320,9 @@ DEFAULT_GATES = """\
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
+#   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
+#   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
+#   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
 missing: fail
 default:
   kld_max: 0.5
@@ -320,6 +335,12 @@ lanes:
   exl3:
     e2e_acc_min: 0.3
     skip: [kld_max, top1_min]
+  # a drafter is judged on what it is for -- tokens per target pass against the rungs it ships with -- not on its own
+  # logits; the per-bit-width and tool-call rows below are about TARGET rungs
+  draft:
+    draft_tau_min: 1.5
+    draft_redistributable: true
+    skip: [kld_max, top1_min, toolcall_retention_min, toolcall_pass, runtime, coherence]
 rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01
@@ -333,7 +354,7 @@ rungs:
   - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw", "MIX-4*bpw"]
     kld_max: 0.08
     top1_min: 90
-  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
     kld_max: 0.2
     top1_min: 85
   - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw"]
@@ -351,7 +372,7 @@ kinds:
   agentic:
     toolcall_retention_min: 90
     rungs:
-      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
         toolcall_retention_min: 85
       - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
         toolcall_retention_min: 75
@@ -402,6 +423,8 @@ _CHECKS = {
     "decision_agreement_min": ("decision_agreement", ">=", "decision agreement %"),
     "toolcall_retention_min": ("toolcall_retention", ">=", "tool-call retention %"),
     "e2e_acc_min": ("e2e_acc", ">=", "end-to-end next-token agreement"),
+    "draft_tau_min": ("draft_tau", ">=", "drafter tokens per target pass"),
+    "draft_accept_rate_min": ("draft_accept_rate", ">=", "drafter accept rate"),
 }
 _RUNTIME_OK = {"stock": {"stock"}, "ik_llama": {"stock", "ik_llama"}}
 
@@ -437,6 +460,10 @@ def evaluate_gate(metrics, th, missing="fail"):
                 continue
             row("tool calls", v, "pass", v is True if v is not None else missing == "skip",
                 "" if v is not None else "not measured")
+        elif key == "draft_redistributable" and want:
+            v = metrics.get("draft_redistributable")
+            row("drafter licence allows republishing", v, "true", v is True if v is not None else missing == "skip",
+                "" if v is not None else "licence unknown")
         elif key == "coherence" and want:
             v = metrics.get("coherence")
             row("coherence", v, "PASS", v == "PASS" if v is not None else missing == "skip",
@@ -483,6 +510,13 @@ def metrics_from_results(results, rung):
         m["decision_agreement"] = 100.0 * float(d["agreement"])
     if r.get("coherence"):
         m["coherence"] = r["coherence"]
+    dr = r.get("draft") or {}
+    if dr.get("tau") is not None:
+        m["draft_tau"] = float(dr["tau"])
+    if dr.get("accept_rate") is not None:
+        m["draft_accept_rate"] = float(dr["accept_rate"])
+    if dr.get("redistributable") is not None:
+        m["draft_redistributable"] = bool(dr["redistributable"])
     return m
 
 
@@ -528,8 +562,9 @@ def main():
     ap.add_argument("--model", help="the build to gate: a GGUF file or a converted model dir")
     ap.add_argument("--source", "--ref", dest="source",
                     help="the fp16/bf16 source: HF dir (mlx/gptq/mx/exl3) or the f16 GGUF (gguf)")
-    ap.add_argument("--lane", default=None, choices=["exl3", "gguf", "mlx", "gptq", "mx"],
-                    help="convert lane (default: gguf for a .gguf file, else exl3)")
+    ap.add_argument("--lane", default=None, choices=["exl3", "gguf", "mlx", "gptq", "mx", "exlr8", "draft"],
+                    help="convert lane (default: gguf for a .gguf file, else exl3). draft = a speculative drafter, "
+                         "gated on the pollard-draft measure numbers in --results (nothing is run)")
     ap.add_argument("--eval", help="HELD-OUT text for the KLD/top-1 measurement (gguf/mlx/gptq/mx)")
     ap.add_argument("--chunks", type=int, default=16, help="eval chunks (gguf: llama-perplexity --chunks)")
     ap.add_argument("--length", type=int, default=256, help="tokens per chunk (mlx/gptq/mx) / e2e length (exl3)")
@@ -557,6 +592,8 @@ def main():
     if not a.model:
         ap.error("--model is required")
     lane = a.lane or ("gguf" if str(a.model).endswith(".gguf") else "exl3")
+    if lane == "draft":
+        a.measure = False                      # pollard-draft measure wrote the numbers; the gate reads them
     rung = a.rung or os.path.basename(str(a.model).rstrip("/\\"))
 
     if a.sanitizer and not os.environ.get("_POLLARD_UNDER_SANITIZER"):
@@ -604,6 +641,8 @@ def main():
             measured = measure_gguf(a.model, a.source, a.eval, a.ngl, a.chunks)
         elif lane == "mlx":
             measured = measure_mlx(a.model, a.source, a.eval, a.length, a.chunks)
+        elif lane == "exlr8":
+            measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, a.trust_remote_code)
         else:
             measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, a.trust_remote_code)
         print(f"   mean KLD {measured['kld']:.5f}   top-1 {measured.get('top1') or 0:.2f}%"
@@ -627,7 +666,7 @@ def main():
         gates = load_gates(a.gate or None)
         results = json.load(open(a.results, encoding="utf-8")) if a.results and os.path.exists(a.results) else {}
         metrics = {**metrics_from_results(results, rung), **{k: v for k, v in measured.items() if v is not None}}
-        kinds = model_kinds(a.model) if gates.get("kinds") else []
+        kinds = model_kinds(a.model) if gates.get("kinds") and lane != "draft" else []
         if gates.get("kinds") and "agentic" not in kinds and (
                 metrics.get("toolcall_status") or metrics.get("toolcall_retention") is not None):
             kinds.append("agentic")            # pollard-toolcall measured it: its template writes tool calls

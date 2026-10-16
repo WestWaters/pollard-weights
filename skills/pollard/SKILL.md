@@ -334,7 +334,13 @@ pollard release --hf Qwen/Qwen3-8B --plan release.yaml --lanes gptq,mx,exl3 --ru
 ```
 Repos: `<Org>/<M>-Pollard` (GGUF, files `<M>-Pollard-<TAG>.gguf`) and `<Org>/<M>-Pollard-MLX|GPTQ|MX|EXL3` (one
 subfolder per rung, default rung at the root). Lanes this machine cannot build are skipped with the command to run
-them where they can. The EAGLE3 `draft` lane is declared but not wired (no pollard-draft yet).
+them where they can. The `draft` lane (`lanes.draft.enabled: true`) ships a speculative drafter matched to the
+quantized target in `<Org>/<M>-Pollard-DRAFT`: `pollard-draft find` (best published DFlash / DSpark / EAGLE-3 head, or
+a same-family small model, checked on hidden size / vocab / tapped layers / licence) -> `convert` (GGUF Q8_0 / Q4_K_M
++ the HF folder at the repo root for vLLM / SGLang / dflash-mlx) -> `measure` (tokens per target pass against every
+GGUF rung, llama-server's own draft counters, chat / code / reasoning / tool-call prompts) -> gate
+(`draft_tau_min`, `draft_redistributable`). Every lane's card gets a Speculative decoding section with its serve
+line. No drafter published: `pollard-draft train` prints the speculators (Apache-2.0) recipe.
 
 ### The publish gate (`pollard-verify --gate gates.yaml`)
 Per-rung thresholds (default <- `lanes.<lane>` <- matching `rungs` patterns): KLD max, top-1 min, task retention

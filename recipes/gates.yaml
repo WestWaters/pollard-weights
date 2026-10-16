@@ -13,6 +13,9 @@
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
+#   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
+#   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
+#   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
 missing: fail
 default:
   kld_max: 0.5
@@ -25,6 +28,12 @@ lanes:
   exl3:
     e2e_acc_min: 0.3
     skip: [kld_max, top1_min]
+  # a drafter is judged on what it is for -- tokens per target pass against the rungs it ships with -- not on its own
+  # logits; the per-bit-width and tool-call rows below are about TARGET rungs
+  draft:
+    draft_tau_min: 1.5
+    draft_redistributable: true
+    skip: [kld_max, top1_min, toolcall_retention_min, toolcall_pass, runtime, coherence]
 rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01
@@ -38,7 +47,7 @@ rungs:
   - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw", "MIX-4*bpw"]
     kld_max: 0.08
     top1_min: 90
-  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
     kld_max: 0.2
     top1_min: 85
   - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw"]
@@ -56,7 +65,7 @@ kinds:
   agentic:
     toolcall_retention_min: 90
     rungs:
-      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
         toolcall_retention_min: 85
       - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
         toolcall_retention_min: 75

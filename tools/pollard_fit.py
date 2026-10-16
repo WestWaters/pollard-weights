@@ -494,7 +494,8 @@ def _fit_passthrough(a, pt, src_tensors, arch, cfg, sensitivity, covered, tiers,
     try:
         import pollard_workspace as ws
         bpw = round(os.path.getsize(out) * 8.0 / arch["total"], 2) if arch.get("total") else None
-        ws.record_build(a.gguf, "gguf", out, tag="passthrough", bpw=bpw)
+        m = re.search(r"-(PT\d+)\.gguf$", os.path.basename(out))      # a passthrough-ladder rung: its own tag
+        ws.record_build(a.gguf, "gguf", out, tag=m.group(1) if m else "passthrough", bpw=bpw)
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"\ndone: {out}")

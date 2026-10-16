@@ -29,6 +29,7 @@ LANE_DEPS = {
     "mx": ["torch", "safetensors", "llmcompressor", "datasets"],
     "mlx": ["mlx-lm"],
     "exl3": ["torch", "safetensors", "exllamav3", "datasets"],
+    "exlr8": ["torch", "safetensors", "datasets", "xxhash"],
     "probe": ["torch", "safetensors", "datasets"],
     "smooth": ["torch", "safetensors"],
 }

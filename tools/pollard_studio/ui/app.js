@@ -46,7 +46,7 @@ const TRELLIS = ["iq1_kt", "iq2_kt", "iq3_kt", "iq4_kt"];
 const BODY_ATOMS = ["iq1_s", "iq1_m", "iq1_kt", "iq2_xxs", "iq2_kt", "iq3_s"];
 const PROT_ATOMS = ["iq1_kt", "iq2_kt", "iq2_s", "iq3_s", "iq4_xs", "q6_K"];
 const EMB_ATOMS  = ["IQ3_S", "Q4_K", "Q6_K", "Q8_0"];
-const LANES = ["GGUF", "GPTQ", "MLX", "EXL3", "MX"];
+const LANES = ["GGUF", "GPTQ", "MLX", "EXL3", "MX", "EXLR8"];
 
 /* Every lane has its own alphabet. iq1_s and q6_K are llama.cpp container types and mean nothing
    to MLX or EXL3 -- showing them on those lanes offers a control the run will ignore. Each entry
@@ -68,6 +68,10 @@ const LANE_ALLOC = {
     ["Bits per weight", "--bpw", "num", [1, 8, 4], "bpw", "pollard_exl3"],
     ["Head bits", "--head-bits", "num", [0, 16, 0], "headBits", "pollard_exl3"],
     ["CUDA devices", "--devices", "text", "device ids, e.g. 0,1", "devices", "pollard_exl3"]] },
+  EXLR8: { tool: "pollard-exlr8", fields: [
+    ["Bits per weight", "--bpw", "num", [2, 6, 4], "bpw", "pollard_exlr8"],
+    ["Stored widths", "--widths", "text", "K list, e.g. 2,3,4,5,6", "widths", "pollard_exlr8"],
+    ["Calibration corpus", "--calib", "text", "pollard-calib output", "calib", "pollard_exlr8"]] },
   MX: { tool: "pollard-mx", fields: [
     ["Body scheme", "--scheme", "sel", ["NVFP4", "MXFP4", "W4A16", "W8A16"], "scheme", "pollard_mx"],
     ["Protect scheme", "--protect-scheme", "sel", ["FP8", "FP8_DYNAMIC", "W8A16"], "protectScheme", "pollard_mx"],
@@ -142,6 +146,8 @@ function laneBpw() {
     case "EXL3":
       return { body: n(R.bpw, 4), protect: n(R.bpw, 4),
                emb: n(R.headBits, 0) || n(R.bpw, 4) };
+    case "EXLR8":                        // the rung's --bpw over the trellis matrices; embeddings FP8 per row
+      return { body: n(R.bpw, 4), protect: n(R.bpw, 4), emb: 8 };
     case "MLX": {                        // --hot-frac of the layers stay 8-bit, the rest go 4
       const hot = n(R.hotFrac, 35) / 100, gs = n(R.groupSize, 64);
       const over = gs > 0 ? 16 / gs : 0;
@@ -745,8 +751,8 @@ const ADV_SECTIONS = [
   { title: "LANE EMITTERS", icon: "box",
     why: "One solved allocation, emitted into whichever runtime you need. Each lane has its own "
        + "atoms and its own knobs.",
-    tools: ["pollard_mlx", "pollard_mx", "pollard_exl3", "pollard_exl3_band",
-            "pollard_export", "pollard_vllm"] },
+    tools: ["pollard_mlx", "pollard_mx", "pollard_exl3", "pollard_exl3_band", "pollard_exlr8",
+            "pollard_export", "pollard_vllm", "pollard_draft", "pollard_draft_train"] },
   { title: "FOUNDATION MODELS", icon: "layers",
     why: "Make your own model, the way the labs make their small open ones: a fresh architecture, or a smaller "
        + "model carved out of a bigger one (depth and width pruning measured on your text), then pretraining "
@@ -1832,7 +1838,7 @@ function wireMonitor() {
         has ? gb(Math.max(...bs.map(b => b.bytes))) + " GB" : "—"}</span></div>
       <div class="kv"><span class="k">Emitter</span><span class="v">${
         { GGUF: "pollard-fit", GPTQ: "pollard-gptq", MLX: "pollard-mlx",
-          EXL3: "pollard-exl3", MX: "pollard-mx" }[l]}</span></div>
+          EXL3: "pollard-exl3", MX: "pollard-mx", EXLR8: "pollard-exlr8" }[l]}</span></div>
     </div>`;
   }).join("");
   $("#mon-chart").innerHTML = barchart(
@@ -2308,6 +2314,8 @@ const LANE_FACTS = {
           atom: "int4 / int8 packed", note: "full-Hessian error feedback, Pollard's own solver." },
   EXL3: { runs: "exllamav3", best: "single consumer GPU, any target bpw",
           atom: "trellis (QTIP-class)", note: "heavy to build; any average bitrate 1-8." },
+  EXLR8: { runs: "GR8 (GLM-5.3) · reference decode -> vLLM", best: "one download, every size",
+           atom: "trellis K2-K6, E4M3 codebook", note: "one encode; each rung is a manifest over it." },
   VLLM: { runs: "vLLM · SGLang", best: "serving at scale",
           atom: "compressed-tensors", note: "emitted from the same measured profile." },
 };
