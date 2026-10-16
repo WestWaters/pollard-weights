@@ -1,5 +1,5 @@
 """The tool-call gate wired in: an AGENTIC model (pollard-modelkind finds a tool-call syntax in its template) gets
-pollard-toolcall by default in `pollard --ladder --run` and `pollard release`, and pollard-verify --gate holds its rungs
+pollard-toolcall in `pollard release` (and `pollard --run --toolcall`), and pollard-verify --gate holds its rungs
 to a tool-call retention threshold (gates.yaml `kinds: agentic:`). A model with no tool syntax is untouched.
 Fakes only: no model, no llama.cpp."""
 from __future__ import annotations

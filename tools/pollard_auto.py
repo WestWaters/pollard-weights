@@ -840,8 +840,8 @@ def _toolcall_gate(a, since):
     gate on every GGUF rung this run built: pollard-toolcall serves each with llama-server --jinja, asks 60 tool
     probes through OpenAI-style `tools`, and records retention vs the f16 in results.json -- which the card turns
     into its Tool-ready column. A quant can keep its perplexity and lose the narrow band of layers that formats
-    tool calls, and an agent harness is exactly where that shows. --no-toolcall skips it."""
-    if not a.run or not getattr(a, "toolcall", True) or not a.gguf:
+    tool calls, and an agent harness is exactly where that shows. Opt-in with --toolcall."""
+    if not a.run or not getattr(a, "toolcall", False) or not a.gguf:
         return
     try:
         from pollard_modelkind import classify
@@ -864,7 +864,7 @@ def _toolcall_gate(a, since):
                                                          "results.json")
     ngl = str(a.ngl) if str(a.ngl).isdigit() else "0"         # a shared GPU is not ours unless told
     print(f"\n   tool-call gate: agentic model ({fam} call syntax) -- {len(builds)} rung(s) vs the f16 "
-          "(--no-toolcall to skip)")
+          "(--toolcall)")
     for b in builds:
         cmd = _resolve_tool(["pollard-toolcall", "--gguf", b["path"], "--ref", a.gguf, "--ngl", ngl,
                              "--results", results, "--rung", b.get("name") or os.path.basename(b["path"])])
@@ -995,10 +995,12 @@ def main():
                          "fast and skips the eval. Use this only to reproduce our published numbers.")
     ap.add_argument("--force-dense", action="store_true", help="override detection -> dense path")
     ap.add_argument("--force-moe", action="store_true", help="override detection -> MoE path")
-    ap.add_argument("--no-toolcall", dest="toolcall", action="store_false",
-                    help="skip the tool-call gate an agentic model gets by default after the build "
-                         "(pollard-toolcall: 60 tool probes per rung through llama-server --jinja, retention vs f16)")
-    ap.set_defaults(toolcall=True)
+    ap.add_argument("--toolcall", dest="toolcall", action="store_true",
+                    help="after the build, run the tool-call gate on an agentic model's rungs (pollard-toolcall: "
+                         "60 tool probes per rung through llama-server --jinja, retention vs f16). OFF by default: "
+                         "a build is not a benchmark; `pollard release` runs it for every agentic rung.")
+    ap.add_argument("--no-toolcall", dest="toolcall", action="store_false", help=argparse.SUPPRESS)
+    ap.set_defaults(toolcall=False)
     ap.add_argument("--no-gate", dest="gate", action="store_false",
                     help="skip the auto coherence gate (loop check + sampling sweep) the one-shot "
                          "MoE build appends after the mix -- by default it runs so you learn if the "
