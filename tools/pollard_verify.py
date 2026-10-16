@@ -26,6 +26,7 @@ Lanes (end-to-end fidelity vs the source, measured the same way for every lane: 
   gptq   transformers: the GPTQ checkpoint vs the source (gptqmodel/optimum to load it)
   mx     transformers: the compressed-tensors checkpoint vs the source
   exl3   per-tensor decode vs source + the assembled forward (the original lane)
+  exlr8  transformers: the rung's reference decode (pollard-exlr8, bit-exact to its codes) vs the source
 
 PUBLISH GATE: --gate gates.yaml applies per-rung thresholds -- KLD max, top-1 min, task retention min
 (pollard-taskeval), tool-call pass (pollard-toolcall), decision agreement (pollard-decision), GGUF runtime
@@ -246,7 +247,8 @@ def measure_mlx(model, source, eval_path, length=512, chunks=8):
     return kld_top1(ref.astype(np.float32), q)
 
 
-def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False):
+def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False,
+               loader=None):
     """transformers: the GPTQ / compressed-tensors (MX) checkpoint vs the source, same chunks. The source's
     logits are computed once, cached as fp16 in the workspace, and the source is freed before the
     quantized model loads, so the two never sit in memory together."""
@@ -260,9 +262,9 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     parts = _chunks(tok(_eval_text(eval_path))["input_ids"], length, chunks)
     cache = _ref_cache(source, eval_path, length, chunks, "hf")
 
-    def logits(path):
-        m = AutoModelForCausalLM.from_pretrained(path, torch_dtype="auto", device_map=device,
-                                                 trust_remote_code=trust_remote_code).eval()
+    def logits(path, load=None):
+        m = load(path) if load else AutoModelForCausalLM.from_pretrained(
+            path, torch_dtype="auto", device_map=device, trust_remote_code=trust_remote_code).eval()
         with torch.no_grad():
             out = [m(torch.tensor([c], device=m.device)).logits[0].float().cpu().numpy() for c in parts]
         del m
@@ -274,7 +276,15 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     else:
         ref = logits(source)
         np.save(cache, ref.astype(np.float16))
-    return kld_top1(ref, logits(model))
+    return kld_top1(ref, logits(model, loader))
+
+
+def measure_exlr8(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False):
+    """An EXLR8 rung: its weights decoded by the reference loader (bit-exact to the stored trellis codes) into the
+    source architecture, then the same KLD / top-1 as the other transformers lanes."""
+    import pollard_exlr8 as X
+    return measure_hf(model, source, eval_path, device, length, chunks, trust_remote_code,
+                      loader=lambda p: X.load_model(p, device, trust_remote_code=trust_remote_code))
 
 
 # ----------------------------------------------------------------------- the publish gate
@@ -320,7 +330,7 @@ rungs:
   - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw"]
     kld_max: 0.08
     top1_min: 90
-  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+  - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
     kld_max: 0.2
     top1_min: 85
   - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw"]
@@ -338,7 +348,7 @@ kinds:
   agentic:
     toolcall_retention_min: 90
     rungs:
-      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
         toolcall_retention_min: 85
       - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
         toolcall_retention_min: 75
@@ -515,7 +525,7 @@ def main():
     ap.add_argument("--model", help="the build to gate: a GGUF file or a converted model dir")
     ap.add_argument("--source", "--ref", dest="source",
                     help="the fp16/bf16 source: HF dir (mlx/gptq/mx/exl3) or the f16 GGUF (gguf)")
-    ap.add_argument("--lane", default=None, choices=["exl3", "gguf", "mlx", "gptq", "mx"],
+    ap.add_argument("--lane", default=None, choices=["exl3", "gguf", "mlx", "gptq", "mx", "exlr8"],
                     help="convert lane (default: gguf for a .gguf file, else exl3)")
     ap.add_argument("--eval", help="HELD-OUT text for the KLD/top-1 measurement (gguf/mlx/gptq/mx)")
     ap.add_argument("--chunks", type=int, default=16, help="eval chunks (gguf: llama-perplexity --chunks)")
@@ -591,6 +601,8 @@ def main():
             measured = measure_gguf(a.model, a.source, a.eval, a.ngl, a.chunks)
         elif lane == "mlx":
             measured = measure_mlx(a.model, a.source, a.eval, a.length, a.chunks)
+        elif lane == "exlr8":
+            measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, a.trust_remote_code)
         else:
             measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, a.trust_remote_code)
         print(f"   mean KLD {measured['kld']:.5f}   top-1 {measured.get('top1') or 0:.2f}%"

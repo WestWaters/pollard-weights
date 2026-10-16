@@ -22,4 +22,6 @@ lanes:
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
   mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8], default: nvfp4}
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
+  # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
+  exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
   draft: {enabled: false}      # EAGLE3 draft head per rung -- not wired yet

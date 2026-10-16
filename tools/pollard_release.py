@@ -16,6 +16,8 @@ The lanes and their ladders (what each lane's runtime supports):
   gptq  int2 / int3 / int4 / int8, measured 4/8 dynamic mix (pollard-export --bits)             -> <M>-Pollard-GPTQ
   mx    NVFP4 / MXFP4 / pure FP8 W8A8 (routers + lm_head kept high, Cohere's recipe)            -> <M>-Pollard-MX
   exl3  several bpw on EXL3's own allocator, smoothed + Calib 3.0 (pollard-exl3 --bpw)           -> <M>-Pollard-EXL3
+  exlr8 ONE trellis encode at K=2..6 (E4M3 codebook, EXLR8 v2 records), then every rung is a manifest: exact
+        knapsack on the measured sensitivity, 2.5 / 3 / 3.25 / 4 / 5 / 6 bpw (pollard-exlr8)   -> <M>-Pollard-EXLR8
   draft EAGLE3 draft head -- declared, NOT wired yet (no pollard-draft); the plan says so.
 
 One repo per lane (the PollardWeights naming: <M>-Pollard for GGUF, <M>-Pollard-<LANE> otherwise). GGUF rungs
@@ -64,6 +66,8 @@ lanes:
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
   mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8], default: nvfp4}
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
+  # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
+  exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
   draft: {enabled: false}      # EAGLE3 draft head per rung -- not wired yet
 """
 
@@ -72,20 +76,23 @@ PRESETS = {
     "text": {},
     # a vision-language model: the GGUF lane ships the mmproj (pollard does that itself); MLX holds the tower
     # high; EXL3 is off because exllamav3's vision support is per-architecture -- turn it on once checked
-    "vlm": {"lanes": {"exl3": {"enabled": False}},
+    "vlm": {"lanes": {"exl3": {"enabled": False}, "exlr8": {"enabled": False}},
             "measure": {"taskeval": {"suite": "quick", "limit": 200}}},
     # a decision model answers on /v1/systemone from first-position logits: llama.cpp only, judged on decisions
     "decision": {"lanes": {"mlx": {"enabled": False}, "gptq": {"enabled": False}, "mx": {"enabled": False},
-                           "exl3": {"enabled": False}},
+                           "exl3": {"enabled": False}, "exlr8": {"enabled": False}},
                  "measure": {"taskeval": None, "decision": True, "toolcall": False}},
     # MoE: vLLM's fused-MoE kernels want one scheme for all experts (--moe-protect-attn-only); 2/3-bit GPTQ
-    # MoE kernels are poor, so the GPTQ ladder is 4 and 8
+    # MoE kernels are poor, so the GPTQ ladder is 4 and 8. EXLR8 is off: pollard-exlr8 writes dense records only,
+    # not EXLR8's per-unit expert files yet
     "moe": {"lanes": {"gptq": {"rungs": [4, 8]}, "mlx": {"rungs": [3, 4, 6, 8]},
-                      "mx": {"moe_protect_attn_only": True}, "exl3": {"rungs": [2.5, 3.0, 4.0]}}},
+                      "mx": {"moe_protect_attn_only": True}, "exl3": {"rungs": [2.5, 3.0, 4.0]},
+                      "exlr8": {"enabled": False}}},
 }
-LANES = ["gguf", "mlx", "gptq", "mx", "exl3", "draft"]
+LANES = ["gguf", "mlx", "gptq", "mx", "exl3", "exlr8", "draft"]
 MX_SCHEMES = {"nvfp4": "NVFP4", "mxfp4": "MXFP4", "fp8": "FP8", "fp8_dynamic": "FP8_DYNAMIC"}
-REQUIRES = {"gguf": "any", "mlx": "apple", "gptq": "cuda", "mx": "cuda", "exl3": "cuda", "draft": "cuda"}
+REQUIRES = {"gguf": "any", "mlx": "apple", "gptq": "cuda", "mx": "cuda", "exl3": "cuda", "exlr8": "cuda",
+            "draft": "cuda"}
 
 
 # ------------------------------------------------------------------------------- plan file
@@ -122,7 +129,7 @@ def load_plan(path=None, preset=None):
 
 def repo_name(org, model, lane):
     """PollardWeights naming, consistent with the repos already published: <M>-Pollard (GGUF),
-    <M>-Pollard-MLX / -GPTQ / -MX / -EXL3 for the others."""
+    <M>-Pollard-MLX / -GPTQ / -MX / -EXL3 / -EXLR8 for the others."""
     import pollard_workspace as ws
     base = ws.model_basename(model)
     return f"{org}/{base}-Pollard" + ("" if lane == "gguf" else f"-{lane.upper()}")
@@ -138,6 +145,9 @@ def rung_tag(lane, rung):
         return MX_SCHEMES[str(rung).lower()]
     if lane == "exl3":
         return f"{float(rung):.1f}bpw"
+    if lane == "exlr8":
+        from pollard_exlr8 import bpw_tag
+        return bpw_tag(rung)                     # 3.25 -> 3.25bpw (EXL3's .1f would print 3.2)
     return str(rung)
 
 
@@ -173,6 +183,7 @@ def _ctx(cfg, src):
         "sens_raw": os.path.join(cal, f"{name}.sensitivity.json"),
         "sens_smooth": os.path.join(cal, f"{name}-smoothed.sensitivity.json"),
         "gguf_dir": gdir, "f16": os.path.join(gdir, f"{base}-f16.gguf"),
+        "exlr8_store": os.path.join(mdir, "exlr8-store"),
         "state": os.path.join(mdir, "release-state.json"), "release_dir": os.path.join(mdir, "release"),
         "ngl": str(cfg.get("ngl", 0)), "gates": cfg.get("gates"),
     }
@@ -193,7 +204,7 @@ def _verify_gate(c):
 
 def prep_steps(cfg, c, lanes):
     cal = cfg.get("calib") or {}
-    smoothed = any(l in lanes for l in ("gptq", "mx", "exl3"))
+    smoothed = any(l in lanes for l in ("gptq", "mx", "exl3", "exlr8"))
     raw_probe = any(l in lanes for l in ("gguf", "mlx"))
     steps = []
     if not os.path.isdir(c["src"]):
@@ -249,20 +260,20 @@ def toolcall_wanted(cfg, c):
 
 
 #: lane -> pollard-toolcall's backend for its rungs (the server its users run it with)
-TOOLCALL_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "mx": "vllm", "exl3": "exl3"}
+TOOLCALL_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "mx": "vllm", "exl3": "exl3", "exlr8": "hf"}
 
 
 def toolcall_cmd(c, lane, out, name, res):
     """pollard-toolcall for one directory-lane rung. The reference is the ORIGINAL bf16 checkout (not the smoothed
     copy), run the rung's own way where it can be: mlx_lm.server for MLX, vLLM for GPTQ / MX (both fall back to the
     in-process transformers backend where no usable vLLM is installed, e.g. Windows). An EXL3 rung runs in-process
-    in exllamav3, so its reference runs in-process in transformers -- same template rendering, same call reader.
-    When that cannot run here (no free GPU, too big) the f16 GGUF through llama-server stands in, and the result is
-    labelled cross-backend. A backend this machine lacks records the rung as not measured and exits 0 -- never a
-    fake number."""
+    in exllamav3 and an EXLR8 rung in-process in transformers on its reference decode, so their reference runs
+    in-process in transformers -- same template rendering, same call reader. When that cannot run here (no free GPU,
+    too big) the f16 GGUF through llama-server stands in, and the result is labelled cross-backend. A backend this
+    machine lacks records the rung as not measured and exits 0 -- never a fake number."""
     cmd = ["pollard-toolcall", "--model", out, "--backend", TOOLCALL_BACKEND[lane], "--ref", c["hf_dir"],
            "--ngl", c["ngl"], "--results", res, "--rung", name]
-    if lane == "exl3":
+    if lane in ("exl3", "exlr8"):
         cmd += ["--ref-backend", "hf"]
     if lane != "mlx":
         cmd += ["--ref-fallback", c["f16"]]
@@ -320,6 +331,13 @@ def lane_steps(cfg, c, lane):
                 Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")]
     steps, res = [], results_path(c, lane)
     tool = toolcall_wanted(cfg, c)
+    if lane == "exlr8":
+        # the ONE encode every rung of this lane is a manifest over (resumable per layer inside pollard-exlr8)
+        widths = ",".join(str(int(k)) for k in (lc.get("widths") or [2, 3, 4, 5, 6]))
+        steps.append(Step(id="exlr8/encode", lane="exlr8", kind="build", requires=REQUIRES["exlr8"],
+                          cmd=["pollard-exlr8", "--model", c["smooth_dir"], "--store", c["exlr8_store"], "--calib",
+                               c["calib"], "--widths", widths, "--encode-only"], out=c["exlr8_store"],
+                          desc="encode every matrix once at each width (LDLQ + tail-biting Viterbi, E4M3 codebook)"))
     for rung in lc.get("rungs") or []:
         tag = rung_tag(lane, rung)
         out = ws.resolve_out(c["src"], lane, tag, create_parent=False)
@@ -339,6 +357,11 @@ def lane_steps(cfg, c, lane):
                 cmd += ["--sensitivity", c["sens_smooth"]]
                 if lc.get("moe_protect_attn_only"):
                     cmd += ["--moe-protect-attn-only"]
+            src = c["smooth_dir"]
+        elif lane == "exlr8":                            # a manifest over the encode: seconds, no re-encode
+            cmd = ["pollard-exlr8", "--model", c["smooth_dir"], "--store", c["exlr8_store"], "--calib", c["calib"],
+                   "--sensitivity", c["sens_smooth"], "--widths", ",".join(str(int(k)) for k in (lc.get("widths") or [2, 3, 4, 5, 6])),
+                   "--bpw", str(float(rung)), "--out", out]
             src = c["smooth_dir"]
         else:                                            # exl3
             cmd = ["pollard-exl3", "--model", c["smooth_dir"], "--bpw", str(float(rung)), "--calib-text", c["calib"],

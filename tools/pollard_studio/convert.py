@@ -44,6 +44,8 @@ LANES = {
              "note": "full-Hessian error feedback; takes a recipe, not a raw profile."},
     "EXL3": {"tool": "pollard_exl3", "takes": "--recipe", "source": "hf",
              "note": "exllamav3 trellis; takes a per-tensor YAML recipe."},
+    "EXLR8": {"tool": "pollard_exlr8", "takes": "--sensitivity", "source": "hf",
+              "note": "one trellis encode at K=2..6, every rung a manifest chosen by the profile."},
     "VLLM": {"tool": "pollard_export", "takes": "--sensitivity", "source": "hf",
              "note": "vLLM / SGLang-loadable checkpoint."},
 }

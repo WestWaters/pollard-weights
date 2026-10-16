@@ -24,6 +24,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard --hf Qwen/Qwen3-8B --format mlx --run   # MLX for Apple Silicon
     pollard --hf Qwen/Qwen3-8B --format exl3 --run  # EXL3 (exllamav3 -- heavy trellis)
     pollard --hf Qwen/Qwen3-8B --format mx --run    # MX: Blackwell NVFP4 / any-GPU W4A16 (compressed-tensors)
+    pollard --hf Qwen/Qwen3-8B --format exlr8 --run # EXLR8: one trellis encode, the whole bpw ladder as manifests
     pollard --gguf model-f16.gguf --imatrix m.imatrix --run    # bring your own imatrix (skips auto-calib)
     pollard --gguf model-f16.gguf --benchmark --run            # + the gold-card board (slow)
     pollard tune --base Qwen/Qwen3.5-9B --data cases.csv --out runs/x --ship   # fine-tune + eval + ship (pollard-tune)
@@ -512,7 +513,7 @@ def _smooth_calib(a, hf_dir):
     """The corpus SmoothQuant measures its activation scales on: the same Calib 3.0 corpus the export lane then
     calibrates on (built here, first, when the lane is an export lane) -- so an agentic model's smoothing sees its
     tool-call traces rendered through its own template, not a bland built-in sentence."""
-    if getattr(a, "format", "gguf") not in ("gptq", "mx", "exl3", "mlx"):
+    if getattr(a, "format", "gguf") not in ("gptq", "mx", "exl3", "exlr8", "mlx"):
         return None
     here = os.path.dirname(os.path.abspath(a.output)) if a.output else os.getcwd()
     prev = getattr(a, "_hf_dir", None)
@@ -678,6 +679,16 @@ def _emit_nongguf(a):
         cmd = ["pollard-mx", "--model", hf_dir, "--calib", calib, "--out", out] + trc
         if sens:
             cmd += ["--sensitivity", sens]
+    elif a.format == "exlr8":
+        # one encode (Hessians from the same Calib 3.0 corpus) -> every rung of the ladder as a manifest chosen by
+        # the measured sensitivity; --output is the parent of the rung folders
+        calib = _ensure_calib_text(a, here)
+        sens = _ensure_sensitivity(a, hf_dir, calib, here)
+        from pollard_exlr8 import DEFAULT_LADDER
+        cmd = ["pollard-exlr8", "--model", hf_dir, "--calib", calib, "--out", out,
+               "--ladder", ",".join(str(b) for b in DEFAULT_LADDER)]
+        if sens:
+            cmd += ["--sensitivity", sens]
     elif a.format == "exl3":
         # GOLD EXL3 = smoothing (applied in _resolve_hf) + Calib 3.0 (-cd) + EXL3's native allocator.
         calib = _ensure_calib_text(a, here)
@@ -693,8 +704,12 @@ def _emit_nongguf(a):
     print(f"   {a.format.upper()} export (Pollard method -- smoothing default + measured allocation):")
     _run(cmd, a.run)
     _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate",
-           "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)"}
+           "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)",
+           "exlr8": "pollard-exlr8 --decode <rung> -> vllm serve / transformers"}
     print(f"   -> {out}  ({_rt.get(a.format, '')})")
+    if a.format == "exlr8":                                 # the ladder's parent: the tool gate takes the 4.0 rung
+        from pollard_exlr8 import bpw_tag
+        return os.path.join(out, f"{os.path.basename(hf_dir.rstrip('/'))}-Pollard-EXLR8-{bpw_tag(4.0)}")
     return out
 
 
@@ -991,10 +1006,10 @@ def main():
     ap.add_argument("--gguf", help="f16/bf16 source GGUF (or use --hf to point at HF weights)")
     ap.add_argument("--hf", help="HuggingFace repo id OR local HF model dir -- Pollard downloads/converts/"
                     "routes it (so a user can one-shot straight from a repo or a model already on disk)")
-    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3", "mx"],
+    ap.add_argument("--format", default="gguf", choices=["gguf", "gptq", "mlx", "exl3", "mx", "exlr8"],
                     help="output lane: gguf (llama.cpp/Ollama, default)  |  gptq (vLLM/SGLang)  |  mlx (Apple) "
                     " |  exl3 (exllamav3 -- the heavy trellis lane)  |  mx (Blackwell NVFP4 / any-GPU W4A16, "
-                    "compressed-tensors)")
+                    "compressed-tensors)  |  exlr8 (one trellis encode, the whole bpw ladder as manifests)")
     ap.add_argument("--output", help="output dir/file for the gptq/mlx/mx/exl3 export (else auto-named)")
     ap.add_argument("--results", help="measured numbers (pollard-bench --out) to put on the card")
     ap.add_argument("--no-card", dest="card", action="store_false",
@@ -1098,12 +1113,12 @@ def _dispatch(a):
     # These lanes silently break on massive-activation outliers without it (EXL3 3090->8.699); smoothing +
     # our Calib 3.0 is the measured EXL3 win (8.670 < exl3-default 8.699). GGUF has its own smoothing; MLX not needed.
     if a.smooth is None:
-        a.smooth = a.format in ("exl3", "gptq", "mx")
+        a.smooth = a.format in ("exl3", "exlr8", "gptq", "mx")
         if a.smooth:
             print(f"   [{a.format}] LOCKED default: preconditioning ON (--no-smooth to skip)")
 
     # NON-GGUF lanes (GPTQ/MLX) emit straight from HF weights -- route and done.
-    if a.format in ("gptq", "mlx", "exl3", "mx"):
+    if a.format in ("gptq", "mlx", "exl3", "mx", "exlr8"):
         print(f"pollard :: {a.hf or a.gguf}  -> {a.format.upper()} lane")
         # Auto-version onboarding: a custom-arch model saved with an older transformers major will crash
         # its remote code under the current one. Build the whole lane in a cached env pinned to the model's
