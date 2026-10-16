@@ -550,7 +550,7 @@ def gguf_ladder_labels(c):
     except Exception:                                              # noqa: BLE001 -- unreadable: the f16 ladder
         pass
     from pollard_auto import LADDER
-    return [(label, frac * f16_gb * 1.1) for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]]
+    return [(label, frac * f16_gb * 1.05) for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]]
 
 
 def _draft_on(cfg):
