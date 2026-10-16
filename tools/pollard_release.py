@@ -924,7 +924,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             else:
                 tg = None if gguf_builds(c) else [("<each GGUF rung>", "<rung .gguf>")]
                 for s in draft_rung_steps(cfg, c, [{"tag": "<drafter rung>", "path": "<each drafter .gguf>"}], tg):
-                    out(f"     (per rung) {s.kind}: $ {_fmt_cmd(s.cmd)}")
+                    out(f"     (per rung) {s.kind}: " + (s.desc if s.fn else f"$ {_fmt_cmd(s.cmd)}"))
             n -= 1
             continue
         if st.kind == "expand":
@@ -943,7 +943,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 out(f"{head}: no ladder rungs in the MANIFEST (the ladder step failed or was skipped)")
             else:
                 for s in gguf_rung_steps(cfg, c, [{"tag": "<rung>", "path": "<each ladder rung .gguf>"}]):
-                    out(f"     (per rung) {s.kind}: $ {_fmt_cmd(s.cmd)}")
+                    out(f"     (per rung) {s.kind}: " + (s.desc if s.fn else f"$ {_fmt_cmd(s.cmd)}"))
             n -= 1
             continue
         if st.kind == "note":

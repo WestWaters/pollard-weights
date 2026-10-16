@@ -219,3 +219,11 @@ def test_a_quantized_source_gets_the_passthrough_ladder_rung_by_rung(model, inpu
     builds = [s for s in steps if s.id.startswith("gguf/ladder-")]
     assert [s.rung for s in builds] == ["PT25", "PT100"]
     assert 9.0 < builds[0].disk_gb < 9.5 and builds[0].cmd[-2:] == ["--rung", "PT25"]
+
+
+def test_the_free_mode_plan_prints_without_running(model, inputs, capsys):
+    cfg = plan(inputs)
+    c, _, steps = R.plan_steps(cfg, model, {"gguf"})
+    st = R.execute(steps, c, cfg, run=False, have=ALL)
+    assert st["gguf/ladder-Q6_K"] == "planned"
+    assert "upload this rung" in capsys.readouterr().out
