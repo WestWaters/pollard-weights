@@ -457,7 +457,7 @@ def test_release_draft_alone_and_pinned_drafter(model):
     cfg["lanes"]["draft"].update({"enabled": True, "drafter": "z-lab/Qwen3-4B-DFlash-b16"})
     _, _, steps = R.plan_steps(cfg, model, {"draft"})
     got = [s.id for s in steps if s.lane == "draft"]
-    assert got == ["draft/find", "draft/convert", "draft/rungs", "draft/card", "draft/upload"]
+    assert got == ["draft/find", "draft/train", "draft/convert", "draft/rungs", "draft/card", "draft/upload"]
     find = steps[[s.id for s in steps].index("draft/find")].cmd
     assert find[find.index("--drafter") + 1] == "z-lab/Qwen3-4B-DFlash-b16"
 
@@ -504,7 +504,8 @@ def test_release_execute_expands_draft_rungs(model, monkeypatch):
     D.record(c["src"], dq, "DFlash-Q8_0", "gguf", "dflash", {})
     st = R.execute([s for s in steps if s.kind != "upload"], c, cfg, run=True, have=ALL, out=lambda *_: None)
     assert st["draft/DFlash-Q8_0/measure"] == "done" and st["draft/DFlash-Q8_0/verify"] == "done"
-    assert [x[:2] for x in ran if "draft" in " ".join(x)] == [["pollard-draft", "find"], ["pollard-draft", "convert"],
+    assert [x[:2] for x in ran if "draft" in " ".join(x)] == [["pollard-draft", "find"], ["pollard-draft", "train"],
+                                    ["pollard-draft", "convert"],
                                     ["pollard-draft", "measure"], ["pollard-verify", "--lane"],
                                     ["pollard-draft", "card"]]
 

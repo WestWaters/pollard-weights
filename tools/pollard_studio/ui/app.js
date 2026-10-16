@@ -746,7 +746,7 @@ const ADV_SECTIONS = [
     why: "One solved allocation, emitted into whichever runtime you need. Each lane has its own "
        + "atoms and its own knobs.",
     tools: ["pollard_mlx", "pollard_mx", "pollard_exl3", "pollard_exl3_band",
-            "pollard_export", "pollard_vllm", "pollard_draft"] },
+            "pollard_export", "pollard_vllm", "pollard_draft", "pollard_draft_train"] },
   { title: "FOUNDATION MODELS", icon: "layers",
     why: "Make your own model, the way the labs make their small open ones: a fresh architecture, or a smaller "
        + "model carved out of a bigger one (depth and width pruning measured on your text), then pretraining "
