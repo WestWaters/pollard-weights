@@ -509,8 +509,7 @@ def main():
         # TEXT layer is still captured here, at FP8 -- wrong, just more quietly
         mods.append(QuantizationModifier(targets=rec["protect"], scheme=a.protect_scheme,
                                          ignore=rec["ignore"]))
-    cal = ([l for l in open(a.calib, encoding="utf-8", errors="ignore").read().splitlines() if l.strip()]
-           if a.calib else None)
+    cal = ws.calib_samples(a.calib) if a.calib else None    # whole samples (tool calls intact), not lines
     print(f"   emitting via llm-compressor ({len(cal) if cal else 'no'} calib rows) -> {a.out}")
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     def _oneshot(**kw):

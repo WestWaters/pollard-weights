@@ -289,7 +289,9 @@ DEFAULT_GATES = """\
 #   retention_min    task retention vs f16, percent (overall)            pollard-taskeval --results
 #   mt_retention_min mean chrF++ retention over the language pairs       pollard-taskeval --suite mt
 #   toolcall_pass    true = still emits valid tool calls                 pollard-toolcall --results
-#   toolcall_retention_min  tool-call success vs the f16's, percent      pollard-toolcall --ref --results
+#   toolcall_retention_min  tool-call success vs the reference's, percent pollard-toolcall --ref --results
+#   toolcall_not_measured   fail | skip: a rung pollard-toolcall recorded as NOT MEASURED (no server for its lane on
+#                    this machine, GPU not free, too big) -- default: the `missing` policy
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
@@ -328,8 +330,9 @@ rungs:
   - match: ["*_KT*", "*KT-*", "PollardMix*"]
     runtime: ik_llama
 # per model KIND (pollard-modelkind), applied after the rung entries. agentic = the chat template writes tool calls
-# in a syntax pollard-modelkind recognises; its rungs must keep their tool calling (pollard-toolcall, 60 probes
-# through llama-server --jinja, retention = rung success / f16 success).
+# in a syntax pollard-modelkind recognises; its rungs must keep their tool calling -- in EVERY lane (pollard-toolcall,
+# 60 probes through the lane's own server: llama-server --jinja / mlx_lm.server / vllm serve --tool-call-parser /
+# TabbyAPI; retention = rung success / reference success). The bit-width patterns below cover every lane's rung names.
 kinds:
   agentic:
     toolcall_retention_min: 90
@@ -396,10 +399,18 @@ def evaluate_gate(metrics, th, missing="fail"):
 
     def row(name, value, want, ok, why=""):
         checks.append({"check": name, "value": value, "want": want, "ok": bool(ok), "why": why})
+    # a rung pollard-toolcall explicitly recorded as NOT MEASURED (no server for its lane here, GPU not free, too
+    # big) is held to `toolcall_not_measured` (default: the `missing` policy), with the reason on the row
+    tc_nm = metrics.get("toolcall_status") == "not-measured"
+    tc_policy = th.get("toolcall_not_measured", missing)
+    tc_why = f"not measured: {metrics.get('toolcall_reason') or 'no reason recorded'}"
     for key, want in th.items():
         if key in _CHECKS:
             mkey, op, human = _CHECKS[key]
             v = metrics.get(mkey)
+            if v is None and tc_nm and key.startswith("toolcall"):
+                row(human, None, f"{op} {want}", tc_policy == "skip", tc_why)
+                continue
             if v is None:
                 row(human, None, f"{op} {want}", missing == "skip", "not measured")
                 continue
@@ -407,6 +418,9 @@ def evaluate_gate(metrics, th, missing="fail"):
             row(human, v, f"{op} {want}", ok)
         elif key == "toolcall_pass" and want:
             v = metrics.get("toolcall_pass")
+            if v is None and tc_nm:
+                row("tool calls", None, "pass", tc_policy == "skip", tc_why)
+                continue
             row("tool calls", v, "pass", v is True if v is not None else missing == "skip",
                 "" if v is not None else "not measured")
         elif key == "coherence" and want:
@@ -440,6 +454,10 @@ def metrics_from_results(results, rung):
     if mt:
         m["mt_retention"] = sum(mt) / len(mt)
     tc = r.get("toolcall") or {}
+    if tc.get("status") == "not-measured":
+        m["toolcall_status"], m["toolcall_reason"] = "not-measured", tc.get("reason")
+    if tc.get("cross_backend"):
+        m["toolcall_cross_backend"] = True
     if tc.get("pass") is not None:
         m["toolcall_pass"] = bool(tc["pass"])
     if tc.get("retention") is not None:
@@ -596,6 +614,9 @@ def main():
         results = json.load(open(a.results, encoding="utf-8")) if a.results and os.path.exists(a.results) else {}
         metrics = {**metrics_from_results(results, rung), **{k: v for k, v in measured.items() if v is not None}}
         kinds = model_kinds(a.model) if gates.get("kinds") else []
+        if gates.get("kinds") and "agentic" not in kinds and (
+                metrics.get("toolcall_status") or metrics.get("toolcall_retention") is not None):
+            kinds.append("agentic")            # pollard-toolcall measured it: its template writes tool calls
         th = thresholds_for(gates, rung, lane, kinds)
         gate_res = evaluate_gate(metrics, th, gates.get("missing", "fail"))
         gate_res.update({"rung": rung, "lane": lane, "gates": os.path.basename(a.gate) if a.gate else "built-in",

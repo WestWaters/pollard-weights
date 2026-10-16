@@ -7,11 +7,19 @@ that breaks first is narrow: emitting a syntactically correct call with the righ
 right argument types. It is a formatting skill concentrated in a small band of layers, which makes
 it unusually fragile to quantization and unusually cheap to protect once you know it went.
 
-The full gate (default) runs the REAL serving path: the rung is served with `llama-server --jinja`
-and asked through /v1/chat/completions with OpenAI-style `tools`, so the model's own chat template
-renders the tool list, the model answers in its own call syntax (Hermes, Qwen3-Coder XML, LFM2
-pythonic, harmony, Mistral... -- pollard-modelkind names it) and llama.cpp's own parser extracts the
-call. Sixty probes in four categories:
+The full gate (default) runs the REAL serving path, on every lane: the rung is served by the server its users will
+run it with and asked through /v1/chat/completions with OpenAI-style `tools`, so the model's own chat template renders
+the tool list, the model answers in its own call syntax (Hermes, Qwen3-Coder XML, LFM2 pythonic, harmony, Mistral...
+-- pollard-modelkind names it) and that server's own parser extracts the call:
+
+    gguf  llama-server --jinja                          (GGUF)
+    mlx   mlx_lm.server                                 (MLX)
+    vllm  vllm serve --enable-auto-tool-choice --tool-call-parser <family>   (GPTQ / AWQ / FP8 / MXFP4 / NVFP4)
+    exl3  TabbyAPI, exllamav3's OpenAI server           (EXL3)
+    url   an OpenAI-compatible server already running
+
+--backend auto (default) picks it from the file, the workspace MANIFEST lane or config.json. Sixty probes in four
+categories:
 
     single    one tool on offer, typed arguments (string / integer / number / boolean / enum)
     choose    eight tools on offer: pick the right one and fill it
@@ -19,12 +27,22 @@ call. Sixty probes in four categories:
     nested    several arguments, nested objects and arrays
 
 scored as parse rate, right function, arguments schema-valid, arguments exact and abstention, with
-Wilson CIs. Against the f16 the gate number is RETENTION (rung success / f16 success) with a paired
-bootstrap CI; the f16's run is cached beside it, so a ladder runs it once. A reasoning model's
-thinking is kept out of the grade (pollard-modelkind split_reasoning).
+Wilson CIs. Against the reference the gate number is RETENTION (rung success / reference success) with a paired
+bootstrap CI; the reference's run is cached, so a ladder runs it once. The reference is served by the rung's OWN
+backend where it can be (the bf16 checkout through mlx_lm.server for an MLX rung, through vLLM for a GPTQ / MX rung);
+when it cannot (no GPU free, does not fit), --ref-fallback (the f16 GGUF through llama-server) stands in and the
+result says cross-backend. A reasoning model's thinking is kept out of the grade (pollard-modelkind split_reasoning).
 
-    pollard-toolcall --gguf build.gguf --ref f16.gguf              # full gate, retention vs f16
-    pollard-toolcall --gguf build.gguf --ref f16.gguf --quick      # the old 4-probe plain-prompt check
+A backend this machine cannot run -- vLLM / exllamav3 without an NVIDIA GPU, a GPU with another process resident (a
+shared box's GPU is not ours to take), a model that does not fit the free memory -- is recorded as
+{"status": "not-measured", "reason": ...} and exits 0: the build goes on, and the card says "not measured (reason)".
+llama-server runs with -ngl 0 unless --ngl says otherwise.
+
+    pollard-toolcall --gguf build.gguf --ref f16.gguf                     # GGUF, retention vs f16
+    pollard-toolcall --model ./M-Pollard-MLX-4bit --ref ./M               # MLX, vs the bf16 through mlx_lm.server
+    pollard-toolcall --model ./M-Pollard-GPTQ-int4 --ref ./M --ref-fallback M-f16.gguf   # vLLM
+    pollard-toolcall --backend url --url http://127.0.0.1:8000 --rung my-rung            # already served
+    pollard-toolcall --gguf build.gguf --ref f16.gguf --quick             # the old 4-probe plain-prompt check
 
 What --quick counts as a failure, in the order they actually happen:
 
@@ -670,38 +688,306 @@ def score_suite(rows):
 _SERVER_LOG = "toolcall-server.log"
 
 
-@contextlib.contextmanager
-def served(model, ngl, ctx=4096, threads=None, server=None, log_path=None):
-    """llama-server --jinja for the duration; yields its base url. --jinja is what makes this the real path: the
-    model's own template renders the tools, and llama.cpp's own parser (with its lazy grammar) reads the call."""
-    from pollard_calc import find_llama_bin
-    binary = server or find_llama_bin("llama-server") or "llama-server"
+# ---------------------------------------------------------------------------------------------- serving backends
+#
+# Every lane is gated through the server its users will run it with, because that server's chat-template rendering
+# and tool-call parser decide what an agent harness receives:
+#
+#   gguf  llama-server --jinja                                   the GGUF lane
+#   mlx   mlx_lm.server                                          the MLX lane (the tokenizer's chat template renders
+#                                                                `tools`; mlx-lm's tool parser reads the call)
+#   vllm  vllm serve --enable-auto-tool-choice --tool-call-parser <family>
+#                                                                GPTQ / AWQ / FP8 / MXFP4 / NVFP4 (gptq + mx lanes)
+#   exl3  TabbyAPI (exllamav3's OpenAI-compatible server)         the EXL3 lane
+#   url   an OpenAI-compatible server that is already running
+#
+# A backend this machine cannot run -- vLLM on a Mac, a GPU with someone else's process resident, a model that will
+# not fit the memory that is free -- is never faked: the rung is recorded as {"status": "not-measured", "reason": ...},
+# the build carries on, and the card says "not measured (reason)".
+
+BACKENDS = ("gguf", "mlx", "vllm", "exl3", "url")
+#: build lane -> the backend that serves it
+LANE_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "awq": "vllm", "mx": "vllm", "exl3": "exl3"}
+#: the backend -> how the card and the logs name its server
+BACKEND_SERVER = {"gguf": "llama-server --jinja", "mlx": "mlx_lm.server", "vllm": "vllm serve",
+                  "exl3": "TabbyAPI (exllamav3)", "url": "an OpenAI-compatible server"}
+#: name the vLLM / TabbyAPI server answers to (the requests carry it)
+SERVED_NAME = "pollard-toolcall"
+#: Windows / desktop processes that sit on every NVIDIA GPU and do not mean someone is using it
+GPU_SHELL = ("dwm.exe", "explorer.exe", "shellhost", "searchhost", "startmenuexperiencehost", "textinputhost",
+             "shellexperiencehost", "crossdeviceresume", "systemsettings", "applicationframehost", "ctfmon",
+             "lockapp", "widgets", "windowsterminal", "nvidia overlay", "nvcontainer", "msedgewebview2", "dcv2",
+             "xorg", "gnome-shell", "xwayland", "kwin")
+
+
+class NotMeasured(Exception):
+    """This backend cannot measure this model on this machine. str(e) is the reason the card prints."""
+
+
+def _apple():
+    import platform
+    return sys.platform == "darwin" and platform.machine() in ("arm64", "aarch64")
+
+
+def _has_module(name):
+    try:
+        import importlib.util
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _config(path):
+    for name in ("config.json",):
+        try:
+            with open(os.path.join(path, name), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def lane_of(path):
+    """gguf | mlx | gptq | mx | exl3 | hf (an unquantized checkpoint) | None -- which lane a build belongs to: the
+    workspace MANIFEST's word when the build is recorded there, else what its files say."""
+    p = str(path or "").rstrip("/\\")
+    if p.lower().endswith(".gguf"):
+        return "gguf"
+    if not p or not os.path.isdir(p):
+        return None
+    try:
+        import pollard_workspace as ws
+        _, b = ws.find_build(p)
+        if b and b.get("lane"):
+            return b["lane"]
+    except Exception:                                            # noqa: BLE001 -- no workspace: read the files
+        pass
+    cfg = _config(p)
+    qc = cfg.get("quantization_config") or {}
+    meth = str(qc.get("quant_method") or "").lower()
+    if not meth and os.path.isfile(os.path.join(p, "quantization_config.json")):
+        try:
+            meth = str(json.load(open(os.path.join(p, "quantization_config.json"))).get("quant_method", "")).lower()
+        except (OSError, ValueError):
+            meth = ""
+    if meth.startswith("exl"):
+        return "exl3"
+    if meth in ("compressed-tensors", "fp8", "mxfp4", "nvfp4", "modelopt", "modelopt_fp4", "quark"):
+        return "mx"
+    if meth:
+        return "gptq"                                            # gptq / awq / bitsandbytes ...: vLLM serves it
+    if isinstance(cfg.get("quantization"), dict) and "bits" in cfg["quantization"]:
+        return "mlx"                                             # mlx-lm writes {"quantization": {group_size, bits}}
+    if cfg:
+        return "hf"
+    return None
+
+
+def pick_backend(path, prefer=None, url=None):
+    """The backend for this model. An unquantized checkpoint (a reference) goes to the rung's own backend when that
+    backend loads HF weights (mlx, vllm), so the reference is served the SAME way as the rung."""
+    if url:
+        return "url"
+    lane = lane_of(path)
+    if lane in LANE_BACKEND:
+        return LANE_BACKEND[lane]
+    if lane == "hf":
+        if prefer in ("mlx", "vllm"):
+            return prefer
+        return "mlx" if _apple() else "vllm"
+    return prefer if prefer in BACKENDS else "gguf"
+
+
+def model_gb(path):
+    """Weight GB on disk (a GGUF file, or every weight file in a checkpoint dir). 0 = unknown."""
+    p = str(path or "")
+    try:
+        if os.path.isfile(p):
+            return os.path.getsize(p) / 1e9
+        tot = 0
+        for root, _, files in os.walk(p):
+            for f in files:
+                if f.endswith((".safetensors", ".bin", ".gguf", ".npz", ".pt")):
+                    tot += os.path.getsize(os.path.join(root, f))
+        return tot / 1e9
+    except OSError:
+        return 0.0
+
+
+def _nvsmi(args):
+    """nvidia-smi's stdout, or None when there is no NVIDIA driver here."""
+    import shutil
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        r = subprocess.run(["nvidia-smi"] + list(args), capture_output=True, text=True, timeout=20)
+    except Exception:                                            # noqa: BLE001
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def gpu_users(table=None, apps=None):
+    """Processes resident on the NVIDIA GPU that are not the desktop shell -- graphics (a game, G / C+G) as well as
+    compute. `--query-compute-apps` alone misses a game, which is exactly the process the shared box must not
+    disturb, so the plain process table is read too."""
+    table = _nvsmi([]) if table is None else table
+    apps = _nvsmi(["--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"]) \
+        if apps is None else apps
+    names = []
+    in_procs = False
+    for line in (table or "").splitlines():
+        if "Processes:" in line:
+            in_procs = True
+            continue
+        if not in_procs:
+            continue
+        m = re.match(r"^\|\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(C\+G|G|C|M|M\+C)\s+(.+?)\s+(\d+MiB|N/A)\s*\|", line)
+        if m:
+            names.append(m.group(3).strip())
+    for line in (apps or "").splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) >= 2 and parts[1]:
+            names.append(parts[1])
+    out = []
+    for n in names:
+        base = re.split(r"[\\/]", n)[-1]
+        if not any(s in base.lower() for s in GPU_SHELL) and base not in out:
+            out.append(base)
+    return out
+
+
+def gpu_free_gb(text=None):
+    """Free VRAM on the emptiest card (vLLM / exllamav3 load onto one), or None when there is no NVIDIA GPU."""
+    text = _nvsmi(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]) if text is None else text
+    vals = [int(x) for x in re.findall(r"\d+", text or "")]
+    return max(vals) / 1024 if vals else None
+
+
+def _free_ram_gb():
+    try:
+        from pollard_calc import detect_available_ram_gb
+        return detect_available_ram_gb() or 0.0
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def check_gpu(backend, need_gb=0.0, users=None, free=None):
+    """A GPU-only backend (vLLM, exllamav3) runs only on an NVIDIA GPU that nobody else is using and that has room.
+    On a shared box the GPU belongs to whoever is on it: a resident process means not-measured, never a launch."""
+    users = gpu_users() if users is None else users
+    free = gpu_free_gb() if free is None else free
+    if free is None:
+        raise NotMeasured(f"{BACKEND_SERVER[backend]} needs an NVIDIA GPU and this machine has none")
+    if users:
+        raise NotMeasured("the GPU has another process resident (" + ", ".join(users[:3]) + ") -- not ours to take")
+    want = need_gb * 1.2 + 1.5                                   # weights + a 4K KV cache + the runtime's own
+    if need_gb and want > free:
+        raise NotMeasured(f"{need_gb:.1f}GB model needs ~{want:.1f}GB of VRAM, {free:.1f}GB free")
+
+
+def check_ram(need_gb, avail=None):
+    """A CPU / unified-memory backend (llama-server -ngl 0, mlx_lm) must fit the RAM that is free right now."""
+    avail = _free_ram_gb() if avail is None else avail
+    want = need_gb * 1.15 + 1.0
+    if need_gb and avail and want > avail:
+        raise NotMeasured(f"{need_gb:.1f}GB model needs ~{want:.1f}GB of RAM, {avail:.1f}GB free")
+
+
+def find_tabbyapi():
+    """A TabbyAPI checkout (exllamav3's OpenAI-compatible server): $POLLARD_TABBYAPI, else the usual places."""
+    cands = [os.environ.get("POLLARD_TABBYAPI"), os.environ.get("TABBYAPI_DIR"),
+             os.path.expanduser("~/tabbyAPI"), os.path.expanduser("~/TabbyAPI"),
+             os.path.expanduser("~/src/tabbyAPI")]
+    for d in cands:
+        if d and os.path.isfile(os.path.join(d, "main.py")):
+            return d
+    return None
+
+
+def _tabby_python(tabby):
+    for rel in ("venv/bin/python", ".venv/bin/python", "venv/Scripts/python.exe", ".venv/Scripts/python.exe"):
+        p = os.path.join(tabby, rel)
+        if os.path.isfile(p):
+            return p
+    return os.environ.get("POLLARD_TABBYAPI_PYTHON") or sys.executable
+
+
+def _free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
+    return port
+
+
+def gguf_cmd(binary, model, port, ngl, ctx=4096, threads=None):
+    """llama-server --jinja: the model's own template renders the tools, llama.cpp's own parser (with its lazy
+    grammar) reads the call."""
     cmd = [binary, "-m", model, "--host", "127.0.0.1", "--port", str(port), "-ngl", str(ngl), "-c", str(ctx),
            "-np", "1",                       # one slot: deterministic, and no KV pool shared four ways
            "--jinja",
            "--reasoning-format", "deepseek"]  # thinking goes to reasoning_content, not into the call parser
     if threads:
         cmd += ["-t", str(threads)]
+    return cmd
+
+
+def mlx_cmd(python, model, port, trust_remote_code=False):
+    """mlx_lm.server: the tokenizer's chat template renders `tools`, mlx-lm's tool parser fills `tool_calls`."""
+    cmd = [python, "-m", "mlx_lm.server", "--model", model, "--host", "127.0.0.1", "--port", str(port),
+           "--temp", "0"]
+    if trust_remote_code:
+        cmd += ["--trust-remote-code"]
+    return cmd
+
+
+def vllm_cmd(binary, model, port, parser, ctx=4096, trust_remote_code=False, gpu_util=0.85):
+    """vllm serve with the tool parser for this model's call syntax (pollard-modelkind toolcall_info)."""
+    cmd = [binary, "serve", model, "--host", "127.0.0.1", "--port", str(port), "--served-model-name", SERVED_NAME,
+           "--enable-auto-tool-choice", "--tool-call-parser", parser, "--max-model-len", str(ctx),
+           "--gpu-memory-utilization", f"{gpu_util:.2f}"]
+    if trust_remote_code:
+        cmd += ["--trust-remote-code"]
+    return cmd
+
+
+def exl3_cmd(python, tabby, model, port, ctx=4096):
+    """TabbyAPI on one EXL3 rung: its model dir is the rung's parent, its model name the rung's folder."""
+    model = os.path.abspath(str(model).rstrip("/\\"))
+    return [python, os.path.join(tabby, "main.py"), "--host", "127.0.0.1", "--port", str(port),
+            "--model-dir", os.path.dirname(model), "--model-name", os.path.basename(model),
+            "--max-seq-len", str(ctx), "--disable-auth", "true"]
+
+
+def _trust(model):
+    try:
+        return bool(_config(model).get("auto_map"))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+@contextlib.contextmanager
+def _launch(cmd, what, log_path=None, health="/health", port=None, env=None, cwd=None, wait_s=900):
+    """Start one server, wait for `health` to answer 200, yield its base url, always stop it afterwards."""
     log = open(log_path or _SERVER_LOG, "w", encoding="utf-8", errors="replace")
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    try:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, cwd=cwd)
+    except OSError as e:
+        log.close()
+        raise NotMeasured(f"could not start {what}: {e}") from None
     base = f"http://127.0.0.1:{port}"
     try:
-        for _ in range(900):
+        for _ in range(wait_s):
             if proc.poll() is not None:
-                raise SystemExit(f"llama-server exited ({proc.returncode}) before serving {model}; "
-                                 f"see {log.name}")
+                raise SystemExit(f"{what} exited ({proc.returncode}) before serving; see {log.name}")
             try:
-                with urllib.request.urlopen(base + "/health", timeout=2) as r:
+                with urllib.request.urlopen(base + health, timeout=2) as r:
                     if r.status == 200:
                         break
             except Exception:                                    # noqa: BLE001 -- still loading
                 time.sleep(1)
         else:
-            raise SystemExit(f"llama-server never became ready for {model}; see {log.name}")
+            raise SystemExit(f"{what} never became ready; see {log.name}")
         yield base
     finally:
         if proc.poll() is None:
@@ -711,6 +997,85 @@ def served(model, ngl, ctx=4096, threads=None, server=None, log_path=None):
             except Exception:                                    # noqa: BLE001
                 proc.kill()
         log.close()
+
+
+@contextlib.contextmanager
+def served(model, ngl, ctx=4096, threads=None, server=None, log_path=None):
+    """llama-server --jinja for the duration; yields its base url."""
+    from pollard_calc import find_llama_bin
+    import shutil
+    binary = server or find_llama_bin("llama-server") or shutil.which("llama-server")
+    if not binary:
+        raise NotMeasured("llama-server not found (install llama.cpp or pass --llama-server)")
+    port = _free_port()
+    with _launch(gguf_cmd(binary, model, port, ngl, ctx, threads), f"llama-server on {model}", log_path,
+                 port=port) as base:
+        yield base
+
+
+def preflight(backend, model, ngl="0", kind=None, server=None):
+    """Raise NotMeasured when this machine cannot serve `model` with `backend`; else the extra request fields the
+    backend wants. Asked BEFORE a server starts: memory first (never start what will not fit), then the GPU rule."""
+    kind = kind or {}
+    need = model_gb(model)
+    if backend == "gguf":
+        if str(ngl) in ("0", ""):
+            check_ram(need)
+        return {}
+    if backend == "mlx":
+        if not _apple():
+            raise NotMeasured("mlx_lm.server needs Apple Silicon")
+        if not (os.environ.get("POLLARD_MLX_PYTHON") or _has_module("mlx_lm")):
+            raise NotMeasured("mlx-lm is not installed here (pip install mlx-lm)")
+        check_ram(need)
+        return {}
+    if backend == "vllm":
+        import shutil
+        if not (server or shutil.which("vllm")):
+            raise NotMeasured("vLLM is not installed here")
+        parser = (kind.get("tools") or {}).get("vllm_parser")
+        if not parser:
+            fam = (kind.get("tools") or {}).get("family", "none")
+            raise NotMeasured(f"no vLLM --tool-call-parser reads the '{fam}' call syntax")
+        check_gpu("vllm", need)
+        return {"model": SERVED_NAME}
+    if backend == "exl3":
+        if not find_tabbyapi():
+            raise NotMeasured("no OpenAI-compatible exllamav3 server here (TabbyAPI not found; "
+                              "set POLLARD_TABBYAPI to its checkout)")
+        check_gpu("exl3", need)
+        return {}
+    return {}
+
+
+@contextlib.contextmanager
+def backend_server(backend, model, ngl="0", threads=None, server=None, url=None, kind=None, ctx=4096):
+    """The rung served by `backend` for the duration; yields its base url."""
+    if backend == "url":
+        if not url:
+            raise NotMeasured("--backend url needs --url")
+        yield re.sub(r"/v1/?$", "", url.rstrip("/"))
+        return
+    if backend == "gguf":
+        with served(model, ngl, ctx, threads=threads, server=server) as base:
+            yield base
+        return
+    port = _free_port()
+    if backend == "mlx":
+        py = os.environ.get("POLLARD_MLX_PYTHON") or sys.executable
+        cmd = mlx_cmd(py, model, port, _trust(model))
+    elif backend == "vllm":
+        import shutil
+        parser = ((kind or {}).get("tools") or {}).get("vllm_parser")
+        cmd = vllm_cmd(server or shutil.which("vllm"), model, port, parser, ctx, _trust(model))
+    elif backend == "exl3":
+        tabby = find_tabbyapi()
+        cmd = exl3_cmd(_tabby_python(tabby), tabby, model, port, ctx)
+    else:
+        raise NotMeasured(f"unknown backend {backend!r}")
+    with _launch(cmd, f"{BACKEND_SERVER[backend]} on {model}", port=port,
+                 cwd=find_tabbyapi() if backend == "exl3" else None) as base:
+        yield base
 
 
 def _post(base, payload, timeout=600):
@@ -728,20 +1093,22 @@ def _post(base, payload, timeout=600):
         return {"error": repr(e)[:200]}
 
 
-def request_for(probe, max_tokens, template_kwargs=None):
+def request_for(probe, max_tokens, template_kwargs=None, extra=None):
     """The OpenAI request one probe sends: the user turn, the tools on offer, greedy decoding."""
     body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": probe["prompt"]}],
             "tools": [TOOLBOX[t] for t in probe["tools"]], "tool_choice": "auto", "parallel_tool_calls": False,
             "temperature": 0, "top_k": 1, "seed": 0, "max_tokens": max_tokens}
     if template_kwargs:
         body["chat_template_kwargs"] = template_kwargs
+    if extra:
+        body.update(extra)
     return body
 
 
-def run_suite(base, probes=None, max_tokens=384, template_kwargs=None, progress=None):
+def run_suite(base, probes=None, max_tokens=384, template_kwargs=None, progress=None, extra=None):
     rows = []
     for i, p in enumerate(probes or SUITE):
-        reply = _post(base, request_for(p, max_tokens, template_kwargs))
+        reply = _post(base, request_for(p, max_tokens, template_kwargs, extra))
         rows.append(grade_reply(reply, p))
         if progress:
             progress(i + 1, len(probes or SUITE), rows[-1])
@@ -753,19 +1120,47 @@ def suite_hash(probes=None, extra=""):
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+def fingerprint(path):
+    """size:mtime of a file; of a checkpoint dir, its weight bytes and newest weight mtime."""
+    p = str(path or "")
+    if os.path.isfile(p):
+        st = os.stat(p)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    size, newest = 0, 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            if f.endswith((".safetensors", ".bin", ".gguf", ".json")):
+                st = os.stat(os.path.join(root, f))
+                size, newest = size + st.st_size, max(newest, int(st.st_mtime))
+    return f"{size}:{newest}"
+
+
 def _ref_cache_path(ref, key):
+    ref = str(ref).rstrip("/\\")
+    if os.path.isdir(ref):                                       # never write into an HF cache snapshot
+        try:
+            import pollard_workspace as ws
+            d = os.path.join(ws.cache_dir(create=True), "toolcall")
+        except Exception:                                        # noqa: BLE001
+            d = os.path.join(os.path.dirname(os.path.abspath(ref)), ".pollard-cache")
+        tag = hashlib.sha256(os.path.abspath(ref).encode()).hexdigest()[:8]
+        return os.path.join(d, f"{os.path.basename(ref)}-{tag}.toolcall-{key}.json")
     d = os.path.join(os.path.dirname(os.path.abspath(ref)), ".pollard-cache")
     return os.path.join(d, f"{os.path.basename(ref)}.toolcall-{key}.json")
 
 
-def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, quiet=False):
-    """Serve one GGUF and run the suite on it. Returns (rows, meta)."""
+def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, quiet=False,
+              backend="gguf", url=None):
+    """Serve one model with `backend` and run the suite on it. Returns (rows, meta); NotMeasured when this machine
+    cannot serve it that way."""
     kind = {}
-    try:
-        from pollard_modelkind import classify
-        kind = classify(model)
-    except Exception:                                            # noqa: BLE001
-        kind = {}
+    if model and os.path.exists(str(model)):
+        try:
+            from pollard_modelkind import classify
+            kind = classify(model)
+        except (Exception, SystemExit):                          # noqa: BLE001
+            kind = {}
+    extra = preflight(backend, model, ngl, kind, server) if backend != "url" else {}
     thinking = bool(kind.get("thinking"))
     budget = max_tokens or (N_PREDICT_REASONING if thinking and not no_think else 384)
     tkw = None
@@ -774,21 +1169,24 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
         tkw = dict(tog.get("off") or {}) or None
     fam = (kind.get("tools") or {}).get("family")
     if not quiet:
-        print(f"   {os.path.basename(model)}: tool syntax {fam or '?'}, budget {budget} tokens"
-              + (", thinking off" if tkw else ""), flush=True)
+        print(f"   {os.path.basename(str(model or url).rstrip('/'))}: {BACKEND_SERVER.get(backend, backend)}, "
+              f"tool syntax {fam or '?'}, budget {budget} tokens" + (", thinking off" if tkw else ""), flush=True)
 
     def prog(i, n, row):
         if not quiet and (i % 10 == 0 or i == n):
             print(f"     {i}/{n}", flush=True)
-    with served(model, ngl, threads=threads, server=server) as base:
-        rows = run_suite(base, probes, budget, tkw, prog)
-    return rows, {"family": fam, "budget": budget, "thinking": thinking, "template_kwargs": tkw}
+    with backend_server(backend, model, ngl, threads, server, url, kind) as base:
+        rows = run_suite(base, probes, budget, tkw, prog, extra)
+    return rows, {"family": fam, "budget": budget, "thinking": thinking, "template_kwargs": tkw,
+                  "backend": backend}
 
 
-def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, refresh=False):
-    """The f16's rows, cached beside it: every rung of a ladder is compared to the same f16, so it runs once."""
-    st = os.stat(ref)
-    key = suite_hash(probes, f"{st.st_size}:{int(st.st_mtime)}:{max_tokens}:{no_think}")
+def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, refresh=False,
+                   backend="gguf", url=None):
+    """The reference's rows, cached: every rung of a ladder is compared to the same reference, so it runs once."""
+    if backend == "url":
+        return run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend, url=url)
+    key = suite_hash(probes, f"{fingerprint(ref)}:{max_tokens}:{no_think}:{backend}")
     path = _ref_cache_path(ref, key)
     if not refresh and os.path.isfile(path):
         try:
@@ -797,7 +1195,7 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
             return d["rows"], d.get("meta", {})
         except (ValueError, OSError, KeyError):
             pass
-    rows, meta = run_model(ref, ngl, threads, server, max_tokens, no_think, probes)
+    rows, meta = run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         json.dump({"rows": rows, "meta": meta}, open(path, "w", encoding="utf-8"), indent=1)
@@ -897,46 +1295,109 @@ def verdict_for(s, rs=None, ret=None, min_rate=0.75, min_retention=90.0):
     return (s["rate"] or 0.0) >= min_rate
 
 
+def _server_for(backend, a):
+    """The server binary override that applies to this backend (--llama-server / --vllm)."""
+    return {"gguf": a.llama_server, "vllm": getattr(a, "vllm", None)}.get(backend)
+
+
+def record_not_measured(a, rung, backend, reason, lane=None):
+    """A rung this machine could not measure: said so in results.json, never a fake number."""
+    if a.results:
+        import pollard_workspace as ws
+        tc = {"status": "not-measured", "reason": str(reason), "backend": backend, "mode": "full"}
+        if lane:
+            tc["lane"] = lane
+        ws.merge_results(a.results, rung, {"toolcall": tc})
+
+
+def _resolve_ref(a, backend, kw):
+    """(ref_rows, ref_meta, ref_backend, note) -- the reference served by the rung's own backend when it can be; else
+    the --ref-fallback (the f16 GGUF through llama-server), labelled cross-backend; else no reference at all."""
+    if not (a.ref or a.ref_url):
+        return None, None, None, None
+    rb = a.ref_backend if a.ref_backend != "auto" else pick_backend(a.ref, prefer=backend, url=a.ref_url)
+    try:
+        rows, meta = run_ref_cached(a.ref, a.ngl, refresh=a.refresh_ref, backend=rb, url=a.ref_url,
+                                    **dict(kw, server=_server_for(rb, a)))
+        return rows, meta, rb, None
+    except NotMeasured as e:
+        why = f"{BACKEND_SERVER.get(rb, rb)} reference not measured: {e}"
+        print(f"   ({why})")
+    if a.ref_fallback and os.path.exists(a.ref_fallback):
+        fb = pick_backend(a.ref_fallback)
+        try:
+            rows, meta = run_ref_cached(a.ref_fallback, a.ngl, refresh=a.refresh_ref, backend=fb,
+                                        **dict(kw, server=_server_for(fb, a)))
+            return rows, meta, fb, f"{why}; reference = {os.path.basename(a.ref_fallback)} via {BACKEND_SERVER[fb]}"
+        except NotMeasured as e:
+            why += f"; fallback {os.path.basename(a.ref_fallback)} not measured either: {e}"
+            print(f"   ({why})")
+    return None, None, None, why
+
+
 def main_full(a):
     probes = _balanced(a.limit)
-    print(f"== pollard-toolcall :: {os.path.basename(a.gguf)}  ({len(probes)} probes, llama-server --jinja)")
-    kw = dict(threads=a.threads, server=a.llama_server, max_tokens=a.n_predict, no_think=a.no_think, probes=probes)
-    rows, meta = run_model(a.gguf, a.ngl, **kw)
+    model = a.model or a.gguf
+    backend = a.backend if a.backend != "auto" else pick_backend(model, url=a.url)
+    rung = a.rung or os.path.basename(str(model or "served").rstrip("/\\"))
+    lane = lane_of(model) if model else None
+    print(f"== pollard-toolcall :: {rung}  ({len(probes)} probes, {BACKEND_SERVER.get(backend, backend)})")
+    kw = dict(threads=a.threads, max_tokens=a.n_predict, no_think=a.no_think, probes=probes)
+    try:
+        rows, meta = run_model(model, a.ngl, backend=backend, url=a.url, server=_server_for(backend, a), **kw)
+    except NotMeasured as e:
+        print(f"\n  NOT MEASURED ({backend}): {e}\n  -- recorded as such; nothing here is a tool-call result.")
+        record_not_measured(a, rung, backend, e, lane)
+        return 0
     s = score_suite(rows)
-    print_board(os.path.basename(a.gguf), s, rows, a.verbose)
-    rs, ref_rows, ret = None, None, (None, None, None)
-    if a.ref:
-        ref_rows, _ = run_ref_cached(a.ref, a.ngl, refresh=a.refresh_ref, **kw)
+    print_board(rung, s, rows, a.verbose)
+    ref_rows, ref_meta, ref_backend, ref_note = _resolve_ref(a, backend, kw)
+    rs, ret = None, (None, None, None)
+    if ref_rows is not None:
         rs = score_suite(ref_rows)
-        print_board(os.path.basename(a.ref) + "  (reference)", rs, ref_rows, a.verbose)
+        ref_name = os.path.basename(str((a.ref_fallback if ref_note else None) or a.ref or a.ref_url).rstrip("/\\"))
+        print_board(f"{ref_name}  (reference, {BACKEND_SERVER.get(ref_backend, ref_backend)})", rs, ref_rows,
+                    a.verbose)
         ret = retention_ci(rows, ref_rows)
         if ret[0] is not None:
             print(f"\n  RETENTION {100 * ret[0]:.1f}%  (95% paired-bootstrap CI {100 * ret[1]:.1f}-{100 * ret[2]:.1f}%)"
                   f"   success {_pct(s['rate'])} vs {_pct(rs['rate'])}")
-            print(f"  same outcome as the f16 on {_same(rows, ref_rows)}/{len(rows)} probes")
+            print(f"  same outcome as the reference on {_same(rows, ref_rows)}/{len(rows)} probes")
+            if ref_backend != backend:
+                print(f"  (cross-backend: rung via {BACKEND_SERVER.get(backend, backend)}, reference via "
+                      f"{BACKEND_SERVER.get(ref_backend, ref_backend)} -- part of any gap is the server, not the quant)")
         else:
             print("\n  (the reference passes no probe: nothing to retain -- retention is undefined)")
+    elif ref_note:
+        print(f"\n  no reference measured ({ref_note}): the gate is the absolute success rate")
     ok = verdict_for(s, rs, ret[0], a.min_rate, a.min_retention)
     if not ok and ret[0] is not None:
         _advice()
     if a.out:
         json.dump({"score": s, "rows": rows, "ref_score": rs, "ref_rows": ref_rows, "meta": meta,
-                   "retention": ret[0], "retention_ci": [ret[1], ret[2]]}, open(a.out, "w"), indent=2)
+                   "retention": ret[0], "retention_ci": [ret[1], ret[2]], "backend": backend,
+                   "ref_backend": ref_backend, "ref_note": ref_note}, open(a.out, "w"), indent=2)
     if a.results:
         import pollard_workspace as ws
-        tc = {"pass": bool(ok), "mode": "full", "rate": s["rate"], "rate_ci": s["rate_ci"], "n": s["n"],
+        tc = {"status": "measured", "pass": bool(ok), "mode": "full", "backend": backend,
+              "rate": s["rate"], "rate_ci": s["rate_ci"], "n": s["n"],
               "modes": s["modes"], "parse_rate": s["parse_rate"], "function_acc": s["function_acc"],
               "args_valid": s["args_valid"], "exact": s["exact"], "abstention": s["abstention"],
               "categories": s["categories"], "family": meta.get("family")}
+        if lane:
+            tc["lane"] = lane
         if rs is not None:
-            tc.update({"ref_rate": rs["rate"], "ref_rate_ci": rs["rate_ci"],
+            tc.update({"ref_rate": rs["rate"], "ref_rate_ci": rs["rate_ci"], "ref_backend": ref_backend,
+                       "cross_backend": ref_backend != backend,
                        "drop": round((rs["rate"] or 0) - (s["rate"] or 0), 4)})
+        if ref_note:
+            tc["ref_note"] = ref_note
         if ref_rows is not None:
             tc["agreement"] = round(_same(rows, ref_rows) / max(len(rows), 1), 4)
         if ret[0] is not None:
             tc.update({"retention": round(100 * ret[0], 2),
                        "retention_ci": [round(100 * ret[1], 2), round(100 * ret[2], 2)]})
-        ws.merge_results(a.results, a.rung or os.path.basename(a.gguf), {"toolcall": tc})
+        ws.merge_results(a.results, rung, {"toolcall": tc})
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
@@ -945,14 +1406,29 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
-    ap.add_argument("--gguf", required=True, help="the build to check")
-    ap.add_argument("--ref", help="reference build (the f16), to report RETENTION rather than a bare rate")
+    ap.add_argument("--model", help="the build to check: a GGUF file or a lane's checkpoint dir (MLX / GPTQ / AWQ / "
+                                    "MX / EXL3)")
+    ap.add_argument("--gguf", help="the GGUF build to check (same as --model; --quick needs a GGUF)")
+    ap.add_argument("--backend", default="auto", choices=("auto",) + BACKENDS,
+                    help="the server that serves the build: gguf (llama-server --jinja), mlx (mlx_lm.server), vllm "
+                         "(vllm serve --tool-call-parser <family>), exl3 (TabbyAPI), url (already running). "
+                         "auto (default) = from the file / the MANIFEST lane / config.json")
+    ap.add_argument("--url", help="--backend url: the OpenAI-compatible server's base url")
+    ap.add_argument("--ref", help="reference (the f16 GGUF, or the bf16 HF checkout for a directory lane), to report "
+                                  "RETENTION rather than a bare rate")
+    ap.add_argument("--ref-backend", default="auto", choices=("auto",) + BACKENDS,
+                    help="the reference's server (auto: the rung's own backend whenever it can load the reference)")
+    ap.add_argument("--ref-url", help="--ref-backend url: where the reference is already served")
+    ap.add_argument("--ref-fallback", help="when the reference cannot be served by the rung's backend here (no GPU, "
+                                           "too big): use this one instead (the f16 GGUF) -- labelled cross-backend")
     ap.add_argument("--quick", action="store_true",
                     help="the old 4-probe plain-prompt check through llama-cli (no chat template, no server)")
-    ap.add_argument("--ngl", default="0", help="GPU layers (a number, or auto; default 0 -- shared boxes)")
+    ap.add_argument("--ngl", default="0", help="GPU layers for llama-server (a number, or auto; default 0 -- shared "
+                                               "boxes: the GPU is not ours unless this says so)")
     ap.add_argument("--threads", type=int, default=None)
     ap.add_argument("--llama-cli", default="llama-cli", help="--quick: the llama-cli binary")
     ap.add_argument("--llama-server", default=None, help="the llama-server binary (default: the runtime build/PATH)")
+    ap.add_argument("--vllm", default=None, help="the vllm binary (default: vllm on PATH)")
     ap.add_argument("--min-rate", type=float, default=0.75,
                     help="without --ref: fail below this success rate (default 0.75)")
     ap.add_argument("--min-retention", type=float, default=90.0,
@@ -966,13 +1442,21 @@ def main(argv=None):
     ap.add_argument("--out", help="write the full result here as JSON")
     ap.add_argument("--results", help="merge this rung's numbers into this results.json "
                                       "(what pollard-card --results and pollard-verify --gate read)")
-    ap.add_argument("--rung", help="the rung's name/tag in --results (default: the GGUF file name)")
+    ap.add_argument("--rung", help="the rung's name/tag in --results (default: the build's file / folder name)")
     ap.add_argument("--n-predict", type=int, default=0,
                     help=f"generation budget (default: 384, or {N_PREDICT_REASONING} for a reasoning model; "
                          f"--quick: {N_PREDICT_PLAIN} / {N_PREDICT_REASONING})")
     a = ap.parse_args(argv)
-    raise SystemExit(main_quick(a) if a.quick else main_full(a))
-
+    if a.quick:
+        a.gguf = a.gguf or a.model
+        if not a.gguf:
+            ap.error("--quick needs --gguf")
+        raise SystemExit(main_quick(a))
+    if not (a.model or a.gguf or a.url):
+        ap.error("pass --model (or --gguf) for the build to check, or --url for one already served")
+    if a.ref_backend == "url" and not a.ref_url:
+        ap.error("--ref-backend url needs --ref-url")
+    raise SystemExit(main_full(a))
 
 if __name__ == "__main__":
     main()

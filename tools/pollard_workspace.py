@@ -237,6 +237,32 @@ def record_gate(build_path: str, gate: dict) -> bool:
     return True
 
 
+def calib_samples(path: str) -> list:
+    """Calibration SAMPLES from a corpus, for an exporter that takes one sample per item (GPTQ, llm-compressor).
+
+    pollard-calib writes <corpus>.samples.jsonl beside the corpus with every sample whole -- a rendered agent trace
+    keeps its tool list, its call and the tool's answer in one sample. Without that twin (a corpus from elsewhere, or
+    an older one) the corpus is read the way it always was: one sample per non-empty line."""
+    twin = str(path) + ".samples.jsonl"
+    # a twin older than the corpus belongs to a corpus that has since been replaced
+    if os.path.isfile(twin) and os.path.getmtime(twin) >= os.path.getmtime(path) - 2:
+        out = []
+        try:
+            with open(twin, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        s = json.loads(line)
+                        if isinstance(s, str) and s.strip():
+                            out.append(s)
+        except (OSError, ValueError):
+            out = []
+        if out:
+            return out
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+
 def merge_results(path: str, rung: str, patch: dict, meta: dict | None = None) -> dict:
     """Merge measured numbers for one rung into a results.json (the file pollard-card --results reads:
     {rung: {ppl, kld, top1, toolcall, decision, retention, mt, ...}, _meta keys...}). Nested dicts are

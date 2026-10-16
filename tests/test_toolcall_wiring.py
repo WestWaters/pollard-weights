@@ -1,5 +1,5 @@
 """The tool-call gate wired in: an AGENTIC model (pollard-modelkind finds a tool-call syntax in its template) gets
-pollard-toolcall in `pollard release` (and `pollard --run --toolcall`), and pollard-verify --gate holds its rungs
+pollard-toolcall in `pollard release` and, by default, in `pollard --run` (--no-toolcall skips it), and pollard-verify --gate holds its rungs
 to a tool-call retention threshold (gates.yaml `kinds: agentic:`). A model with no tool syntax is untouched.
 Fakes only: no model, no llama.cpp."""
 from __future__ import annotations
@@ -125,7 +125,8 @@ def test_auto_runs_the_gate_on_this_runs_rungs_only(monkeypatch, tmp_path):
     pa._toolcall_gate(a, since=os.path.getmtime(new))
     assert len(calls) == 1
     cmd = calls[0]
-    assert "--gguf" in cmd and str(new) in cmd and cmd[cmd.index("--ref") + 1] == a.gguf
+    assert cmd[cmd.index("--model") + 1] == str(new) and cmd[cmd.index("--ref") + 1] == a.gguf
+    assert cmd[cmd.index("--backend") + 1] == "gguf"
     assert cmd[cmd.index("--ngl") + 1] == "0"                  # 'auto' never becomes a GPU claim here
     assert a.results and cmd[cmd.index("--results") + 1] == a.results
 
@@ -139,4 +140,37 @@ def test_auto_skips_a_model_with_no_tool_syntax_and_honours_no_toolcall(monkeypa
     monkeypatch.setattr(MK, "classify", _kind("hermes"))
     pa._toolcall_gate(_auto_args(tmp_path, toolcall=False), since=0)
     pa._toolcall_gate(_auto_args(tmp_path, run=False), since=0)
+    assert calls == []
+
+
+def test_auto_toolcall_is_on_by_default_and_no_toolcall_skips_it(monkeypatch):
+    seen = []
+    monkeypatch.setattr(pa, "_dispatch", lambda a: seen.append(a))
+    for argv, want in ((["pollard", "--gguf", "m.gguf"], True),
+                       (["pollard", "--gguf", "m.gguf", "--toolcall"], True),          # the old flag: a no-op alias
+                       (["pollard", "--gguf", "m.gguf", "--no-toolcall"], False)):
+        monkeypatch.setattr(sys, "argv", argv)
+        pa.main()
+        assert seen[-1].toolcall is want, argv
+
+
+def test_auto_gates_a_directory_lane_rung_against_the_original_weights(monkeypatch, tmp_path):
+    out = tmp_path / "M-Pollard-MLX"
+    out.mkdir()
+    a = types.SimpleNamespace(run=True, toolcall=True, gguf=None, ngl="auto", results=None, format="mlx",
+                              hf="Org/M", _hf_src=str(tmp_path / "M"), _hf_dir=str(tmp_path / "M-smoothed"))
+    monkeypatch.setattr(MK, "classify", _kind("hermes"))
+    monkeypatch.setattr(pa, "_f16_gguf_for", lambda src: "/ws/M-f16.gguf")
+    calls = []
+    monkeypatch.setattr(pa.subprocess, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=0))
+    pa._toolcall_gate(a, since=0, lane_out=str(out))
+    (cmd,) = calls
+    assert cmd[cmd.index("--model") + 1] == str(out) and cmd[cmd.index("--backend") + 1] == "auto"
+    assert cmd[cmd.index("--ref") + 1] == a._hf_src                          # the original, not the smoothed copy
+    assert cmd[cmd.index("--ref-fallback") + 1] == "/ws/M-f16.gguf"
+    assert cmd[cmd.index("--ngl") + 1] == "0"
+    assert a.results == str(tmp_path / "results.json")
+    calls.clear()
+    monkeypatch.setattr(MK, "classify", _kind("none"))
+    pa._toolcall_gate(a, since=0, lane_out=str(out))
     assert calls == []

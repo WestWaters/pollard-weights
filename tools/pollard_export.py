@@ -267,7 +267,7 @@ def main():
                  "The checkpoint it writes loads in vLLM/SGLang.")
     if not a.calib:
         sys.exit("ERROR: --calib is required to build (use --plan-only / --shard-plan for planning only).")
-    calib = [ln.strip() for ln in open(a.calib, encoding="utf-8") if ln.strip()]
+    calib = ws.calib_samples(a.calib)            # whole samples: an agent trace keeps its tool call in one piece
     qcfg = QuantizeConfig(bits=low, group_size=a.group_size, desc_act=False, sym=True,
                           dynamic=(dyn or None))
     trc = resolve_trust_remote_code(a.model, a.trust_remote_code)

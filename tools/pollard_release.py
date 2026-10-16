@@ -248,6 +248,25 @@ def toolcall_wanted(cfg, c):
     return False
 
 
+#: lane -> pollard-toolcall's backend for its rungs (the server its users run it with)
+TOOLCALL_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "mx": "vllm", "exl3": "exl3"}
+
+
+def toolcall_cmd(c, lane, out, name, res):
+    """pollard-toolcall for one directory-lane rung. The reference is the ORIGINAL bf16 checkout (not the smoothed
+    copy), served by the rung's own backend where it can be: mlx_lm.server for MLX, vLLM for GPTQ / MX. EXL3 has no
+    bf16 server of its own, so its reference goes through vLLM. When that cannot run here (no free GPU, too big) the
+    f16 GGUF through llama-server stands in, and the result is labelled cross-backend. A backend this machine
+    lacks records the rung as not measured and exits 0 -- never a fake number."""
+    cmd = ["pollard-toolcall", "--model", out, "--backend", TOOLCALL_BACKEND[lane], "--ref", c["hf_dir"],
+           "--ngl", c["ngl"], "--results", res, "--rung", name]
+    if lane == "exl3":
+        cmd += ["--ref-backend", "vllm"]
+    if lane != "mlx":
+        cmd += ["--ref-fallback", c["f16"]]
+    return cmd
+
+
 def gguf_rung_steps(cfg, c, builds):
     """Measure + verify for every rung the GGUF ladder produced (read back from the MANIFEST)."""
     m, res, steps = dict(cfg.get("measure") or {}), results_path(c, "gguf"), []
@@ -291,12 +310,14 @@ def lane_steps(cfg, c, lane):
     if lane == "gguf":
         cmd = ["pollard", "--hf", c["hf_dir"], "--output", c["gguf_dir"], "--calib", c["calib"],
                "--sensitivity", c["sens_raw"], "--ladder", "--run", "--no-card", "--force",
+               "--no-toolcall",                          # release measures every rung itself (gguf/rungs)
                "--ngl", "auto" if c["ngl"] == "auto" else c["ngl"],
                "--calib-profile", str((cfg.get("calib") or {}).get("profile", "auto"))]
         return [Step(id="gguf/ladder", lane="gguf", kind="build", requires="any", cmd=cmd, out=c["f16"],
                      desc="convert -> imatrix -> measured publish ladder (+ IQ*_KT flagship where ik_llama builds)"),
                 Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")]
     steps, res = [], results_path(c, lane)
+    tool = toolcall_wanted(cfg, c)
     for rung in lc.get("rungs") or []:
         tag = rung_tag(lane, rung)
         out = ws.resolve_out(c["src"], lane, tag, create_parent=False)
@@ -324,6 +345,9 @@ def lane_steps(cfg, c, lane):
         rid = f"{lane}/{tag}"
         steps.append(Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
                           out=out, src=src))
+        if tool:
+            steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
+                              cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1)))
         # gated against the ORIGINAL weights, not the smoothed copy: fidelity to the model people asked for
         ver = ["pollard-verify", "--lane", lane, "--model", out, "--source", c["hf_dir"], "--rung", name,
                "--results", res] + _verify_gate(c)

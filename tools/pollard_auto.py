@@ -499,12 +499,28 @@ def _precondition_hf(a, hf_dir):
     if getattr(a, "smooth", False):
         out = cur.rstrip("/\\") + "-smoothed"
         cmd = [sys.executable, os.path.join(here, "pollard_hf_smooth.py"), "--model", cur, "--out", out] + trc
-        if a.calib: cmd += ["--calib", a.calib]
+        calib = a.calib or _smooth_calib(a, cur)
+        if calib: cmd += ["--calib", calib]
         print(f"   [precondition] smooth (SmoothQuant, FP16): {' '.join(cmd)}")
         if a.run and subprocess.run(cmd).returncode != 0:
             sys.exit("   smooth failed.")
         cur = out
     return cur
+
+
+def _smooth_calib(a, hf_dir):
+    """The corpus SmoothQuant measures its activation scales on: the same Calib 3.0 corpus the export lane then
+    calibrates on (built here, first, when the lane is an export lane) -- so an agentic model's smoothing sees its
+    tool-call traces rendered through its own template, not a bland built-in sentence."""
+    if getattr(a, "format", "gguf") not in ("gptq", "mx", "exl3", "mlx"):
+        return None
+    here = os.path.dirname(os.path.abspath(a.output)) if a.output else os.getcwd()
+    prev = getattr(a, "_hf_dir", None)
+    a._hf_dir = hf_dir                                  # the template the corpus renders through
+    try:
+        return _ensure_calib_text(a, here)
+    finally:
+        a._hf_dir = prev
 
 
 def _preflight(a, hf_dir):
@@ -541,6 +557,7 @@ def _resolve_hf(a):
     Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
     if os.path.isdir(a.hf):
         _preflight(a, a.hf)
+        a._hf_src = a.hf                                # the original weights: the tool-call reference
         a._hf_dir = _precondition_hf(a, a.hf)
         return a._hf_dir
     import pollard_workspace as ws
@@ -550,6 +567,7 @@ def _resolve_hf(a):
         local = ws.fetch_source(a.hf)                   # single copy, no ~/.cache dup
     if os.path.isdir(local):
         _preflight(a, local)
+    a._hf_src = local
     a._hf_dir = _precondition_hf(a, local)
     return a._hf_dir
 
@@ -677,6 +695,7 @@ def _emit_nongguf(a):
     _rt = {"gptq": "vllm serve / sglang", "mlx": "mlx_lm.generate",
            "exl3": "exllamav3 / TabbyAPI", "mx": "vllm serve (compressed-tensors)"}
     print(f"   -> {out}  ({_rt.get(a.format, '')})")
+    return out
 
 
 def _imatrix_shape(gguf):
@@ -835,21 +854,73 @@ def _emit_mmproj(a, conv, hf_dir, gguf_out):
     print(f"   wrote {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
 
 
-def _toolcall_gate(a, since):
-    """An AGENTIC model (pollard-modelkind: its chat template writes tool calls in a known syntax) gets the tool-call
-    gate on every GGUF rung this run built: pollard-toolcall serves each with llama-server --jinja, asks 60 tool
-    probes through OpenAI-style `tools`, and records retention vs the f16 in results.json -- which the card turns
-    into its Tool-ready column. A quant can keep its perplexity and lose the narrow band of layers that formats
-    tool calls, and an agent harness is exactly where that shows. Opt-in with --toolcall."""
-    if not a.run or not getattr(a, "toolcall", False) or not a.gguf:
-        return
+def _agentic_family(src):
+    """The tool-call syntax pollard-modelkind finds in this model's chat template, or None (not agentic / unreadable)."""
     try:
         from pollard_modelkind import classify
-        tools = classify(a.gguf).get("tools") or {}
+        fam = (classify(src).get("tools") or {}).get("family", "none")
     except (Exception, SystemExit):                              # noqa: BLE001
+        return None
+    return None if fam in (None, "none") else fam
+
+
+def _f16_gguf_for(src):
+    """An f16 GGUF of this model already in the workspace (a GGUF run made one): the cross-backend reference a
+    directory lane falls back to when its own backend cannot serve the bf16 here."""
+    if not src:
+        return None
+    try:
+        import glob
+        import pollard_workspace as ws
+        hits = sorted(glob.glob(os.path.join(ws.model_dir(src), "**", "*-f16.gguf"), recursive=True))
+        return hits[0] if hits else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _toolcall_cmd(path, ref, ngl, results, rung, backend="auto", ref_fallback=None):
+    cmd = ["pollard-toolcall", "--model", path, "--backend", backend, "--ngl", ngl, "--results", results,
+           "--rung", rung]
+    if ref:
+        cmd += ["--ref", ref]
+    if ref_fallback:
+        cmd += ["--ref-fallback", ref_fallback]
+    return _resolve_tool(cmd)
+
+
+def _toolcall_gate(a, since, lane_out=None):
+    """An AGENTIC model (pollard-modelkind: its chat template writes tool calls in a known syntax) gets the tool-call
+    gate on every rung this run built, in whichever lane it built: pollard-toolcall serves each rung with that
+    lane's own server (llama-server --jinja for GGUF, mlx_lm.server for MLX, vllm serve --tool-call-parser for
+    GPTQ / MX, TabbyAPI for EXL3), asks 60 tool probes through OpenAI-style `tools`, and records retention vs the
+    reference in results.json -- which the card turns into its Tool-ready column. A quant can keep its perplexity and
+    lose the narrow band of layers that formats tool calls, and an agent harness is exactly where that shows.
+    On by default; --no-toolcall skips it. A lane this machine cannot serve is recorded as not measured."""
+    if not a.run or not getattr(a, "toolcall", True):
         return
-    fam = tools.get("family", "none")
-    if fam == "none":
+    # a shared GPU is not ours unless told: 'auto' never becomes a GPU claim for llama-server here
+    ngl = str(a.ngl) if str(a.ngl).isdigit() else "0"
+    if lane_out:                                                 # a directory lane: the one rung this run emitted
+        ref = getattr(a, "_hf_src", None) or getattr(a, "_hf_dir", None)
+        fam = _agentic_family(lane_out) or _agentic_family(ref)
+        if not fam or not os.path.exists(lane_out):
+            return
+        results = getattr(a, "results", None) or os.path.join(os.path.dirname(os.path.abspath(lane_out)) or ".",
+                                                             "results.json")
+        print(f"\n   tool-call gate: agentic model ({fam} call syntax) -- the {a.format.upper()} rung vs the "
+              "original weights (--no-toolcall to skip)")
+        cmd = _toolcall_cmd(lane_out, ref, ngl, results, os.path.basename(lane_out.rstrip("/\\")),
+                            ref_fallback=_f16_gguf_for(a.hf))
+        print("   $ " + " ".join(str(c) for c in cmd))
+        r = subprocess.run(cmd)
+        if r.returncode not in (0, 1):                           # 1 = FAIL, a number for the card; else a crash
+            print(f"   (tool-call gate on {os.path.basename(lane_out)} did not finish: exit {r.returncode})")
+        a.results = results
+        return
+    if not a.gguf:
+        return
+    fam = _agentic_family(a.gguf)
+    if not fam:
         return
     try:
         import pollard_workspace as ws
@@ -862,12 +933,11 @@ def _toolcall_gate(a, since):
         return
     results = getattr(a, "results", None) or os.path.join(os.path.dirname(os.path.abspath(a.gguf)) or ".",
                                                          "results.json")
-    ngl = str(a.ngl) if str(a.ngl).isdigit() else "0"         # a shared GPU is not ours unless told
     print(f"\n   tool-call gate: agentic model ({fam} call syntax) -- {len(builds)} rung(s) vs the f16 "
-          "(--toolcall)")
+          "(--no-toolcall to skip)")
     for b in builds:
-        cmd = _resolve_tool(["pollard-toolcall", "--gguf", b["path"], "--ref", a.gguf, "--ngl", ngl,
-                             "--results", results, "--rung", b.get("name") or os.path.basename(b["path"])])
+        cmd = _toolcall_cmd(b["path"], a.gguf, ngl, results, b.get("name") or os.path.basename(b["path"]),
+                            backend="gguf")
         print("   $ " + " ".join(str(c) for c in cmd))
         r = subprocess.run(cmd)
         if r.returncode not in (0, 1):                           # 1 = FAIL, a number for the card; else a crash
@@ -995,12 +1065,16 @@ def main():
                          "fast and skips the eval. Use this only to reproduce our published numbers.")
     ap.add_argument("--force-dense", action="store_true", help="override detection -> dense path")
     ap.add_argument("--force-moe", action="store_true", help="override detection -> MoE path")
+    ap.add_argument("--no-toolcall", dest="toolcall", action="store_false",
+                    help="skip the tool-call gate. By default an AGENTIC model (its chat template writes tool calls "
+                         "in a syntax pollard-modelkind knows) gets pollard-toolcall on every rung this run built, in "
+                         "every lane: 60 tool probes through the lane's own server (llama-server --jinja, "
+                         "mlx_lm.server, vllm serve --tool-call-parser, TabbyAPI), retention vs the reference, into "
+                         "results.json and the card's Tool-ready column. A lane this machine cannot serve is recorded "
+                         "as not measured, never faked.")
     ap.add_argument("--toolcall", dest="toolcall", action="store_true",
-                    help="after the build, run the tool-call gate on an agentic model's rungs (pollard-toolcall: "
-                         "60 tool probes per rung through llama-server --jinja, retention vs f16). OFF by default: "
-                         "a build is not a benchmark; `pollard release` runs it for every agentic rung.")
-    ap.add_argument("--no-toolcall", dest="toolcall", action="store_false", help=argparse.SUPPRESS)
-    ap.set_defaults(toolcall=False)
+                    help="(the default; kept so older command lines still parse)")
+    ap.set_defaults(toolcall=True)
     ap.add_argument("--no-gate", dest="gate", action="store_false",
                     help="skip the auto coherence gate (loop check + sampling sweep) the one-shot "
                          "MoE build appends after the mix -- by default it runs so you learn if the "
@@ -1060,7 +1134,9 @@ def _dispatch(a):
                     print("   [match-transformers] env setup failed -- falling back to the current env")
             except Exception as e:
                 print(f"   [match-transformers] skipped ({e}); using the current env")
-        _emit_nongguf(a)
+        out = _emit_nongguf(a)
+        if a.run and out:
+            _toolcall_gate(a, since=a._t0, lane_out=out)
         if not a.run:
             print("\n   plan only -- re-run with --run to execute.")
         return
@@ -1172,6 +1248,8 @@ def _dispatch_passthrough(a, tensors):
         print("   1) one passthrough build that fits --ram:")
         _run(cmd, a.run)
     print("   2) (no trellis flagship for a quantized source: automap would requantize every tensor, QAT ones included)")
+    if a.run:
+        _toolcall_gate(a, since=getattr(a, "_t0", 0.0))
     if a.run and getattr(a, "card", True):
         _emit_card(a)
     if not a.run:
