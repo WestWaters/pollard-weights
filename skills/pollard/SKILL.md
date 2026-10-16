@@ -159,6 +159,32 @@ Optional flagship extreme rung: an **automap 1-bit trellis mix** (the "gold-card
 
 ---
 
+## Already-quantized source (vendor QAT GGUF) — passthrough
+
+A QAT release (NVIDIA Nemotron-3.5-Bolt-24GB-GGUF: experts IQ2_XXS trained in, Mamba NVFP4, attention/embeddings
+Q8_0) must NOT be requantized wholesale — that dequantizes the QAT codes and rounds them again. Pollard's
+**passthrough** policy (`tools/pollard_passthrough.py`, auto-on when most weight bytes are already block-quantized):
+- a tensor whose assigned type == its current type is **copied byte-for-byte** (llama-quantize writes the source
+  bytes when target == current; pollard-fit re-hashes every copied tensor after the build and fails on any diff);
+- a tensor assigned a **lower** type is requantized (`--allow-requantize`) from its current data;
+- **no upgrades** — a plan or `--tier` asking for more bits than the tensor has is refused.
+- Only `--passthrough-classes` may move (default `bulk` = routed experts + dense FFN; also attn / shexp / emb /
+  other). Each quantizable tensor gets its own anchored line (`^blk\.1\.ffn_up_exps\.weight$=iq1_s`), base preset
+  Q8_0 decides nothing — first-match-wins cannot bite.
+```bash
+pollard --gguf Bolt-24GB.gguf --ladder --run          # imatrix + sensitivity ON THIS FILE, rungs PT25/50/75/100
+pollard-sensitivity --gguf Bolt-24GB.gguf --imatrix b.imatrix --eval held.txt --passthrough --out b.sens.json
+pollard-fit --gguf Bolt-24GB.gguf --ram 24 --reserve 0 --imatrix b.imatrix --sensitivity b.sens.json
+```
+`pollard-sensitivity --passthrough`: the quantized file is its own reference (no f16 exists), each probe crushes one
+layer's changeable tensors to the lowest legal type (iq1_s for IQ2_XXS + imatrix), the noise curve is measured
+relative to the file. Below IQ2_XXS only the 1-bit types exist and they need an imatrix — without one nothing in an
+IQ2 source can move. **Requant-source caveat:** a downgraded tensor is quantized from dequant(current), two
+roundings; right for QAT codes, but for an ordinary PTQ file a rung from bf16 usually wins. No trellis flagship on
+this path (automap requantizes everything). Runtime must load the arch (Bolt: llama.cpp ≥ cd0a5b6, #30520).
+
+---
+
 ## MoE path
 
 ### MoE QUALITY win — the MEASURED allocator (this is the proven one; do NOT reinvent it)
@@ -265,8 +291,9 @@ use (NVIDIA Minitron/Nemotron-style): **new** (a fresh qwen3 / llama / qwen2 arc
 dims; tokenizer copied or trained), **prune** (carve a smaller model out of a teacher: drop the layers with the
 lowest block influence and the FFN channels that fire least, measured on `--calib`), **train** (pretrain,
 continue, or distill from the teacher: CE + a distillation loss -- `--loss kl` (temperature-scaled, default) /
-`rkl` / `cakld` (confidence-aware forward/reverse mix) / `kl_top_k`, AngelSlim's set, `--lm-loss-weight` for
-independent weights; `--data` mixes text / jsonl / `hf:` sources by weight; checkpoint + `--resume`; multi-GPU via
+`rkl` / `cakld` (confidence-aware forward/reverse mix) / `kl_top_k`, AngelSlim's set, or `jaccard` (weighted
+Jaccard 1 − Σmin(ps,pt)/Σmax(ps,pt) at T=1, NVIDIA Bolt's QAD loss -- `--kd 1` reproduces their no-CE recipe),
+`--lm-loss-weight` for independent weights; `--data` mixes text / jsonl / `hf:` sources by weight; checkpoint + `--resume`; multi-GPU via
 `torchrun`), **card** (lineage from `forge.json`, license required).
 ```bash
 pollard-forge prune --teacher Qwen/Qwen3-4B --calib calib.txt --keep-layers 0.75 --ffn 0.6 --out my-2b
@@ -278,6 +305,19 @@ pollard --hf my-2b --run            # GGUF ladder + card like any model
 Keep chat data in the mix for an instruct model (raw web text alone erases chat — measured on STQ1_0). A pruned or
 distilled model inherits its teacher's license terms; the card refuses to guess one. Checkpoints save in bf16
 (`--save-dtype`); mid-run checkpoints stay fp32 so `--resume` is exact.
+
+### Bit-exact fake quantization for QAT (`tools/pollard_fq.py`, library)
+
+The foundation of pollard-qat: torch ports of ggml's ENCODERS + decoders, so training sees exactly the weights the
+GGUF will hold. `fq.quant_dequant(W, "iq2_xxs", imatrix)` == `dequant(ggml_quantize_chunk(...))` bit for bit;
+`fq.fake_quant(W, t, imatrix)` adds the STE; `fq.FakeQuantLinear(linear, t, imatrix, refresh_every=N)` wraps a layer.
+Supported (gate passed): **q2_K, q3_K** (imatrix encoders), **tq2_0**, **iq2_xxs / iq2_xs** (imatrix required, as
+in ggml), **iq2_s** (with or without), **stq1_0** (Pollard's patched imatrix encoder). Anything else raises —
+never approximated. The rounding follows the runtime build site by site (fused fma vs vectorised unfused
+reductions — see the module docstring); `POLLARD_FQ_CONTRACT=0` for a non-contracting (MSVC) build. HARD GATE:
+`pytest tests/test_fq_parity.py` (live vs runtime libggml + golden hashes for CI). IQ2 grids are read from the
+runtime's ggml sources (`POLLARD_GGML_SRC`). Encoder cost on CPU per 4M weights: q3_K 0.6 s, q2_K 2 s,
+iq2_s 10 s, iq2_xxs 21 s, iq2_xs 45 s — use `refresh_every` in training.
 
 ## Release a model on EVERY lane (`pollard release`)
 
@@ -549,7 +589,9 @@ Every one of these was measured the hard way, and each alone pins accuracy at ex
 | `pollard-pack` | Cerebras wafer capacity + expert-prune plan (forecast) | MoE (lever) |
 | `pollard-prune` | REAP-style expert pruning — drop cold experts, rewrite a SMALLER GGUF | **MoE only** |
 | `pollard-ngram` | n-gram / per-layer embedding tables on the SSD: inspect, launch line, swap watch (`pollard-fit --disk`) | models with a lookup table |
-| `pollard-forge` | make your own model: new architecture, Minitron-style prune, pretrain / distill, lineage card | any decoder-only |
+| `pollard-forge` | make your own model: new architecture, Minitron-style prune, pretrain / distill (kl / rkl / cakld / top-k / jaccard), lineage card | any decoder-only |
+| `pollard_fq` (library) | bit-exact fake quant for QAT: q2_K / q3_K / tq2_0 / iq2_xxs / iq2_xs / iq2_s / stq1_0, STE, parity-gated vs ggml | any |
+| `pollard-fit --passthrough` | already-quantized (QAT) GGUF: copy unchanged tensors byte-exact, requant only measured downgrades, no upgrades | any GGUF the runtime loads |
 | `pollard-release` | **every lane as a ladder** (gguf/mlx/gptq/mx/exl3), gated, carded, resumable, upload on double opt-in (also `pollard release`) | any |
 | `pollard-tune` | fine-tune on YOUR data (LoRA/QLoRA SFT and/or GRPO: mlx / TRL / Unsloth), eval base vs tuned vs frontier, ship + serve | any HF causal LM |
 | `pollard-export` | vLLM/SGLang GPTQ checkpoint (4/8 dynamic; `--bits 2/3/4/8` ladder rungs) | any |

@@ -177,6 +177,67 @@ def _uncoverable_pins(gguf, imatrix):
     return lines                                           # written to a --tensor-type-file
 
 
+def _profile_out(a):
+    if a.out:
+        return a.out
+    try:
+        import pollard_workspace as ws
+        return os.path.join(ws.calibration_dir(a.gguf, create=True), ws.model_basename(a.gguf) + ".sensitivity.json")
+    except Exception:
+        return a.gguf.rsplit(".gguf", 1)[0] + ".sensitivity.json"
+
+
+def _main_passthrough(a, layers, groups, tmp):
+    """Sensitivity on an already-quantized host (see pollard_passthrough): the source is the reference."""
+    import pollard_passthrough as pt
+    tensors = pt.read_tensors(a.gguf)
+    covered = imatrix_covered_tensors(a.imatrix)
+    classes = tuple(pt.GROUP_CLASS.get(g, g) for g in groups)
+    probe = a.probe or pt.default_probe(tensors, classes, True, covered)
+    if not probe:
+        sys.exit(f"ERROR: nothing in {', '.join(groups)} can be downgraded from its current type -- "
+                 "there is no allocation to measure.")
+    base = os.path.join(tmp, "base.dat")
+    print(f"== pollard-sensitivity --passthrough :: {a.gguf}  ({layers} layers, groups={groups}, probe={probe})")
+    print("   reference = the quantized source itself (a passthrough build of it is byte-identical, KL 0)")
+    base_cmd = [a.llama_perplexity, "-m", a.gguf, "-f", a.eval, "--kl-divergence-base", base,
+                "-ngl", str(a.ngl), "-c", "512"] + (["--rpc", a.rpc] if a.rpc else [])
+    r = _run(base_cmd)
+    if not os.path.exists(base) or os.path.getsize(base) == 0:
+        sys.exit(f"ERROR: could not build the reference logits -- {_diagnose(r.stderr, 'the base forward pass')}")
+    probe_path = os.path.join(tmp, "probe.gguf")
+    tt = os.path.join(tmp, "probe.tensor-types.txt")
+
+    def build(assign):
+        lines, flags, _ = pt.quantize_plan(tensors, assign)
+        with open(tt, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        rr = _run(pt.build_command(a.llama_quantize, a.gguf, probe_path, tt, flags, a.imatrix))
+        if not _valid_gguf(probe_path):
+            print(f"   probe build failed -- {_diagnose(rr.stderr, 'llama-quantize')}")
+            return None
+        return probe_path
+
+    def kl(path):
+        k = _kl(a.llama_perplexity, path, a.eval, base, a.rpc, a.ngl)
+        os.path.exists(path) and os.remove(path)
+        return k
+
+    prof = pt.sweep(tensors, layers, groups, probe, build, kl, True, covered)
+    prof["source"] = os.path.basename(a.gguf)
+    for f in (base, tt):
+        os.path.exists(f) and os.remove(f)
+    os.rmdir(tmp) if not os.listdir(tmp) else None
+    if prof["failed"]:
+        print(f"WARNING: {len(prof['failed'])} probe(s) failed -- set to MAX sensitivity (protected): "
+              f"{', '.join(prof['failed'][:8])}")
+    out = _profile_out(a)
+    with open(out, "w") as f:
+        json.dump(prof, f, indent=2)
+    print(f"\ndone: {out}\nuse it:  pollard-fit --gguf {a.gguf} --ram <GB> --imatrix {a.imatrix} "
+          f"--sensitivity {out}   (passthrough is automatic for a quantized source)")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -190,9 +251,16 @@ def main():
     ap.add_argument("--yes", action="store_true", help="warn about an overlapping eval but continue")
     ap.add_argument("--eval", required=True, help="held-out eval text (disjoint from imatrix)")
     ap.add_argument("--out", help="profile path (default: <gguf>.sensitivity.json)")
-    ap.add_argument("--groups", default="ffn,attn",
-                    help="tensor groups to probe, comma-separated (default ffn,attn)")
-    ap.add_argument("--probe", default="iq2_xxs", help="crush type for the probe (default iq2_xxs)")
+    ap.add_argument("--groups", default=None,
+                    help="tensor groups to probe, comma-separated (default ffn,attn; ffn with --passthrough)")
+    ap.add_argument("--probe", default=None,
+                    help="crush type for the probe (default iq2_xxs; with --passthrough the lowest type the "
+                         "changeable tensors can reach, e.g. iq1_s for a QAT IQ2_XXS source)")
+    ap.add_argument("--passthrough", action="store_true",
+                    help="the source is ALREADY QUANTIZED (a vendor QAT GGUF): it is its own reference (base "
+                         "logits from this file, no f16), every probe build copies the untouched tensors "
+                         "byte-for-byte and requantizes only the crushed group, and the noise curve is measured "
+                         "relative to this file -- the profile pollard-fit --passthrough allocates on")
     ap.add_argument("--ref", default="IQ4_XS", help="reference uniform preset (default IQ4_XS)")
     ap.add_argument("--llama-quantize", default="llama-quantize")
     ap.add_argument("--llama-perplexity", default="llama-perplexity")
@@ -255,7 +323,9 @@ def main():
               "      knapsack somewhere to move bits). On dense it is an open question by size --\n"
               "      measured on Qwen2.5-0.5B the profile lost to plain imatrix; larger dense\n"
               "      models are untested. Bench both arms before shipping.", flush=True)
-    groups = [g.strip() for g in a.groups.split(",") if g.strip()]
+    groups = [g.strip() for g in (a.groups or ("ffn" if a.passthrough else "ffn,attn")).split(",") if g.strip()]
+    if not a.passthrough and a.probe is None:
+        a.probe = "iq2_xxs"
 
     # FEASIBILITY GUARD: the sweep is len(groups)*layers FULL-MODEL quantize+KL passes.
     # The knapsack pays off on a SMALL MoE (granite-3B: ~2 min/pass); on a BIG MoE each
@@ -287,6 +357,8 @@ def main():
                  f"sensitivity signal doesn't need a huge corpus).")
 
     tmp = tempfile.mkdtemp(prefix="pollard_sens_")
+    if a.passthrough:
+        return _main_passthrough(a, layers, groups, tmp)
     base = os.path.join(tmp, "base.dat")
     ref = os.path.join(tmp, "ref.gguf")
     probe = os.path.join(tmp, "probe.gguf")
