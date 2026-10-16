@@ -927,6 +927,9 @@ def main():
     ap.add_argument("--credits", action="append", default=[],
                     help="extra credit bullet (repeatable); base model + llama.cpp + Pollard are automatic")
     ap.add_argument("--base-owner", help="who published the base model, for Credits")
+    ap.add_argument("--draft-results", help="results-draft.json from pollard-draft measure: adds a Speculative "
+                    "decoding section (matched drafter, measured tokens per target pass, this lane's serve line)")
+    ap.add_argument("--draft-repo", help="the drafter repo (<M>-Pollard-DRAFT) the section points at")
     ap.add_argument("--extra-md", help="markdown file of EXTRA `## ` sections for this model -- the "
                     "per-model prose the template cannot know (a measured comparison, an arch note, a "
                     "quirk). Inserted after Available files, in file order, so regenerating a card "
@@ -1352,6 +1355,12 @@ def main():
         out += exlr8_section(builds, repo, cfg)
     if not decision:
         out += tool_serving_section(facts.get("tools"), lanes, repo, exn)
+    # ---- Speculative decoding: the matched drafter (pollard-draft), measured against these quantized rungs
+    if a.draft_results and os.path.exists(a.draft_results) and a.draft_repo:
+        import pollard_draft as PD
+        org = repo.split("/")[0] if "/" in repo else (account or PLACEHOLDER_OWNER)
+        trepos = {**PD.target_repos_for(org, base_model, lanes), primary: repo}
+        out += PD.card_section(json.load(open(a.draft_results, encoding="utf-8")), a.draft_repo, trepos, primary)
 
     # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
     # prints from, so the card and the CLI cannot drift apart

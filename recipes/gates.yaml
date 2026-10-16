@@ -13,6 +13,9 @@
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
+#   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
+#   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
+#   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
 missing: fail
 default:
   kld_max: 0.5
@@ -25,6 +28,12 @@ lanes:
   exl3:
     e2e_acc_min: 0.3
     skip: [kld_max, top1_min]
+  # a drafter is judged on what it is for -- tokens per target pass against the rungs it ships with -- not on its own
+  # logits; the per-bit-width and tool-call rows below are about TARGET rungs
+  draft:
+    draft_tau_min: 1.5
+    draft_redistributable: true
+    skip: [kld_max, top1_min, toolcall_retention_min, toolcall_pass, runtime, coherence]
 rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01

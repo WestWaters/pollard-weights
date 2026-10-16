@@ -19,9 +19,14 @@ The lanes and their ladders (what each lane's runtime supports):
   exl3  several bpw on EXL3's own allocator, smoothed + Calib 3.0 (pollard-exl3 --bpw)           -> <M>-Pollard-EXL3
   exlr8 ONE trellis encode at K=2..6 (E4M3 codebook, EXLR8 v2 records), then every rung is a manifest: exact
         knapsack on the measured sensitivity, 2.5 / 3 / 3.25 / 4 / 5 / 6 bpw (pollard-exlr8)   -> <M>-Pollard-EXLR8
-  draft EAGLE3 draft head -- declared, NOT wired yet (no pollard-draft); the plan says so.
+  draft a speculative drafter matched to the quantized target (pollard-draft): the best published DFlash / DSpark /
+        EAGLE-3 head (or a same-family small model), GGUF ladder Q8_0 / Q4_K_M + its HF folder, MEASURED as tokens
+        per target pass against every GGUF rung of this release, gated on that                -> <M>-Pollard-DRAFT
 
-One repo per lane (the PollardWeights naming: <M>-Pollard for GGUF, <M>-Pollard-<LANE> otherwise). GGUF rungs
+One repo per lane (the PollardWeights naming: <M>-Pollard for GGUF, <M>-Pollard-<LANE> otherwise). The drafter repo
+holds the drafter's HF folder at its root (what vLLM / SGLang / dflash-mlx load by repo id) and its GGUF rungs beside
+it (<M>-Pollard-DRAFT-<Kind>-<QUANT>.gguf, for llama.cpp -md); every target lane's card gets a Speculative decoding
+section with the measured numbers and that lane's serve line. GGUF rungs
 are files at the repo root, named <M>-Pollard-<TAG>.gguf like every published Pollard GGUF; a directory lane puts
 each rung in its own subfolder (`4bit/`, `int4/`, `nvfp4/`, `4.0bpw/`) with the lane's default rung ALSO at the
 root, so `mlx_lm.generate --model <repo>` / `vllm serve <repo>` work as-is -- the layout MiniCPM5-2B-Pollard-MLX
@@ -69,7 +74,9 @@ lanes:
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
   # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
   exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
-  draft: {enabled: false}      # EAGLE3 draft head per rung -- not wired yet
+  draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128}
+                               # speculative drafter (pollard-draft): drafter = auto (search the Hub) or a repo id;
+                               # measured against `targets` (all = every GGUF rung of this release, or a list of tags)
 """
 
 PRESETS = {
@@ -105,7 +112,7 @@ def mx_mix_bpw(rung):
 
 
 REQUIRES = {"gguf": "any", "mlx": "apple", "gptq": "cuda", "mx": "cuda", "exl3": "cuda", "exlr8": "cuda",
-            "draft": "cuda"}
+            "draft": "any"}
 
 
 # ------------------------------------------------------------------------------- plan file
@@ -212,7 +219,7 @@ def results_path(c, lane):
 
 def lane_key(c, lane):
     """The MANIFEST key each lane's tool records its builds under (what pollard-card --builds-from reads)."""
-    return {"gguf": c["f16"], "mlx": c["hf_dir"]}.get(lane, c["smooth_dir"])
+    return {"gguf": c["f16"], "mlx": c["hf_dir"], "draft": c["src"]}.get(lane, c["smooth_dir"])
 
 
 def _verify_gate(c):
@@ -330,13 +337,65 @@ def gguf_rung_steps(cfg, c, builds):
     return steps
 
 
+def draft_steps(cfg, c, lc):
+    """find -> convert (GGUF ladder + HF folder) -> expand: measure + gate each drafter rung against the target rungs."""
+    found = os.path.join(c["mdir"], "draft", "drafter.json")
+    find = ["pollard-draft", "find", "--target", c["src"], "--target-dir", c["hf_dir"], "--out", found]
+    if lc.get("drafter") not in (None, "auto"):
+        find += ["--drafter", str(lc["drafter"])]
+    conv = ["pollard-draft", "convert", "--target", c["src"], "--target-dir", c["hf_dir"], "--from", found,
+            "--key", c["src"], "--rungs", ",".join(str(r) for r in lc.get("rungs") or ["Q8_0", "Q4_K_M"])]
+    return [Step(id="draft/find", lane="draft", kind="build", requires="any", cmd=find, out=found,
+                 desc="the best published drafter for this model, checked against its config"),
+            Step(id="draft/convert", lane="draft", kind="build", requires="any", cmd=conv,
+                 out=os.path.join(c["mdir"], "draft")),
+            Step(id="draft/rungs", lane="draft", kind="expand", requires="any")]
+
+
+def draft_targets(cfg, c):
+    """(tag, path) of the target rungs a drafter is measured against: this release's GGUF rungs (all, or the plan's
+    list), else the f16 -- labelled as such on the card."""
+    want = ((cfg.get("lanes") or {}).get("draft") or {}).get("targets", "all")
+    rungs = [(b.get("tag") or b.get("name"), b.get("path")) for b in gguf_builds(c) if b.get("path")]
+    if want not in (None, "all"):
+        keep = {str(x).lower() for x in (want if isinstance(want, list) else [want])}
+        rungs = [r for r in rungs if str(r[0]).lower() in keep]
+    return rungs or [("f16", c["f16"])]
+
+
+def draft_rung_steps(cfg, c, builds, targets=None):
+    """Measure + verify every drafter rung the MANIFEST holds. The HF folder is measured through its BF16 GGUF (the
+    same weights) so its gate has a number; the BF16 GGUF itself is an intermediate, not a rung."""
+    lc = (cfg.get("lanes") or {}).get("draft") or {}
+    res, steps = results_path(c, "draft"), []
+    targets = targets or draft_targets(cfg, c)
+    for b in builds:
+        if b.get("publish") is False or b.get("format") == "mlx":
+            continue
+        tag, path = b.get("tag") or b.get("name"), b.get("path")
+        rid = f"draft/{tag}"
+        m = ["pollard-draft", "measure", "--drafter", path, "--rung", tag, "--results", res, "--ngl", c["ngl"],
+             "--max-tokens", str(lc.get("max_tokens", 128))]
+        if lc.get("limit"):
+            m += ["--limit", str(lc["limit"])]
+        if lc.get("n_max") not in (None, "auto"):
+            m += ["--n-max", str(lc["n_max"])]
+        if b.get("format") == "hf" and b.get("via"):
+            m += ["--via", b["via"]]
+        for t, p in targets:
+            m += ["--target", p, "--target-tag", t]
+        steps.append(Step(id=f"{rid}/measure", lane="draft", rung=tag, kind="measure", requires="any", cmd=m))
+        steps.append(Step(id=f"{rid}/verify", lane="draft", rung=tag, kind="verify", requires="any", out=path,
+                          cmd=["pollard-verify", "--lane", "draft", "--model", path, "--rung", tag, "--results", res]
+                          + _verify_gate(c)))
+    return steps
+
+
 def lane_steps(cfg, c, lane):
     lc = (cfg.get("lanes") or {}).get(lane) or {}
     import pollard_workspace as ws
     if lane == "draft":
-        return [Step(id="draft/note", lane="draft", kind="note", requires="any",
-                     desc="EAGLE3 draft heads are declared but NOT wired: there is no pollard-draft tool yet "
-                          "(llama.cpp b9606+ serves EAGLE3; train/measure one per rung when it lands).")]
+        return draft_steps(cfg, c, lc)
     if lane == "gguf":
         cmd = ["pollard", "--hf", c["hf_dir"], "--output", c["gguf_dir"], "--calib", c["calib"],
                "--sensitivity", c["sens_raw"], "--ladder", "--run", "--no-card", "--force",
@@ -405,6 +464,10 @@ def lane_steps(cfg, c, lane):
     return steps
 
 
+def _draft_on(cfg):
+    return bool(((cfg.get("lanes") or {}).get("draft") or {}).get("enabled"))
+
+
 def publish_steps(cfg, c, lane):
     import pollard_workspace as ws
     repo = repo_name(cfg.get("org", "PollardWeights"), c["src"], lane)
@@ -413,6 +476,14 @@ def publish_steps(cfg, c, lane):
             "--base-model", c["src"], "--lane", lane, "--builds-from", lane_key(c, lane),
             "--results", results_path(c, lane), "--repo", repo, "--out", os.path.join(outdir, "README.md"),
             "--verified-only"]
+    if lane == "draft":
+        card = ["pollard-draft", "card", "--target", c["src"], "--key", c["src"], "--results", results_path(c, lane),
+                "--repo", repo, "--org", cfg.get("org", "PollardWeights"), "--out", os.path.join(outdir, "README.md"),
+                "--verified-only", "--lanes", ",".join(l for l in LANES if l not in ("draft", "exl3", "exlr8") and
+                                                      ((cfg.get("lanes") or {}).get(l) or {}).get("enabled"))]
+    elif _draft_on(cfg):
+        card += ["--draft-results", results_path(c, "draft"),
+                 "--draft-repo", repo_name(cfg.get("org", "PollardWeights"), c["src"], "draft")]
     if lane == "gguf":
         card += ["--calib-file", os.path.basename(c["calib"]),
                  "--calib-note", f"the pollard-calib '{(cfg.get('calib') or {}).get('profile', 'auto')}' profile "
@@ -428,10 +499,15 @@ def plan_steps(cfg, src, only=None):
     lanes = [l for l in LANES if ((cfg.get("lanes") or {}).get(l) or {}).get("enabled")
              and (not only or l in only)]
     steps = prep_steps(cfg, c, lanes)
+    # the drafter is measured against the GGUF rungs and every lane's card quotes it: build + gate it right after the
+    # GGUF ladder, before any card is written
+    early_draft = "draft" in lanes and "gguf" in lanes
     for lane in lanes:
-        steps += lane_steps(cfg, c, lane)
-        if lane != "draft":
-            steps += publish_steps(cfg, c, lane)
+        if lane != "draft" or not early_draft:
+            steps += lane_steps(cfg, c, lane)
+        if lane == "gguf" and early_draft:
+            steps += lane_steps(cfg, c, "draft")
+        steps += publish_steps(cfg, c, lane)
     return c, lanes, steps
 
 
@@ -555,7 +631,18 @@ def upload(step, c, cfg, run_upload):
     api = HfApi()
     api.create_repo(repo, repo_type="model", exist_ok=True)
     expect = {"README.md"}
-    if lane == "gguf":
+    if lane == "draft":
+        for b in builds:
+            if b.get("publish") is False:
+                continue
+            if b.get("format") == "gguf":
+                name = b.get("name") or os.path.basename(b["path"])
+                api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
+                expect.add(name)
+            elif b.get("format") == "hf":                      # the HF drafter at the root: vLLM / SGLang / MLX
+                api.upload_folder(folder_path=b["path"], repo_id=repo)
+                expect.add("config.json")
+    elif lane == "gguf":
         for b in builds:
             name = b.get("name") or os.path.basename(b["path"])
             api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
@@ -598,6 +685,20 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
         st = queue.pop(0)
         n += 1
         head = f"{n:3d}. [{st.lane}{'/' + st.rung if st.rung else ''}] {st.kind}"
+        if st.kind == "expand" and st.lane == "draft":
+            import pollard_draft as D
+            builds = D.draft_builds(c["src"])
+            if builds:
+                queue[0:0] = draft_rung_steps(cfg, c, builds)
+                out(f"{head}: {len(builds)} drafter rung(s) in the MANIFEST -> measure vs the target rungs + gate each")
+            elif run:
+                out(f"{head}: no drafter rungs in the MANIFEST (find/convert failed or was skipped)")
+            else:
+                tg = None if gguf_builds(c) else [("<each GGUF rung>", "<rung .gguf>")]
+                for s in draft_rung_steps(cfg, c, [{"tag": "<drafter rung>", "path": "<each drafter .gguf>"}], tg):
+                    out(f"     (per rung) {s.kind}: $ {_fmt_cmd(s.cmd)}")
+            n -= 1
+            continue
         if st.kind == "expand":
             if run and have.get("any"):
                 canonical_gguf(c)
@@ -709,11 +810,10 @@ def main(argv=None):
     print(f"   lanes: {', '.join(lanes) or 'none'}   |   this machine: "
           + ", ".join(k for k in ("apple", "cuda") if have[k]) + (" (CPU only)" if not (have['apple'] or have['cuda']) else ""))
     for lane in lanes:
-        if lane == "draft":
-            continue
         lc = (cfg["lanes"].get(lane) or {})
         rungs = "publish ladder (Q6_K / IQ4_XS / IQ3_S / 2-bit + flagship)" if lane == "gguf" else \
-            ", ".join(rung_tag(lane, r) for r in lc.get("rungs") or [])
+            ("drafter " + str(lc.get("drafter", "auto")) + ": GGUF " + ", ".join(str(r) for r in lc.get("rungs") or [])
+             + " + HF folder" if lane == "draft" else ", ".join(rung_tag(lane, r) for r in lc.get("rungs") or []))
         print(f"   {lane:5s} -> {repo_name(cfg.get('org', 'PollardWeights'), src, lane):48s} {rungs}")
     upload_ok = bool(cfg.get("upload")) and a.upload
     print(f"   upload: {'ON' if upload_ok else 'off'}"
