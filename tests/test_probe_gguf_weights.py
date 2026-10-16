@@ -167,3 +167,71 @@ def test_cost_overflow_does_not_emit_infinite_profile(tmp_path):
     write_imatrix(matrix, name, [1] * 4)
     with pytest.raises(SystemExit, match="non-finite probe cost"):
         P._imatrix_sensitivity(str(model), str(matrix), ["attn"], 2, [])
+
+
+def write_model(path, tensors, arch="lfm2moe"):
+    writer = gguf.GGUFWriter(path, arch)
+    for name, w in tensors.items():
+        writer.add_tensor(name, np.asarray(w, dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def write_imatrix_many(path, names, n=4):
+    records = bytearray(struct.pack("<i", len(names)))
+    for name in names:
+        encoded = name.encode()
+        records.extend(struct.pack("<i", len(encoded)) + encoded + struct.pack("<ii", 1, n))
+        records.extend(np.ones(n, dtype=np.float32).tobytes())
+    path.write_bytes(records)
+
+
+W = [[1, .5, .25, -1], [.5, -.25, 1, 2]]
+
+
+def test_lfm2_short_convolution_is_a_sequence_mixer(tmp_path):
+    # LFM2.5-24B-A2B, 2026-10-16: the profile refused with "unscored: shortconv.in_proj.weight,
+    # shortconv.out_proj.weight". Its conv kernel (shortconv.conv.weight) is not a matmul: never in the
+    # imatrix, never quantized -- it must neither block the profile nor be pinned.
+    model, matrix = tmp_path / "lfm.gguf", tmp_path / "lfm.dat"
+    write_model(model, {"blk.0.shortconv.in_proj.weight": W, "blk.0.shortconv.out_proj.weight": W,
+                        "blk.0.shortconv.conv.weight": [[1, 2, 3]], "blk.0.ffn_up.weight": W})
+    write_imatrix_many(matrix, ["blk.0.shortconv.in_proj.weight", "blk.0.shortconv.out_proj.weight",
+                                "blk.0.ffn_up.weight"])
+    costs, _, layers = P._imatrix_sensitivity(str(model), str(matrix), ["ffn", "attn"], 2, [])
+    one = float(((torch.tensor(W) - P._rtn(torch.tensor(W), 2)) ** 2).sum())
+    assert costs["attn"]["0"] == pytest.approx(2 * one) and costs["ffn"]["0"] == pytest.approx(one)
+    assert layers == 1
+
+
+def test_nemotron_latent_moe_projections_are_channel_mixers(tmp_path):
+    model, matrix = tmp_path / "nh.gguf", tmp_path / "nh.dat"
+    write_model(model, {"blk.0.ffn_latent_down.weight": W, "blk.0.ffn_latent_up.weight": W,
+                        "blk.0.ssm_in.weight": W, "blk.0.ssm_out.weight": W}, arch="nemotron_h_moe")
+    write_imatrix_many(matrix, ["blk.0.ffn_latent_down.weight", "blk.0.ffn_latent_up.weight",
+                                "blk.0.ssm_in.weight", "blk.0.ssm_out.weight"])
+    costs, _, _ = P._imatrix_sensitivity(str(model), str(matrix), ["ffn", "attn"], 2, [])
+    assert costs["ffn"]["0"] == pytest.approx(costs["attn"]["0"]) and costs["ffn"]["0"] > 0
+
+
+def test_per_tensor_output_scale_is_folded_into_the_weight(tmp_path):
+    # NVIDIA's QAT Bolt GGUF: ssm_in / ssm_out are NVFP4 with a separate F32 `<name>.scale`; the raw FP4 decode
+    # is ~1e4x the real weight, so an unscaled cost would swamp every other tensor in the profile.
+    s = 0.01
+    big = (np.asarray(W) / s).tolist()
+    model, ref, matrix = tmp_path / "scaled.gguf", tmp_path / "plain.gguf", tmp_path / "m.dat"
+    write_model(model, {"blk.0.ssm_in.weight": big, "blk.0.ssm_in.scale": [s]}, arch="nemotron_h_moe")
+    write_model(ref, {"blk.0.ssm_in.weight": W}, arch="nemotron_h_moe")
+    write_imatrix_many(matrix, ["blk.0.ssm_in.weight"])
+    scaled, _, _ = P._imatrix_sensitivity(str(model), str(matrix), ["attn"], 2, [])
+    plain, _, _ = P._imatrix_sensitivity(str(ref), str(matrix), ["attn"], 2, [])
+    assert scaled["attn"]["0"] == pytest.approx(plain["attn"]["0"], rel=1e-5)
+
+
+def test_per_row_scale_and_a_misfit_scale(tmp_path):
+    w = torch.ones(2, 4)
+    assert torch.equal(P._apply_scale(w, [2.0, 3.0]), torch.tensor([[2.0] * 4, [3.0] * 4]))
+    with pytest.raises(ValueError):
+        P._apply_scale(w, [1.0, 2.0, 3.0])

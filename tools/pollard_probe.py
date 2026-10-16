@@ -251,12 +251,21 @@ GROUP_ATTR = {"ffn": [("mlp", ("gate_proj", "up_proj", "down_proj"))],
 # Qwen3.8-27B is exactly this shape -- 48 of its 65 blocks are SSM, only 17 carry real attention.
 # Leaving the SSM names out scored 256 of 496 covered matmuls and handed back 48 layers at cost
 # 0.0, which reads to the allocator as "free to crush". Hence the invariant enforced below.
+#
+# LFM2 / LFM2.5 (lfm2, lfm2moe) mix most blocks with a gated SHORT CONVOLUTION: shortconv.in_proj and
+# shortconv.out_proj are its two matmuls, so they are sequence mixers too. The depthwise kernel itself
+# (shortconv.conv.weight, like Mamba's ssm_conv1d) is not a matmul -- the imatrix never sees it and
+# llama-quantize keeps it F32 -- so it is deliberately NOT listed: it is neither scored nor pinned.
+# Nemotron-H LatentMoE (nemotron_h_moe) projects the hidden state into and out of the expert latent
+# with ffn_latent_down / ffn_latent_up around the routed experts: channel mixing, so 'ffn'.
 GROUP_GGUF = {"ffn": ("ffn_gate", "ffn_up", "ffn_down",
                       "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
-                      "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"),
+                      "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+                      "ffn_latent_down", "ffn_latent_up"),
               "attn": ("attn_q", "attn_k", "attn_v", "attn_output",
                        "attn_qkv", "attn_gate",
-                       "ssm_in", "ssm_out", "ssm_alpha", "ssm_beta", "ssm_x", "ssm_dt")}
+                       "ssm_in", "ssm_out", "ssm_alpha", "ssm_beta", "ssm_x", "ssm_dt",
+                       "shortconv.in_proj", "shortconv.out_proj")}
 
 
 def _gguf_slot(name, groups):
@@ -319,6 +328,11 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
         raise SystemExit(f"could not read an imatrix from {imatrix_path} (tried legacy .dat and "
                          f"GGUF). Build one with llama-imatrix first.")
     rd = GGUFReader(gguf_path)
+    # A vendor-quantized source can carry a per-tensor scale beside an FP4 weight: NVIDIA's QAT
+    # Nemotron GGUF stores ssm_in / ssm_out as NVFP4 plus `<name>.scale` (F32), and the runtime
+    # multiplies the matmul output by it. The raw NVFP4 decode is ~1e4x the real weight, so without
+    # the scale those tensors would dominate every cost in the profile.
+    scales = {t.name[:-len(".scale")] + ".weight": t for t in rd.tensors if t.name.endswith(".scale")}
     bitset = sorted({probe_bits} | {b for _, b in ladder_bits})
     cost = {g: {} for g in groups}
     noise = {t: 0.0 for t, _ in ladder_bits}
@@ -350,6 +364,8 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
             continue
         try:
             W = torch.from_numpy(np.asarray(_dequant(t))).float()
+            if t.name in scales:
+                W = _apply_scale(W, np.asarray(_dequant(scales[t.name])).reshape(-1))
             h = _imatrix_weights(W, hj, t.name.endswith("_exps.weight"))
         except Exception as e:
             skipped.append(f"{t.name} ({e})")
@@ -419,6 +435,17 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
               f"in the imatrix (layers {ex}{' ...' if len(pinned) > 4 else ''}) -- left out of the "
               f"profile so the allocator PINS them rather than reading 0.0 as free.", flush=True)
     return cost, noise, layers
+
+
+def _apply_scale(W, s):
+    """Fold a stored output scale into the weight: one scalar for the tensor, or one per output row."""
+    import numpy as np
+    s = torch.from_numpy(np.ascontiguousarray(np.asarray(s, dtype="float32")))
+    if s.numel() == 1:
+        return W * float(s[0])
+    if W.ndim >= 2 and s.numel() == W.shape[-2]:
+        return W * s.reshape(*([1] * (W.ndim - 2)), -1, 1)
+    raise ValueError(f"scale of {s.numel()} values does not fit weight {tuple(W.shape)}")
 
 
 def _imatrix_weights(weights, importance, merged_experts=False):
