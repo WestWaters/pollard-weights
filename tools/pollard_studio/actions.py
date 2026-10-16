@@ -17,7 +17,7 @@ import sys
 
 # lane -> the tool that emits it
 LANE_TOOL = {"GGUF": "pollard_fit", "GPTQ": "pollard_gptq", "MLX": "pollard_mlx",
-             "EXL3": "pollard_exl3", "MX": "pollard_mx"}
+             "EXL3": "pollard_exl3", "MX": "pollard_mx", "EXLR8": "pollard_exlr8"}
 
 
 def _opt(args: list, flag: str, value) -> None:
@@ -113,7 +113,7 @@ def lane(r: dict) -> tuple[str, list]:
     # every lane but GGUF was built on its tool's defaults, which throws away the measurement.
     # Each lane takes the profile in its own form -- MLX/MX read sensitivity.json directly, EXL3
     # wants a per-tensor YAML. GPTQ has no profile-file input at all; its --recipe is a named mix.
-    if tool in ("pollard_mlx", "pollard_mx"):
+    if tool in ("pollard_mlx", "pollard_mx", "pollard_exlr8"):
         _opt(a, "--sensitivity", r.get("sensitivity"))
     elif tool == "pollard_exl3":
         _opt(a, "--recipe", r.get("recipeFile"))
@@ -132,6 +132,10 @@ def lane(r: dict) -> tuple[str, list]:
         _opt(a, "--bpw", r.get("bpw"))
         _opt(a, "--head-bits", r.get("headBits"))
         _opt(a, "--devices", r.get("devices"))
+    elif tool == "pollard_exlr8":
+        _opt(a, "--bpw", r.get("bpw") or 4)            # one rung; the whole ladder reuses the same encode
+        _opt(a, "--calib", r.get("calib"))
+        _opt(a, "--widths", r.get("widths"))
     elif tool == "pollard_gptq":
         _opt(a, "--bits", r.get("bits"))
         _opt(a, "--groupsize", r.get("groupsize"))
