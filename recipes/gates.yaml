@@ -7,6 +7,7 @@
 #   retention_min    task retention vs f16, percent (overall)            pollard-taskeval --results
 #   mt_retention_min mean chrF++ retention over the language pairs       pollard-taskeval --suite mt
 #   toolcall_pass    true = still emits valid tool calls                 pollard-toolcall --results
+#   toolcall_retention_min  tool-call success vs the f16's, percent      pollard-toolcall --ref --results
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
@@ -44,3 +45,14 @@ rungs:
   # the trellis flagship is ik_llama-only BY DESIGN -- the gate checks it says so, not that it isn't
   - match: ["*_KT*", "*KT-*", "PollardMix*"]
     runtime: ik_llama
+# per model KIND (pollard-modelkind), applied after the rung entries. agentic = the chat template writes tool calls
+# in a syntax pollard-modelkind recognises; its rungs must keep their tool calling (pollard-toolcall, 60 probes
+# through llama-server --jinja, retention = rung success / f16 success).
+kinds:
+  agentic:
+    toolcall_retention_min: 90
+    rungs:
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+        toolcall_retention_min: 85
+      - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
+        toolcall_retention_min: 75

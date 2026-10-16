@@ -341,7 +341,7 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
     card: gemma-4-12B-it went out reading "Input support: text" while its 175MB projector sat in
     the same folder, and "imatrix: no" for a build an imatrix produced. What shipped is knowable
     from the model and the build directory, so read it."""
-    facts = {"input": None, "imatrix": None, "params_b": None, "decision": False}
+    facts = {"input": None, "imatrix": None, "params_b": None, "decision": False, "tools": None}
     # classify needs something on disk. A repo id reads nothing, so fall back to a built GGUF
     # (which carries the chat template) or the pulled source in the workspace.
     probe = model_id if os.path.isdir(str(model_id)) else None
@@ -357,6 +357,7 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
         from pollard_modelkind import classify
         k = classify(probe)
         facts["decision"] = bool(k.get("decision"))
+        facts["tools"] = k.get("tools")
         mods = [m for m in k.get("modalities", []) if m != "speech_out"]
         # A modality only ships if the projector that carries it ships too.
         # The text GGUF carries no modality signals by construction -- the projector does, and it
@@ -420,8 +421,10 @@ def parse_params_b(params, cfg):
 TOOLCALL_MIN_RATE = 0.75      # pollard-toolcall's own --min-rate default
 
 
-def agent_ready_cell(tc):
-    """'yes (95%)' / 'no (60%)' / '--' from a pollard-toolcall result ({pass, rate} or its score {rate})."""
+def tool_ready_cell(tc):
+    """The Tool-ready cell from a pollard-toolcall result. The full gate (served through llama-server --jinja, 60
+    probes) reports retention vs the f16: 'yes (98% of f16; CI 90-104)'. Without a reference, or from the --quick
+    check: 'yes (95%)' / 'no (60%)'. '--' when nothing was measured."""
     if not isinstance(tc, dict):
         return "--"
     rate = tc.get("rate")
@@ -430,7 +433,49 @@ def agent_ready_cell(tc):
         ok = float(rate) >= TOOLCALL_MIN_RATE
     if ok is None:
         return "--"
-    return ("yes" if ok else "no") + (f" ({float(rate):.0%})" if rate is not None else "")
+    word = "yes" if ok else "no"
+    ret, ci = tc.get("retention"), tc.get("retention_ci")
+    if ret is not None:
+        lo_hi = f"; CI {float(ci[0]):.0f}-{float(ci[1]):.0f}" if isinstance(ci, (list, tuple)) and len(ci) == 2 \
+            and None not in ci else ""
+        return f"{word} ({float(ret):.0f}% of f16{lo_hi})"
+    return word + (f" ({float(rate):.0%})" if rate is not None else "")
+
+
+#: the name earlier cards and tests used
+agent_ready_cell = tool_ready_cell
+
+
+def tool_serving_section(tools, lanes, repo, example_file):
+    """'Tool calling': the call syntax the chat template uses and the server flags that parse it, per lane --
+    the setting users get wrong most often. From pollard-modelkind's toolcall_info; nothing when the template
+    writes no tool calls."""
+    if not isinstance(tools, dict) or tools.get("family", "none") == "none":
+        return []
+    fam = tools["family"]
+    lc = tools.get("llama_cpp") or {}
+    out = ["## Tool calling", "",
+           f"The chat template writes tool calls in the **`{fam}`** syntax (detected by rendering it with "
+           "[pollard-modelkind](https://github.com/WestWaters/pollard-weights)):", ""]
+    if tools.get("example"):
+        ex = tools["example"].encode("ascii", "backslashreplace").decode()
+        out += ["```", ex, "```", ""]
+    out.append("Serve with:")
+    out.append("")
+    if "gguf" in lanes:
+        out.append(f"- **llama.cpp**: `llama-server -m {example_file} --jinja` -- the model's own template renders "
+                   f"the tools and llama.cpp parses the calls ({lc.get('format') or 'its template-driven parser'}); "
+                   "pass `tools` in `/v1/chat/completions`.")
+    if tools.get("vllm_parser"):
+        note = "" if tools.get("vllm_parser_confirmed") else " (parser name not yet confirmed for this model)"
+        target = repo if any(l in lanes for l in ("gptq", "mx")) else "<the original weights>"
+        out.append(f"- **vLLM**: `vllm serve {target} {tools['vllm_flags']}`{note}")
+    else:
+        out.append("- **vLLM**: no `--tool-call-parser` reads this syntax; parse the calls client-side.")
+    if not tools.get("supports_tools"):
+        out.append("- The template does not render a tool list, so describe the tools in the system prompt.")
+    out.append("")
+    return out
 
 
 def _fmt_kl(v):
@@ -570,6 +615,8 @@ def retention_section(builds, results):
             tc = r.get("toolcall")
             if not isinstance(tc, dict) or tc.get("rate") is None:
                 cells.append("--")
+            elif tc.get("retention") is not None:
+                cells.append(_pct(float(tc["retention"])))
             elif tc.get("ref_rate"):
                 cells.append(_pct(100 * float(tc["rate"]) / float(tc["ref_rate"])))
             else:
@@ -587,7 +634,7 @@ def retention_section(builds, results):
         notes.append(f"_Tasks: {tasks or suite.get('suite', '?')} ({suite.get('harness', 'lm_eval')}, "
                      f"limit {suite.get('limit', 'full')}), scored by pollard-taskeval._")
     if has_tc:
-        notes.append("_Tool calls = the rung's tool-call format validity as a share of the f16's "
+        notes.append("_Tool calls = the rung's tool-call success as a share of the f16's "
                      "([pollard-toolcall](https://github.com/WestWaters/pollard-weights)); \"valid\" when no f16 run was "
                      "recorded. Decisions = share of typed decisions identical to the f16's._")
     for n in notes:
@@ -983,12 +1030,12 @@ def main():
     mixed = bool(ik_builds) and len(ik_builds) != len(runtimes)
     rt_h = " runs in |" if mixed else ""
     rt_s = "---|" if mixed else ""
-    # agent-ready: whether the rung still emits valid tool calls (pollard-toolcall), when the results carry
+    # Tool-ready: whether the rung still calls tools (pollard-toolcall), when the results carry
     # it. A quant can keep its perplexity and lose the narrow band of layers that formats tool calls, and
     # an agent harness is exactly where that shows -- so it is a column, not a footnote. Never measured here.
     has_tc = any(isinstance((results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("toolcall"),
                             dict) for b in builds)
-    tc_h = " agent-ready |" if has_tc else ""
+    tc_h = " Tool-ready |" if has_tc else ""
     tc_s = "---|" if has_tc else ""
     # verified: the pollard-verify --gate verdict, from the MANIFEST (record_gate) or results.json -- only
     # when a gate actually ran, so a card never implies a check nobody made
@@ -1025,7 +1072,7 @@ def main():
             out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {ag} | "
                        f"{_fmt_kl(d.get('option_kl'))} |{rt_c}{verified_cell(b, results) if has_v else ''} {note} |")
             continue
-        tc_c = f" {agent_ready_cell(r.get('toolcall'))} |" if has_tc else ""
+        tc_c = f" {tool_ready_cell(r.get('toolcall'))} |" if has_tc else ""
         v_c = verified_cell(b, results) if has_v else ""
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c}{v_c} {note} |")
@@ -1038,8 +1085,11 @@ def main():
                 "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
                 "and met. A rung that failed is not published._"]
     if has_tc and not decision:
-        out += ["", "_Agent-ready = the rung still writes valid tool calls ([pollard-toolcall]"
-                "(https://github.com/WestWaters/pollard-weights): format validity on its tool-call probes)._"]
+        out += ["", "_Tool-ready = the rung still calls tools ([pollard-toolcall](https://github.com/WestWaters/"
+                "pollard-weights)): served with `llama-server --jinja`, asked 60 tool probes (single call, choose "
+                "among eight tools, no call needed, nested arguments) through OpenAI-style `tools`, and scored on "
+                "the calls llama.cpp parses -- shown as success relative to the f16 with a 95% paired-bootstrap CI, "
+                "or as a bare success rate when no f16 run was recorded._"]
     if has_tps:
         hw = results.get("_hw")
         out.append("")
@@ -1157,6 +1207,8 @@ def main():
     if "mlx" in lanes:
         out += ["```bash", f'mlx_lm.generate --model {repo} --prompt "Hello"', "```", ""]
     out += vllm_serve_block(repo, lanes)
+    if not decision:
+        out += tool_serving_section(facts.get("tools"), lanes, repo, exn)
 
     # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
     # prints from, so the card and the CLI cannot drift apart

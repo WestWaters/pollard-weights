@@ -113,10 +113,40 @@ def test_toolcall_writes_rate_and_reference_into_results(monkeypatch, tmp_path):
                         [good, bad] if "IQ2" in model else [good, good])
     res = tmp_path / "results.json"
     monkeypatch.setattr(sys, "argv", ["pollard-toolcall", "--gguf", "M-IQ2_M.gguf", "--ref", "M-f16.gguf",
-                                      "--results", str(res), "--rung", "M-Pollard-IQ2_M.gguf"])
+                                      "--results", str(res), "--rung", "M-Pollard-IQ2_M.gguf", "--quick"])
     with pytest.raises(SystemExit):
         TC.main()
     tc = json.load(open(res))["M-Pollard-IQ2_M.gguf"]["toolcall"]
     assert tc["rate"] == 0.5 and tc["ref_rate"] == 1.0 and tc["drop"] == 0.5 and tc["pass"] is False
     md = "\n".join(C.retention_section(BUILDS, json.load(open(res))))
     assert "| `M-Pollard-IQ2_M.gguf` | 50.0% |" in md
+
+
+def test_full_toolcall_writes_retention_with_ci_into_results(monkeypatch, tmp_path):
+    """The served gate: per-probe rows for the rung and the f16 -> retention + paired CI in results.json, which the
+    card's retention section and pollard-verify's toolcall_retention_min read."""
+    import pytest
+    import pollard_toolcall as TC
+
+    def rows(n_ok):
+        return [{"id": p["id"], "category": p["category"], "expected": p["expect"] is not None,
+                 "called": True, "parsed": True, "name_ok": True, "args_valid": True, "exact": i < n_ok,
+                 "ok": i < n_ok, "failure": None if i < n_ok else "wrong-value", "detail": "", "sample": ""}
+                for i, p in enumerate(TC.SUITE)]
+    monkeypatch.setattr(TC, "run_model", lambda *a, **k: (rows(45), {"family": "hermes"}))
+    monkeypatch.setattr(TC, "run_ref_cached", lambda *a, **k: (rows(50), {"family": "hermes"}))
+    res = tmp_path / "results.json"
+    monkeypatch.setattr(sys, "argv", ["pollard-toolcall", "--gguf", "M-IQ2_M.gguf", "--ref", "M-f16.gguf",
+                                      "--results", str(res), "--rung", "M-Pollard-IQ2_M.gguf"])
+    with pytest.raises(SystemExit):
+        TC.main()
+    tc = json.load(open(res))["M-Pollard-IQ2_M.gguf"]["toolcall"]
+    assert tc["mode"] == "full" and tc["retention"] == 90.0 and tc["pass"] is True     # 45/50, gate at 90
+    lo, hi = tc["retention_ci"]
+    assert lo < 90.0 <= hi <= 100.0
+    assert tc["family"] == "hermes" and tc["n"] == 60 and tc["rate_ci"][0] < tc["rate"] < tc["rate_ci"][1]
+    md = "\n".join(C.retention_section(BUILDS, json.load(open(res))))
+    assert "| `M-Pollard-IQ2_M.gguf` | 90.0% |" in md
+    import pollard_verify as V
+    m = V.metrics_from_results(json.load(open(res)), "M-Pollard-IQ2_M.gguf")
+    assert m["toolcall_retention"] == 90.0

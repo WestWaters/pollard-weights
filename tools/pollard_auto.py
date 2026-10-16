@@ -34,7 +34,7 @@ EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix 
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
 pollard-probe, --no-measure to skip); EXL3 = smoothing + Calib 3.0 packed to -cd + EXL3's native allocator.
 """
-import argparse, contextlib, json, os, re, subprocess, sys
+import argparse, contextlib, json, os, re, subprocess, sys, time
 
 from pollard_calc import (read_gguf_meta, gguf_to_config, analyse, find_llama_bin,
                           detect_gpu_gb, detect_available_ram_gb)
@@ -835,6 +835,46 @@ def _emit_mmproj(a, conv, hf_dir, gguf_out):
     print(f"   wrote {out}  ({os.path.getsize(out)/1e6:.1f} MB)")
 
 
+def _toolcall_gate(a, since):
+    """An AGENTIC model (pollard-modelkind: its chat template writes tool calls in a known syntax) gets the tool-call
+    gate on every GGUF rung this run built: pollard-toolcall serves each with llama-server --jinja, asks 60 tool
+    probes through OpenAI-style `tools`, and records retention vs the f16 in results.json -- which the card turns
+    into its Tool-ready column. A quant can keep its perplexity and lose the narrow band of layers that formats
+    tool calls, and an agent harness is exactly where that shows. Opt-in with --toolcall."""
+    if not a.run or not getattr(a, "toolcall", False) or not a.gguf:
+        return
+    try:
+        from pollard_modelkind import classify
+        tools = classify(a.gguf).get("tools") or {}
+    except (Exception, SystemExit):                              # noqa: BLE001
+        return
+    fam = tools.get("family", "none")
+    if fam == "none":
+        return
+    try:
+        import pollard_workspace as ws
+        builds = [b for b in ws.read_manifest(a.gguf).get("builds", [])
+                  if b.get("lane") == "gguf" and os.path.isfile(b.get("path", ""))
+                  and os.path.getmtime(b["path"]) >= since - 5]
+    except Exception:                                            # noqa: BLE001
+        builds = []
+    if not builds:
+        return
+    results = getattr(a, "results", None) or os.path.join(os.path.dirname(os.path.abspath(a.gguf)) or ".",
+                                                         "results.json")
+    ngl = str(a.ngl) if str(a.ngl).isdigit() else "0"         # a shared GPU is not ours unless told
+    print(f"\n   tool-call gate: agentic model ({fam} call syntax) -- {len(builds)} rung(s) vs the f16 "
+          "(--toolcall)")
+    for b in builds:
+        cmd = _resolve_tool(["pollard-toolcall", "--gguf", b["path"], "--ref", a.gguf, "--ngl", ngl,
+                             "--results", results, "--rung", b.get("name") or os.path.basename(b["path"])])
+        print("   $ " + " ".join(str(c) for c in cmd))
+        r = subprocess.run(cmd)
+        if r.returncode not in (0, 1):                           # 1 = FAIL, a number for the card; else a crash
+            print(f"   (tool-call gate on {os.path.basename(b['path'])} did not finish: exit {r.returncode})")
+    a.results = results
+
+
 def _emit_card(a):
     """Write the model card for what was just built.
 
@@ -955,6 +995,12 @@ def main():
                          "fast and skips the eval. Use this only to reproduce our published numbers.")
     ap.add_argument("--force-dense", action="store_true", help="override detection -> dense path")
     ap.add_argument("--force-moe", action="store_true", help="override detection -> MoE path")
+    ap.add_argument("--toolcall", dest="toolcall", action="store_true",
+                    help="after the build, run the tool-call gate on an agentic model's rungs (pollard-toolcall: "
+                         "60 tool probes per rung through llama-server --jinja, retention vs f16). OFF by default: "
+                         "a build is not a benchmark; `pollard release` runs it for every agentic rung.")
+    ap.add_argument("--no-toolcall", dest="toolcall", action="store_false", help=argparse.SUPPRESS)
+    ap.set_defaults(toolcall=False)
     ap.add_argument("--no-gate", dest="gate", action="store_false",
                     help="skip the auto coherence gate (loop check + sampling sweep) the one-shot "
                          "MoE build appends after the mix -- by default it runs so you learn if the "
@@ -969,6 +1015,7 @@ def main():
 
 
 def _dispatch(a):
+    a._t0 = time.time()
     if not a.gguf and not a.hf:
         # argparse-style usage error; `ap` lives in main(), so ap.error here was a NameError (Joey's review).
         sys.exit("pollard: error: pass --gguf <file> or --hf <repo-or-dir>")
@@ -1095,6 +1142,8 @@ def _dispatch(a):
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
+    if a.run:
+        _toolcall_gate(a, since=getattr(a, "_t0", 0.0))
     if a.run and getattr(a, "card", True):
         _emit_card(a)
     if not a.run:

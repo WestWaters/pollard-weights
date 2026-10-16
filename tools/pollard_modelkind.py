@@ -159,11 +159,15 @@ _REASONING_TAGS = ("reasoning", "thinking", "chain-of-thought", "cot", "reasonin
 _MARK_R, _MARK_A, _MARK_U = "RZQXREASON", "AZQXANSWER", "UZQXUSER"
 
 
-def _jinja_env():
-    """A jinja2 environment that renders HF chat templates the way transformers does (no tokenizer)."""
+def _jinja_env(mutable=False):
+    """A jinja2 environment that renders HF chat templates the way transformers does (no tokenizer).
+
+    `mutable=True` allows list.append / dict.update inside the template (still sandboxed): a few shipped
+    templates (Kimi-K2) build lists that way, which llama.cpp's own jinja engine accepts and transformers'
+    immutable sandbox refuses."""
     import jinja2
     from jinja2.ext import Extension
-    from jinja2.sandbox import ImmutableSandboxedEnvironment
+    from jinja2.sandbox import ImmutableSandboxedEnvironment, SandboxedEnvironment
 
     class _Generation(Extension):                       # transformers' {% generation %} block
         tags = {"generation"}
@@ -187,8 +191,8 @@ def _jinja_env():
         import datetime
         return datetime.datetime.now().strftime(fmt)
 
-    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                        extensions=[_Generation, jinja2.ext.loopcontrols])
+    cls = SandboxedEnvironment if mutable else ImmutableSandboxedEnvironment
+    env = cls(trim_blocks=True, lstrip_blocks=True, extensions=[_Generation, jinja2.ext.loopcontrols])
     env.filters["tojson"] = tojson
     env.globals["raise_exception"] = raise_exception
     env.globals["strftime_now"] = strftime_now
@@ -219,10 +223,10 @@ class ChatTemplate:
     The calibration renderer falls back to this when transformers is absent, and the reasoning probe
     always uses it. `render(messages, add_generation_prompt, tools, **template_vars)`."""
 
-    def __init__(self, source, specials=None):
+    def __init__(self, source, specials=None, mutable=False):
         self.source = source
         self.specials = dict(specials or {})
-        self._tpl = _jinja_env().from_string(source)
+        self._tpl = _jinja_env(mutable).from_string(source)
 
     @classmethod
     def from_model(cls, model):
@@ -550,6 +554,492 @@ def strip_reasoning(text, info=None):
     return split_reasoning(text, info)[1]
 
 
+# ----------------------------------------------------------------- tool calling (the parser family)
+#
+# A model that calls tools writes the call in ITS OWN syntax -- Hermes `<tool_call>{json}</tool_call>`, Qwen3-Coder
+# XML, LFM2's pythonic list, gpt-oss harmony channels, Mistral `[TOOL_CALLS]` -- and the server has to be told
+# which parser reads it (vLLM `--tool-call-parser`, llama.cpp `--jinja` + its own template sniffing). Users mis-set
+# this constantly, and a gate that grades calls in a format the model was never trained on measures the prompt.
+# So the template is asked, the way llama.cpp asks it (common/chat.cpp):
+#
+#   1. SNIFF the template source for the markers llama.cpp's specialised handlers key on (same order, first match
+#      wins: Ministral-3, gpt-oss, Muse, Functionary v3.2, Kimi-K2, Kimi-K3, Cohere2, LFM2, LFM2.5, GigaChat,
+#      MiniMax-M3, DeepSeek-V3.2/V4, Gemma 4, MiniCPM5, Qwen3-Coder), then markers unique to other families.
+#   2. RENDER it (jinja2): one dummy tool, one assistant turn carrying a dummy `tool_calls`, a tool result. The text
+#      between the user turn and the tool result IS the model's call syntax, the same diff llama.cpp's autoparser
+#      runs; the rendered call is classified by signature. Rendering the tool list with and without tools says
+#      whether the template describes tools at all, and where it puts them.
+#   3. A template that renders no call (some drop `tool_calls` and let the model write calls into content: LFM2,
+#      Granite 3.x, R1-distill) keeps the sniffed family; one with neither is `none`.
+
+#: family -> how it is served and written. vllm = `--tool-call-parser` value; vllm_ok True = in vLLM's documented
+#: parser list, False = in vLLM's source tree (CLI name or model mapping unconfirmed), None = no vLLM parser.
+#: shape = where the name/arguments live: json (name inside one JSON object), tag+json (name in markup, JSON args),
+#: tag+tagged (one markup element per argument), pythonic (`[fn(a=1)]`), kv (Gemma `{a:<|"|>x<|"|>}`).
+TOOL_FAMILIES = {
+    "hermes": dict(vllm="hermes", vllm_ok=True, shape="json",
+                   fmt='<tool_call>\n{"name": NAME, "arguments": {...}}\n</tool_call>'),
+    "qwen3_coder": dict(vllm="qwen3_coder", vllm_ok=True, alt="qwen3_xml", shape="tag+tagged",
+                        fmt="<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>"),
+    "lfm2": dict(vllm="lfm2", vllm_ok=False, shape="pythonic",
+                 fmt='<|tool_call_start|>[NAME(key="value")]<|tool_call_end|>'),
+    "harmony": dict(vllm="openai", vllm_ok=True, shape="tag+json",
+                    fmt="<|start|>assistant to=functions.NAME<|channel|>commentary json<|message|>{...}<|call|>"),
+    "mistral": dict(vllm="mistral", vllm_ok=True, shape="tag+json",
+                    fmt='[TOOL_CALLS]NAME[ARGS]{...}  (tokenizer v11+)  |  [TOOL_CALLS][{"name": NAME, "arguments": {...}}]'),
+    "llama3_json": dict(vllm="llama3_json", vllm_ok=True, shape="json",
+                        fmt='{"name": NAME, "parameters": {...}}'),
+    "pythonic": dict(vllm="pythonic", vllm_ok=True, alt="llama4_pythonic", shape="pythonic",
+                     fmt='[NAME(key="value")]'),
+    "xlam": dict(vllm="xlam", vllm_ok=True, shape="json", fmt='[{"name": NAME, "arguments": {...}}]'),
+    "deepseek_v3": dict(vllm="deepseek_v3", vllm_ok=True, shape="tag+json",
+                        fmt="<\uff5ctool\u2581calls\u2581begin\uff5c><\uff5ctool\u2581call\u2581begin\uff5c>function<\uff5ctool\u2581sep\uff5c>NAME\n```json\n{...}\n```"
+                            "<\uff5ctool\u2581call\u2581end\uff5c><\uff5ctool\u2581calls\u2581end\uff5c>"),
+    "deepseek_v31": dict(vllm="deepseek_v31", vllm_ok=True, shape="tag+json",
+                         fmt="<\uff5ctool\u2581calls\u2581begin\uff5c><\uff5ctool\u2581call\u2581begin\uff5c>NAME<\uff5ctool\u2581sep\uff5c>{...}<\uff5ctool\u2581call\u2581end\uff5c>"
+                             "<\uff5ctool\u2581calls\u2581end\uff5c>"),
+    "deepseek_v32": dict(vllm="deepseek_v32", vllm_ok=False, shape="tag+tagged",
+                         fmt='<\uff5cDSML\uff5cfunction_calls|tool_calls><\uff5cDSML\uff5cinvoke name="NAME"><\uff5cDSML\uff5cparameter name="KEY" '
+                             'string="true">VALUE</\uff5cDSML\uff5cparameter></\uff5cDSML\uff5cinvoke>...'),
+    "glm45": dict(vllm="glm45", vllm_ok=True, shape="tag+tagged",
+                  fmt="<tool_call>NAME\n<arg_key>KEY</arg_key>\n<arg_value>VALUE</arg_value>\n</tool_call>"),
+    "glm47": dict(vllm="glm47", vllm_ok=True, shape="tag+tagged",
+                  fmt="<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value></tool_call>"),
+    "kimi_k2": dict(vllm="kimi_k2", vllm_ok=True, shape="tag+json",
+                    fmt="<|tool_calls_section_begin|><|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>{...}"
+                        "<|tool_call_end|><|tool_calls_section_end|>"),
+    "kimi_k3": dict(vllm="kimi_k3", vllm_ok=False, shape="tag+tagged",
+                    fmt='<|open|>call tool="NAME" index="1"<|sep|><|open|>argument key="KEY" ...<|sep|>VALUE<|close|>argument'),
+    "granite": dict(vllm="granite", vllm_ok=True, shape="json",
+                    fmt='<|tool_call|>[{"name": NAME, "arguments": {...}}]'),
+    "functiongemma": dict(vllm="functiongemma", vllm_ok=True, shape="kv",
+                          fmt="<start_function_call>call:NAME{key:<escape>value<escape>}<end_function_call>"),
+    "gemma4": dict(vllm="gemma4", vllm_ok=False, shape="kv",
+                   fmt='<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>'),
+    "cohere": dict(vllm="cohere_command3", vllm_ok=False, shape="json",
+                   fmt='<|START_ACTION|>[{"tool_call_id": "0", "tool_name": NAME, "parameters": {...}}]<|END_ACTION|>'),
+    "cohere_cmdr": dict(vllm=None, vllm_ok=None, shape="json",
+                        fmt='Action: ```json\n[{"tool_name": NAME, "parameters": {...}}]\n```'),
+    "minimax_m1": dict(vllm="minimax", vllm_ok=False, shape="json",
+                       fmt='<tool_calls>\n{"name": NAME, "arguments": {...}}\n</tool_calls>'),
+    "minimax_m2": dict(vllm="minimax_m2", vllm_ok=False, shape="tag+tagged",
+                       fmt='<minimax:tool_call>\n<invoke name="NAME">\n<parameter name="KEY">VALUE</parameter>\n</invoke>\n'
+                           '</minimax:tool_call>'),
+    "minimax_m3": dict(vllm="minimax_m3", vllm_ok=False, shape="tag+tagged",
+                       fmt=']<]minimax[>[<tool_call>]<]minimax[>[<invoke name="NAME">]<]minimax[>[<KEY>VALUE...'),
+    "seed_oss": dict(vllm="seed_oss", vllm_ok=False, shape="tag+tagged",
+                     fmt="<seed:tool_call>\n<function=NAME>\n<parameter=KEY>VALUE</parameter>\n</function>\n</seed:tool_call>"),
+    "functionary_v31": dict(vllm=None, vllm_ok=None, shape="tag+json", fmt="<function=NAME>{...}</function>"),
+    "functionary_v32": dict(vllm=None, vllm_ok=None, shape="tag+json", fmt=">>>NAME\n{...}"),
+    "firefunction": dict(vllm=None, vllm_ok=None, shape="json",
+                         fmt=' functools[{"name": NAME, "arguments": {...}}]'),
+    "apriel": dict(vllm=None, vllm_ok=None, shape="json",
+                   fmt='<tool_calls>[{"name": NAME, "arguments": {...}}]</tool_calls>'),
+    "apertus": dict(vllm=None, vllm_ok=None, shape="json", fmt='<|tools_prefix|>[{NAME: {...}}]<|tools_suffix|>'),
+    "nemotron_v2": dict(vllm=None, vllm_ok=None, shape="json",
+                        fmt='<TOOLCALL>[{"name": NAME, "arguments": {...}}]</TOOLCALL>'),
+    "gigachat": dict(vllm=None, vllm_ok=None, shape="json",
+                     fmt='<|function_call|>{"name": NAME, "arguments": {...}}  (v3: a "function call" role turn)'),
+    "minicpm5": dict(vllm=None, vllm_ok=None, shape="tag+tagged",
+                     fmt='<function name="NAME"><param name="KEY">VALUE</param></function>'),
+    "hunyuan": dict(vllm=None, vllm_ok=None, shape="tag+tagged",
+                    fmt="<tool_calls:opensource><tool_call:opensource>NAME<tool_sep:opensource><arg_key:opensource>KEY"
+                        "</arg_key:opensource><arg_value:opensource>VALUE</arg_value:opensource>..."),
+    "solar_open": dict(vllm=None, vllm_ok=None, shape="tag+json",
+                       fmt="<|tool_calls|><|tool_call:begin|>ID<|tool_call:name|>NAME<|tool_call:args|>{...}<|tool_call:end|>"),
+    "muse_glimmer": dict(vllm=None, vllm_ok=None, shape="tag+tagged",
+                         fmt='<atem:function_calls><atem:invoke name="NAME"><atem:parameter name="KEY">VALUE'
+                             '</atem:parameter></atem:invoke></atem:function_calls>'),
+    "json": dict(vllm=None, vllm_ok=None, shape="json", fmt="a JSON call in an unlisted wrapper"),
+    "unknown": dict(vllm=None, vllm_ok=None, shape=None, fmt="an unlisted call syntax"),
+}
+
+
+def llama_cpp_handler(src):
+    """The handler llama.cpp's common_chat_try_specialized_template picks for this template source (same checks,
+    same order -- first match wins), or "autoparser" when none matches (render-and-diff classification)."""
+    src = src or ""
+
+    def has(*xs):
+        return all(x in src for x in xs)
+    if has("[SYSTEM_PROMPT]", "[TOOL_CALLS]", "[ARGS]") and "[CALL_ID]" not in src:
+        return "Ministral/Magistral 3", "mistral"
+    if "<|channel|>" in src:
+        return "GPT-OSS", "harmony"
+    if has("<atem:function_calls>", "<|eom|>"):
+        return "Muse Glimmer", "muse_glimmer"
+    if has(">>>all", ">>>${recipient}"):
+        return "Functionary v3.2", "functionary_v32"
+    if has("<|tool_calls_section_begin|>", "<|tool_call_begin|>"):
+        return "Kimi K2", "kimi_k2"
+    if has("<|open|>", "<|close|>", "<|end_of_msg|>"):
+        return "Kimi K3", "kimi_k3"
+    if has("<|START_TEXT|>", "<|START_ACTION|>"):
+        return "Cohere2 MoE", "cohere"
+    if has("<|tool_list_start|>", "<|tool_list_end|>"):
+        return "LFM2", "lfm2"
+    if "List of tools: [" in src and "<|tool_list_start|>" not in src:
+        return "LFM2.5", "lfm2"
+    if has("<|role_sep|>", "<|message_sep|>") and "<|function_call|>" not in src:
+        return "GigaChatV3", "gigachat"
+    if has("]<]minimax[>[", "<tool_call>", "<invoke name="):
+        return "MiniMax-M3", "minimax_m3"
+    if has("dsml_token", "DSML") and ("function_calls" in src or "tool_calls" in src):
+        return "DeepSeek V3.2/V4", "deepseek_v32"
+    if "'<|tool_call>call:'" in src:
+        return "Gemma4", "gemma4"
+    if has("Tool usage guidelines:", '<function name="', '<param name="'):
+        return "MiniCPM5", "minicpm5"
+    if has("<tool_call>", "<function=", "<parameter="):
+        return "Qwen3-Coder", "qwen3_coder"
+    return "autoparser", None
+
+
+def _sniff_tool_family(src):
+    """(family, strong) from the template source alone. llama.cpp's specialised list first; then markers unique
+    to one family (strong); then shapes several families share (weak -- rendering decides)."""
+    handler, fam = llama_cpp_handler(src)
+    if fam:
+        return fam, True
+    s = src or ""
+    for marker, fam in (("<seed:tool_call>", "seed_oss"), ("<minimax:tool_call>", "minimax_m2"),
+                        ("<start_function_call>", "functiongemma"), ("<|tool_call|>", "granite"),
+                        ("<|START_ACTION|>", "cohere"), ("[TOOL_CALLS]", "mistral"), ("functools[", "firefunction"), ("<TOOLCALL>", "nemotron_v2"),
+                        ("<|function_call|>", "gigachat"), ("tool_call:opensource", "hunyuan"),
+                        ("<|tool_call:begin|>", "solar_open"), ("<|tools_prefix|>", "apertus")):
+        if marker in s:
+            return fam, True
+    if "tool\u2581calls\u2581begin" in s:
+        return ("deepseek_v3" if "```json" in s else "deepseek_v31"), True
+    if "Action:" in s and "tool_name" in s:
+        return "cohere_cmdr", True
+    if "<function=" in s and "<|python_tag|>" in s:
+        return "functionary_v31", True
+    if "<arg_key>" in s and "<tool_call>" in s:
+        return "glm45", False
+    if "<tool_calls>" in s:
+        return "apriel", False
+    if "<tool_call>" in s:
+        return "hermes", False
+    if "<|python_tag|>" in s or ('"parameters"' in s and re.search(r"\btools\b", s)):
+        return "llama3_json", False
+    return None, False
+
+
+_TC_NAME, _TC_VAL, _TC_USER, _TC_RES, _TC_SYS, _TC_DESC = (
+    "pzq_lookup", "PZQCITY", "PZQUSER", "PZQRESULT", "PZQSYS", "PZQDESC")
+_TC_TOOLS = [{"type": "function", "function": {
+    "name": _TC_NAME, "description": f"Look up {_TC_DESC}.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "the city"},
+                                                     "days": {"type": "integer", "description": "how many days"}},
+                   "required": ["city"]}}}]
+#: list containers seen around a rendered tool list
+_TOOL_LIST_MARKERS = ("<tools>", "<|tool_list_start|>", "List of tools:", "[AVAILABLE_TOOLS]", "<|tools_prefix|>",
+                      "# Tools", "namespace functions", "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>", "<available_tools>",
+                      "You have access to the following functions", "Here is a list of functions in JSON format")
+
+
+#: what ends a rendered call, and what ends the assistant turn after it (the example stops at the latter)
+_CALL_CLOSERS = (r"</tool_call>|<\|tool_call_end\|>|<\|tool_calls_section_end\|>|<\|call\|>|tool\u2581calls?\u2581end\uff5c>|"
+                 r"<\|END_ACTION\|>|</tool_calls>|</TOOLCALL>|<tool_call\|>|</minimax:tool_call>|</seed:tool_call>|"
+                 r"</\uff5cDSML\uff5c(?:function|tool)_calls>|</atem:function_calls>|</function>|<\|tool_call:end\|>|"
+                 r"</tool_calls?:opensource>|<end_function_call>|<\|tools_suffix\|>|<\|close\|>tools<\|sep\|>|"
+                 r"</invoke>|```|[\]\}]")
+_TURN_ENDS = ("<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|end|>", "<\uff5cend\u2581of\u2581sentence\uff5c>", "[TOOL_RESULTS]",
+              "<|observation|>", "</s>", "<seed:eos>", "[e~[", "</assistant>", "<|message_sep|>", "<|END_OF_TURN_TOKEN|>",
+              "<turn|>", "<|im_system|>", "<\uff5chy_eos", "<|end_of_text|>", "<|calls|>", "<end_of_sentence>", "\n\n<sep>",
+              "<|tool_response", "<|close|>message", "]<]minimax[>[</tool_call>")
+
+
+def _classify_call_text(seg, name=_TC_NAME):
+    """The family a rendered call belongs to, by signature. None when the name is not in the text at all."""
+    if not seg or name not in seg:
+        return None
+    n = re.escape(name)
+    checks = [
+        (lambda: f"to=functions.{name}" in seg, "harmony"),
+        (lambda: "<|tool_calls_section_begin|>" in seg, "kimi_k2"),
+        (lambda: '<|open|>call tool="' in seg, "kimi_k3"),
+        (lambda: "DSML" in seg, "deepseek_v32"),
+        (lambda: "tool\u2581call\u2581begin" in seg, "deepseek"),
+        (lambda: "]<]minimax[>[" in seg, "minimax_m3"),
+        (lambda: "<minimax:tool_call>" in seg, "minimax_m2"),
+        (lambda: "<seed:tool_call>" in seg, "seed_oss"),
+        (lambda: "<atem:function_calls>" in seg, "muse_glimmer"),
+        (lambda: "tool_call:opensource" in seg, "hunyuan"),
+        (lambda: "<|tool_call:begin|>" in seg, "solar_open"),
+        (lambda: "<start_function_call>" in seg, "functiongemma"),
+        (lambda: "<|tool_call>call:" in seg, "gemma4"),
+        (lambda: "<|tool_call_start|>" in seg, "lfm2"),
+        (lambda: "<|START_ACTION|>" in seg, "cohere"),
+        (lambda: bool(re.search(r"Action:\s*```json", seg)), "cohere_cmdr"),
+        (lambda: "[TOOL_CALLS]" in seg, "mistral"),
+        (lambda: "<|tool_call|>" in seg, "granite"),
+        (lambda: "<TOOLCALL>" in seg, "nemotron_v2"),
+        (lambda: "<|tools_prefix|>" in seg, "apertus"),
+        (lambda: "<|function_call|>" in seg or "function call<|role_sep|>" in seg, "gigachat"),
+        (lambda: bool(re.search(r'<function name="%s"' % n, seg)), "minicpm5"),
+        (lambda: f"<function={name}>" in seg, "function="),
+        (lambda: f">>>{name}" in seg, "functionary_v32"),
+        (lambda: "functools[" in seg, "firefunction"),
+        (lambda: "<arg_key>" in seg, "glm"),
+        (lambda: "<tool_calls>" in seg, "tool_calls"),
+        (lambda: "<tool_call>" in seg and '"name"' in seg, "hermes"),
+        (lambda: bool(re.search(r"\[\s*%s\(" % n, seg)), "pythonic"),
+        (lambda: '"parameters"' in seg and '"name"' in seg, "llama3_json"),
+        (lambda: bool(re.search(r'\[\s*\{\s*"name"\s*:\s*"%s"' % n, seg)), "xlam"),
+        (lambda: '"name"' in seg, "json"),
+    ]
+    for test, fam in checks:
+        if not test():
+            continue
+        if fam == "deepseek":
+            return "deepseek_v3" if "```json" in seg else "deepseek_v31"
+        if fam == "function=":
+            return "qwen3_coder" if "<parameter=" in seg else "functionary_v31"
+        if fam == "glm":
+            return "glm47" if re.search(r"%s<arg_key>" % n, seg) else "glm45"
+        if fam == "tool_calls":
+            return "apriel" if re.search(r"<tool_calls>\s*\[", seg) else "minimax_m1"
+        return fam
+    return "unknown"
+
+
+def _tc_messages(arg_string):
+    args = {"city": _TC_VAL, "days": 7}
+    call = {"id": "pzqcall01", "type": "function",                 # 9 chars: Mistral templates insist
+            "function": {"name": _TC_NAME, "arguments": json.dumps(args) if arg_string else args}}
+    return [{"role": "user", "content": _TC_USER},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "pzqcall01", "name": _TC_NAME, "content": _TC_RES},
+            {"role": "assistant", "content": "PZQFINAL"}]
+
+
+def _render_tool_probe(ct):
+    """What rendering says about tools: the call segment, the tool list with and without tools, the placement."""
+    out = {"rendered": False, "seg": None, "call": None, "tools_rendered": None, "placement": None,
+           "container": None, "args_string": None}
+    full = None
+    for as_string in (False, True):                          # object arguments first, then a JSON string
+        r = _safe(ct.render, _tc_messages(as_string), tools=_TC_TOOLS)
+        if r and _TC_USER in r:
+            full = r
+            out["args_string"] = as_string
+            if _TC_VAL in r:
+                break
+    if full is not None:
+        out["rendered"] = True
+        ui = full.index(_TC_USER) + len(_TC_USER)
+        ri = full.find(_TC_RES, ui)
+        seg = full[ui:ri if ri >= 0 else len(full)]
+        out["seg"] = seg
+        if _TC_NAME in seg:
+            gen = _safe(ct.render, [{"role": "user", "content": _TC_USER}], add_generation_prompt=True,
+                        tools=_TC_TOOLS) or ""
+            call = full[len(gen):] if gen and full.startswith(gen) else seg
+            cut = call.find(_TC_RES)
+            call = call[:cut] if cut >= 0 else call
+            # trim to the call itself: drop an empty thinking block in front, stop after the last argument's closer
+            end = max(call.rfind(_TC_VAL), call.rfind("7"))
+            # stop at the end of the call: the last call closer before the turn ends
+            tail = call[end:]
+            stops = [tail.find(t) for t in _TURN_ENDS if t in tail]
+            stop = min(stops) if stops else len(tail)
+            ends = [m.end() for m in re.finditer(_CALL_CLOSERS, tail[:stop])]
+            call = call[:end + (max(ends) if ends else stop)]
+            call = re.sub(r"^\s*(<think>\s*</think>|</think>|<\|START_THINKING\|><\|END_THINKING\|>)\s*", "", call)
+            out["call"] = call.strip()
+    # the tool list: rendered at all, and where
+    msgs = [{"role": "system", "content": _TC_SYS}, {"role": "user", "content": _TC_USER}]
+    with_t = _safe(ct.render, msgs, add_generation_prompt=True, tools=_TC_TOOLS)
+    if with_t is None:
+        msgs = msgs[1:]
+        with_t = _safe(ct.render, msgs, add_generation_prompt=True, tools=_TC_TOOLS)
+    if with_t is not None:
+        ti = with_t.find(_TC_NAME)
+        out["tools_rendered"] = ti >= 0
+        if ti >= 0:
+            ui, si = with_t.find(_TC_USER), with_t.find(_TC_SYS)
+            eot = ""
+            pair = _safe(ct.render, [{"role": "user", "content": "UZQX"}, {"role": "assistant", "content": "AZQX"}])
+            if pair and "AZQX" in pair:
+                eot = pair[pair.index("AZQX") + 4:].strip()
+            if ui >= 0 and ti > ui:
+                out["placement"] = "after the user message"
+            elif si >= 0 and (not eot or eot not in with_t[min(si, ti):max(si, ti)]):
+                out["placement"] = "system prompt"
+            elif ui >= 0 and (not eot or eot not in with_t[ti:ui]):
+                out["placement"] = "user turn"
+            else:
+                out["placement"] = "own turn"
+            near = with_t[max(0, ti - 600):ti]
+            hits = [(near.rfind(mk), mk) for mk in _TOOL_LIST_MARKERS if mk in near]
+            out["container"] = max(hits)[1] if hits else None
+    return out
+
+
+def toolcall_info(model=None, tpl=None, archs=None, conf=None) -> dict:
+    """Does this model call tools, in which syntax, and how must it be served?
+
+    {"family", "supports_tools", "supports_tool_calls", "source": static|render|static+render,
+     "vllm_parser", "vllm_parser_confirmed", "vllm_flags", "llama_cpp": {"flags", "handler", "format"},
+     "tool_list": {"placement", "container"}, "call_format", "shape", "example", "why": [...]}"""
+    if tpl is None:
+        tpl, archs, conf = _template_and_arch(model)
+    if isinstance(tpl, list):                                    # named templates: prefer "tool_use"
+        tpl = next((t.get("template") for t in tpl if t.get("name") == "tool_use"),
+                   next((t.get("template") for t in tpl if t.get("name") == "default"), tpl[0].get("template")))
+    tpl = tpl if isinstance(tpl, str) else ""
+    why = []
+    info = {"family": "none", "supports_tools": False, "supports_tool_calls": False, "source": None,
+            "vllm_parser": None, "vllm_parser_confirmed": None, "vllm_flags": None,
+            "llama_cpp": None, "tool_list": {"placement": None, "container": None},
+            "call_format": None, "shape": None, "example": None, "why": why}
+    if not tpl:
+        why.append("no chat template -> no tool calling")
+        return info
+    sniffed, strong = _sniff_tool_family(tpl)
+    handler, _ = llama_cpp_handler(tpl)
+    probe = None
+    for mutable in (False, True):
+        try:
+            ct = ChatTemplate(tpl, _special_tokens(model, conf or {}), mutable=mutable)
+        except Exception:                                        # noqa: BLE001 -- no jinja2 / bad syntax
+            break
+        got = _safe(_render_tool_probe, ct)
+        if got and (probe is None or got.get("rendered") or probe.get("tools_rendered") is None):
+            probe = got
+        if probe and probe.get("rendered"):
+            break
+    rendered = _classify_call_text((probe or {}).get("seg"))
+    if rendered:
+        info["supports_tool_calls"] = True
+        info["example"] = ((probe.get("call") or "").replace(_TC_NAME, "get_weather")
+                           .replace(_TC_VAL, "Paris")[:400]) or None
+    tools_seen = (probe or {}).get("tools_rendered")
+    if tools_seen is not None:
+        info["supports_tools"] = bool(tools_seen)
+        info["tool_list"] = {"placement": probe.get("placement"), "container": probe.get("container")}
+    else:                                                       # no rendering: what the source reads
+        info["supports_tools"] = bool(re.search(r"\btools\b", tpl)) and bool(sniffed)
+    if strong and sniffed:
+        fam = sniffed
+        info["source"] = "static+render" if rendered == sniffed else "static"
+        why.append(f"template markers -> {sniffed}" + (f" (llama.cpp: specialised '{handler}')"
+                                                       if handler != "autoparser" else ""))
+        if rendered and rendered != sniffed:
+            why.append(f"rendered call reads as {rendered}; the markers win, as in llama.cpp")
+        if not rendered:
+            why.append("the template does not render tool_calls back -- the model writes calls into its content")
+        info["supports_tool_calls"] = True
+    elif rendered:
+        fam, info["source"] = rendered, "render"
+        why.append(f"rendered assistant tool call reads as {rendered}")
+    elif sniffed and info["supports_tools"]:
+        fam, info["source"] = sniffed, "static"
+        info["supports_tool_calls"] = True
+        why.append(f"template describes tools and mentions {sniffed}-style calls (not rendered)")
+    else:
+        fam = "none"
+        why.append("template renders no tool list" if not info["supports_tools"] else
+                   "template lists tools but writes no call syntax of its own")
+    info["family"] = fam
+    if fam != "none":
+        meta = TOOL_FAMILIES.get(fam, TOOL_FAMILIES["unknown"])
+        ex, lead = info["example"] or "", re.split(r"NAME|\{", meta["fmt"])[0].strip()
+        if lead and lead in ex:                                  # start the example at the call, not the header
+            info["example"] = ex[ex.index(lead):]
+        info["call_format"], info["shape"] = meta["fmt"], meta["shape"]
+        info["vllm_parser"], info["vllm_parser_confirmed"] = meta["vllm"], meta["vllm_ok"]
+        if meta["vllm"]:
+            info["vllm_flags"] = f"--enable-auto-tool-choice --tool-call-parser {meta['vllm']}"
+        if handler != "autoparser":
+            fmt = f"specialised: {handler}"
+        else:
+            shape = {"json": "JSON_NATIVE", "tag+json": "TAG_WITH_JSON", "tag+tagged": "TAG_WITH_TAGGED"}.get(
+                meta["shape"])
+            fmt = f"autoparser ({shape})" if shape else "autoparser (no native shape -- check the parse)"
+        info["llama_cpp"] = {"flags": "--jinja", "handler": handler, "format": fmt}
+        if not info["supports_tools"]:
+            why.append("the template does not render a tool list -- tools must be described in the system prompt")
+    return info
+
+
+def serve_with_line(t, model="<model>"):
+    """One line: how to serve this model so its tool calls are parsed -- llama.cpp and vLLM."""
+    if not t or t.get("family", "none") == "none":
+        return "no tool calling in the chat template"
+    parts = ["llama-server --jinja"]
+    lc = t.get("llama_cpp") or {}
+    if lc.get("format"):
+        parts[0] += f"  ({lc['format']})"
+    if t.get("vllm_parser"):
+        parts.append(f"vllm serve {model} {t['vllm_flags']}" + ("" if t.get("vllm_parser_confirmed") else
+                                                          "  (parser name unconfirmed for this model)"))
+    else:
+        parts.append("vLLM: no tool parser for this syntax")
+    return "  |  ".join(parts)
+
+
+def format_tool_call(family, name, arguments):
+    """One call written in a family's own syntax -- for a template that does not render tool_calls back (LFM2,
+    Granite 3.x, R1-distill): the calibration text must still carry the call the way the model writes it.
+    Returns None for a family with no exact writer here (the caller keeps its JSON fallback)."""
+    args = arguments if isinstance(arguments, dict) else {}
+    if isinstance(arguments, str):
+        try:
+            args = json.loads(arguments)
+        except ValueError:
+            args = {}
+    js = json.dumps(args, ensure_ascii=False)
+    obj = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
+
+    def py(v):
+        return repr(v) if not isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+    def val(v):
+        return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    pyc = f"[{name}(" + ", ".join(f"{k}={py(v)}" for k, v in args.items()) + ")]"
+    w = {
+        "hermes": f"<tool_call>\n{obj}\n</tool_call>",
+        "qwen3_coder": f"<tool_call>\n<function={name}>\n" + "".join(
+            f"<parameter={k}>\n{val(v)}\n</parameter>\n" for k, v in args.items()) + "</function>\n</tool_call>",
+        "lfm2": f"<|tool_call_start|>{pyc}<|tool_call_end|>",
+        "pythonic": pyc,
+        "mistral": f"[TOOL_CALLS]{name}[ARGS]{js}",
+        "llama3_json": json.dumps({"name": name, "parameters": args}, ensure_ascii=False),
+        "xlam": f"[{obj}]",
+        "granite": f"<|tool_call|>[{obj}]",
+        "deepseek_v3": f"<\uff5ctool\u2581calls\u2581begin\uff5c><\uff5ctool\u2581call\u2581begin\uff5c>function<\uff5ctool\u2581sep\uff5c>{name}\n```json\n{js}\n```"
+                       "<\uff5ctool\u2581call\u2581end\uff5c><\uff5ctool\u2581calls\u2581end\uff5c>",
+        "deepseek_v31": f"<\uff5ctool\u2581calls\u2581begin\uff5c><\uff5ctool\u2581call\u2581begin\uff5c>{name}<\uff5ctool\u2581sep\uff5c>{js}<\uff5ctool\u2581call\u2581end\uff5c>"
+                        "<\uff5ctool\u2581calls\u2581end\uff5c>",
+        "glm45": f"<tool_call>{name}\n" + "".join(f"<arg_key>{k}</arg_key>\n<arg_value>{val(v)}</arg_value>\n"
+                                                   for k, v in args.items()) + "</tool_call>",
+        "glm47": f"<tool_call>{name}" + "".join(f"<arg_key>{k}</arg_key><arg_value>{val(v)}</arg_value>"
+                                                for k, v in args.items()) + "</tool_call>",
+        "kimi_k2": f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0<|tool_call_argument_begin|>{js}"
+                   "<|tool_call_end|><|tool_calls_section_end|>",
+        "minimax_m2": f'<minimax:tool_call>\n<invoke name="{name}">\n' + "".join(
+            f'<parameter name="{k}">{val(v)}</parameter>\n' for k, v in args.items()) + "</invoke>\n</minimax:tool_call>",
+        "seed_oss": f"<seed:tool_call>\n<function={name}>\n" + "".join(
+            f"<parameter={k}>{val(v)}</parameter>\n" for k, v in args.items()) + "</function>\n</seed:tool_call>",
+        "cohere": "<|START_ACTION|>[\n    " + json.dumps({"tool_call_id": "0", "tool_name": name, "parameters": args},
+                                                         ensure_ascii=False) + "\n]<|END_ACTION|>",
+        "apriel": f"<tool_calls>[{obj}]</tool_calls>",
+        "nemotron_v2": f"<TOOLCALL>[{obj}]</TOOLCALL>",
+        "functionary_v31": f"<function={name}>{js}</function>",
+        "firefunction": f" functools[{obj}]",
+        "functiongemma": f"<start_function_call>call:{name}{{" + ",".join(
+            f"{k}:<escape>{v}<escape>" if isinstance(v, str) else f"{k}:{json.dumps(v)}" for k, v in args.items())
+            + "}<end_function_call>",
+        "gemma4": f"<|tool_call>call:{name}{{" + ",".join(
+            f'{k}:<|"|>{v}<|"|>' if isinstance(v, str) else f"{k}:{json.dumps(v)}" for k, v in args.items())
+            + "}<tool_call|>",
+    }
+    return w.get(family)
+
+
 _DECISION_TAGS = ("decision-model", "calibrated-probabilities", "system-one")
 _DECISION_NAME = re.compile(r"(^|[^a-z])(jev|openjev|nanojev|laya|semif)([^a-z]|$)|decision[-_ ]?model", re.I)
 
@@ -617,9 +1107,14 @@ def classify(model) -> dict:
     if thinking:
         why.append(f"reasoning model ({rinfo['mode']}): {rinfo['open'] or ''}...{rinfo['close'] or ''}"
                    + (f" -- {rinfo['why'][0]}" if rinfo["why"] else ""))
-    agentic = len(re.findall(r"tool_call|tool_response|function_call|\btools\b", low)) >= 3
+    # Tool calling: the parser family the template writes calls in (rendered, llama.cpp-style sniffing first).
+    tinfo = _safe(toolcall_info, model, tpl, archs, conf) or {"family": "none"}
+    agentic = len(re.findall(r"tool_call|tool_response|function_call|\btools\b", low)) >= 3 \
+        or tinfo.get("family", "none") != "none"
     if agentic:
-        why.append(f"template drives tool calls ({len(re.findall('tool', low))} mentions)")
+        fam = tinfo.get("family", "none")
+        why.append(f"template drives tool calls ({len(re.findall('tool', low))} mentions)"
+                   + (f"; call syntax: {fam}" if fam != "none" else ""))
     # Modalities. HF puts each one in its own sub-config (vision_config, audio_config, ...), the
     # template carries its placeholder tokens, and the architecture name usually says so too. A
     # model that takes or emits something other than text cannot be scored like text at all.
@@ -696,6 +1191,7 @@ def classify(model) -> dict:
                  "raw-text" if not instruct else "in-domain"),
         "gate_tokens": TOKENS_THINKING if thinking else TOKENS_PLAIN,
         "reasoning": {k: v for k, v in rinfo.items() if k != "why"},
+        "tools": {k: v for k, v in tinfo.items() if k != "why"},
         "why": why,
     }
     names = [str(x) for x in (model, (conf or {}).get("general.name"), (conf or {}).get("_name_or_path")) if x]
@@ -743,6 +1239,13 @@ def main():
               + f"  [{r.get('source')}]")
         print(f"   calib       : pollard-calib adds a reasoning share rendered with these delimiters"
               + (" (thinking on AND off)" if r["mode"] == "toggle" else ""))
+    t = k.get("tools") or {}
+    if t.get("family", "none") != "none":
+        print(f"   tool calls  : {t['family']}  [{t.get('source')}]"
+              + ("" if t.get("supports_tools") else "  (template renders no tool list)"))
+        if t.get("example"):
+            print("   call syntax : " + t["example"].replace("\n", "\\n")[:160].encode("ascii", "backslashreplace").decode())
+        print("   serve with  : " + serve_with_line(t))
     print(f"   gate budget : {k['gate_tokens']} tokens"
           + ("   (thinking block runs first)" if k["thinking"] else ""))
 
