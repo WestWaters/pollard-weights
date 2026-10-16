@@ -78,11 +78,61 @@ def log(msg):
     print(f"[runtime {_dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
+class GitOwnershipError(RuntimeError):
+    """git refused a tree as "dubious ownership" -- never the same thing as "this patch is absent"."""
+
+
+def _is_git(cmd):
+    if isinstance(cmd, str):
+        return cmd.lstrip().startswith("git ")
+    return bool(cmd) and os.path.basename(str(cmd[0])).lower() in ("git", "git.exe")
+
+
+def _git_target(cmd):
+    if not isinstance(cmd, str):
+        for i, x in enumerate(cmd[:-1]):
+            if x == "-C":
+                return cmd[i + 1]
+    return os.getcwd()
+
+
+def trust_trees(*paths):
+    """Let git work in these trees whoever owns them, for this process and every git it starts.
+
+    The box runs the nightly update as SYSTEM while the trees belong to the user, and git then answers
+    every command with "detected dubious ownership". `git apply --check --reverse` failing looked exactly
+    like "this patch is not in the live build", so every live patch was skipped without a word. A
+    safe.directory entry in GIT_CONFIG_COUNT/KEY/VALUE is command-line scope, which git honours for it
+    (a repo's own config would not be), and it reaches the git calls in pollard_runtime too."""
+    env = os.environ
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        n = 0
+    have = {env.get(f"GIT_CONFIG_VALUE_{i}") for i in range(n) if env.get(f"GIT_CONFIG_KEY_{i}") == "safe.directory"}
+    for p in paths:
+        a = os.path.abspath(p)
+        for v in dict.fromkeys((a, a.replace("\\", "/"))):
+            if v not in have:
+                env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"] = "safe.directory", v
+                have.add(v)
+                n += 1
+    env["GIT_CONFIG_COUNT"] = str(n)
+
+
 def _run(cmd, cwd=None, timeout=None, env=None):
     if WIN and isinstance(cmd, str):
-        return subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, errors="replace",
-                              timeout=timeout, env=env)
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+        r = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, env=env)
+    else:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+    # Fail loudly: a refused tree must stop the update, not read as "patch absent" / "no changes".
+    if r.returncode != 0 and _is_git(cmd) and "dubious ownership" in (r.stderr or ""):
+        tree = _git_target(cmd) if cwd is None else cwd
+        raise GitOwnershipError(f"git refuses {tree} (dubious ownership: it belongs to another account than "
+                                f"this one). Run as the tree's owner, or: git config --global --add "
+                                f"safe.directory {os.path.abspath(tree).replace(os.sep, '/')}")
+    return r
 
 
 def _git(tree, *a):
@@ -427,10 +477,27 @@ def patch_is_live(tree, m):
     return len(found) >= max(1, len(distinct) // 2)
 
 
+_ARCH_ADDED = (re.compile(r'^\+\s*\{\s*LLM_ARCH_[A-Z0-9_]+\s*,\s*"([^"]+)"\s*\}', re.M),   # llama-arch.cpp name map
+               re.compile(r'^\+\s*MODEL_ARCH\.[A-Z0-9_]+\s*:\s*"([^"]+)"', re.M))             # gguf-py MODEL_ARCH_NAMES
+
+
+def patch_arch_names(diff_text):
+    """The architecture names a patch registers: its added LLM_ARCH_NAMES / MODEL_ARCH_NAMES entries."""
+    return {n for rx in _ARCH_ADDED for n in rx.findall(diff_text or "")}
+
+
 def _is_arch_patch(m, upstream_archs):
-    """A patch that only added architecture registrations upstream now has is safely superseded."""
-    adds = [x for x in m.get("adds_strings", []) if re.match(r"^[a-z][a-z0-9_.\-]{2,24}$", x)]
-    return bool(adds) and any(x in upstream_archs for x in adds)
+    """A patch whose architectures upstream now ALL carries is superseded.
+
+    Decided by the exact architecture names the patch registers, never by its other added strings: the
+    clef-omni patch also adds the plain string "clef", upstream has `clef` but not `clef-omni`, and an
+    any()-over-strings test called the patch "not needed" (2026-10-15, staging 620d222)."""
+    try:
+        text = open(m["_patch"], encoding="utf-8", errors="replace").read()
+    except (OSError, KeyError):
+        return False
+    archs = patch_arch_names(text)
+    return bool(archs) and archs <= set(upstream_archs or ())
 
 
 def _absorbed(staging, m, need=0.9):
@@ -532,6 +599,17 @@ def dirty_is_declared(tree):
 
 
 def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None, cuda_arch=None):
+    e = ENGINES[name]
+    tree = e["dir"]
+    trust_trees(tree, tree + ".next", tree + ".prev")
+    try:
+        return _update_engine(name, check, jobs, allow_drop, extra, cuda_arch)
+    except GitOwnershipError as exc:
+        log(f"{name}: NOT updating -- {exc}")
+        return False
+
+
+def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
     e = ENGINES[name]
     tree, url = e["dir"], e["url"]
     st = live_state(tree)
