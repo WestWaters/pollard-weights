@@ -81,6 +81,25 @@ def _rne(x):
     return _torch().round(x).to(_torch().int64)
 
 
+def _sqrtf(x):
+    """sqrtf(x), correctly rounded on every platform. torch.sqrt on float32 is not: x86 wheels route it
+    through MKL's vector sqrt (accurate to < 1 ulp, not correctly rounded), so linux/amd64 returned values
+    1 ulp off the C. Take the root in float64, round once to float32, then settle the last bit exactly: a
+    float32 midpoint has 25 significant bits, so its square is exact in float64 and comparing it against x
+    picks the correctly rounded neighbour whatever the library's sqrt accuracy (no ties are possible)."""
+    torch = _torch()
+    xd = x.double()
+    r = torch.sqrt(xd).float()
+    up = torch.nextafter(r, torch.full_like(r, float("inf")))
+    dn = torch.nextafter(r, torch.zeros_like(r))
+    rd = r.double()
+    hi = (rd + up.double()) * 0.5
+    lo = (rd + dn.double()) * 0.5
+    r = torch.where(hi * hi < xd, up, r)
+    r = torch.where((r > 0) & (lo * lo > xd), dn, r)
+    return r
+
+
 def _fp16(x):
     return x.to(_torch().float16).to(_torch().float32)
 
@@ -336,7 +355,7 @@ def _q2_k(x, qw):
     B = x.shape[0]
     sigma2 = _sumsq(x) / _c(QK_K)
     xs = x.reshape(B, 16, 16)
-    weight = qw.reshape(B, 16, 16) * torch.sqrt(_fma(xs, xs, sigma2[:, None, None]))
+    weight = qw.reshape(B, 16, 16) * _sqrtf(_fma(xs, xs, sigma2[:, None, None]))
     sw = torch.zeros(B, 16, dtype=torch.float32)
     for l in range(16):
         sw = sw + weight[:, :, l]
@@ -366,7 +385,7 @@ def _q3_k(x, qw):
     B = x.shape[0]
     sigma2 = (_c(2) * _sumsq(x)) / _c(QK_K)
     xs = x.reshape(B, 16, 16)
-    weight = qw.reshape(B, 16, 16) * torch.sqrt(_fma(xs, xs, sigma2[:, None, None]))
+    weight = qw.reshape(B, 16, 16) * _sqrtf(_fma(xs, xs, sigma2[:, None, None]))
     sw = torch.zeros(B, 16, dtype=torch.float32)
     for l in range(16):
         sw = sw + weight[:, :, l]
@@ -634,12 +653,12 @@ def _iq2_16(kind, x, qw):
     xb = x.reshape(B * 16, 16)
     sg = sigma2.repeat_interleave(16)
     if qw is not None:
-        weight = qw.reshape(B * 16, 16) * torch.sqrt(_fma(xb, xb, sg[:, None]))
+        weight = qw.reshape(B * 16, 16) * _sqrtf(_fma(xb, xb, sg[:, None]))
     else:
         if not s_kind:
             raise ValueError("iq2_xs needs an imatrix (ggml asserts quant_weights)")
         weight = _fma(_c(0.25), sg[:, None], xb * xb)
-    waux = torch.sqrt(weight)
+    waux = _sqrtf(weight)
     G = xb.shape[0]
     if s_kind:
         neg = ~(xb >= 0)
@@ -720,8 +739,8 @@ def _iq2_xxs(x, qw):
     sigma2 = _sumsq(x) / _c(QK_K)
     xb = x.reshape(B * 8, 32)
     sg = sigma2.repeat_interleave(8)
-    weight = qw.reshape(B * 8, 32) * torch.sqrt(_fma(xb, xb, sg[:, None]))
-    waux = torch.sqrt(weight)
+    weight = qw.reshape(B * 8, 32) * _sqrtf(_fma(xb, xb, sg[:, None]))
+    waux = _sqrtf(weight)
     G = xb.shape[0]
     xv, sv = [], []
     for k in range(4):
