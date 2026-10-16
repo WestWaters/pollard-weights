@@ -377,6 +377,7 @@ def test_card_mx_rung_table(tmp_path):
 
 def test_pollard_mx_cli_format_plan_only(tmp_path, monkeypatch, capsys):
     import pollard_mx as X
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))       # nix runs with an unwritable HOME
     src = str(tmp_path / "src")
     tiny_ckpt(src)
     monkeypatch.setattr(sys, "argv", ["pollard-mx", "--model", src, "--format", "mxfp6-e3m2", "--plan-only"])
