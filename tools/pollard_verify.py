@@ -261,8 +261,21 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     cache = _ref_cache(source, eval_path, length, chunks, "hf")
 
     def logits(path):
-        m = AutoModelForCausalLM.from_pretrained(path, torch_dtype="auto", device_map=device,
-                                                 trust_remote_code=trust_remote_code).eval()
+        import pollard_mxfp6 as M6
+        if M6.read_meta(path):
+            # a pollard-mx MXFP6 / mix rung: the source architecture with every quantized linear replaced by the
+            # rung's own bytes decoded exactly (weight-only, so this IS the math any runtime does with them)
+            m = AutoModelForCausalLM.from_pretrained(source, torch_dtype="auto", device_map=device,
+                                                     trust_remote_code=trust_remote_code).eval()
+            sd = m.state_dict()
+            for k, w in M6.dequantized_weights(path).items():
+                key = k if k in sd else next((x for x in sd if x.endswith("." + k.split(".", 1)[-1])), None)
+                if key is None:
+                    raise SystemExit(f"{k}: no such weight in the source model")
+                sd[key].copy_(torch.from_numpy(w).to(sd[key].dtype))
+        else:
+            m = AutoModelForCausalLM.from_pretrained(path, torch_dtype="auto", device_map=device,
+                                                     trust_remote_code=trust_remote_code).eval()
         with torch.no_grad():
             out = [m(torch.tensor([c], device=m.device)).logits[0].float().cpu().numpy() for c in parts]
         del m
@@ -311,13 +324,13 @@ rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01
     top1_min: 97
-  - match: ["Q6_K*", "*6bit*", "*-6.0bpw"]
+  - match: ["Q6_K*", "*6bit*", "*-6.0bpw", "*MXFP6*", "MIX-6*bpw"]
     kld_max: 0.02
     top1_min: 95
-  - match: ["Q5_K*", "*5bit*", "*-5.0bpw"]
+  - match: ["Q5_K*", "*5bit*", "*-5.0bpw", "MIX-5*bpw"]
     kld_max: 0.04
     top1_min: 93
-  - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw"]
+  - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw", "MIX-4*bpw"]
     kld_max: 0.08
     top1_min: 90
   - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]

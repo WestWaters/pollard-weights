@@ -36,7 +36,7 @@ LANE_TAGS = {"gguf": ["gguf", "llama.cpp", "ik_llama.cpp", "trellis", "imatrix"]
              # rubin / vera-rubin / fp8 belong to the mx lane only: Rubin runs the same NVFP4 / MXFP4 / FP8
              # formats as Blackwell through vLLM. llama.cpp has no FP4 tensor-core path on sm_100/107, so
              # a GGUF card must never carry a Rubin tag that reads as an optimized build for it.
-             "mx": ["nvfp4", "fp8", "compressed-tensors", "vllm", "blackwell", "rubin", "vera-rubin"],
+             "mx": ["nvfp4", "fp8", "mxfp6", "compressed-tensors", "vllm", "blackwell", "rubin", "vera-rubin"],
              "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"]}
 # lane -> the hero's "Pollard shrank this model<...>" phrase
 LANE_WORD = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
@@ -502,7 +502,7 @@ def tool_serve_lines(tools, lanes, repo, example_file):
     elif tools.get("vllm_parser"):
         note = "" if tools.get("vllm_parser_confirmed") else " (parser name not yet confirmed for this model)"
         target = repo if vllm_lanes else "<the original weights>"
-        what = " (" + " / ".join({"gptq": "GPTQ", "mx": "NVFP4 / MXFP4 / FP8"}[l] for l in vllm_lanes) + ")" \
+        what = " (" + " / ".join({"gptq": "GPTQ", "mx": "NVFP4 / MXFP4 / MXFP6 / FP8"}[l] for l in vllm_lanes) + ")" \
             if vllm_lanes else ""
         out.append(f"- **vLLM**{what}: `vllm serve {target} {tools['vllm_flags']}`{note}")
     else:
@@ -561,11 +561,52 @@ def rungs_section(builds, lane, repo):
     rows = [f"| `{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} |"
             for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
     pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+    if lane == "mx":
+        return mx_rungs_section(builds, repo, pick)
     return ["## Rungs in this repo", "",
             "Each rung is a complete checkpoint in its own folder; the repo root holds the default rung, so "
             "pointing a runtime at the repo id loads that one.", "",
             "| folder | size | avg bits |", "|---|---:|---:|", *rows, "",
             "```bash", f'hf download {repo} --include "{pick}/*" --local-dir .', run.format(d=pick), "```", ""]
+
+
+def mx_rungs_section(builds, repo, pick):
+    """The MX lane's rung table with a format column and, per rung, the runtimes that load it (pollard_mx.json, written
+    by pollard-mx --format / --mix; an llm-compressor rung has none and is a compressed-tensors checkpoint for vLLM)."""
+    import pollard_mxfp6 as M6
+    rows, serve = [], []
+    for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
+        d = rung_subfolder(b, "mx")
+        meta = M6.read_meta(b.get("path", "")) or {}
+        if meta:
+            fmt = meta["format"].upper() if meta["format"] != "mix" else "mix " + " / ".join(
+                f"{a.upper().replace('_', '-')} {100 * v:.0f}%" for a, v in meta.get("atoms", {}).items())
+            lay = meta.get("layout", "")
+            loads = ", ".join(r for r, st, _ in (tuple(x) for x in meta.get("runtimes", [])) if st == "yes") or "--"
+            for line in M6.serve_lines(meta, f"./{d}"):
+                serve.append(line)
+        else:
+            fmt, lay, loads = str(b.get("tag") or d).upper(), "compressed-tensors", "vLLM"
+            serve.append(f"vllm serve ./{d}")
+        rows.append(f"| `{d}/` | {fmt} | {lay} | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} | {loads} |")
+    notes = []
+    for b in builds:
+        meta = M6.read_meta(b.get("path", "")) or {}
+        for rt, st, how in (tuple(x) for x in meta.get("runtimes", [])):
+            line = f"- `{rung_subfolder(b, 'mx')}/` **{rt}** ({st}): {how}"
+            if line not in notes:
+                notes.append(line)
+    out = ["## Rungs in this repo", "",
+           "Each rung is a complete checkpoint in its own folder; the repo root holds the default rung, so "
+           "pointing a runtime at the repo id loads that one. MXFP6 and mix rungs are weight-only (activations stay "
+           "16-bit) OCP MX: 32-weight blocks with an E8M0 scale; mixes put each fused layer at MXFP8 / MXFP6 / FP4 by "
+           "its measured sensitivity, with routers, lm_head and embeddings at the checkpoint's precision.", "",
+           "| folder | format | layout | size | avg bits | loads in |", "|---|---|---|---:|---:|---|", *rows, ""]
+    if notes:
+        out += ["Runtimes per rung:", "", *notes, ""]
+    out += ["```bash", f'hf download {repo} --include "{pick}/*" --local-dir .']
+    out += [s for s in dict.fromkeys(serve) if f"./{pick}" in s] or [f"vllm serve ./{pick}"]
+    return out + ["```", ""]
 
 
 def gate_verdict(b, results):

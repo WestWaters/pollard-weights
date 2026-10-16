@@ -29,13 +29,13 @@ rungs:
   - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
     kld_max: 0.01
     top1_min: 97
-  - match: ["Q6_K*", "*6bit*", "*-6.0bpw"]
+  - match: ["Q6_K*", "*6bit*", "*-6.0bpw", "*MXFP6*", "MIX-6*bpw"]
     kld_max: 0.02
     top1_min: 95
-  - match: ["Q5_K*", "*5bit*", "*-5.0bpw"]
+  - match: ["Q5_K*", "*5bit*", "*-5.0bpw", "MIX-5*bpw"]
     kld_max: 0.04
     top1_min: 93
-  - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw"]
+  - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw", "MIX-4*bpw"]
     kld_max: 0.08
     top1_min: 90
   - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]

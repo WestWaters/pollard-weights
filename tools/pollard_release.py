@@ -14,7 +14,8 @@ The lanes and their ladders (what each lane's runtime supports):
         Q6_K / IQ4_XS / IQ3_S / 2-bit, plus the IQ*_KT flagship where ik_llama builds it      -> <M>-Pollard
   mlx   2 / 3 / 4 / 5 / 6 / 8-bit, measured allocation (pollard-mlx --bits)                     -> <M>-Pollard-MLX
   gptq  int2 / int3 / int4 / int8, measured 4/8 dynamic mix (pollard-export --bits)             -> <M>-Pollard-GPTQ
-  mx    NVFP4 / MXFP4 / pure FP8 W8A8 (routers + lm_head kept high, Cohere's recipe)            -> <M>-Pollard-MX
+  mx    NVFP4 / MXFP4 / pure FP8 W8A8 (routers + lm_head kept high, Cohere's recipe), MXFP6 E2M3 / E3M2, and
+        measured MX mixes (mix<bpw>: MXFP8 / MXFP6 / FP4 per fused layer, pollard-mx --mix)          -> <M>-Pollard-MX
   exl3  several bpw on EXL3's own allocator, smoothed + Calib 3.0 (pollard-exl3 --bpw)           -> <M>-Pollard-EXL3
   draft EAGLE3 draft head -- declared, NOT wired yet (no pollard-draft); the plan says so.
 
@@ -62,7 +63,7 @@ lanes:
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
   mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
-  mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8], default: nvfp4}
+  mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
   draft: {enabled: false}      # EAGLE3 draft head per rung -- not wired yet
 """
@@ -85,6 +86,16 @@ PRESETS = {
 }
 LANES = ["gguf", "mlx", "gptq", "mx", "exl3", "draft"]
 MX_SCHEMES = {"nvfp4": "NVFP4", "mxfp4": "MXFP4", "fp8": "FP8", "fp8_dynamic": "FP8_DYNAMIC"}
+#: model-free MX rungs (pollard_mxfp6): uniform MXFP6, and `mix<bpw>` measured mixes
+MX6_FORMATS = {"mxfp6_e2m3": "mxfp6-e2m3", "mxfp6_e3m2": "mxfp6-e3m2"}
+
+
+def mx_mix_bpw(rung):
+    """`mix5.5` / `mix-5.5` -> 5.5; None for any other rung name."""
+    r = str(rung).lower()
+    if not r.startswith("mix"):
+        return None
+    return float(r[3:].lstrip("-_").removesuffix("bpw"))
 REQUIRES = {"gguf": "any", "mlx": "apple", "gptq": "cuda", "mx": "cuda", "exl3": "cuda", "draft": "cuda"}
 
 
@@ -135,6 +146,10 @@ def rung_tag(lane, rung):
     if lane == "gptq":
         return f"int{int(rung)}"
     if lane == "mx":
+        if mx_mix_bpw(rung) is not None:
+            return f"MIX-{mx_mix_bpw(rung):g}bpw"
+        if str(rung).lower() in MX6_FORMATS:
+            return MX6_FORMATS[str(rung).lower()].upper()
         return MX_SCHEMES[str(rung).lower()]
     if lane == "exl3":
         return f"{float(rung):.1f}bpw"
@@ -331,6 +346,12 @@ def lane_steps(cfg, c, lane):
         elif lane == "gptq":
             cmd = ["pollard-export", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"],
                    "--calib", c["calib"], "--bits", str(int(rung)), "--out", out]
+            src = c["smooth_dir"]
+        elif lane == "mx" and (mx_mix_bpw(rung) is not None or str(rung).lower() in MX6_FORMATS):
+            # model-free, weight-only, CPU: no calibration set, no llm-compressor
+            cmd = ["pollard-mx", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"], "--out", out]
+            cmd += (["--mix", f"{mx_mix_bpw(rung):g}"] if mx_mix_bpw(rung) is not None
+                    else ["--format", MX6_FORMATS[str(rung).lower()]])
             src = c["smooth_dir"]
         elif lane == "mx":
             scheme = MX_SCHEMES[str(rung).lower()]
