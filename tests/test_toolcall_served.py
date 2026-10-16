@@ -280,3 +280,10 @@ def test_run_suite_against_an_openai_endpoint():
     s = TC.score_suite(rows)
     assert s["rate"] == 1.0, [r for r in rows if not r["ok"]]
     assert s["parse_rate"] == s["function_acc"] == s["exact"] == s["abstention"] == 1.0
+
+
+def test_a_call_the_server_parser_dropped_is_unparsed_not_prose():
+    """mlx_lm.server drops call text its parser rejects but still finishes with tool_calls: that is a format failure."""
+    row = TC.grade_reply(reply(content="", finish="tool_calls"), PROBE["s01"])
+    assert row["failure"] == "unparsed"
+    assert TC.grade_reply(reply(content="", finish="stop"), PROBE["s01"])["failure"] == "no-call"

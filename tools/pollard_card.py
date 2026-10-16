@@ -421,12 +421,32 @@ def parse_params_b(params, cfg):
 TOOLCALL_MIN_RATE = 0.75      # pollard-toolcall's own --min-rate default
 
 
+#: pollard-toolcall backend -> the server the card names for it
+TOOL_SERVERS = {"gguf": "`llama-server --jinja`", "mlx": "`mlx_lm.server`",
+                "vllm": "`vllm serve --enable-auto-tool-choice --tool-call-parser <family>`",
+                "exl3": "exllamav3 (in-process, the model's chat template)",
+                "hf": "transformers (in-process, the model's chat template)", "url": "an OpenAI-compatible server"}
+
+
+def _ref_word(tc):
+    """What the retention is a share of: the f16 GGUF for a GGUF rung (or a cross-backend fallback), the bf16 original
+    for a directory lane served the same way as its reference."""
+    rb = tc.get("ref_backend") or tc.get("backend") or "gguf"
+    if tc.get("cross_backend"):
+        return "f16 GGUF, cross-backend" if rb == "gguf" else f"bf16 via {rb}, cross-backend"
+    return "f16" if rb == "gguf" else "bf16"
+
+
 def tool_ready_cell(tc):
-    """The Tool-ready cell from a pollard-toolcall result. The full gate (served through llama-server --jinja, 60
-    probes) reports retention vs the f16: 'yes (98% of f16; CI 90-104)'. Without a reference, or from the --quick
-    check: 'yes (95%)' / 'no (60%)'. '--' when nothing was measured."""
+    """The Tool-ready cell from a pollard-toolcall result. The full gate (served by the lane's own server, 60 probes)
+    reports retention vs the reference: 'yes (98% of f16; CI 90-104)', 'yes (97% of bf16)' for an MLX / vLLM rung
+    against its bf16 original. Without a reference, or from the --quick check: 'yes (95%)' / 'no (60%)'. A rung this
+    machine could not serve: 'not measured (reason)'. '--' when nothing was recorded."""
     if not isinstance(tc, dict):
         return "--"
+    if tc.get("status") == "not-measured":
+        why = str(tc.get("reason") or "").strip().replace("|", "/")
+        return f"not measured ({why})" if why else "not measured"
     rate = tc.get("rate")
     ok = tc.get("pass")
     if ok is None and rate is not None:
@@ -438,7 +458,7 @@ def tool_ready_cell(tc):
     if ret is not None:
         lo_hi = f"; CI {float(ci[0]):.0f}-{float(ci[1]):.0f}" if isinstance(ci, (list, tuple)) and len(ci) == 2 \
             and None not in ci else ""
-        return f"{word} ({float(ret):.0f}% of f16{lo_hi})"
+        return f"{word} ({float(ret):.0f}% of {_ref_word(tc)}{lo_hi})"
     return word + (f" ({float(rate):.0%})" if rate is not None else "")
 
 
@@ -446,14 +466,61 @@ def tool_ready_cell(tc):
 agent_ready_cell = tool_ready_cell
 
 
+def tool_ready_note(builds, results):
+    """The Tool-ready footnote, naming the server each lane in the table was actually measured through."""
+    seen = []
+    for b in builds:
+        tc = (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("toolcall")
+        if isinstance(tc, dict) and tc.get("status") != "not-measured":
+            be = tc.get("backend") or "gguf"
+            if be not in seen:
+                seen.append(be)
+    servers = ", ".join(TOOL_SERVERS.get(be, be) for be in (seen or ["gguf"]))
+    return ("_Tool-ready = the rung still calls tools ([pollard-toolcall](https://github.com/WestWaters/"
+            f"pollard-weights)): served with {servers}, asked 60 tool probes (single call, choose among eight tools, "
+            "no call needed, nested arguments) through OpenAI-style `tools`, and scored on the calls that server "
+            "parses -- shown as success relative to the reference (the f16 for GGUF, the bf16 original for the other "
+            "lanes) with a 95% paired-bootstrap CI, or as a bare success rate when no reference run was recorded. "
+            "\"cross-backend\" = the reference ran on a different server than the rung; \"not measured\" = this "
+            "lane's server could not run where the rung was built._")
+
+
+def tool_serve_lines(tools, lanes, repo, example_file):
+    """One serve line per lane, each with the flags that make THAT server parse this model's tool calls."""
+    lc = tools.get("llama_cpp") or {}
+    out = []
+    if "gguf" in lanes:
+        out.append(f"- **llama.cpp** (GGUF): `llama-server -m {example_file} --jinja` -- the model's own template "
+                   f"renders the tools and llama.cpp parses the calls ({lc.get('format') or 'its template-driven parser'}"
+                   "); pass `tools` in `/v1/chat/completions`.")
+    if "mlx" in lanes:
+        out.append(f"- **MLX**: `mlx_lm.server --model {repo}` -- the tokenizer's chat template renders `tools` and "
+                   "mlx-lm's tool parser fills `tool_calls` in `/v1/chat/completions`.")
+    vllm_lanes = [l for l in ("gptq", "mx") if l in lanes]
+    if not (vllm_lanes or "gguf" in lanes):
+        pass                                                     # an MLX / EXL3 repo: vLLM is not how it is served
+    elif tools.get("vllm_parser"):
+        note = "" if tools.get("vllm_parser_confirmed") else " (parser name not yet confirmed for this model)"
+        target = repo if vllm_lanes else "<the original weights>"
+        what = " (" + " / ".join({"gptq": "GPTQ", "mx": "NVFP4 / MXFP4 / FP8"}[l] for l in vllm_lanes) + ")" \
+            if vllm_lanes else ""
+        out.append(f"- **vLLM**{what}: `vllm serve {target} {tools['vllm_flags']}`{note}")
+    else:
+        out.append("- **vLLM**: no `--tool-call-parser` reads this syntax; parse the calls client-side.")
+    if "exl3" in lanes:
+        out.append(f"- **ExLlamaV3** (EXL3): serve a rung folder with [TabbyAPI](https://github.com/theroyallab/tabbyAPI) "
+                   "(`python main.py --model-dir . --model-name <rung folder>`) and pass `tools` in "
+                   "`/v1/chat/completions`; TabbyAPI renders them with the model's chat template.")
+    return out
+
+
 def tool_serving_section(tools, lanes, repo, example_file):
-    """'Tool calling': the call syntax the chat template uses and the server flags that parse it, per lane --
-    the setting users get wrong most often. From pollard-modelkind's toolcall_info; nothing when the template
-    writes no tool calls."""
+    """'Tool calling': the call syntax the chat template uses and, per lane, the server flags that parse it -- the
+    setting users get wrong most often. From pollard-modelkind's toolcall_info; nothing when the template writes no
+    tool calls."""
     if not isinstance(tools, dict) or tools.get("family", "none") == "none":
         return []
     fam = tools["family"]
-    lc = tools.get("llama_cpp") or {}
     out = ["## Tool calling", "",
            f"The chat template writes tool calls in the **`{fam}`** syntax (detected by rendering it with "
            "[pollard-modelkind](https://github.com/WestWaters/pollard-weights)):", ""]
@@ -462,16 +529,7 @@ def tool_serving_section(tools, lanes, repo, example_file):
         out += ["```", ex, "```", ""]
     out.append("Serve with:")
     out.append("")
-    if "gguf" in lanes:
-        out.append(f"- **llama.cpp**: `llama-server -m {example_file} --jinja` -- the model's own template renders "
-                   f"the tools and llama.cpp parses the calls ({lc.get('format') or 'its template-driven parser'}); "
-                   "pass `tools` in `/v1/chat/completions`.")
-    if tools.get("vllm_parser"):
-        note = "" if tools.get("vllm_parser_confirmed") else " (parser name not yet confirmed for this model)"
-        target = repo if any(l in lanes for l in ("gptq", "mx")) else "<the original weights>"
-        out.append(f"- **vLLM**: `vllm serve {target} {tools['vllm_flags']}`{note}")
-    else:
-        out.append("- **vLLM**: no `--tool-call-parser` reads this syntax; parse the calls client-side.")
+    out += tool_serve_lines(tools, lanes, repo, example_file)
     if not tools.get("supports_tools"):
         out.append("- The template does not render a tool list, so describe the tools in the system prompt.")
     out.append("")
@@ -613,7 +671,9 @@ def retention_section(builds, results):
             cells.append(_pct(sum(vals) / len(vals)) if vals else "--")
         if has_tc:
             tc = r.get("toolcall")
-            if not isinstance(tc, dict) or tc.get("rate") is None:
+            if isinstance(tc, dict) and tc.get("status") == "not-measured":
+                cells.append("not measured")
+            elif not isinstance(tc, dict) or tc.get("rate") is None:
                 cells.append("--")
             elif tc.get("retention") is not None:
                 cells.append(_pct(float(tc["retention"])))
@@ -1085,11 +1145,7 @@ def main():
                 "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
                 "and met. A rung that failed is not published._"]
     if has_tc and not decision:
-        out += ["", "_Tool-ready = the rung still calls tools ([pollard-toolcall](https://github.com/WestWaters/"
-                "pollard-weights)): served with `llama-server --jinja`, asked 60 tool probes (single call, choose "
-                "among eight tools, no call needed, nested arguments) through OpenAI-style `tools`, and scored on "
-                "the calls llama.cpp parses -- shown as success relative to the f16 with a 95% paired-bootstrap CI, "
-                "or as a bare success rate when no f16 run was recorded._"]
+        out += ["", tool_ready_note(builds, results)]
     if has_tps:
         hw = results.get("_hw")
         out.append("")

@@ -928,6 +928,22 @@ def provenance(profile, why, counts, stats, renderer_why, selfgen=None, reasonin
             "self_generated": selfgen, "domains": doms, "reasoning": reasoning}
 
 
+def samples_path(corpus):
+    """The sample-preserving twin of a corpus: one JSON string per line, one SAMPLE per string."""
+    return str(corpus) + ".samples.jsonl"
+
+
+def write_samples(corpus, samples):
+    """The corpus is raw text joined by newlines -- right for llama-imatrix and the token-packing lanes, which read it
+    as one stream. But a rendered chat sample is many lines (turn tokens, a tool list, a <tool_call> block, the tool's
+    answer), and the GPTQ / MX exporters take one calibration sample per LINE: read as lines, an agent trace becomes
+    fragments and no sample holds a whole tool call. This twin keeps every sample whole for them
+    (pollard_workspace.calib_samples reads it)."""
+    with open(samples_path(corpus), "w", encoding="utf-8") as f:
+        for s in samples:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -1069,6 +1085,7 @@ def main():
         sys.exit(f"ERROR (pollard-calib): {bad}")
     with open(a.out, "w", encoding="utf-8") as f:
         f.write("\n".join(s for _, s in train))
+    write_samples(a.out, [s for _, s in train])
     print(f"== pollard-calib :: Calib 3.0 corpus, profile {profile} ({why})")
     print(f"   chat samples rendered with {renderer.why}")
     for d, src, ntr, nh in stats:
@@ -1087,6 +1104,7 @@ def main():
     if a.held_out:
         with open(a.held_out, "w", encoding="utf-8") as f:
             f.write("\n".join(s for _, s in held))
+        write_samples(a.held_out, [s for _, s in held])
         print(f"   wrote {a.held_out} ({len(held)} held-out samples -- overfit check)")
     prov = provenance(profile, why, counts, stats, renderer.why, selfgen,
                       reasoning={"verdict": {k: v for k, v in rinfo.items() if k != "why"},
