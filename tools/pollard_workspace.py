@@ -177,6 +177,7 @@ def record_build(model: str, lane: str, path: str, tag: str = "", bpw=None, ppl=
     entry = {"name": os.path.basename(path.rstrip("/\\")), "lane": lane, "tag": str(tag),
              "path": os.path.abspath(path), "bpw": bpw, "ppl": ppl, "verified": verified,
              "bytes": size, "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    entry.update(extra or {})
     man["builds"] = [b for b in man.get("builds", []) if b.get("path") != entry["path"]]
     man["builds"].append(entry)
     md = model_dir(model, create=True)

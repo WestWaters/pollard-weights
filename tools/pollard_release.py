@@ -42,6 +42,13 @@ How it runs -- and why:
   * every rung goes through `pollard-verify --gate` (gates.yaml); a rung that fails is not carded and not
     uploaded. The cards are pollard-card per lane, --verified-only, from the numbers this run measured.
   * nothing is uploaded unless the plan says `upload: true` AND the command line says --upload.
+  * --free-after-upload (with --upload): for a box whose free disk is smaller than a lane's whole ladder. Each rung
+    is built -> measured -> gated -> uploaded on its own, then its LOCAL file is deleted before the next rung (a
+    rung that fails the gate is deleted unpublished). The GGUF ladder is built one rung at a time (pollard --rung).
+    Every build step first checks free disk against the rung's estimated size and holds the rung (not the release)
+    when it does not fit. Only files this release built are ever deleted -- never the source, f16, imatrix or calib.
+  * existing inputs can be named in the plan instead of rebuilt: `f16:` (an f16/bf16 GGUF), `imatrix:`,
+    `sensitivity:` (the raw-weights profile), `calib_file:` + `heldout_file:` (skip pollard-calib).
 """
 from __future__ import annotations
 
@@ -204,7 +211,7 @@ def _ctx(cfg, src):
     base = os.path.basename(hf_dir.rstrip("/\\"))
     smooth = hf_dir.rstrip("/\\") + "-smoothed"
     gdir = os.path.join(mdir, "gguf")
-    return {
+    ctx = {
         "src": src, "hf_dir": hf_dir, "mdir": mdir, "name": name, "smooth_dir": smooth,
         "calib": os.path.join(cal, "release-calib.txt"), "heldout": os.path.join(cal, "release-calib.heldout.txt"),
         "sens_raw": os.path.join(cal, f"{name}.sensitivity.json"),
@@ -213,7 +220,16 @@ def _ctx(cfg, src):
         "exlr8_store": os.path.join(mdir, "exlr8-store"),
         "state": os.path.join(mdir, "release-state.json"), "release_dir": os.path.join(mdir, "release"),
         "ngl": str(cfg.get("ngl", 0)), "gates": cfg.get("gates"),
+        "imatrix": cfg.get("imatrix"), "free": bool(cfg.get("_free_after_upload")),
+        "org": cfg.get("org", "PollardWeights"),
     }
+    # inputs that already exist (a big model's f16 / imatrix / profile / corpus): used as they are, never rebuilt
+    for key, plan_key in (("f16", "f16"), ("sens_raw", "sensitivity"), ("calib", "calib_file"),
+                          ("heldout", "heldout_file")):
+        if cfg.get(plan_key):
+            ctx[key] = os.path.abspath(str(cfg[plan_key]))
+    ctx["given_f16"] = bool(cfg.get("f16"))
+    return ctx
 
 
 def results_path(c, lane):
@@ -248,8 +264,17 @@ def prep_steps(cfg, c, lanes):
         calib += ["--reasoning-share", str(cal["reasoning_share"])]
     if cal.get("self_generate"):
         calib += ["--self-generate", "--server", str(cal["self_generate"])]
-    steps.append(Step(id="prep/calib", lane="prep", kind="prep", requires="any", cmd=calib, out=c["calib"]))
-    if raw_probe:
+    if cfg.get("calib_file"):
+        if not cfg.get("heldout_file"):
+            raise SystemExit("calib_file: needs heldout_file: too (the verify gate measures on held-out text)")
+        steps.append(Step(id="prep/calib", lane="prep", kind="note", requires="any",
+                          desc=f"calibration given in the plan: {c['calib']} (held-out {c['heldout']})"))
+    else:
+        steps.append(Step(id="prep/calib", lane="prep", kind="prep", requires="any", cmd=calib, out=c["calib"]))
+    if raw_probe and cfg.get("sensitivity"):
+        steps.append(Step(id="prep/probe", lane="prep", kind="note", requires="any",
+                          desc=f"sensitivity profile given in the plan: {c['sens_raw']}"))
+    elif raw_probe:
         probe = ["pollard-probe", "--model", c["hf_dir"], "--eval", c["heldout"], "--out", c["sens_raw"]]
         if c["ngl"] == "0" and machine()["cuda"]:
             probe += ["--device", "cpu"]                 # a shared GPU is not ours (see pollard --ngl 0)
@@ -258,10 +283,13 @@ def prep_steps(cfg, c, lanes):
         # the LOCKED gold recipe for the low-bit trellis / error-feedback lanes: SmoothQuant first
         steps.append(Step(id="prep/smooth", lane="prep", kind="prep", requires="cuda",
                           cmd=["pollard-hf-smooth", "--model", c["hf_dir"], "--out", c["smooth_dir"],
-                               "--calib", c["calib"]], out=c["smooth_dir"]))
+                               "--calib", c["calib"]], out=c["smooth_dir"],
+                          disk_gb=_size_gb(c["hf_dir"]) * 1.02,
+                          blocks=[l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]))
         steps.append(Step(id="prep/probe-smoothed", lane="prep", kind="prep", requires="cuda",
                           cmd=["pollard-probe", "--model", c["smooth_dir"], "--eval", c["heldout"],
-                               "--out", c["sens_smooth"]], out=c["sens_smooth"]))
+                               "--out", c["sens_smooth"]], out=c["sens_smooth"],
+                          blocks=[l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]))
     return steps
 
 
@@ -337,7 +365,15 @@ def gguf_rung_steps(cfg, c, builds):
         steps.append(Step(id=f"{rid}/verify", lane="gguf", rung=tag, kind="verify", requires="any", out=path,
                           cmd=["pollard-verify", "--lane", "gguf", "--model", path, "--ref", c["f16"],
                                "--eval", c["heldout"], "--ngl", c["ngl"], "--coherence"] + _verify_gate(c) + common))
+        if c.get("free"):
+            steps.append(_publish_rung_step(c, "gguf", tag, path))
     return steps
+
+
+def _publish_rung_step(c, lane, tag, path):
+    repo = repo_name(c["org"], c["src"], lane)
+    return Step(id=f"{lane}/{tag}/publish", lane=lane, rung=tag, kind="publish", requires="any", fn="publish_rung",
+                out=path, repo=repo, desc=f"upload this rung -> https://huggingface.co/{repo}, then free its local copy")
 
 
 def draft_steps(cfg, c, lc):
@@ -418,14 +454,27 @@ def lane_steps(cfg, c, lane):
     if lane == "draft":
         return draft_steps(cfg, c, lc)
     if lane == "gguf":
-        cmd = ["pollard", "--hf", c["hf_dir"], "--output", c["gguf_dir"], "--calib", c["calib"],
+        src = ["--gguf", c["f16"]] if c.get("given_f16") else ["--hf", c["hf_dir"], "--output", c["gguf_dir"]]
+        cmd = ["pollard"] + src + ["--calib", c["calib"],
                "--sensitivity", c["sens_raw"], "--ladder", "--run", "--no-card", "--force",
                "--no-toolcall",                          # release measures every rung itself (gguf/rungs)
                "--ngl", "auto" if c["ngl"] == "auto" else c["ngl"],
                "--calib-profile", str((cfg.get("calib") or {}).get("profile", "auto"))]
-        return [Step(id="gguf/ladder", lane="gguf", kind="build", requires="any", cmd=cmd, out=c["f16"],
-                     desc="convert -> imatrix -> measured publish ladder (+ IQ*_KT flagship where ik_llama builds)"),
-                Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")]
+        if c.get("imatrix"):
+            cmd += ["--imatrix", os.path.abspath(str(c["imatrix"]))]
+        if not c.get("free"):
+            return [Step(id="gguf/ladder", lane="gguf", kind="build", requires="any", cmd=cmd, out=c["f16"],
+                         desc="convert -> imatrix -> measured publish ladder (+ IQ*_KT flagship where ik_llama builds)"),
+                    Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")]
+        # one rung at a time: build -> measure + gate -> upload -> free, so the peak disk is ONE rung, not the ladder
+        from pollard_auto import LADDER
+        steps, f16_gb = [], _size_gb(c["f16"])
+        for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]:
+            steps.append(Step(id=f"gguf/ladder-{label}", lane="gguf", rung=label, kind="build", requires="any",
+                              cmd=cmd + ["--rung", label], out=None, disk_gb=frac * f16_gb * 1.1 if f16_gb else 0,
+                              desc=f"the {label} rung of the measured publish ladder"))
+            steps.append(Step(id=f"gguf/rungs-{label}", lane="gguf", kind="expand", requires="any"))
+        return steps
     steps, res = [], results_path(c, lane)
     tool = toolcall_wanted(cfg, c)
     if lane == "exlr8":
@@ -472,7 +521,7 @@ def lane_steps(cfg, c, lane):
             src = c["smooth_dir"]
         rid = f"{lane}/{tag}"
         steps.append(Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
-                          out=out, src=src))
+                          out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0))
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
                               cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1)))
@@ -482,6 +531,10 @@ def lane_steps(cfg, c, lane):
         ver += ["--end-to-end"] if lane == "exl3" else ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
                           cmd=ver, out=out))
+        if c.get("free"):
+            st = _publish_rung_step(c, lane, tag, out)
+            st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
+            steps.append(st)
     return steps
 
 
@@ -509,6 +562,8 @@ def publish_steps(cfg, c, lane):
         card += ["--calib-file", os.path.basename(c["calib"]),
                  "--calib-note", f"the pollard-calib '{(cfg.get('calib') or {}).get('profile', 'auto')}' profile "
                                  "(sources, revisions and licences in the shipped .sources.json)"]
+    if c.get("free") and lane != "draft":
+        card += ["--runtime-from-repo"]                  # freed rungs are read from their published copy
     steps = [Step(id=f"{lane}/card", lane=lane, kind="card", requires="any", cmd=card, out=outdir, repo=repo)]
     steps.append(Step(id=f"{lane}/upload", lane=lane, kind="upload", requires="any", fn="upload", repo=repo,
                       out=outdir, desc=f"publish the verified {lane} rungs + card -> https://huggingface.co/{repo}"))
@@ -637,7 +692,8 @@ def upload(step, c, cfg, run_upload):
     from pollard_card import rung_subfolder
     lane, repo = step.lane, step.repo
     builds = [b for b in ws.read_manifest(lane_key(c, lane)).get("builds", [])
-              if b.get("lane") == lane and b.get("verified") is True and os.path.exists(b.get("path", ""))]
+              if b.get("lane") == lane and b.get("verified") is True
+              and (os.path.exists(b.get("path", "")) or b.get("uploaded") == repo)]
     card = os.path.join(step.out, "README.md")
     if not builds:
         raise RuntimeError(f"no verified {lane} rung to publish")
@@ -665,9 +721,12 @@ def upload(step, c, cfg, run_upload):
                 expect.add("config.json")
     elif lane == "gguf":
         for b in builds:
-            name = b.get("name") or os.path.basename(b["path"])
-            api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
+            name = b.get("uploaded_as") or b.get("name") or os.path.basename(b["path"])
+            if b.get("uploaded") != repo:                      # --free-after-upload already put it there
+                api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
             expect.add(name)
+        if c.get("imatrix") and os.path.exists(str(c["imatrix"])):
+            api.upload_file(path_or_fileobj=str(c["imatrix"]), path_in_repo=f"{c['name']}.imatrix", repo_id=repo)
         for side in (c["calib"], c["calib"] + ".sources.json"):
             if os.path.exists(side):
                 api.upload_file(path_or_fileobj=side, path_in_repo=os.path.basename(side), repo_id=repo)
@@ -677,16 +736,149 @@ def upload(step, c, cfg, run_upload):
     else:
         for b in builds:
             sub = rung_subfolder(b, lane)
-            api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
+            if b.get("uploaded") != repo:
+                api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
             expect.add(f"{sub}/config.json")
-        root = default_build(builds, lane, ((cfg.get("lanes") or {}).get(lane) or {}).get("default"))
-        api.upload_folder(folder_path=root["path"], repo_id=repo)
+        if not any(b.get("root") for b in builds):
+            local = [b for b in builds if os.path.exists(b.get("path", ""))]
+            root = default_build(local, lane, ((cfg.get("lanes") or {}).get(lane) or {}).get("default"))
+            if root:
+                api.upload_folder(folder_path=root["path"], repo_id=repo)
     api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo)
     missing = expect - set(api.list_repo_files(repo))
     if missing:
         raise RuntimeError(f"{repo} is missing {sorted(missing)} after upload -- not live")
     print(f"      live: https://huggingface.co/{repo}  ({len(builds)} rung(s))")
     return "uploaded"
+
+
+def _size_gb(path):
+    """Size of a file or a directory tree in GB (0 when it is not there yet)."""
+    if not path or not os.path.exists(path):
+        return 0.0
+    if os.path.isfile(path):
+        return os.path.getsize(path) / 1e9
+    tot = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                tot += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return tot / 1e9
+
+
+#: average bits per weight of a directory-lane rung, for the disk estimate (not a claim about the build)
+_MX_BITS = {"nvfp4": 4.5, "mxfp4": 4.25, "fp8": 8.0, "fp8_dynamic": 8.0, "mxfp6_e2m3": 6.25, "mxfp6_e3m2": 6.25}
+
+
+def _rung_gb(lane, rung, hf_dir):
+    """Estimated size of one directory-lane rung: the bf16 checkpoint scaled by the rung's bits, plus 10%."""
+    r = str(rung).lower()
+    if lane == "mx":
+        bits = mx_mix_bpw(rung) if mx_mix_bpw(rung) is not None else _MX_BITS.get(r, 8.0)
+    else:
+        try:
+            bits = float(rung)
+        except ValueError:
+            bits = 8.0
+    return _size_gb(hf_dir) * bits / 16.0 * 1.1
+
+
+def disk_free_gb(path):
+    p = os.path.abspath(path or ".")
+    while not os.path.exists(p) and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    return shutil.disk_usage(p).free / 1e9
+
+
+def _protected_paths(c):
+    """Never deleted by --free-after-upload: the inputs, whatever a build entry says."""
+    keep = {c.get("f16"), c.get("hf_dir"), c.get("smooth_dir"), c.get("calib"), c.get("heldout"), c.get("imatrix"),
+            c.get("sens_raw"), c.get("sens_smooth"), c.get("src")}
+    return {os.path.normcase(os.path.abspath(str(k).rstrip("/\\"))) for k in keep if k}
+
+
+def _freeable(c, b):
+    """A build file this release made: under the workspace model dirs, or the automap flagship mix the ladder
+    wrote next to the f16. Anything else (an input, a file someone put there) is left alone."""
+    import pollard_workspace as ws
+    path = os.path.normcase(os.path.abspath(str(b.get("path", "")).rstrip("/\\")))
+    if not path or path in _protected_paths(c):
+        return False
+    roots = [ws.model_dir(c["src"]), ws.model_dir(c["f16"]), ws.model_dir(c["hf_dir"]),
+             ws.model_dir(c["smooth_dir"]), c["mdir"]]
+    if any(path.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots):
+        return True
+    return bool(b.get("flagship")) and os.path.dirname(path) == os.path.normcase(
+        os.path.dirname(os.path.abspath(c["f16"]))) and path.endswith("-mix.gguf")
+
+
+def _free_local(c, b, out=print):
+    path = b.get("path", "")
+    if not _freeable(c, b):
+        out(f"      (kept {path}: not a file this release built)")
+        return False
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+    out(f"      freed {path} (disk free now {disk_free_gb(path):.1f} GB)")
+    return True
+
+
+def publish_rung(step, c, cfg, run_upload, out=print):
+    """--free-after-upload: upload ONE gated rung to its lane repo, check it landed, mark it uploaded in the MANIFEST,
+    then delete the local copy. A rung that did not pass the gate is not published; its file is freed too (its
+    numbers stay in the results file)."""
+    import pollard_workspace as ws
+    from pollard_card import rung_subfolder
+    lane, repo = step.lane, step.repo
+    key = lane_key(c, lane)
+    man = ws.read_manifest(key)
+    want = os.path.normcase(os.path.abspath(str(step.out).rstrip("/\\")))
+    b = next((x for x in man.get("builds", []) if x.get("lane") == lane and
+              os.path.normcase(os.path.abspath(str(x.get("path", "")).rstrip("/\\"))) == want), None)
+    if b is None:
+        if not os.path.exists(str(step.out)):
+            out("      (nothing to publish: the rung was not built)")
+            return "skipped: not built"
+        raise RuntimeError(f"{step.out} is not in the MANIFEST")
+    if b.get("uploaded"):
+        return "done"
+    if b.get("verified") is not True:
+        _free_local(c, b, out)
+        b["freed"] = "did not pass the gate -- not published"
+        ws._write_manifest(key, man)
+        return "done"
+    if not run_upload:
+        raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    from huggingface_hub import HfApi
+    api = HfApi()
+    api.create_repo(repo, repo_type="model", exist_ok=True)
+    if lane == "gguf":
+        name = b.get("name") or os.path.basename(b["path"])
+        api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
+        landed = name in set(api.list_repo_files(repo))
+        b["uploaded_as"] = name
+    else:
+        sub = rung_subfolder(b, lane)
+        api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
+        if step.default:
+            api.upload_folder(folder_path=b["path"], repo_id=repo)
+            b["root"] = True
+        landed = f"{sub}/config.json" in set(api.list_repo_files(repo))
+        b["uploaded_as"] = sub
+    if not landed:
+        raise RuntimeError(f"{b['uploaded_as']} is not in {repo} after the upload -- keeping the local copy")
+    b["uploaded"] = repo
+    ws._write_manifest(key, man)
+    out(f"      uploaded {b['uploaded_as']} -> https://huggingface.co/{repo}")
+    if _free_local(c, b, out):
+        b["freed"] = "uploaded"
+        ws._write_manifest(key, man)
+    return "done"
 
 
 def run_cmd(cmd, ok_codes=(0,)):
@@ -724,6 +916,11 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             if run and have.get("any"):
                 canonical_gguf(c)
             builds = gguf_builds(c)
+            if c.get("free"):                        # one rung at a time: only what is built and not yet published
+                done = {s.get("id") for s in queue} | set(statuses)
+                builds = [b for b in builds if not b.get("uploaded") and not b.get("freed")
+                          and os.path.exists(b.get("path", ""))
+                          and f"gguf/{b.get('tag') or b.get('name')}/publish" not in done]
             if builds:
                 queue[0:0] = gguf_rung_steps(cfg, c, builds)
                 out(f"{head}: {len(builds)} ladder rung(s) in the MANIFEST -> measure + verify each")
@@ -749,10 +946,27 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 f"with --lanes {st.lane}) -- {what}")
             statuses[st.id] = f"skipped: needs {REQUIRES[st.lane]}"
             continue
-        if st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
+        if st.kind == "publish" and (st.lane, st.rung) in failed_rungs and st.lane not in failed_lanes:
+            pass                                     # free mode: a rung that failed is still freed (not published)
+        elif st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
             out(f"{head}: SKIP (an earlier step of this {'rung' if st.rung else 'lane'} failed) -- {what}")
             statuses[st.id] = "skipped: upstream failed"
             continue
+        need = st.disk_gb or 0
+        if run and need and st.kind in ("build", "prep") and resume_reason(st, state, redo) is None:
+            free = disk_free_gb(st.out or c["mdir"])
+            margin = float(cfg.get("disk_margin_gb", 3))
+            if free < need + margin:
+                msg = f"held: disk (needs ~{need:.1f} GB + {margin:g} margin, {free:.1f} GB free)"
+                out(f"{head}: {msg} -- {what}")
+                statuses[st.id] = msg
+                if st.rung:
+                    failed_rungs.add((st.lane, st.rung))
+                elif st.blocks:
+                    failed_lanes.update(st.blocks)
+                else:
+                    failed_lanes.add(st.lane)
+                continue
         why = resume_reason(st, state, redo)
         if why:
             out(f"{head}: [{why}] {what}")
@@ -768,12 +982,20 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 res = "done"
             elif st.fn == "upload":
                 res = "done" if upload(st, c, cfg, run_upload) == "uploaded" else "held"
+            elif st.fn == "publish_rung":
+                res = publish_rung(st, c, cfg, run_upload, out)
             else:
                 run_cmd(st.cmd, st.ok_codes or (0,))
                 res = "done"
         except Exception as e:                                   # noqa: BLE001
             res = "failed"
             out(f"      FAILED: {e}")
+            if st.blocks and not stop_on_fail:            # e.g. the smoothed copy: only its lanes depend on it
+                failed_lanes.update(st.blocks)
+                statuses[st.id] = res
+                state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                save_state(c["state"], state)
+                continue
             if st.lane == "prep" or stop_on_fail:
                 statuses[st.id] = res
                 state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -808,6 +1030,9 @@ def main(argv=None):
     ap.add_argument("--stop-on-fail", action="store_true", help="stop at the first failed rung (default: carry on)")
     ap.add_argument("--init", metavar="PATH", help="write the plan template (with --preset applied) and exit")
     ap.add_argument("--force", action="store_true", help="ignore the machine lock")
+    ap.add_argument("--free-after-upload", action="store_true",
+                    help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
+                         "needs --upload and `upload: true`")
     a = ap.parse_args(argv)
 
     if a.init:
@@ -818,6 +1043,11 @@ def main(argv=None):
         print(f"wrote {a.init} (preset {a.preset or 'text'}) -- edit it, then: pollard release --hf <model> --plan {a.init}")
         return 0
     cfg = load_plan(a.plan, a.preset)
+    if a.free_after_upload:
+        if not (a.upload and cfg.get("upload")):
+            ap.error("--free-after-upload deletes each rung once it is published: it needs --upload AND "
+                     "`upload: true` in the plan")
+        cfg["_free_after_upload"] = True
     src = a.hf or cfg.get("model")
     if not src:
         ap.error("pass --hf <repo-or-dir> (or set `model:` in the plan)")

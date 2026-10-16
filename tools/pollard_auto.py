@@ -344,6 +344,14 @@ def pick_ladder(points, f16_gb, ik_flagship=False):
     return out
 
 
+def _wanted_rungs(a):
+    """--rung LABEL (repeatable / comma list): build only these ladder labels (`flagship` = the automap mix).
+    None = the whole ladder + flagship. `pollard release --free-after-upload` builds one rung at a time with it, so
+    a box with less free disk than the whole ladder can still publish every rung."""
+    want = [x.strip() for r in (getattr(a, "rung", None) or []) for x in str(r).split(",") if x.strip()]
+    return {w.upper() if w.lower() != "flagship" else "flagship" for w in want} or None
+
+
 def _build_ladder(a, ik_flagship):
     pts = ladder_points(a.gguf, a.imatrix, a.sensitivity)
     f16_gb = os.path.getsize(a.gguf) / 1e9
@@ -351,6 +359,10 @@ def _build_ladder(a, ik_flagship):
     print(f"   1) the publish ladder ({', '.join(picks) or 'nothing reachable'}):")
     for label, (ram, preset, gb) in picks.items():
         print(f"      {label:<7} --ram {ram:<5} -> {preset} ~{gb:.1f} GB")
+    want = _wanted_rungs(a)
+    if want is not None:
+        picks = {k: v for k, v in picks.items() if k.upper() in want}
+        print(f"      --rung: building {', '.join(picks) or 'no ladder rung'} this run")
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, (ram, preset, gb) in picks.items():
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0"]
@@ -451,10 +463,31 @@ def _automap_mix(a, is_moe, ik_dir=None):
     if ik_dir or a.bin:
         am += ["--bin", ik_dir or a.bin]                    # the build find_ik_build() checked
     _run(am, a.run, cwd=here)
+    if a.run and not a.benchmark:
+        _record_flagship(a, here)
     mode = "3-bar BENCHMARK + PPL" if a.benchmark else "ONE mix model, no eval (fast)"
     print(f"   -> run {os.path.basename(out)} on the box -> {mode}"
           + ("" if a.benchmark else "  (add --benchmark for the gold-card numbers)"))
     return out
+
+
+def _record_flagship(a, here, body=None):
+    """Put the automap mix in the MANIFEST beside the ladder rungs, so pollard-release measures, gates, cards and
+    publishes it like any other rung. automap writes `<stem>-mix.gguf` next to the f16; the tag is its body atom
+    (iq1_kt by default with an imatrix -> IQ1_KT, the name the published flagships use)."""
+    stem = os.path.splitext(os.path.basename(a.gguf))[0]
+    mix = os.path.join(here, f"{stem}-mix.gguf")
+    if not os.path.isfile(mix):
+        return None
+    try:
+        import pollard_workspace as ws
+        arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
+        bpw = round(os.path.getsize(mix) * 8.0 / arch["total"], 2) if arch.get("total") else None
+        return ws.record_build(a.gguf, "gguf", mix, tag=str(body or "iq1_kt").upper(), bpw=bpw,
+                               extra={"flagship": True})
+    except Exception as e:                                               # noqa: BLE001
+        print(f"   (warning: could not record the flagship in the workspace manifest: {e})")
+        return None
 
 
 def _find_convert(hf_dir=None):
@@ -1056,6 +1089,9 @@ def main():
                     help="build the whole publish ladder (Q6_K / IQ4_XS / IQ3_S / 2-bit) instead of one "
                          "--ram build: budgets are found by pollard-fit's own planner, the 2-bit rung is the "
                          "IQ*_KT flagship where ik_llama can build it and a stock IQ2 type where it cannot")
+    ap.add_argument("--rung", action="append", metavar="LABEL",
+                    help="with --ladder: build only this rung (Q6_K / IQ4_XS / IQ3_S / IQ2 / flagship); repeatable "
+                         "or a comma list. Default: every rung + the flagship")
     ap.add_argument("--allow-slow", action="store_true",
                     help="let the passthrough sensitivity sweep run on a big model (it is one quantize + KL pass "
                          "per layer; pollard-sensitivity refuses multi-hour sweeps without this)")
@@ -1207,7 +1243,8 @@ def _dispatch(a):
         here = os.path.dirname(os.path.abspath(a.gguf)) or "."
         calib = a.calib or os.path.join(here, "pollard_calib.txt")
         a.sensitivity = _ensure_sensitivity(a, hf_dir, calib, here)
-    if a.ladder:
+    want = _wanted_rungs(a)
+    if a.ladder and (want is None or want - {"flagship"}):
         _build_ladder(a, ik_flagship=bool(a.imatrix) and ik_known is True)
     else:
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
@@ -1227,6 +1264,8 @@ def _dispatch(a):
         print(f"   2) (skipped the {flagship} flagship: no ik_llama.cpp build found, and its trellis atoms are "
               "ik-only" + (" -- the 2-bit rung is the stock IQ2 above" if a.ladder else "")
               + ". Build ik_llama.cpp and set IK_LLAMA_BIN (or --bin) to its build/bin to add it.)")
+    elif a.imatrix and want is not None and "flagship" not in want:
+        print(f"   2) (the {flagship} flagship is not in --rung this run)")
     elif a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
         _automap_mix(a, is_moe=is_moe, ik_dir=ik_dir)
