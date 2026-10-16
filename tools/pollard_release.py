@@ -74,9 +74,12 @@ lanes:
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
   # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
   exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
-  draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128}
+  draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128,
+          prefer_own: false, train: {kind: eagle3, rung: Q4_K_M, taps: rung, samples: null, max_steps: null}}
                                # speculative drafter (pollard-draft): drafter = auto (search the Hub) or a repo id;
-                               # measured against `targets` (all = every GGUF rung of this release, or a list of tags)
+                               # measured against `targets` (all = every GGUF rung of this release, or a list of tags).
+                               # Nothing redistributable published (or prefer_own) -> Pollard trains its own head on a
+                               # CUDA box, quant-aware vs train.rung, measured vs the rungs AND f16
 """
 
 PRESETS = {
@@ -343,10 +346,26 @@ def draft_steps(cfg, c, lc):
     find = ["pollard-draft", "find", "--target", c["src"], "--target-dir", c["hf_dir"], "--out", found]
     if lc.get("drafter") not in (None, "auto"):
         find += ["--drafter", str(lc["drafter"])]
+    rungs = ",".join(str(r) for r in lc.get("rungs") or ["Q8_0", "Q4_K_M"])
     conv = ["pollard-draft", "convert", "--target", c["src"], "--target-dir", c["hf_dir"], "--from", found,
-            "--key", c["src"], "--rungs", ",".join(str(r) for r in lc.get("rungs") or ["Q8_0", "Q4_K_M"])]
+            "--key", c["src"], "--rungs", rungs, "--skip-if-trained"]
+    tc = lc.get("train") or {}
+    train = ["pollard-draft", "train", "--target", c["src"], "--target-dir", c["hf_dir"], "--key", c["src"],
+             "--if-needed", found, "--kind", str(tc.get("kind") or "eagle3"), "--rung-tag", str(tc.get("rung") or
+                                                                                              "Q4_K_M"),
+             "--rung-key", c["f16"], "--taps", str(tc.get("taps") or "rung"), "--rungs", rungs, "--ngl", c["ngl"],
+             "--measure-target", "f16=" + c["f16"], "--run"]
+    for k in ("samples", "max_steps"):
+        if tc.get(k):
+            train += ["--" + k.replace("_", "-"), str(tc[k])]
+    if lc.get("prefer_own"):
+        train += ["--prefer-own"]
     return [Step(id="draft/find", lane="draft", kind="build", requires="any", cmd=find, out=found,
-                 desc="the best published drafter for this model, checked against its config"),
+                 desc="the best published drafter for this model, checked against its config",
+                 ok_codes=(0, 1)),                             # none found is an answer: the train step takes over
+            Step(id="draft/train", lane="draft", kind="build", requires="cuda", cmd=train,
+                 out=os.path.join(c["mdir"], "draft", "train-" + str(tc.get("kind") or "eagle3")),
+                 desc="Pollard's own quant-aware head when nothing redistributable is published"),
             Step(id="draft/convert", lane="draft", kind="build", requires="any", cmd=conv,
                  out=os.path.join(c["mdir"], "draft")),
             Step(id="draft/rungs", lane="draft", kind="expand", requires="any")]
@@ -368,7 +387,9 @@ def draft_rung_steps(cfg, c, builds, targets=None):
     same weights) so its gate has a number; the BF16 GGUF itself is an intermediate, not a rung."""
     lc = (cfg.get("lanes") or {}).get("draft") or {}
     res, steps = results_path(c, "draft"), []
-    targets = targets or draft_targets(cfg, c)
+    targets = list(targets or draft_targets(cfg, c))
+    if any(b.get("source") == "pollard-trained" for b in builds) and not any(p == c["f16"] for _, p in targets):
+        targets.append(("f16", c["f16"]))                     # a quant-aware head shows the bf16 number beside it
     for b in builds:
         if b.get("publish") is False or b.get("format") == "mlx":
             continue

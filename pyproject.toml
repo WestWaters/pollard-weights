@@ -38,7 +38,8 @@ forge = ["torch", "transformers", "safetensors", "datasets", "tokenizers"]
 tune = ["torch", "transformers", "safetensors", "datasets", "trl", "peft"]
 hf = ["huggingface-hub", "hf-transfer"]                            # publishing to the Hub
 # speculative drafters (pollard-draft): find/measure are stdlib + llama.cpp; convert pulls from the Hub. Serving
-# them elsewhere is the runtime's own install (vllm, dflash-mlx); training is `pip install speculators` on a CUDA box
+# them elsewhere is the runtime's own install (vllm, dflash-mlx). `pollard-draft train` (Pollard's own quant-aware
+# head) needs torch/transformers/datasets here and `speculators` (Apache-2.0) in its own env: it pins transformers
 draft = ["huggingface-hub"]
 all = ["torch", "transformers", "safetensors", "exllamav3", "datasets", "gptqmodel",
        "mlx-lm", "llmcompressor", "huggingface-hub", "hf-transfer", "matplotlib", "xxhash"]
@@ -152,7 +153,8 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "p
     "pollard_mxfp6",
     # declared as entry points but never listed here, so `pollard-trellis` and friends installed
     # as a command with no module behind it
-    "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis", "pollard_draft"]
+    "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis", "pollard_draft",
+    "pollard_draft_train"]
 
 # the window's own HTML/CSS/JS and the bear it puts in the dock
 [tool.setuptools.package-data]
