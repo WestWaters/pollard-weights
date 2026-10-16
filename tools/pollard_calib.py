@@ -315,6 +315,15 @@ class Renderer:
                     tpl = self.ct.source
                     self.why = f"{model}'s own chat template (jinja2, no tokenizer)"
         self.rinfo = resolve_reasoning(reasoning, model, tpl)
+        # the tool-call syntax the template writes (pollard-modelkind): used when the template itself does not
+        # render an assistant's tool_calls back, so the trace still carries the call the way the model writes it
+        self.tool_family = "none"
+        if tpl or model:
+            try:
+                from pollard_modelkind import toolcall_info
+                self.tool_family = toolcall_info(model or None, tpl or None).get("family", "none")
+            except (Exception, SystemExit):                      # noqa: BLE001
+                self.tool_family = "none"
 
     # -- template plumbing
     def kwargs(self, thinking):
@@ -338,7 +347,7 @@ class Renderer:
         return chatml(messages, tools) + ("\n<|im_start|>assistant\n" if add_generation_prompt else "")
 
     def _try(self, messages, add_generation_prompt=False, tools=None, **kw):
-        for attempt in (messages, _flatten_tools(messages)):
+        for attempt in (messages, _flatten_tools(messages, getattr(self, "tool_family", None))):
             try:
                 return self._apply(attempt, add_generation_prompt, tools, **kw)
             except Exception:                                    # noqa: BLE001
@@ -356,20 +365,41 @@ class Renderer:
     # -- rendering
     def __call__(self, messages, tools=None, thinking=None):
         msgs = [dict(m) for m in messages]
+        pending, n = [], 0
         for m in msgs:                                          # templates differ on argument encoding
+            if m.get("tool_calls"):
+                m["tool_calls"] = [dict(tc) for tc in m["tool_calls"]]
             for tc in m.get("tool_calls") or []:
-                fn = tc.get("function", {})
+                fn = tc["function"] = dict(tc.get("function", {}))
                 if isinstance(fn.get("arguments"), str):
                     try:
                         fn["arguments"] = json.loads(fn["arguments"])
                     except ValueError:
                         pass
+                if not tc.get("id"):                            # Mistral templates insist on 9-char call ids
+                    n += 1
+                    tc["id"] = f"call{n:05d}"
+                pending.append(tc["id"])
+            if m.get("role") == "tool" and not m.get("tool_call_id") and pending:
+                m["tool_call_id"] = pending.pop(0)
         last = msgs[-1] if msgs else {}
         if self.rinfo.get("reasoning") and last.get("role") == "assistant" and last.get("reasoning_content"):
             return self.render_reasoning(msgs, tools)
         if self.tok is None and self.ct is None:
             return chatml(messages, tools)
-        out = self._try(msgs, tools=tools, **self.kwargs(thinking))
+        kw = self.kwargs(thinking)
+        out = self._try(msgs, tools=tools, **kw)
+        if out is not None and not _calls_rendered(out, msgs):
+            # The template dropped the calls (LFM2, Granite 3.x, R1-distill write them into content themselves):
+            # put each call into the assistant's content in the model's own syntax, keep the tool turns native.
+            fixed = None
+            try:
+                fixed = self._apply(_calls_into_content(msgs, self.tool_family), tools=tools, **kw)
+            except Exception:                                    # noqa: BLE001
+                fixed = None
+            if fixed is None or not _calls_rendered(fixed, msgs):
+                fixed = self._try(_flatten_tools(msgs, self.tool_family), tools=tools, **kw)
+            out = fixed if fixed is not None else out
         return out if out is not None else chatml(messages, tools)
 
     def render_reasoning(self, msgs, tools=None):
@@ -423,16 +453,53 @@ def resolve_reasoning(mode, model, tpl=""):
     return info
 
 
-def _flatten_tools(messages):
-    """For templates without a tool role / tool_calls: the calls and results as plain text turns."""
+def _call_text(tc, family=None):
+    """One tool call as text: in the model's own syntax when pollard-modelkind knows the family, else JSON."""
+    fn = tc.get("function", tc)
+    if family and family != "none":
+        try:
+            from pollard_modelkind import format_tool_call
+            txt = format_tool_call(family, fn.get("name"), fn.get("arguments"))
+            if txt:
+                return txt
+        except ImportError:                                      # pragma: no cover
+            pass
+    return json.dumps({"name": fn.get("name"), "arguments": fn.get("arguments")}, ensure_ascii=False)
+
+
+def _calls_rendered(text, messages):
+    """Did a rendering keep every assistant tool call? (Its function name must appear after the first user turn.)"""
+    names = [tc.get("function", tc).get("name") for m in messages for tc in (m.get("tool_calls") or [])]
+    if not names:
+        return True
+    text = text or ""
+    first = next((str(m.get("content") or "") for m in messages if m.get("role") == "user"), "")
+    if first and first in text:                                  # past the tool list in the system prompt
+        text = text[text.index(first) + len(first):]
+    return all(n and n in text for n in names)
+
+
+def _calls_into_content(messages, family=None):
+    """The assistant's tool_calls moved into its content, written in the model's own call syntax; tool turns kept."""
     out = []
     for m in messages:
         m = dict(m)
         if m.get("tool_calls"):
             m["content"] = (m.get("content") or "") + "".join(
-                "\n" + json.dumps({"name": tc.get("function", {}).get("name"),
-                                   "arguments": tc.get("function", {}).get("arguments")}, ensure_ascii=False)
-                for tc in m.pop("tool_calls"))
+                ("\n" if (m.get("content") or "") else "") + _call_text(tc, family) for tc in m.pop("tool_calls"))
+        out.append(m)
+    return out
+
+
+def _flatten_tools(messages, family=None):
+    """For templates without a tool role / tool_calls: the calls (in the model's own syntax when known) and the
+    results as plain text turns."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("tool_calls"):
+            m["content"] = (m.get("content") or "") + "".join(
+                "\n" + _call_text(tc, family) for tc in m.pop("tool_calls"))
         if m.get("role") == "tool":
             m = {"role": "user", "content": "Tool result: " + str(m.get("content", ""))}
         out.append(m)

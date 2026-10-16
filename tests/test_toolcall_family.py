@@ -238,3 +238,49 @@ def test_every_llama_cpp_template_classifies():
     graded = sum(1 for f in files if f.stem in EXPECTED)
     assert graded >= 60
     assert not wrong, wrong
+
+
+# ------------------------------------------------------------------ calibration traces carry the model's own calls
+
+def _calib_model(tmp_path, key):
+    d = tmp_path / key
+    d.mkdir()
+    (d / "chat_template.jinja").write_text(TEMPLATES[key][1], encoding="utf-8")
+    (d / "config.json").write_text("{}", encoding="utf-8")
+    return str(d)
+
+
+CALIB_REC = {"messages": [
+    {"role": "user", "content": "Weather in Oslo?"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Oslo"}'}}]},
+    {"role": "tool", "content": '{"temp": 3}'},
+    {"role": "assistant", "content": "It is 3C in Oslo."}],
+    "tools": [{"type": "function", "function": {"name": "get_weather", "description": "w", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]}
+
+
+@needs_jinja
+@pytest.mark.parametrize("key,family,call", [
+    ("QWEN25", "hermes", '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Oslo"}}\n</tool_call>'),
+    # LFM2's template drops tool_calls: the call must still reach the corpus, in LFM2's own pythonic syntax
+    ("LFM2", "lfm2", '<|tool_call_start|>[get_weather(city="Oslo")]<|tool_call_end|>'),
+    # Mistral's template insists on 9-character call ids, which dataset rows do not carry
+    ("MISTRAL_NEMO", "mistral", '[TOOL_CALLS][{"name": "get_weather", "arguments": {"city": "Oslo"}'),
+    ("GLM47", "glm47", "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"),
+])
+def test_agent_calibration_renders_calls_in_the_models_own_syntax(tmp_path, key, family, call):
+    import pollard_calib as C
+    r = C.Renderer(_calib_model(tmp_path, key))
+    assert r.tool_family == family
+    out = C.render(CALIB_REC, r)
+    after_user = out[out.index("Weather in Oslo?"):]
+    assert call in after_user, after_user[:300]
+    assert "3C in Oslo" in after_user
+
+
+def test_calls_rendered_ignores_the_tool_list():
+    import pollard_calib as C
+    msgs = CALIB_REC["messages"]
+    assert C._calls_rendered("<tools>get_weather</tools> Weather in Oslo? It is 3C", msgs) is False
+    assert C._calls_rendered("Weather in Oslo? <tool_call>get_weather</tool_call>", msgs) is True

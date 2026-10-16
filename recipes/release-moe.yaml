@@ -12,7 +12,7 @@ calib:
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
   taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
-  toolcall: false              # tool-call validity vs f16 (agent models)
+  toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
 lanes:
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)

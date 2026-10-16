@@ -56,7 +56,7 @@ calib:
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
   taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
-  toolcall: false              # tool-call validity vs f16 (agent models)
+  toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
 lanes:
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
@@ -77,7 +77,7 @@ PRESETS = {
     # a decision model answers on /v1/systemone from first-position logits: llama.cpp only, judged on decisions
     "decision": {"lanes": {"mlx": {"enabled": False}, "gptq": {"enabled": False}, "mx": {"enabled": False},
                            "exl3": {"enabled": False}},
-                 "measure": {"taskeval": None, "decision": True}},
+                 "measure": {"taskeval": None, "decision": True, "toolcall": False}},
     # MoE: vLLM's fused-MoE kernels want one scheme for all experts (--moe-protect-attn-only); 2/3-bit GPTQ
     # MoE kernels are poor, so the GPTQ ladder is 4 and 8
     "moe": {"lanes": {"gptq": {"rungs": [4, 8]}, "mlx": {"rungs": [3, 4, 6, 8]},
@@ -227,9 +227,31 @@ def prep_steps(cfg, c, lanes):
     return steps
 
 
+def toolcall_wanted(cfg, c):
+    """measure.toolcall: true / false as written; `auto` (the default) = on for an AGENTIC model, i.e. one whose chat
+    template writes tool calls in a syntax pollard-modelkind recognises. Asked of the f16 GGUF (it carries the
+    template) or the HF checkout, whichever exists by the time the rungs are expanded."""
+    v = (cfg.get("measure") or {}).get("toolcall", "auto")
+    if v is None or isinstance(v, bool):
+        return bool(v)
+    if str(v).lower() in ("true", "on", "yes"):
+        return True
+    if str(v).lower() != "auto":
+        return False
+    for src in (c.get("f16"), c.get("hf_dir")):
+        if src and os.path.exists(src):
+            try:
+                from pollard_modelkind import classify
+                return (classify(src).get("tools") or {}).get("family", "none") != "none"
+            except (Exception, SystemExit):                      # noqa: BLE001 -- unreadable: no gate
+                return False
+    return False
+
+
 def gguf_rung_steps(cfg, c, builds):
     """Measure + verify for every rung the GGUF ladder produced (read back from the MANIFEST)."""
-    m, res, steps = cfg.get("measure") or {}, results_path(c, "gguf"), []
+    m, res, steps = dict(cfg.get("measure") or {}), results_path(c, "gguf"), []
+    m["toolcall"] = toolcall_wanted(cfg, c)
     for b in builds:
         tag, path = b.get("tag") or b.get("name"), b.get("path")
         common = ["--results", res, "--rung", tag]

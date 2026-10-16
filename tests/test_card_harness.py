@@ -71,11 +71,41 @@ def test_card_has_agent_ready_column_and_harness_section_after_how_to_run(tmp_pa
     md = _card(tmp_path, monkeypatch, {
         "M-Pollard-Q6_K.gguf": {"ppl": 10.1, "kld": 0.01, "toolcall": {"pass": True, "rate": 0.95}},
         "M-Pollard-Q4_K_M.gguf": {"ppl": 10.6, "kld": 0.05, "toolcall": {"pass": False, "rate": 0.6}}})
-    assert "| agent-ready |" in md and "| yes (95%) |" in md and "| no (60%) |" in md
+    assert "| Tool-ready |" in md and "| yes (95%) |" in md and "| no (60%) |" in md
     assert md.index("## How to run") < md.index("## Use it in your harness") < md.index("## Errata")
     assert "pollard serve PollardWeights/M-Pollard:" in md
 
 
 def test_card_without_toolcall_results_has_no_agent_ready_column(tmp_path, monkeypatch):
     md = _card(tmp_path, monkeypatch, {"M-Pollard-Q6_K.gguf": {"ppl": 10.1, "kld": 0.01}})
-    assert "agent-ready" not in md and "## Use it in your harness" in md
+    assert "Tool-ready" not in md and "## Use it in your harness" in md
+
+
+def test_tool_ready_cell_reports_retention_with_its_ci():
+    tc = {"pass": True, "rate": 0.55, "ref_rate": 0.56, "retention": 98.2, "retention_ci": [90.1, 104.7]}
+    assert C.tool_ready_cell(tc) == "yes (98% of f16; CI 90-105)"
+    assert C.tool_ready_cell({"pass": False, "rate": 0.3, "retention": 70.0}) == "no (70% of f16)"
+
+
+def test_card_tool_calling_section_names_the_parser(tmp_path, monkeypatch):
+    """An agentic model's card says which syntax its template writes and the flags that parse it."""
+    import pollard_modelkind as MK
+    tools = {"family": "hermes", "supports_tools": True, "vllm_parser": "hermes", "vllm_parser_confirmed": True,
+             "vllm_flags": "--enable-auto-tool-choice --tool-call-parser hermes",
+             "llama_cpp": {"flags": "--jinja", "handler": "autoparser", "format": "autoparser (JSON_NATIVE)"},
+             "example": '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'}
+    real = MK.classify
+    monkeypatch.setattr(MK, "classify", lambda m: dict(real(m), tools=tools))
+    md = _card(tmp_path, monkeypatch, {
+        "M-Pollard-Q6_K.gguf": {"ppl": 10.1, "kld": 0.01,
+                                "toolcall": {"pass": True, "rate": 0.6, "retention": 100.0,
+                                             "retention_ci": [95.0, 105.0]}}})
+    assert "## Tool calling" in md and "**`hermes`**" in md
+    assert "--jinja" in md and "--tool-call-parser hermes" in md
+    assert "| yes (100% of f16; CI 95-105) |" in md
+    assert md.index("## How to run") < md.index("## Tool calling") < md.index("## Use it in your harness")
+
+
+def test_card_without_a_tool_syntax_has_no_tool_calling_section(tmp_path, monkeypatch):
+    md = _card(tmp_path, monkeypatch, {"M-Pollard-Q6_K.gguf": {"ppl": 10.1, "kld": 0.01}})
+    assert "## Tool calling" not in md

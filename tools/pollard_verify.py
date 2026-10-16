@@ -289,6 +289,7 @@ DEFAULT_GATES = """\
 #   retention_min    task retention vs f16, percent (overall)            pollard-taskeval --results
 #   mt_retention_min mean chrF++ retention over the language pairs       pollard-taskeval --suite mt
 #   toolcall_pass    true = still emits valid tool calls                 pollard-toolcall --results
+#   toolcall_retention_min  tool-call success vs the f16's, percent      pollard-toolcall --ref --results
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
@@ -326,6 +327,17 @@ rungs:
   # the trellis flagship is ik_llama-only BY DESIGN -- the gate checks it says so, not that it isn't
   - match: ["*_KT*", "*KT-*", "PollardMix*"]
     runtime: ik_llama
+# per model KIND (pollard-modelkind), applied after the rung entries. agentic = the chat template writes tool calls
+# in a syntax pollard-modelkind recognises; its rungs must keep their tool calling (pollard-toolcall, 60 probes
+# through llama-server --jinja, retention = rung success / f16 success).
+kinds:
+  agentic:
+    toolcall_retention_min: 90
+    rungs:
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.5bpw"]
+        toolcall_retention_min: 85
+      - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
+        toolcall_retention_min: 75
 """
 
 
@@ -339,15 +351,24 @@ def load_gates(path):
         return json.loads(txt)
 
 
-def thresholds_for(gates, rung, lane=None):
-    """Merged thresholds for one rung: default <- lanes.<lane> <- each matching rungs entry, in order."""
-    th = dict(gates.get("default") or {})
-    th.update((gates.get("lanes") or {}).get(lane or "", {}) or {})
-    for entry in gates.get("rungs") or []:
+def _apply_rungs(th, entries, rung):
+    for entry in entries or []:
         pats = entry.get("match") or []
         pats = [pats] if isinstance(pats, str) else pats
         if rung and any(fnmatch.fnmatch(str(rung).lower(), str(p).lower()) for p in pats):
             th.update({k: v for k, v in entry.items() if k != "match"})
+
+
+def thresholds_for(gates, rung, lane=None, kinds=()):
+    """Merged thresholds for one rung: default <- lanes.<lane> <- each matching rungs entry, in order <- then, for
+    each kind the model is (pollard-modelkind: agentic, ...), kinds.<kind> and its own matching rungs entries."""
+    th = dict(gates.get("default") or {})
+    th.update((gates.get("lanes") or {}).get(lane or "", {}) or {})
+    _apply_rungs(th, gates.get("rungs"), rung)
+    for kind in kinds or ():
+        sec = (gates.get("kinds") or {}).get(kind) or {}
+        th.update({k: v for k, v in sec.items() if k != "rungs"})
+        _apply_rungs(th, sec.get("rungs"), rung)
     # a lane can opt out of a check it has no way to measure (exl3: no logit-level KLD path yet)
     for k in ((gates.get("lanes") or {}).get(lane or "", {}) or {}).get("skip") or []:
         th.pop(k, None)
@@ -362,6 +383,7 @@ _CHECKS = {
     "retention_min": ("retention", ">=", "task retention %"),
     "mt_retention_min": ("mt_retention", ">=", "translation retention %"),
     "decision_agreement_min": ("decision_agreement", ">=", "decision agreement %"),
+    "toolcall_retention_min": ("toolcall_retention", ">=", "tool-call retention %"),
     "e2e_acc_min": ("e2e_acc", ">=", "end-to-end next-token agreement"),
 }
 _RUNTIME_OK = {"stock": {"stock"}, "ik_llama": {"stock", "ik_llama"}}
@@ -420,12 +442,33 @@ def metrics_from_results(results, rung):
     tc = r.get("toolcall") or {}
     if tc.get("pass") is not None:
         m["toolcall_pass"] = bool(tc["pass"])
+    if tc.get("retention") is not None:
+        m["toolcall_retention"] = float(tc["retention"])
+    elif tc.get("rate") is not None and tc.get("ref_rate"):          # a --quick run: rate / f16 rate
+        m["toolcall_retention"] = 100.0 * float(tc["rate"]) / float(tc["ref_rate"])
     d = r.get("decision") or {}
     if d.get("agreement") is not None:
         m["decision_agreement"] = 100.0 * float(d["agreement"])
     if r.get("coherence"):
         m["coherence"] = r["coherence"]
     return m
+
+
+def model_kinds(model):
+    """The kinds pollard-modelkind finds in this build ("agentic" = its template writes tool calls in a known
+    syntax), for the gate file's `kinds:` section. Empty when the model cannot be read."""
+    try:
+        from pollard_modelkind import classify
+        k = classify(model)
+    except (Exception, SystemExit):                          # noqa: BLE001 -- not a readable model
+        return []
+    out = []
+    if (k.get("tools") or {}).get("family", "none") != "none":
+        out.append("agentic")
+    for name in ("thinking", "decision", "vision"):
+        if k.get(name):
+            out.append(name)
+    return out
 
 
 def gguf_runtime(path):
@@ -552,10 +595,11 @@ def main():
         gates = load_gates(a.gate or None)
         results = json.load(open(a.results, encoding="utf-8")) if a.results and os.path.exists(a.results) else {}
         metrics = {**metrics_from_results(results, rung), **{k: v for k, v in measured.items() if v is not None}}
-        th = thresholds_for(gates, rung, lane)
+        kinds = model_kinds(a.model) if gates.get("kinds") else []
+        th = thresholds_for(gates, rung, lane, kinds)
         gate_res = evaluate_gate(metrics, th, gates.get("missing", "fail"))
         gate_res.update({"rung": rung, "lane": lane, "gates": os.path.basename(a.gate) if a.gate else "built-in",
-                         "thresholds": th})
+                         "thresholds": th, "kinds": kinds})
         print_gate(rung, gate_res)
         if not gate_res["pass"]:
             fails += 1
