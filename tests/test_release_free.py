@@ -196,3 +196,12 @@ def test_pollard_auto_rung_filter():
     import pollard_auto as A
     assert A._wanted_rungs(argparse.Namespace(rung=None)) is None
     assert A._wanted_rungs(argparse.Namespace(rung=["iq4_xs,Flagship", "Q6_K"])) == {"IQ4_XS", "flagship", "Q6_K"}
+
+
+def test_bare_pollard_resolves_to_its_module_without_a_launcher(monkeypatch):
+    import shutil
+    import pollard_auto as A
+    monkeypatch.setattr(shutil, "which", lambda n: None)        # a SYSTEM scheduled task: no venv Scripts on PATH
+    cmd = A._resolve_tool(["pollard", "--gguf", "x.gguf"])
+    assert cmd[0] == sys.executable and cmd[1].endswith("pollard_auto.py") and cmd[2:] == ["--gguf", "x.gguf"]
+    assert A._resolve_tool(["pollard-verify", "--x"])[1].endswith("pollard_verify.py")

@@ -136,7 +136,8 @@ def _resolve_tool(cmd):
     clean convert because `pollard-calib` was "not found" on a box that had the module right here. If
     the launcher is missing, run the module behind it with this interpreter instead."""
     import shutil
-    if not cmd or not str(cmd[0]).startswith("pollard-") or shutil.which(str(cmd[0])):
+    name = str(cmd[0]) if cmd else ""
+    if not cmd or not (name == "pollard" or name.startswith("pollard-")) or shutil.which(name):
         return cmd
     here = os.path.dirname(os.path.abspath(__file__))
     try:
