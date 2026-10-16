@@ -25,7 +25,13 @@ def make(out, tokenizer_dir):
     t.update(vocab_size=V, hidden_size=H, num_hidden_layers=L, num_attention_heads=NH, num_key_value_heads=NKV,
              head_dim=HD, num_experts=E, num_experts_per_tok=K, moe_intermediate_size=FF, intermediate_size=FF*2,
              max_position_embeddings=4096)
-    rp = t.get("rope_parameters") or t.get("rope_scaling") or {}
+    # Interleaved M-RoPE, set explicitly: transformers >= 5.15's Qwen3OmniMoeConfig() no longer carries
+    # mrope_section, and without it the GGUF has no clef-omni.rope.dimension_sections and llama-server refuses
+    # it. The sections count rope pairs and must sum to head_dim/2 = 8 (the full-size [24, 20, 20] trips a
+    # GGML_ASSERT). Text-only positions are equal on all three axes, so the recorded answers do not change.
+    for key in ("rope_parameters", "rope_scaling"):
+        if key == "rope_parameters" or isinstance(t.get(key), dict):
+            t[key] = dict(t.get(key) or {}, mrope_section=[3, 3, 2], mrope_interleaved=True)
     c["thinker_config"]["vision_config"]["deepstack_visual_indexes"] = [0]
     c["architectures"] = ["Qwen3OmniMoeForConditionalGeneration"]
     json.dump(c, open(f"{out}/config.json", "w"), indent=1)

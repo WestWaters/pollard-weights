@@ -20,6 +20,13 @@ import pollard_runtime_update as U
 NEW_CMAKE, OLD_CMAKE = (4, 4, 2), (3, 28, 3)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_caps(tmp_path_factory, monkeypatch):
+    """Never read or write the real runtime/cuda_caps.json; no POLLARD_CUDA_ARCH from the caller."""
+    monkeypatch.setattr(U, "CUDA_CAPS_FILE", str(tmp_path_factory.mktemp("caps") / "cuda_caps.json"))
+    monkeypatch.delenv("POLLARD_CUDA_ARCH", raising=False)
+
+
 def test_parsers_read_real_tool_output():
     smi = "10.7\n10.7\n"                              # one line per GPU
     assert U.parse_compute_caps(smi) == ["10.7"]
@@ -172,3 +179,105 @@ def test_update_refuses_before_cloning(monkeypatch, tmp_path):
     monkeypatch.setattr(U, "_run", lambda *a, **k: cloned.append(a) or (_ for _ in ()).throw(AssertionError(a)))
     assert U.update_engine("fake") is False
     assert not cloned
+
+
+# ---- GPU hidden (CUDA_VISIBLE_DEVICES=-1): `native` would build for no GPU ----------------------------------
+# The build box hides its GPU while it is in use. A `native` build configured then records
+# CMAKE_CUDA_ARCHITECTURES_NATIVE "No CUDA devices found.-real" and ships with no Blackwell kernels.
+
+HIDDEN_SMI = "No devices were found\n"          # what nvidia-smi prints with CUDA_VISIBLE_DEVICES=-1
+
+
+def _detect(smi, nvcc=(12, 8)):
+    def probe(cmd, timeout=20):
+        if cmd[0] == "nvidia-smi":
+            return smi
+        return f"Cuda compilation tools, release {nvcc[0]}.{nvcc[1]}, V0" if "nvcc" in cmd[0] else "cmake version 4.4.2"
+    return lambda: U.detect_cuda(probe=probe)
+
+
+NATIVE = ["GGML_CUDA:BOOL=ON", "CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=native", "GGML_NATIVE:BOOL=ON"]
+
+
+def test_hidden_gpu_never_keeps_native_cuda12(tmp_path):
+    with pytest.raises(U.CudaArchError, match="POLLARD_CUDA_ARCH"):
+        U.cache_flags(_tree(tmp_path, NATIVE), detect=_detect(HIDDEN_SMI))
+
+
+def test_hidden_gpu_cuda13_gets_the_portable_list(tmp_path):
+    f = U.cache_flags(_tree(tmp_path, NATIVE), detect=_detect(HIDDEN_SMI, (13, 0)))
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == U.CUDA13_PORTABLE
+
+
+def test_hidden_gpu_uses_the_arch_recorded_while_it_was_visible(tmp_path):
+    seen = tmp_path / "seen"
+    seen.mkdir()
+    f = U.cache_flags(_tree(seen, NATIVE), detect=_detect("12.0\n"))
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == "native"             # visible: unchanged
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    f = U.cache_flags(_tree(hidden, NATIVE), detect=_detect(HIDDEN_SMI))
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == "120a-real"
+
+
+def test_hidden_gpu_configured_arch_env_then_engines_json(tmp_path, monkeypatch):
+    U._save_caps(["8.6"])                                         # env and engines.json win over the record
+    f = U.cache_flags(_tree(tmp_path, NATIVE), detect=_detect(HIDDEN_SMI), configured="120a-real")
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == "120a-real"
+    monkeypatch.setenv("POLLARD_CUDA_ARCH", "89-real")
+    f = U.cache_flags(str(tmp_path), detect=_detect(HIDDEN_SMI), configured="120a-real")
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == "89-real"
+
+
+def test_visible_gpu_still_wins_over_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("POLLARD_CUDA_ARCH", "89-real")
+    f = U.cache_flags(_tree(tmp_path, NATIVE), detect=_detect("12.0\n"))
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == "native"
+
+
+def test_hidden_gpu_explicit_cached_list_is_kept(tmp_path):
+    f = U.cache_flags(_tree(tmp_path, ["GGML_CUDA:BOOL=ON", "CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=120a-real"]),
+                      detect=_detect(HIDDEN_SMI))
+    assert f["CMAKE_CUDA_ARCHITECTURES"] == "120a-real"
+
+
+def _configured(tmp_path, cache_lines, native_value):
+    tree = _tree(tmp_path, cache_lines)
+    d = tmp_path / "build" / "CMakeFiles" / "4.4.2"
+    d.mkdir(parents=True)
+    (d / "CMakeCUDACompiler.cmake").write_text(f'set(CMAKE_CUDA_ARCHITECTURES_NATIVE "{native_value}")\n')
+    return tree
+
+
+def test_post_configure_check_catches_no_device_sentinel(tmp_path):
+    tree = _configured(tmp_path, NATIVE, "No CUDA devices found.-real")
+    assert "No CUDA devices" in U.configured_cuda_arch_problem(tree)
+
+
+def test_post_configure_check_passes_explicit_arch_even_with_sentinel(tmp_path):
+    # CMake probes the native arch whatever the list says; with an explicit list it is unused.
+    tree = _configured(tmp_path, ["GGML_CUDA:BOOL=ON", "CMAKE_CUDA_ARCHITECTURES:STRING=120a-real"],
+                       "No CUDA devices found.-real")
+    assert U.configured_cuda_arch_problem(tree) == ""
+
+
+def test_post_configure_check_passes_native_with_a_gpu(tmp_path):
+    assert U.configured_cuda_arch_problem(_configured(tmp_path, NATIVE, "120-real")) == ""
+
+
+def test_post_configure_check_unset_arch_with_ggml_native(tmp_path):
+    tree = _configured(tmp_path, ["GGML_CUDA:BOOL=ON", "GGML_NATIVE:BOOL=ON"], "No CUDA devices found.-real")
+    assert U.configured_cuda_arch_problem(tree)
+
+
+def test_build_stops_after_configure_when_no_gpu_targeted(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, cwd=None, timeout=None, env=None):
+        calls.append(cmd)
+        _configured(tmp_path, NATIVE, "No CUDA devices found.-real")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    monkeypatch.setattr(U, "_run", fake_run)
+    ok, msg = U.build(str(tmp_path), {"GGML_CUDA": "ON", "CMAKE_CUDA_ARCHITECTURES": "native"}, 2)
+    assert not ok and "No CUDA devices" in msg
+    assert len(calls) == 1                                        # configure only, no compile

@@ -195,3 +195,84 @@ def test_trust_trees_keeps_existing_git_config_env(monkeypatch):
     monkeypatch.setattr(U.os, "environ", env)
     U.trust_trees("/t")
     assert env["GIT_CONFIG_KEY_0"] == "core.autocrlf" and env["GIT_CONFIG_COUNT"] in ("2", "3")
+
+
+# ---- (d) a stale index right after the clone (Windows, SYSTEM): refresh it, and keep git's words -----------
+
+def _git_repo(tmp, files):
+    staging = os.path.join(tmp, "staging")
+    os.makedirs(staging)
+    for name, text in files.items():
+        open(os.path.join(staging, name), "w").write(text)
+    subprocess.run(["git", "init", "-q", staging], check=True)
+    subprocess.run(["git", "-C", staging, "add", "."], check=True)
+    subprocess.run(["git", "-C", staging, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b"], check=True)
+    return staging
+
+
+_PATCH_F = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
+
+
+def _stale(staging):
+    """Same content, different stat data: what `git apply --3way` refuses as 'does not match index'."""
+    for name in os.listdir(staging):
+        p = os.path.join(staging, name)
+        if os.path.isfile(p):
+            os.utime(p, (946684800, 946684800))
+
+
+def test_reapply_refreshes_a_stale_index_before_applying(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = _git_repo(tmp, {"f.txt": "a\nb\nc\n"})
+        p = os.path.join(tmp, "f.patch")
+        open(p, "w").write(_PATCH_F)
+        _stale(staging)
+        # the failure this guards against: without a refresh git refuses the file
+        r = subprocess.run(["git", "-C", staging, "apply", "--3way", "--check", p], capture_output=True, text=True)
+        assert r.returncode != 0 and "does not match index" in r.stderr
+        monkeypatch.setattr(U, "_patches_for", lambda tree: [{"_patch": p, "files": ["f.txt"]}])
+        monkeypatch.setattr(U, "REPO", tmp)
+        block, notes = U.reapply(staging, os.path.join(tmp, "live"), fresh=True)
+        assert not block, (block, notes)
+        assert "re-applied f.patch" in notes
+        assert open(os.path.join(staging, "f.txt")).read() == "a\nB\nc\n"
+
+
+def test_refresh_alone_makes_a_stale_clone_apply():
+    # reapply's own `git stash create` happens to refresh the index on this git too, so check the refresh directly
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = _git_repo(tmp, {"f.txt": "a\nb\nc\n"})
+        p = os.path.join(tmp, "f.patch")
+        open(p, "w").write(_PATCH_F)
+        _stale(staging)
+        U.refresh_staging_index(staging)
+        r = subprocess.run(["git", "-C", staging, "apply", "--3way", "--check", p], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+
+def test_refresh_resets_a_clone_whose_files_differ():
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = _git_repo(tmp, {"f.txt": "a\nb\nc\n"})
+        open(os.path.join(staging, "f.txt"), "w").write("a\r\nb\r\nc\r\n")    # e.g. an autocrlf checkout
+        note = U.refresh_staging_index(staging)
+        assert "reset to HEAD" in note
+        assert open(os.path.join(staging, "f.txt")).read() == "a\nb\nc\n"
+
+
+def test_refresh_is_quiet_on_a_clean_clone():
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = _git_repo(tmp, {"f.txt": "a\nb\nc\n"})
+        assert U.refresh_staging_index(staging) == ""
+
+
+def test_apply_failure_carries_git_stderr(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        staging = _git_repo(tmp, {"f.txt": "x\ny\nz\n"})            # the patch's context is not there
+        p = os.path.join(tmp, "f.patch")
+        open(p, "w").write(_PATCH_F)
+        monkeypatch.setattr(U, "_patches_for", lambda tree: [{"_patch": p, "files": ["f.txt"]}])
+        monkeypatch.setattr(U, "_absorbed", lambda staging, mm: False)
+        monkeypatch.setattr(U, "REPO", tmp)
+        block, notes = U.reapply(staging, os.path.join(tmp, "live"), fresh=True)
+        assert block and "git:" in block[0] and "f.txt" in block[0], block
+        assert any("git apply failed" in n and "f.txt" in n for n in notes), notes

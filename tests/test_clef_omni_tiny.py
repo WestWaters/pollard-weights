@@ -100,6 +100,10 @@ def test_tiny_checkpoint_converts_to_clef_omni(tiny_gguf):
     names = {t.name for t in reader.tensors}
     assert any(n.startswith("blk.0.") for n in names)
     assert any("decision" in n or "joint" in n or n.startswith("dec.") for n in names), sorted(names)[:40]
+    # llama-server refuses a clef-omni GGUF without its M-RoPE sections ("key not found")
+    sec = reader.fields.get("clef-omni.rope.dimension_sections")
+    assert sec is not None, "no clef-omni.rope.dimension_sections (mrope_section missing from the config)"
+    assert [int(sec.parts[i][0]) for i in sec.data][:3] == [3, 3, 2]
 
 
 def _free_port():
