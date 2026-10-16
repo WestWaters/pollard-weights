@@ -23,6 +23,8 @@ the managed trees (runtime/llama.cpp, runtime/ik_llama.cpp) track upstream on th
   pollard-runtime --update --check         # only report how far behind upstream each engine is
   pollard-runtime --rollback llama.cpp
   pollard-runtime --update --cuda-arch '107-real;100f-virtual'   # force the CUDA arch list (wins over detection)
+  POLLARD_CUDA_ARCH=120a-real pollard-runtime --update   # arch to use when the GPU is hidden (also engines.json
+                                                          # "cuda_arch"; else the arch seen when it was visible)
   pollard-runtime --schedule daily         # launchd (macOS) / Task Scheduler (Windows), low priority
 
 Pipelines call update_engine() themselves when a model's architecture is missing (POLLARD_AUTO_UPDATE=0
@@ -293,7 +295,7 @@ def _has_real_code(entries, n):
     return any(_entry_num(e) == n and not e.strip().endswith("-virtual") for e in entries)
 
 
-def select_cuda_arch(cached, caps, nvcc, cmake, override=None):
+def select_cuda_arch(cached, caps, nvcc, cmake, override=None, fallback=None):
     """CMAKE_CUDA_ARCHITECTURES for this build -> (value or None to leave unset, note or '').
 
     The update used to carry CMakeCache's value over verbatim. That is right while the box stays the
@@ -302,9 +304,27 @@ def select_cuda_arch(cached, caps, nvcc, cmake, override=None):
     only while it still covers every GPU in the box under this toolkit. `native` already resolves
     against the GPU present at configure time, so it is kept -- the RTX 5070 Ti build box (cc 12.0)
     builds exactly as before -- except on Rubin, where it is replaced by the explicit list that also
-    carries the Blackwell-family PTX. An `override` (--cuda-arch) wins over all of it."""
+    carries the Blackwell-family PTX. An `override` (--cuda-arch) wins over all of it.
+
+    With NO GPU visible (CUDA_VISIBLE_DEVICES=-1 -- the build box hides its GPU while it is in use), `native`
+    is never kept: CMake then records "No CUDA devices found.-real" and the build carries no kernels for
+    the card at all. `fallback` (POLLARD_CUDA_ARCH, the engine's cuda_arch in engines.json, else the arch
+    detected on an earlier run) is used instead; with none, CUDA 13 gets the portable list and anything
+    older is refused (CudaArchError) rather than built for nothing."""
     if override:
         return override, f"--cuda-arch override: {override}"
+    if not caps and cached and cached.strip().lower() == "native":
+        if fallback:
+            return fallback, f"no GPU visible, '{cached}' would build for none -- using {fallback}"
+        if nvcc and nvcc >= (13, 0):
+            return CUDA13_PORTABLE, f"no GPU visible, '{cached}' would build for none -- portable list {CUDA13_PORTABLE}"
+        raise CudaArchError(
+            f"no GPU is visible (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}) and the "
+            f"build's arch is '{cached}', which would compile kernels for no GPU at all. Set POLLARD_CUDA_ARCH "
+            "(e.g. 120a-real), \"cuda_arch\" for this engine in runtime-patches/engines.json, or pass --cuda-arch "
+            "-- or run once with the GPU visible so its arch is recorded.")
+    if not caps and not cached and fallback:
+        return fallback, f"no GPU visible -- using configured arch {fallback}"
     want = []
     for cap in caps:                                  # raises for Rubin on a too-old toolkit
         want += [a for a in archs_for_cap(cap, nvcc, cmake) if a not in want]
@@ -332,11 +352,58 @@ def select_cuda_arch(cached, caps, nvcc, cmake, override=None):
     return None, ""
 
 
-def cache_flags(tree, cuda_arch=None, detect=None):
+CUDA_CAPS_FILE = os.path.join(REPO, "runtime", "cuda_caps.json")
+
+
+def _save_caps(caps):
+    """Remember the GPU's compute capability, for runs where the GPU is hidden."""
+    try:
+        old = json.load(open(CUDA_CAPS_FILE)).get("caps")
+    except (OSError, ValueError, AttributeError):
+        old = None
+    if old == caps:
+        return
+    try:
+        os.makedirs(os.path.dirname(CUDA_CAPS_FILE), exist_ok=True)
+        json.dump({"caps": caps, "detected": _dt.datetime.now().isoformat(timespec="seconds")},
+                  open(CUDA_CAPS_FILE, "w"), indent=1)
+    except OSError as exc:
+        log(f"cuda arch: could not record detected compute capability ({exc})")
+
+
+def _saved_caps():
+    try:
+        caps = json.load(open(CUDA_CAPS_FILE)).get("caps") or []
+        return [c for c in caps if re.match(r"^\d+\.\d+$", str(c))]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def configured_cuda_arch(configured=None, nvcc=None, cmake=None):
+    """The arch to build for when no GPU is visible -> (value or None, where it came from).
+    POLLARD_CUDA_ARCH, then the engine's engines.json `cuda_arch` (`configured`), then the compute
+    capability recorded the last time the GPU was visible."""
+    env = os.environ.get("POLLARD_CUDA_ARCH", "").strip()
+    if env:
+        return env, "POLLARD_CUDA_ARCH"
+    if configured:
+        return configured, "engines.json cuda_arch"
+    caps = _saved_caps()
+    if caps:
+        want = []
+        for cap in caps:
+            want += [a for a in archs_for_cap(cap, nvcc, cmake) if a not in want]
+        return ";".join(want), f"compute capability {', '.join(caps)} recorded in {CUDA_CAPS_FILE}"
+    return None, ""
+
+
+def cache_flags(tree, cuda_arch=None, detect=None, configured=None):
     """CMake options the live build was configured with, so an update builds the same engine.
 
     On a CUDA build the arch list is re-checked against the GPU and toolkit in the box right now
-    (select_cuda_arch); raises CudaArchError when the toolkit cannot build for the GPU at all."""
+    (select_cuda_arch); raises CudaArchError when the toolkit cannot build for the GPU at all.
+    A visible GPU's compute capability is recorded, so a later run with the GPU hidden still builds
+    for it (`configured` = the engine's engines.json cuda_arch, see configured_cuda_arch)."""
     p = os.path.join(tree, "build", "CMakeCache.txt")
     out = {}
     if os.path.isfile(p):
@@ -352,7 +419,14 @@ def cache_flags(tree, cuda_arch=None, detect=None):
             out["CMAKE_CUDA_ARCHITECTURES"] = "native"
     if out.get("GGML_CUDA") == "ON":
         caps, nvcc, cmake = ([], None, None) if cuda_arch else (detect or detect_cuda)()
-        value, note = select_cuda_arch(out.get("CMAKE_CUDA_ARCHITECTURES"), caps, nvcc, cmake, cuda_arch)
+        fallback, src = (None, "")
+        if caps:
+            _save_caps(caps)
+        elif not cuda_arch:
+            fallback, src = configured_cuda_arch(configured, nvcc, cmake)
+        value, note = select_cuda_arch(out.get("CMAKE_CUDA_ARCHITECTURES"), caps, nvcc, cmake, cuda_arch, fallback)
+        if fallback and value == fallback:
+            note += f" (from {src})"
         if value:
             out["CMAKE_CUDA_ARCHITECTURES"] = value
         if note:
@@ -384,12 +458,57 @@ def build(tree, flags, jobs):
     else:
         steps = [["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", *defs],
                  ["cmake", "--build", "build", "--config", "Release", "-j", str(jobs)]]
-    for s in steps:
+    for i, s in enumerate(steps):
         r = _run(s, cwd=tree, timeout=4 * 3600)
         if r.returncode != 0:
             tail = (r.stdout + r.stderr)[-1500:]
             return False, f"build step failed: {s if isinstance(s, str) else ' '.join(s)}\n{tail}"
+        if i == 0 and flags.get("GGML_CUDA") == "ON":
+            bad = configured_cuda_arch_problem(tree)
+            if bad:
+                return False, f"configure produced a CUDA build for no GPU -- not compiling: {bad}"
     return True, "built all targets"
+
+
+NO_DEVICE = "no cuda devices"
+
+
+def configured_cuda_arch_problem(tree):
+    """After configure: does the build actually target a GPU? -> problem text, '' when it does.
+
+    `native` with no visible GPU makes CMake record CMAKE_CUDA_ARCHITECTURES_NATIVE "No CUDA devices
+    found.-real" (build/CMakeFiles/<ver>/CMakeCUDACompiler.cmake) and the build has no kernels for the
+    card. Caught here, before an hour of compiling, instead of at the first model load."""
+    cache = os.path.join(tree, "build", "CMakeCache.txt")
+    value, ggml_native = None, False
+    try:
+        for line in open(cache, encoding="utf-8", errors="replace"):
+            if re.match(r"^GGML_NATIVE:BOOL=(ON|TRUE|1)$", line.strip(), re.I):
+                ggml_native = True
+            m = re.match(r"^(CMAKE_CUDA_ARCHITECTURES\w*):[A-Z]+=(.*)$", line.strip())
+            if m:
+                if NO_DEVICE in m.group(2).lower():
+                    return f"{m.group(1)}={m.group(2)} in {cache}"
+                if m.group(1) == "CMAKE_CUDA_ARCHITECTURES":
+                    value = m.group(2).strip()
+    except OSError:
+        return ""
+    if value is not None and not value:
+        return f"CMAKE_CUDA_ARCHITECTURES is empty in {cache}"
+    if value is None:
+        if not ggml_native:
+            return ""
+        value = "native"            # llama.cpp's own default with GGML_NATIVE=ON and no arch given
+    for f in glob.glob(os.path.join(tree, "build", "CMakeFiles", "*", "CMakeCUDACompiler.cmake")):
+        try:
+            text = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        m = re.search(r'set\(CMAKE_CUDA_ARCHITECTURES_NATIVE\s+"([^"]*)"\)', text)
+        if m and "native" in value.lower() and (NO_DEVICE in m.group(1).lower() or not m.group(1).strip()):
+            return (f"CMAKE_CUDA_ARCHITECTURES={value} resolved to '{m.group(1)}' ({f}) -- the GPU was not "
+                    "visible at configure time; set POLLARD_CUDA_ARCH or pass --cuda-arch")
+    return ""
 
 
 def smoke(tree):
@@ -423,6 +542,33 @@ def _patches_for(tree):
     return [m for m in caps if m.get("tree_slug") == slug]
 
 
+def _git_err(r, n=400):
+    """git's stderr (else stdout) on one line, the tail that names the cause."""
+    text = " | ".join(l.strip() for l in ((r.stderr or "") or (r.stdout or "")).splitlines() if l.strip())
+    return text[-n:] or "(no output)"
+
+
+def refresh_staging_index(staging):
+    """Bring the freshly cloned STAGING tree's index back in line with its files before any patch.
+
+    On the Windows build box (update run as SYSTEM) every patch failed right after the clone -- clef-omni
+    "not in the live build", the rest BLOCKED -- and every one applied cleanly after `git reset --hard HEAD`.
+    The clone's index held stat data that no longer matched the files (racy timestamps, autocrlf rewrites,
+    a second account touching the tree), and `git apply --3way` refuses any file that "does not match
+    index". A fresh clone has nothing of ours in it, so resetting it is safe. Never call this on the live
+    tree. Returns a note when something had to be fixed or failed, '' when the index was already clean."""
+    r = _run(["git", "-C", staging, "update-index", "-q", "--refresh"], timeout=300)
+    stale = r.returncode != 0
+    d = _run(["git", "-C", staging, "diff", "--quiet", "HEAD", "--"], timeout=300)
+    if not stale and d.returncode == 0:
+        return ""
+    h = _run(["git", "-C", staging, "reset", "-q", "--hard", "HEAD"], timeout=600)
+    if h.returncode != 0:
+        return f"index refresh: reset of the staged clone failed: {_git_err(h)}"
+    return ("index refresh: staged clone's index was stale" + (f" ({_git_err(r, 200)})" if stale else "")
+            + " -- reset to HEAD before applying patches")
+
+
 def reapply(staging, tree, fresh=False):
     """Captured patches + scripted patches. Returns (blocking_failures, notes).
 
@@ -431,12 +577,18 @@ def reapply(staging, tree, fresh=False):
     from pollard_runtime import _arch_list_from_source
     up = _arch_list_from_source(staging) or set()
     block, notes = [], []
+    n = refresh_staging_index(staging)
+    if n:
+        notes.append(n)
     for m in _patches_for(tree):
         snap = _git(staging, "stash", "create")          # index + tree as the earlier patches left them
         r = _run(["git", "-C", staging, "apply", "--3way", "--ignore-whitespace", m["_patch"]], timeout=300)
         if r.returncode == 0:
             notes.append(f"re-applied {os.path.basename(m['_patch'])}")
             continue
+        # Keep git's own words: a failure that is not a real conflict (a stale index, a missing base blob)
+        # reads exactly like one without them.
+        notes.append(f"{os.path.basename(m['_patch'])}: git apply failed (exit {r.returncode}): {_git_err(r)}")
         # A failed --3way apply does NOT leave the tree alone: the hunks that merged stay applied and the
         # rest are written as <<<<<<< conflicts. ik_llama's superseded k2-horizon-arch patch did exactly
         # that, was reported "not needed", and the build then died on conflict markers in llama-arch.h.
@@ -452,10 +604,10 @@ def reapply(staging, tree, fresh=False):
             notes.append(f"{name} not needed: upstream already carries its changes")
         else:
             block.append(f"{name} is live in this engine and does not apply to upstream -- rebase it first "
-                         f"(it changes {', '.join(m.get('files', [])[:4])}{'...' if len(m.get('files', [])) > 4 else ''})")
+                         f"(it changes {', '.join(m.get('files', [])[:4])}{'...' if len(m.get('files', [])) > 4 else ''}; git: {_git_err(r, 300)})")
     for sc in sorted(glob.glob(os.path.join(REPO, "runtime-patches", "scripts", "*.py"))):
         r = _run([sys.executable, sc, staging], timeout=600)
-        notes.append(f"{os.path.basename(sc)}: {'ok' if r.returncode == 0 else 'not applicable (' + (r.stdout + r.stderr).strip().splitlines()[-1][:120] + ')'}")
+        notes.append(f"{os.path.basename(sc)}: {'ok' if r.returncode == 0 else 'not applicable (' + _git_err(r, 120) + ')'}")
     return block, notes
 
 
@@ -627,7 +779,8 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
     # is known now, not an hour into the build. A fresh tree has no cache, so `tree` and the staging
     # clone give the same answer. --with CMAKE_CUDA_ARCHITECTURES=... counts as an override too.
     try:
-        flags = cache_flags(tree, cuda_arch=cuda_arch or (extra or {}).get("CMAKE_CUDA_ARCHITECTURES"))
+        flags = cache_flags(tree, cuda_arch=cuda_arch or (extra or {}).get("CMAKE_CUDA_ARCHITECTURES"),
+                            configured=e.get("cuda_arch"))
     except CudaArchError as exc:
         log(f"{name}: NOT updating -- {exc}")
         return False
