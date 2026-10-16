@@ -880,6 +880,13 @@ def main_quick(a):
     return 0 if verdict else 1
 
 
+def _same(rows, ref_rows):
+    """Probes where the rung and the f16 had the same outcome: retention can sit at 100% while the rung trades
+    false calls for missed ones, and this is the number that shows it."""
+    ref = {q["id"]: q["ok"] for q in ref_rows}
+    return sum(1 for r in rows if r["id"] in ref and ref[r["id"]] == r["ok"])
+
+
 def verdict_for(s, rs=None, ret=None, min_rate=0.75, min_retention=90.0):
     """PASS/FAIL. With a reference the gate is retention (the rung against its own f16 -- a small model that was
     never good at tools is not failed for that); without one it is the absolute success rate."""
@@ -906,8 +913,7 @@ def main_full(a):
         if ret[0] is not None:
             print(f"\n  RETENTION {100 * ret[0]:.1f}%  (95% paired-bootstrap CI {100 * ret[1]:.1f}-{100 * ret[2]:.1f}%)"
                   f"   success {_pct(s['rate'])} vs {_pct(rs['rate'])}")
-            same = sum(1 for r in rows for q in ref_rows if q["id"] == r["id"] and q["ok"] == r["ok"])
-            print(f"  same outcome as the f16 on {same}/{len(rows)} probes")
+            print(f"  same outcome as the f16 on {_same(rows, ref_rows)}/{len(rows)} probes")
         else:
             print("\n  (the reference passes no probe: nothing to retain -- retention is undefined)")
     ok = verdict_for(s, rs, ret[0], a.min_rate, a.min_retention)
@@ -925,6 +931,8 @@ def main_full(a):
         if rs is not None:
             tc.update({"ref_rate": rs["rate"], "ref_rate_ci": rs["rate_ci"],
                        "drop": round((rs["rate"] or 0) - (s["rate"] or 0), 4)})
+        if ref_rows is not None:
+            tc["agreement"] = round(_same(rows, ref_rows) / max(len(rows), 1), 4)
         if ret[0] is not None:
             tc.update({"retention": round(100 * ret[0], 2),
                        "retention_ci": [round(100 * ret[1], 2), round(100 * ret[2], 2)]})
