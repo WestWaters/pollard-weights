@@ -144,6 +144,10 @@ def test_gpu_free_is_the_emptiest_card():
 
 def test_preflight_not_measured_paths(monkeypatch, tmp_path):
     d = _dir(tmp_path, "m", {})
+    monkeypatch.setattr(TC, "gpu_free_gb", lambda *a: None)
+    with pytest.raises(TC.NotMeasured, match="needs an NVIDIA GPU"):             # a Mac: the first reason
+        TC.preflight("vllm", d, kind={"tools": {"vllm_parser": "hermes"}}, server="/bin/vllm")
+    monkeypatch.setattr(TC, "gpu_free_gb", lambda *a: 15.0)
     monkeypatch.setattr(TC, "_apple", lambda: False)
     with pytest.raises(TC.NotMeasured, match="Apple Silicon"):
         TC.preflight("mlx", d)
@@ -157,7 +161,6 @@ def test_preflight_not_measured_paths(monkeypatch, tmp_path):
         TC.preflight("exl3", d)
     # vLLM present and a parser known: the GPU rule decides
     monkeypatch.setattr(TC, "gpu_users", lambda *a: ["Game.exe"])
-    monkeypatch.setattr(TC, "gpu_free_gb", lambda *a: 15.0)
     with pytest.raises(TC.NotMeasured, match="resident"):
         TC.preflight("vllm", d, kind={"tools": {"vllm_parser": "hermes"}}, server="/bin/vllm")
     monkeypatch.setattr(TC, "gpu_users", lambda *a: [])

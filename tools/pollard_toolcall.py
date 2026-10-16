@@ -591,6 +591,10 @@ def grade_reply(reply, probe):
             row.update(failure="unclosed-think", detail="the budget ran out before any call was made")
         elif looks_like_call:
             row.update(failure="unparsed", detail="call-shaped text the server's parser did not accept")
+        elif finish == "tool_calls":
+            # mlx_lm.server: the model opened a call, the parser rejected its text and dropped it from the reply
+            row.update(failure="unparsed", detail="the server's parser dropped the call (finish_reason tool_calls, "
+                                                  "no tool_calls)")
         else:
             row.update(failure="no-call", detail="answered in prose instead of calling")
         return row
@@ -1029,6 +1033,8 @@ def preflight(backend, model, ngl="0", kind=None, server=None):
             raise NotMeasured("mlx-lm is not installed here (pip install mlx-lm)")
         check_ram(need)
         return {}
+    if backend in ("vllm", "exl3") and gpu_free_gb() is None:
+        raise NotMeasured(f"{BACKEND_SERVER[backend]} needs an NVIDIA GPU and this machine has none")
     if backend == "vllm":
         import shutil
         if not (server or shutil.which("vllm")):
