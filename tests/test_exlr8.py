@@ -602,7 +602,8 @@ def test_release_plans_one_encode_then_a_manifest_per_rung(model):
     assert by["exlr8/3.25bpw/build"].out.endswith("Tiny-1B-Pollard-EXLR8-3.25bpw")
     v = by["exlr8/3.25bpw/verify"].cmd
     assert v[v.index("--lane") + 1] == "exlr8" and v[v.index("--source") + 1] == c["hf_dir"] and "--eval" in v
-    assert R.repo_name("PollardWeights", "Qwen/Qwen3-8B", "exlr8") == "PollardWeights/Qwen3-8B-Pollard-EXLR8"
+    assert R.repo_name("PollardWeights", "Qwen/Qwen3-8B", "exlr8") == "PollardWeights/Qwen3-8B-Pollard"
+    assert R.lane_folder("exlr8") == "EXLR8"
     assert R.REQUIRES["exlr8"] == "cuda" and R.rung_tag("exlr8", 3.25) == "3.25bpw"
 
 

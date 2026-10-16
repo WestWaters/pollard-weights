@@ -58,9 +58,11 @@ def test_plan_file_overrides_preset_and_cli_preset_overrides_file(tmp_path):
 
 def test_repo_names_match_the_published_pollardweights_shelf():
     assert R.repo_name("PollardWeights", "Qwen/Qwen3-8B", "gguf") == "PollardWeights/Qwen3-8B-Pollard"
-    assert R.repo_name("PollardWeights", "openbmb/MiniCPM5-2B", "mlx") == "PollardWeights/MiniCPM5-2B-Pollard-MLX"
-    for lane in ("gptq", "mx", "exl3"):
-        assert R.repo_name("O", "a/M", lane) == f"O/M-Pollard-{lane.upper()}"
+    # ONE repo per model: every lane in <M>-Pollard, GGUF at the root, the others in their own folder
+    assert R.repo_name("PollardWeights", "openbmb/MiniCPM5-2B", "mlx") == "PollardWeights/MiniCPM5-2B-Pollard"
+    for lane in ("gptq", "mx", "exl3", "exlr8", "draft"):
+        assert R.repo_name("O", "a/M", lane) == "O/M-Pollard" and R.lane_folder(lane) == lane.upper()
+    assert R.lane_folder("gguf") == ""
 
 
 def test_every_lane_is_a_ladder_with_build_then_verify_per_rung(model):

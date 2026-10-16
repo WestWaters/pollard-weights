@@ -248,6 +248,23 @@ class _Local:
         self.fh.close()
 
 
+def hf_headers(url, extra=None):
+    """Request headers for a Hub URL: the user's token when one is set, so a PRIVATE repo (pollard release keeps a
+    repo private until every lane has landed) can still be read. Never sent anywhere but huggingface.co."""
+    h = {"User-Agent": "pollard-ggufcheck", **(extra or {})}
+    if str(url).startswith("https://huggingface.co/"):
+        tok = os.environ.get("HF_TOKEN")
+        if not tok:
+            try:
+                from huggingface_hub import get_token
+                tok = get_token()
+            except Exception:                                     # noqa: BLE001
+                tok = None
+        if tok:
+            h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
 class _Remote:
     """Byte source for a URL, pulled in range-request windows.
 
@@ -264,8 +281,7 @@ class _Remote:
     def _fill(self, upto):
         while len(self.buf) < upto:
             end = max(upto, len(self.buf) + self.window) - 1
-            r = self._req.Request(self.url, headers={"Range": f"bytes={len(self.buf)}-{end}",
-                                                    "User-Agent": "pollard-ggufcheck"})
+            r = self._req.Request(self.url, headers=hf_headers(self.url, {"Range": f"bytes={len(self.buf)}-{end}"}))
             with self._req.urlopen(r, timeout=90) as fh:
                 got = fh.read()
             if not got:
@@ -446,8 +462,7 @@ def main():
     if a.repo:
         import urllib.request
         url = f"https://huggingface.co/api/models/{a.repo}"
-        with urllib.request.urlopen(urllib.request.Request(
-                url, headers={"User-Agent": "pollard-ggufcheck"}), timeout=60) as fh:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hf_headers(url)), timeout=60) as fh:
             info = json.load(fh)
         targets += [f"https://huggingface.co/{a.repo}/resolve/main/{s['rfilename']}"
                     for s in info.get("siblings", []) if s["rfilename"].endswith(".gguf")]
