@@ -8,7 +8,48 @@ import pollard_runtime_update as U
 import pollard_runtime as R
 
 REPO = os.path.join(os.path.dirname(__file__), "..")
-CLEF_OMNI = os.path.join(REPO, "runtime-patches", "llama.cpp-clef-omni.patch")
+_REAL_CLEF_OMNI = os.path.join(REPO, "runtime-patches", "llama.cpp-clef-omni.patch")
+# The registration hunks of runtime-patches/llama.cpp-clef-omni.patch. The nix package ships only the .py files
+# of tests/ and no runtime-patches/, so the tests fall back to this excerpt there; it carries the same arch
+# registrations (and the neighbouring upstream `clef` lines that tripped the old any()-over-strings check).
+_CLEF_OMNI_EXCERPT = """\
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -573,6 +573,7 @@ class MODEL_ARCH(IntEnum):
+     QWEN35MOE        = auto()
+     CLEF             = auto()
+     VLLM_DECISION2   = auto()
++    CLEF_OMNI        = auto()
+     QWEN4EXP         = auto()
+@@ -1377,6 +1378,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
+     MODEL_ARCH.CLEF:             "clef",
+     MODEL_ARCH.VLLM_DECISION2:   "vllm-decision2",
++    MODEL_ARCH.CLEF_OMNI:        "clef-omni",
+     MODEL_ARCH.QWEN4EXP:         "qwen4exp",
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -42,6 +42,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
+     { LLM_ARCH_CLEF,             "clef"             },
+     { LLM_ARCH_VLLM_DECISION2,   "vllm-decision2"   },
++    { LLM_ARCH_CLEF_OMNI,        "clef-omni"        },
+     { LLM_ARCH_QWEN4EXP,         "qwen4exp"         },
+"""
+
+
+def _clef_omni_patch():
+    if os.path.exists(_REAL_CLEF_OMNI):
+        return _REAL_CLEF_OMNI
+    p = os.path.join(tempfile.gettempdir(), "pollard-test-clef-omni-excerpt.patch")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(_CLEF_OMNI_EXCERPT)
+    return p
+
+
+CLEF_OMNI = _clef_omni_patch()
 # upstream at 620d222: has clef (and vllm-decision2), not clef-omni
 UPSTREAM_620D222 = {"llama", "qwen35", "qwen35moe", "clef", "vllm-decision2", "qwen3vlmoe", "nemotron_h_moe"}
 
