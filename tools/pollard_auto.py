@@ -404,6 +404,10 @@ def _build_ladder_passthrough(a, tensors):
         print("      nothing in the changeable classes can go lower" +
               ("" if a.imatrix else " without an imatrix (the 1-bit / IQ2 rungs need one)") + ".")
         return
+    want = _wanted_rungs(a)
+    if want is not None:
+        rungs = [(lb, t) for lb, t in rungs if lb.upper() in want]
+        print(f"      --rung: building {', '.join(lb for lb, _ in rungs) or 'no passthrough rung'} this run")
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, target in rungs:
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", f"{(target + 1) / 0.85e9:.9f}", "--reserve", "0",

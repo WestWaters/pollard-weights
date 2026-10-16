@@ -467,11 +467,10 @@ def lane_steps(cfg, c, lane):
                          desc="convert -> imatrix -> measured publish ladder (+ IQ*_KT flagship where ik_llama builds)"),
                     Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")]
         # one rung at a time: build -> measure + gate -> upload -> free, so the peak disk is ONE rung, not the ladder
-        from pollard_auto import LADDER
-        steps, f16_gb = [], _size_gb(c["f16"])
-        for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]:
+        steps = []
+        for label, gb in gguf_ladder_labels(c):
             steps.append(Step(id=f"gguf/ladder-{label}", lane="gguf", rung=label, kind="build", requires="any",
-                              cmd=cmd + ["--rung", label], out=None, disk_gb=frac * f16_gb * 1.1 if f16_gb else 0,
+                              cmd=cmd + ["--rung", label], out=None, disk_gb=gb,
                               desc=f"the {label} rung of the measured publish ladder"))
             steps.append(Step(id=f"gguf/rungs-{label}", lane="gguf", kind="expand", requires="any"))
         return steps
@@ -536,6 +535,22 @@ def lane_steps(cfg, c, lane):
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
             steps.append(st)
     return steps
+
+
+def gguf_ladder_labels(c):
+    """[(label, estimated GB)] of the GGUF ladder, rung by rung, for --free-after-upload. An f16/bf16 source gets
+    pollard's publish ladder (Q6_K / IQ4_XS / IQ3_S / IQ2 + the automap flagship, sized as fractions of the f16); an
+    already-quantized source (a vendor QAT GGUF) gets the passthrough ladder (PT25..PT100, sized from its tensors)."""
+    f16_gb = _size_gb(c["f16"])
+    try:
+        import pollard_passthrough as pt
+        ts = pt.read_tensors(c["f16"]) if os.path.isfile(c["f16"]) else None
+        if ts is not None and pt.is_quantized_source(ts):
+            return [(lb, b / 1e9 * 1.02) for lb, b in pt.ladder_targets(ts, imatrix_ok=bool(c.get("imatrix")))]
+    except Exception:                                              # noqa: BLE001 -- unreadable: the f16 ladder
+        pass
+    from pollard_auto import LADDER
+    return [(label, frac * f16_gb * 1.1) for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]]
 
 
 def _draft_on(cfg):

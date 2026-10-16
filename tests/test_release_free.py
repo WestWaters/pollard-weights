@@ -205,3 +205,14 @@ def test_bare_pollard_resolves_to_its_module_without_a_launcher(monkeypatch):
     cmd = A._resolve_tool(["pollard", "--gguf", "x.gguf"])
     assert cmd[0] == sys.executable and cmd[1].endswith("pollard_auto.py") and cmd[2:] == ["--gguf", "x.gguf"]
     assert A._resolve_tool(["pollard-verify", "--x"])[1].endswith("pollard_verify.py")
+
+
+def test_a_quantized_source_gets_the_passthrough_ladder_rung_by_rung(model, inputs, monkeypatch):
+    import pollard_passthrough as pt
+    monkeypatch.setattr(pt, "read_tensors", lambda p: [{"n_bytes": 10}])
+    monkeypatch.setattr(pt, "is_quantized_source", lambda ts: True)
+    monkeypatch.setattr(pt, "ladder_targets", lambda ts, imatrix_ok=True: [("PT25", 9e9), ("PT100", 6e9)])
+    c, _, steps = R.plan_steps(plan(inputs), model, {"gguf"})
+    builds = [s for s in steps if s.id.startswith("gguf/ladder-")]
+    assert [s.rung for s in builds] == ["PT25", "PT100"]
+    assert 9.0 < builds[0].disk_gb < 9.5 and builds[0].cmd[-2:] == ["--rung", "PT25"]
