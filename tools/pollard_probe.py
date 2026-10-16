@@ -782,6 +782,7 @@ def main():
         profile, noise, layers = _imatrix_sensitivity(a.gguf, a.from_imatrix, groups,
                                                       a.probe_bits, LADDER_BITS)
         out = a.out or (os.path.splitext(a.gguf)[0] + ".sensitivity.json")
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)   # a fresh workspace has no calibration/
         json.dump({**profile, "noise": noise, "probe": f"rtn{a.probe_bits}", "layers": layers,
                    "source": a.gguf, "method": "imatrix-hessian"}, open(out, "w"), indent=2)
         for g in groups:
@@ -926,6 +927,7 @@ def main():
         print(f"  RANKING {st['verdict']} -- {st['advice']}", flush=True)
     elif slices:
         print("  (stability needs the forward-pass sweep; --stream keeps no per-chunk costs)", flush=True)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     json.dump(payload, open(out, "w"), indent=2)
     for g in groups:
         vals = list(profile[g].values())

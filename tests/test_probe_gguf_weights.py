@@ -235,3 +235,17 @@ def test_per_row_scale_and_a_misfit_scale(tmp_path):
     assert torch.equal(P._apply_scale(w, [2.0, 3.0]), torch.tensor([[2.0] * 4, [3.0] * 4]))
     with pytest.raises(ValueError):
         P._apply_scale(w, [1.0, 2.0, 3.0])
+
+
+def test_from_imatrix_cli_creates_the_output_folder(tmp_path, monkeypatch):
+    # LFM2.5 release, 2026-10-16: the profile scored all 220 tensors, then died writing into a calibration/ folder a
+    # fresh workspace did not have yet (the plan named its corpus, so pollard-calib never made the folder).
+    model, matrix = tmp_path / "m.gguf", tmp_path / "m.dat"
+    write_model(model, {"blk.0.ffn_up.weight": W})
+    write_imatrix_many(matrix, ["blk.0.ffn_up.weight"])
+    out = tmp_path / "models" / "M" / "calibration" / "M.sensitivity.json"
+    monkeypatch.setattr(sys, "argv", ["pollard-probe", "--from-imatrix", str(matrix), "--gguf", str(model),
+                                      "--out", str(out), "--groups", "ffn"])
+    P.main()
+    import json
+    assert json.load(open(out))["method"] == "imatrix-hessian"
