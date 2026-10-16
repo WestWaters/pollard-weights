@@ -61,9 +61,12 @@ class FakeApi:
 
 @pytest.fixture
 def hub(monkeypatch):
-    import huggingface_hub
+    """A fake huggingface_hub module: the tests run where the package is not installed (the nix core build)."""
+    import types
     store = {}
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: FakeApi(store))
+    fake = types.ModuleType("huggingface_hub")
+    fake.HfApi = lambda: FakeApi(store)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
     return store
 
 
