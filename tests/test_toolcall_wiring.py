@@ -9,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import pollard_auto as pa  # noqa: E402
@@ -62,7 +64,10 @@ def test_model_kinds_reads_the_tool_family(monkeypatch):
 
 
 def test_shipped_gates_yaml_matches_the_builtin():
-    assert (ROOT / "recipes" / "gates.yaml").read_text(encoding="utf-8") == V.DEFAULT_GATES
+    shipped = ROOT / "recipes" / "gates.yaml"
+    if not shipped.is_file():                                    # the nix check ships tests/*.py only
+        pytest.skip("recipes/gates.yaml not in this source tree")
+    assert shipped.read_text(encoding="utf-8") == V.DEFAULT_GATES
 
 
 # ------------------------------------------------------------------ release: toolcall auto
