@@ -1040,7 +1040,430 @@ def format_tool_call(family, name, arguments):
     return w.get(family)
 
 
-_DECISION_TAGS = ("decision-model", "calibrated-probabilities", "system-one")
+# ----------------------------------------------------------------- reading calls back (the inverse of the writers)
+#
+# A server parses the model's calls for us (llama-server --jinja, mlx_lm.server, vllm --tool-call-parser). A model run
+# IN-PROCESS (exllamav3, transformers) hands back raw text, so the call has to be read the way that family's server
+# parser would read it: keyed on the family toolcall_info named, strict about the family's own markers (call-shaped
+# text in another syntax is NOT a call -- a server would not accept it either), typed through the tool's schema the
+# way vLLM's tagged-argument parsers do. parse_tool_calls(format_tool_call(f, n, a), f) == [(n, a)] for every family
+# with a writer; the families below without a reader are reported, never guessed.
+
+#: every opener a call can start with, any family -- "the model tried to call" even when nothing parsed
+CALL_MARKERS = re.compile(
+    r"<tool_call>|<tool_calls>|\[TOOL_CALLS\]|<\|tool_call|<function[=\s]|<\|python_tag\|>|<\|START_ACTION\|>|"
+    r"<TOOLCALL>|<minimax:tool_call>|<seed:tool_call>|<invoke name=|<start_function_call>|<\|tool_calls_section_begin"
+    r"|tool\u2581calls?\u2581begin|DSML|to=functions\.|functools\[|<\|function_call\|>|<\|tools_prefix\|>|"
+    r"tool_call:opensource|>>>[A-Za-z_]|Action:\s*```|\"name\"\s*:|\w+\([^()]*=")
+
+
+def call_shaped(text):
+    """Does this answer look like an attempted call (in any family's syntax)? A call the parser could not read is a
+    format failure (`unparsed`), not prose -- the served and the in-process paths both grade it that way."""
+    return bool(CALL_MARKERS.search(text or ""))
+
+
+def _json_values(s, opener="{["):
+    """Every JSON value starting at a `{`/`[` in s, left to right (raw_decode; non-JSON skipped)."""
+    dec, out, i = json.JSONDecoder(), [], 0
+    while i < len(s):
+        if s[i] in opener:
+            try:
+                val, end = dec.raw_decode(s, i)
+                out.append(val)
+                i = end
+                continue
+            except ValueError:
+                pass
+        i += 1
+    return out
+
+
+def _call_from_obj(o):
+    """(name, args) from one JSON call object, whichever spelling the family uses; None when it is not a call."""
+    if not isinstance(o, dict):
+        return None
+    if isinstance(o.get("function"), dict):                          # OpenAI shape
+        o = o["function"]
+    name = o.get("name") or o.get("tool_name")
+    if not isinstance(name, str):
+        if len(o) == 1 and isinstance(next(iter(o.values())), dict):  # apertus {NAME: {...}}
+            return next(iter(o.keys())), next(iter(o.values()))
+        return None
+    args = next((o[k] for k in ("arguments", "parameters", "args", "input") if k in o), {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            return name, args                                        # graded as bad-args, as a server would pass it
+    return name, args
+
+
+def _calls_in_json(s):
+    out = []
+    for v in _json_values(s):
+        for o in (v if isinstance(v, list) else [v]):
+            c = _call_from_obj(o)
+            if c:
+                out.append(c)
+    return out
+
+
+def _coerce(raw, spec):
+    """One tagged argument's text -> its value, by the schema type (vLLM qwen3_coder / glm / minimax readers)."""
+    t = (spec or {}).get("type")
+    if t == "string":
+        return raw
+    if t == "integer":
+        try:
+            return int(raw.strip())
+        except ValueError:
+            pass
+    if t == "number":
+        try:
+            f = float(raw.strip())
+            return int(f) if f.is_integer() and re.fullmatch(r"-?\d+", raw.strip()) else f
+        except ValueError:
+            pass
+    if t == "boolean" and raw.strip().lower() in ("true", "false"):
+        return raw.strip().lower() == "true"
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    try:
+        import ast
+        return ast.literal_eval(raw)
+    except Exception:                                                # noqa: BLE001
+        return raw
+
+
+def _tagged(name, pairs, schemas):
+    props = ((schemas or {}).get(name) or {})
+    return name, {k.strip(): _coerce(v, props.get(k.strip())) for k, v in pairs}
+
+
+def _strip1(v):
+    """A tagged value without the one newline the writers put either side of it."""
+    if v.startswith("\n"):
+        v = v[1:]
+    if v.endswith("\n"):
+        v = v[:-1]
+    return v
+
+
+def _pythonic(s):
+    """[f(a=1), g(b="x")] -> [(name, args)] via ast (JSON true/false/null accepted too)."""
+    import ast
+    s = s.strip()
+    if not s.startswith("["):
+        s = "[" + s + "]"
+    try:
+        tree = ast.parse(s, mode="eval").body
+    except SyntaxError:
+        return []
+    out = []
+
+    def lit(node):
+        if isinstance(node, ast.Name) and node.id in ("true", "false", "null"):
+            return {"true": True, "false": False, "null": None}[node.id]
+        if isinstance(node, ast.List):
+            return [lit(e) for e in node.elts]
+        if isinstance(node, ast.Dict):
+            return {lit(k): lit(v) for k, v in zip(node.keys, node.values)}
+        return ast.literal_eval(node)
+    for call in (tree.elts if isinstance(tree, ast.List) else [tree]):
+        if not isinstance(call, ast.Call):
+            return []
+        fn = call.func
+        name = fn.id if isinstance(fn, ast.Name) else (ast.unparse(fn) if isinstance(fn, ast.Attribute) else None)
+        try:
+            out.append((name, {k.arg: lit(k.value) for k in call.keywords}))
+        except Exception:                                            # noqa: BLE001 -- a non-literal argument
+            return []
+    return out
+
+
+def _balanced_list(t, start):
+    """The `[...]` starting at t[start], string-aware; None when it never closes."""
+    depth, q, esc = 0, None, False
+    for i in range(start, len(t)):
+        c = t[i]
+        if q:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == q:
+                q = None
+        elif c in "\"'":
+            q = c
+        elif c in "[(":
+            depth += 1
+        elif c in "])":
+            depth -= 1
+            if depth == 0:
+                return t[start:i + 1]
+    return None
+
+
+def _kv_object(body, quote):
+    """Gemma's `{key:<|"|>v<|"|>,n:3}` (or FunctionGemma's <escape>) -> a dict."""
+    s = body.replace(quote, '"')
+    s = re.sub(r'([{,]\s*)([A-Za-z_][\w\-]*)\s*:', r'\1"\2":', s)
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, dict) else None
+    except ValueError:
+        return None
+
+
+_FW = "\uff5c"                                                     # DeepSeek's full-width bar
+_TCB, _TCE, _TSEP = f"<{_FW}tool\u2581call\u2581begin{_FW}>", f"<{_FW}tool\u2581call\u2581end{_FW}>", f"<{_FW}tool\u2581sep{_FW}>"
+
+
+def _p_hermes(t, sc):
+    out = []
+    for m in re.finditer(r"<tool_call>(.*?)(?:</tool_call>|$)", t, re.S):
+        out += _calls_in_json(m.group(1))
+    return out
+
+
+def _p_function_eq(t, sc):                                         # qwen3_coder / seed_oss
+    out = []
+    for m in re.finditer(r"<function=([^>\s]+)>(.*?)(?:</function>|$)", t, re.S):
+        pairs = [(k, _strip1(v)) for k, v in re.findall(
+            r"<parameter=([^>\s]+)>(.*?)(?:</parameter>|(?=<parameter=)|$)", m.group(2), re.S)]
+        out.append(_tagged(m.group(1).strip(), pairs, sc))
+    return out
+
+
+def _p_glm(t, sc):
+    out = []
+    for m in re.finditer(r"<tool_call>\s*([^\s<]+)\s*(.*?)(?:</tool_call>|$)", t, re.S):
+        pairs = [(k, _strip1(v)) for k, v in re.findall(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+                                                        m.group(2), re.S)]
+        out.append(_tagged(m.group(1), pairs, sc))
+    return out
+
+
+def _p_invoke(t, sc, inv=r'<invoke name="([^"]+)">', par=r'<parameter name="([^"]+)">(.*?)</parameter>',
+              end=r"</invoke>"):
+    out = []
+    for m in re.finditer(inv + r"(.*?)(?:" + end + r"|$)", t, re.S):
+        out.append(_tagged(m.group(1), [(k, _strip1(v)) for k, v in re.findall(par, m.group(2), re.S)], sc))
+    return out
+
+
+def _p_dsml(t, sc):
+    out = []
+    for m in re.finditer(rf'<{_FW}DSML{_FW}invoke name="([^"]+)">(.*?)(?:</{_FW}DSML{_FW}invoke>|$)', t, re.S):
+        args = {}
+        props = (sc or {}).get(m.group(1)) or {}
+        for k, isstr, v in re.findall(rf'<{_FW}DSML{_FW}parameter name="([^"]+)"(?:\s+string="(\w+)")?>(.*?)'
+                                      rf'</{_FW}DSML{_FW}parameter>', m.group(2), re.S):
+            args[k] = v if isstr == "true" else _coerce(v, props.get(k))
+        out.append((m.group(1), args))
+    return out
+
+
+def _p_pythonic_wrapped(t, sc, start=r"<\|tool_call_start\|>", end=r"<\|tool_call_end\|>"):
+    out = []
+    for m in re.finditer(start + r"(.*?)(?:" + end + r"|$)", t, re.S):
+        out += _pythonic(m.group(1))
+    return out
+
+
+def _p_pythonic(t, sc):
+    m = re.search(r"\[\s*[A-Za-z_][\w.]*\s*\(", t)
+    if not m:
+        return []
+    body = _balanced_list(t, m.start())
+    return _pythonic(body) if body else []
+
+
+def _p_mistral(t, sc):
+    out = []
+    for seg in t.split("[TOOL_CALLS]")[1:]:
+        s = seg.strip()
+        if s[:1] in "[{":
+            out += _calls_in_json(s)
+            continue
+        m = re.match(r"([\w.\-]+)\s*(?:\[CALL_ID\]\s*\S+?\s*)?(?:\[ARGS\])?\s*(?=\{)", s)
+        if m:
+            vals = _json_values(s[m.end():], "{")
+            if vals and isinstance(vals[0], dict):
+                out.append((m.group(1), vals[0]))
+    return out
+
+
+def _p_llama3_json(t, sc):
+    s = t.strip()
+    if s.startswith("<|python_tag|>"):
+        s = s[len("<|python_tag|>"):].strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    if not s.startswith("{"):                                        # vLLM: the reply must OPEN with the call
+        return []
+    return _calls_in_json(s)
+
+
+def _p_xlam(t, sc):
+    s = re.sub(r"^```(?:json)?\s*", "", t.strip())
+    if s[:1] not in "[{":
+        return []
+    return _calls_in_json(s)
+
+
+def _p_after(marker, end=None):
+    def p(t, sc):
+        out = []
+        for seg in t.split(marker)[1:]:
+            if end and end in seg:
+                seg = seg.split(end, 1)[0]
+            out += _calls_in_json(seg)
+        return out
+    return p
+
+
+def _p_harmony(t, sc):
+    out = []
+    for m in re.finditer(r"to=functions\.([\w\-.]+)(.*?)<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|<\|return\|>|$)",
+                         t, re.S):
+        vals = _json_values(m.group(3), "{")
+        out.append((m.group(1), vals[0] if vals else m.group(3).strip()))
+    return out
+
+
+def _p_deepseek_v3(t, sc):
+    return [(n.strip(), json.loads(a)) for n, a in re.findall(
+        re.escape(_TCB) + r"\s*function\s*" + re.escape(_TSEP) + r"\s*([^\n]+?)\s*\n\s*```(?:json)?\s*(\{.*?\})\s*```",
+        t, re.S) if _ok_json(a)]
+
+
+def _p_deepseek_v31(t, sc):
+    return [(n.strip(), json.loads(a)) for n, a in re.findall(
+        re.escape(_TCB) + r"\s*([^\n<]+?)\s*" + re.escape(_TSEP) + r"\s*(\{.*?\})\s*" + re.escape(_TCE), t, re.S)
+        if _ok_json(a)]
+
+
+def _ok_json(s):
+    try:
+        json.loads(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _p_kimi_k2(t, sc):
+    out = []
+    for n, a in re.findall(r"<\|tool_call_begin\|>\s*(?:functions\.)?([\w\-.]+?)(?::\d+)?\s*"
+                           r"<\|tool_call_argument_begin\|>\s*(.*?)\s*<\|tool_call_end\|>", t, re.S):
+        vals = _json_values(a, "{")
+        if vals:
+            out.append((n, vals[0]))
+    return out
+
+
+def _p_kv(open_, close, quote):
+    def p(t, sc):
+        out = []
+        for m in re.finditer(re.escape(open_) + r"call:([\w\-.]+)\s*(\{.*?\})\s*(?:" + re.escape(close) + "|$)", t, re.S):
+            d = _kv_object(m.group(2), quote)
+            if d is not None:
+                out.append((m.group(1), d))
+        return out
+    return p
+
+
+def _p_functionary_v31(t, sc):
+    return [(n, json.loads(a)) for n, a in re.findall(r"<function=([\w\-.]+)>\s*(\{.*?\})\s*</function>", t, re.S)
+            if _ok_json(a)]
+
+
+def _p_functionary_v32(t, sc):
+    out = []
+    for m in re.finditer(r">>>\s*([\w\-.]+)\s*\n", t):
+        if m.group(1) == "all":
+            continue
+        vals = _json_values(t[m.end():], "{")
+        if vals:
+            out.append((m.group(1), vals[0]))
+    return out
+
+
+def _p_solar(t, sc):
+    return [(n.strip(), json.loads(a)) for n, a in re.findall(
+        r"<\|tool_call:name\|>(.*?)<\|tool_call:args\|>\s*(\{.*?\})\s*(?:<\|tool_call:end\|>|$)", t, re.S)
+        if _ok_json(a)]
+
+
+def _p_cohere_cmdr(t, sc):
+    m = re.search(r"Action:\s*```(?:json)?\s*(.*?)```", t, re.S)
+    return _calls_in_json(m.group(1)) if m else []
+
+
+#: family -> the reader that takes its calls back out of raw text (what that family's server parser accepts)
+CALL_READERS = {
+    "hermes": _p_hermes, "qwen3_coder": _p_function_eq, "seed_oss": _p_function_eq,
+    "glm45": _p_glm, "glm47": _p_glm,
+    "minimax_m2": _p_invoke,
+    "minicpm5": lambda t, sc: _p_invoke(t, sc, r'<function name="([^"]+)">', r'<param name="([^"]+)">(.*?)</param>',
+                                        r"</function>"),
+    "deepseek_v32": _p_dsml,
+    "lfm2": _p_pythonic_wrapped, "pythonic": _p_pythonic,
+    "mistral": _p_mistral, "llama3_json": _p_llama3_json, "xlam": _p_xlam,
+    "granite": _p_after("<|tool_call|>"),
+    "harmony": _p_harmony,
+    "deepseek_v3": _p_deepseek_v3, "deepseek_v31": _p_deepseek_v31,
+    "kimi_k2": _p_kimi_k2,
+    "cohere": _p_after("<|START_ACTION|>", "<|END_ACTION|>"), "cohere_cmdr": _p_cohere_cmdr,
+    "minimax_m1": _p_after("<tool_calls>", "</tool_calls>"), "apriel": _p_after("<tool_calls>", "</tool_calls>"),
+    "nemotron_v2": _p_after("<TOOLCALL>", "</TOOLCALL>"),
+    "functionary_v31": _p_functionary_v31, "functionary_v32": _p_functionary_v32,
+    "firefunction": _p_after("functools"),
+    "functiongemma": _p_kv("<start_function_call>", "<end_function_call>", "<escape>"),
+    "gemma4": _p_kv("<|tool_call>", "<tool_call|>", '<|"|>'),
+    "gigachat": _p_after("<|function_call|>"),
+    "solar_open": _p_solar,
+    "apertus": _p_after("<|tools_prefix|>", "<|tools_suffix|>"),
+    "json": lambda t, sc: _calls_in_json(t),
+}
+
+
+def tool_schemas(tools):
+    """{name: properties} from an OpenAI `tools` list -- how tagged arguments are typed back."""
+    out = {}
+    for t in tools or []:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        if fn.get("name"):
+            out[fn["name"]] = (fn.get("parameters") or {}).get("properties") or {}
+    return out
+
+
+def parse_tool_calls(text, family, tools=None):
+    """(calls, content, attempted) from a model's raw answer (thinking already removed).
+
+    calls     [{"name": str, "arguments": dict | str}] in the order written -- what a server returns in tool_calls
+    content   the text with the calls taken out (prose around them)
+    attempted True when the answer carries call markers at all (parsed or not)
+
+    Raises KeyError for a family with no reader here (the caller reports it, never guesses)."""
+    reader = CALL_READERS[family]
+    t = text or ""
+    calls = []
+    try:
+        calls = [{"name": n, "arguments": a} for n, a in reader(t, tool_schemas(tools)) if n]
+    except Exception:                                                # noqa: BLE001 -- unreadable = no call
+        calls = []
+    attempted = call_shaped(t) or bool(calls)
+    content = t
+    if calls:
+        first = CALL_MARKERS.search(t)
+        content = t[:first.start()].strip() if first else ""
+    return calls, content, attempted
+
+
+_DECISION_TAGS =("decision-model", "calibrated-probabilities", "system-one")
 _DECISION_NAME = re.compile(r"(^|[^a-z])(jev|openjev|nanojev|laya|semif)([^a-z]|$)|decision[-_ ]?model", re.I)
 
 

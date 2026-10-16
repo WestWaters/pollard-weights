@@ -424,7 +424,8 @@ TOOLCALL_MIN_RATE = 0.75      # pollard-toolcall's own --min-rate default
 #: pollard-toolcall backend -> the server the card names for it
 TOOL_SERVERS = {"gguf": "`llama-server --jinja`", "mlx": "`mlx_lm.server`",
                 "vllm": "`vllm serve --enable-auto-tool-choice --tool-call-parser <family>`",
-                "exl3": "TabbyAPI (exllamav3)", "url": "an OpenAI-compatible server"}
+                "exl3": "exllamav3 (in-process, the model's chat template)",
+                "hf": "transformers (in-process, the model's chat template)", "url": "an OpenAI-compatible server"}
 
 
 def _ref_word(tc):

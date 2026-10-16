@@ -7,19 +7,28 @@ that breaks first is narrow: emitting a syntactically correct call with the righ
 right argument types. It is a formatting skill concentrated in a small band of layers, which makes
 it unusually fragile to quantization and unusually cheap to protect once you know it went.
 
-The full gate (default) runs the REAL serving path, on every lane: the rung is served by the server its users will
-run it with and asked through /v1/chat/completions with OpenAI-style `tools`, so the model's own chat template renders
-the tool list, the model answers in its own call syntax (Hermes, Qwen3-Coder XML, LFM2 pythonic, harmony, Mistral...
--- pollard-modelkind names it) and that server's own parser extracts the call:
+The full gate (default) runs the REAL serving path, on every lane: the rung is asked with OpenAI-style `tools`, so the
+model's own chat template renders the tool list, the model answers in its own call syntax (Hermes, Qwen3-Coder XML,
+LFM2 pythonic, harmony, Mistral... -- pollard-modelkind names it) and the call is read back the way that family's
+server parser reads it:
 
-    gguf  llama-server --jinja                          (GGUF)
-    mlx   mlx_lm.server                                 (MLX)
-    vllm  vllm serve --enable-auto-tool-choice --tool-call-parser <family>   (GPTQ / AWQ / FP8 / MXFP4 / NVFP4)
-    exl3  TabbyAPI, exllamav3's OpenAI server           (EXL3)
-    url   an OpenAI-compatible server already running
+    served (the server's own parser reads the call):
+      gguf  llama-server --jinja                                   GGUF
+      mlx   mlx_lm.server                                          MLX
+      vllm  vllm serve --enable-auto-tool-choice --tool-call-parser <family>
+                                                                   GPTQ / AWQ / FP8 / MXFP4 / NVFP4 (a CUDA vLLM)
+      url   an OpenAI-compatible server already running            TabbyAPI, a vLLM elsewhere, ...
+    in this process (the model's HF chat template renders the tools, greedy decoding, and the raw text is read by
+    Pollard's reader for the family -- pollard-modelkind parse_tool_calls -- with thinking stripped):
+      exl3  exllamav3                                              EXL3
+      hf    transformers                                           GPTQ / AWQ / FP8 / compressed-tensors where no
+                                                                   usable vLLM is (Windows, not installed); the bf16
+                                                                   reference of an EXL3 / in-process rung
 
---backend auto (default) picks it from the file, the workspace MANIFEST lane or config.json. Sixty probes in four
-categories:
+Every path ends in the same grader (grade_reply): a served reply and an in-process one are graded by one function.
+--backend auto (default) picks the backend from the file, the workspace MANIFEST lane or config.json; a GPTQ / MX
+rung goes to vLLM when a vLLM with compiled CUDA kernels is installed and to the in-process transformers backend
+otherwise. Sixty probes in four categories:
 
     single    one tool on offer, typed arguments (string / integer / number / boolean / enum)
     choose    eight tools on offer: pick the right one and fill it
@@ -28,20 +37,22 @@ categories:
 
 scored as parse rate, right function, arguments schema-valid, arguments exact and abstention, with
 Wilson CIs. Against the reference the gate number is RETENTION (rung success / reference success) with a paired
-bootstrap CI; the reference's run is cached, so a ladder runs it once. The reference is served by the rung's OWN
-backend where it can be (the bf16 checkout through mlx_lm.server for an MLX rung, through vLLM for a GPTQ / MX rung);
-when it cannot (no GPU free, does not fit), --ref-fallback (the f16 GGUF through llama-server) stands in and the
-result says cross-backend. A reasoning model's thinking is kept out of the grade (pollard-modelkind split_reasoning).
+bootstrap CI; the reference's run is cached, so a ladder runs it once. The reference is run the rung's OWN way where it
+can be (the bf16 checkout through mlx_lm.server for an MLX rung, through vLLM for a vLLM-served rung, in-process
+through transformers for an EXL3 or in-process rung -- same template rendering, same reader); when it cannot (no GPU
+free, does not fit), --ref-fallback (the f16 GGUF through llama-server) stands in and the result says cross-backend.
+A reasoning model's thinking is kept out of the grade (pollard-modelkind split_reasoning).
 
 A backend this machine cannot run -- vLLM / exllamav3 without an NVIDIA GPU, a GPU with another process resident (a
-shared box's GPU is not ours to take), a model that does not fit the free memory -- is recorded as
-{"status": "not-measured", "reason": ...} and exits 0: the build goes on, and the card says "not measured (reason)".
-llama-server runs with -ngl 0 unless --ngl says otherwise.
+shared box's GPU is not ours to take), a model that does not fit the free memory, a quantization format nothing here
+loads -- is recorded as {"status": "not-measured", "reason": ...} and exits 0: the build goes on, and the card says
+"not measured (reason)". llama-server runs with -ngl 0 unless --ngl says otherwise.
 
     pollard-toolcall --gguf build.gguf --ref f16.gguf                     # GGUF, retention vs f16
+    pollard-toolcall --model ./M-Pollard-GPTQ-int4 --ref ./M --ref-fallback M-f16.gguf   # vLLM, else in-process
+    pollard-toolcall --model ./M-Pollard-EXL3-4.0bpw --ref ./M            # exllamav3 in-process, vs bf16 in-process
+    pollard-toolcall --backend url --url http://127.0.0.1:5000 --rung my-rung            # TabbyAPI / any server
     pollard-toolcall --model ./M-Pollard-MLX-4bit --ref ./M               # MLX, vs the bf16 through mlx_lm.server
-    pollard-toolcall --model ./M-Pollard-GPTQ-int4 --ref ./M --ref-fallback M-f16.gguf   # vLLM
-    pollard-toolcall --backend url --url http://127.0.0.1:8000 --rung my-rung            # already served
     pollard-toolcall --gguf build.gguf --ref f16.gguf --quick             # the old 4-probe plain-prompt check
 
 What --quick counts as a failure, in the order they actually happen:
@@ -54,8 +65,8 @@ What --quick counts as a failure, in the order they actually happen:
     bad-type       an argument present with the wrong type
     hallucinated   an argument the schema does not define
 
-The full gate adds: unparsed (call-shaped text the server's parser rejected), bad-enum, bad-args,
-hallucinated-tool, wrong-value and false-call (a tool called where none was needed).
+The full gate adds: unparsed (call-shaped text the parser -- the server's, or the in-process reader --
+rejected), bad-enum, bad-args, hallucinated-tool, wrong-value and false-call (a tool called where none was needed).
 
 A drop in tool-call success between the reference and the build is a direct measurement of the
 fragile band, and pollard-sensitivity can then say which layers carry it.
@@ -145,6 +156,15 @@ def _split_think(text):
         return split_reasoning(text)
     except ImportError:                                          # pragma: no cover
         return "", text or "", False
+
+
+def _call_shaped(text):
+    """Call-shaped text in any family's syntax (pollard-modelkind call_shaped) -- one rule for both paths."""
+    try:
+        from pollard_modelkind import call_shaped
+    except ImportError:                                          # pragma: no cover
+        return bool(re.search(r"<tool_call>|\[TOOL_CALLS\]|<\|tool_call|\"name\"\s*:|<function=", text or ""))
+    return call_shaped(text)
 
 
 def check_call(text, tool, expect=None):
@@ -558,7 +578,8 @@ def _mismatch(args, want):
 
 
 def grade_reply(reply, probe):
-    """Grade one /v1/chat/completions reply against one probe. Returns a row:
+    """Grade one /v1/chat/completions reply against one probe -- THE grader: a served reply goes straight in, an
+    in-process generation goes in through reply_from_text (the same reply shape). Returns a row:
     {id, category, expected, called, parsed, name_ok, args_valid, exact, ok, failure, detail, sample}."""
     msg = ((reply or {}).get("choices") or [{}])[0].get("message") or {}
     finish = ((reply or {}).get("choices") or [{}])[0].get("finish_reason")
@@ -575,8 +596,7 @@ def grade_reply(reply, probe):
         err = (reply or {}).get("error") if reply else "no reply"
         row.update(failure="server-error", detail=str(err)[:160])
         return row
-    looks_like_call = bool(re.search(r"<tool_call>|\[TOOL_CALLS\]|<\|tool_call|\"name\"\s*:|<function=|"
-                                     r"\w+\([^()]*=", text))
+    looks_like_call = _call_shaped(text)
     if exp is None:                                              # abstention: prose is the right answer
         if calls:
             row.update(failure="false-call", detail=f"called {calls[0].get('function', {}).get('name')!r} "
@@ -590,7 +610,7 @@ def grade_reply(reply, probe):
         if unclosed or (finish == "length" and not text.strip()):
             row.update(failure="unclosed-think", detail="the budget ran out before any call was made")
         elif looks_like_call:
-            row.update(failure="unparsed", detail="call-shaped text the server's parser did not accept")
+            row.update(failure="unparsed", detail="call-shaped text the parser did not accept")
         elif finish == "tool_calls":
             # mlx_lm.server: the model opened a call, the parser rejected its text and dropped it from the reply
             row.update(failure="unparsed", detail="the server's parser dropped the call (finish_reason tool_calls, "
@@ -692,30 +712,39 @@ def score_suite(rows):
 _SERVER_LOG = "toolcall-server.log"
 
 
-# ---------------------------------------------------------------------------------------------- serving backends
+# ---------------------------------------------------------------------------------------------- backends
 #
-# Every lane is gated through the server its users will run it with, because that server's chat-template rendering
-# and tool-call parser decide what an agent harness receives:
+# Every lane is gated the way its users will run it, because the chat-template rendering and the call parser decide
+# what an agent harness receives:
 #
-#   gguf  llama-server --jinja                                   the GGUF lane
-#   mlx   mlx_lm.server                                          the MLX lane (the tokenizer's chat template renders
-#                                                                `tools`; mlx-lm's tool parser reads the call)
+#   gguf  llama-server --jinja                                   the GGUF lane                       (served)
+#   mlx   mlx_lm.server                                          the MLX lane                        (served)
 #   vllm  vllm serve --enable-auto-tool-choice --tool-call-parser <family>
-#                                                                GPTQ / AWQ / FP8 / MXFP4 / NVFP4 (gptq + mx lanes)
-#   exl3  TabbyAPI (exllamav3's OpenAI-compatible server)         the EXL3 lane
-#   url   an OpenAI-compatible server that is already running
+#                                                                GPTQ / AWQ / FP8 / MXFP4 / NVFP4    (served)
+#   exl3  exllamav3 in this process                              the EXL3 lane                       (in-process)
+#   hf    transformers in this process                           GPTQ / AWQ / FP8 / compressed-tensors without a
+#                                                                usable vLLM; bf16 references        (in-process)
+#   url   an OpenAI-compatible server that is already running    TabbyAPI, a remote vLLM, ...        (served)
+#
+# In-process: the model's own HF chat template renders the probe's `tools` (transformers apply_chat_template, or
+# pollard-modelkind's jinja2 renderer without transformers), the model decodes greedily, and the raw text is read
+# back by the reader for its family (pollard-modelkind parse_tool_calls -- the same strictness as that family's
+# server parser) into the same reply shape a server returns, so ONE grader (grade_reply) grades every path.
 #
 # A backend this machine cannot run -- vLLM on a Mac, a GPU with someone else's process resident, a model that will
 # not fit the memory that is free -- is never faked: the rung is recorded as {"status": "not-measured", "reason": ...},
 # the build carries on, and the card says "not measured (reason)".
 
-BACKENDS = ("gguf", "mlx", "vllm", "exl3", "url")
-#: build lane -> the backend that serves it
+BACKENDS = ("gguf", "mlx", "vllm", "exl3", "hf", "url")
+#: the backends that run the model inside this process (no server, Pollard's own reader)
+INPROCESS = ("exl3", "hf")
+#: build lane -> the backend that serves it (a vllm lane falls back to hf where no usable vLLM is installed)
 LANE_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "awq": "vllm", "mx": "vllm", "exl3": "exl3"}
-#: the backend -> how the card and the logs name its server
+#: the backend -> how the card and the logs name it
 BACKEND_SERVER = {"gguf": "llama-server --jinja", "mlx": "mlx_lm.server", "vllm": "vllm serve",
-                  "exl3": "TabbyAPI (exllamav3)", "url": "an OpenAI-compatible server"}
-#: name the vLLM / TabbyAPI server answers to (the requests carry it)
+                  "exl3": "exllamav3 (in-process)", "hf": "transformers (in-process)",
+                  "url": "an OpenAI-compatible server"}
+#: name the vLLM server answers to (the requests carry it)
 SERVED_NAME = "pollard-toolcall"
 #: Windows / desktop processes that sit on every NVIDIA GPU and do not mean someone is using it
 GPU_SHELL = ("dwm.exe", "explorer.exe", "shellhost", "searchhost", "startmenuexperiencehost", "textinputhost",
@@ -787,18 +816,42 @@ def lane_of(path):
     return None
 
 
-def pick_backend(path, prefer=None, url=None):
-    """The backend for this model. An unquantized checkpoint (a reference) goes to the rung's own backend when that
-    backend loads HF weights (mlx, vllm), so the reference is served the SAME way as the rung."""
+def quant_method(path):
+    """The checkpoint's quant_method ("gptq", "awq", "compressed-tensors", "fp8", "mxfp4", "exl3", ...) or ""."""
+    p = str(path or "").rstrip("/\\")
+    qc = _config(p).get("quantization_config") or {}
+    meth = str(qc.get("quant_method") or "").lower() if isinstance(qc, dict) else ""
+    if not meth and os.path.isfile(os.path.join(p, "quantization_config.json")):
+        try:
+            meth = str(json.load(open(os.path.join(p, "quantization_config.json"))).get("quant_method", "")).lower()
+        except (OSError, ValueError, AttributeError):
+            meth = ""
+    return meth
+
+
+def pick_backend(path, prefer=None, url=None, vllm_ok=None):
+    """The backend for this model. A GPTQ / AWQ / MX build goes to vLLM where a usable vLLM is installed, else to the
+    in-process transformers backend. An unquantized checkpoint (a reference) goes to the rung's own backend when that
+    backend loads HF weights (mlx, vllm, hf), so the reference is run the SAME way as the rung; an EXL3 rung's
+    reference goes to hf (exllamav3 loads only EXL3 weights; hf renders and reads exactly the way exl3 does)."""
     if url:
         return "url"
     lane = lane_of(path)
+
+    def vllm_or_hf():
+        ok = vllm_status()[0] if vllm_ok is None else vllm_ok
+        return "vllm" if ok else "hf"
     if lane in LANE_BACKEND:
-        return LANE_BACKEND[lane]
+        b = LANE_BACKEND[lane]
+        return vllm_or_hf() if b == "vllm" else b
     if lane == "hf":
-        if prefer in ("mlx", "vllm"):
+        if prefer in ("mlx", "hf"):
             return prefer
-        return "mlx" if _apple() else "vllm"
+        if prefer == "exl3":
+            return "hf"
+        if prefer == "vllm":
+            return vllm_or_hf()
+        return "mlx" if _apple() else vllm_or_hf()
     return prefer if prefer in BACKENDS else "gguf"
 
 
@@ -852,10 +905,13 @@ def gpu_users(table=None, apps=None):
         parts = [x.strip() for x in line.split(",")]
         if len(parts) >= 2 and parts[1]:
             names.append(parts[1])
+    # a shared box's always-on desktop apps (chat overlays, recorders, browsers) hold a graphics context all day; the
+    # owner of the box may name them in POLLARD_GPU_IGNORE (comma list of name fragments) -- a game still counts
+    extra = tuple(x.strip().lower() for x in os.environ.get("POLLARD_GPU_IGNORE", "").split(",") if x.strip())
     out = []
     for n in names:
         base = re.split(r"[\\/]", n)[-1]
-        if not any(s in base.lower() for s in GPU_SHELL) and base not in out:
+        if not any(s in base.lower() for s in GPU_SHELL + extra) and base not in out:
             out.append(base)
     return out
 
@@ -897,23 +953,53 @@ def check_ram(need_gb, avail=None):
         raise NotMeasured(f"{need_gb:.1f}GB model needs ~{want:.1f}GB of RAM, {avail:.1f}GB free")
 
 
-def find_tabbyapi():
-    """A TabbyAPI checkout (exllamav3's OpenAI-compatible server): $POLLARD_TABBYAPI, else the usual places."""
-    cands = [os.environ.get("POLLARD_TABBYAPI"), os.environ.get("TABBYAPI_DIR"),
-             os.path.expanduser("~/tabbyAPI"), os.path.expanduser("~/TabbyAPI"),
-             os.path.expanduser("~/src/tabbyAPI")]
-    for d in cands:
-        if d and os.path.isfile(os.path.join(d, "main.py")):
-            return d
+_VLLM_STATUS = {}
+
+
+def _python_beside(binary):
+    """The interpreter of the environment a console script (vllm / vllm.exe) was installed into."""
+    d = os.path.dirname(os.path.abspath(binary))
+    for name in ("python.exe", "python", "python3"):
+        if os.path.isfile(os.path.join(d, name)):
+            return os.path.join(d, name)
     return None
 
 
-def _tabby_python(tabby):
-    for rel in ("venv/bin/python", ".venv/bin/python", "venv/Scripts/python.exe", ".venv/Scripts/python.exe"):
-        p = os.path.join(tabby, rel)
-        if os.path.isfile(p):
-            return p
-    return os.environ.get("POLLARD_TABBYAPI_PYTHON") or sys.executable
+def vllm_status(binary=None):
+    """(usable, reason): is there a vLLM here that can actually serve on CUDA? Installed is not enough -- `pip install
+    vllm` on Windows builds a source distribution with no compiled kernels (no vllm/_C), which imports and then
+    cannot run anything. So the package directory is checked for its compiled _C extension, without importing vLLM
+    (a fork's Windows wheel -- SystemPanic/vllm-windows, aivrar/vllm-windows-build -- ships one; so does Linux)."""
+    import shutil
+    binary = binary or os.environ.get("POLLARD_VLLM") or shutil.which("vllm")
+    key = binary or "<this python>"
+    if key in _VLLM_STATUS:
+        return _VLLM_STATUS[key]
+    py = (_python_beside(binary) if binary else None) or sys.executable
+    if not binary and not _has_module("vllm"):
+        res = (False, "vLLM is not installed here")
+    else:
+        # the compiled extension by exact name (_C.abi3.so / _C.cp312-win_amd64.pyd ...): Windows' glob is
+        # case-blind, and `_C*` there matches vllm/_custom_ops.py
+        probe = ("import importlib.util as u, os\n"
+                 "s = u.find_spec('vllm')\n"
+                 "d = list(s.submodule_search_locations or [])[0] if s else ''\n"
+                 "ok = d and any(n.startswith('_C.') and n.endswith(('.so', '.pyd')) for n in os.listdir(d))\n"
+                 "print('NOPKG' if not d else ('OK' if ok else 'NOC'))")
+        try:
+            out = subprocess.run([py, "-c", probe], capture_output=True, text=True, timeout=60).stdout.strip()
+        except Exception as e:                                   # noqa: BLE001
+            out = f"ERR {e}"
+        if out.endswith("OK"):
+            res = (True, f"vLLM with compiled kernels ({py})")
+        elif out.endswith("NOC"):
+            res = (False, "the vLLM installed here has no compiled CUDA kernels (vllm/_C missing -- a source build "
+                          "with no GPU target, e.g. `pip install vllm` on Windows); install a CUDA build (a Windows "
+                          "fork wheel or WSL2) or let the in-process transformers backend measure it")
+        else:
+            res = (False, "vLLM is not installed here")
+    _VLLM_STATUS[key] = res
+    return res
 
 
 def _free_port():
@@ -953,14 +1039,6 @@ def vllm_cmd(binary, model, port, parser, ctx=4096, trust_remote_code=False, gpu
     if trust_remote_code:
         cmd += ["--trust-remote-code"]
     return cmd
-
-
-def exl3_cmd(python, tabby, model, port, ctx=4096):
-    """TabbyAPI on one EXL3 rung: its model dir is the rung's parent, its model name the rung's folder."""
-    model = os.path.abspath(str(model).rstrip("/\\"))
-    return [python, os.path.join(tabby, "main.py"), "--host", "127.0.0.1", "--port", str(port),
-            "--model-dir", os.path.dirname(model), "--model-name", os.path.basename(model),
-            "--max-seq-len", str(ctx), "--disable-auth", "true"]
 
 
 def _trust(model):
@@ -1033,25 +1111,354 @@ def preflight(backend, model, ngl="0", kind=None, server=None):
             raise NotMeasured("mlx-lm is not installed here (pip install mlx-lm)")
         check_ram(need)
         return {}
-    if backend in ("vllm", "exl3") and gpu_free_gb() is None:
+    if backend in INPROCESS:
+        return preflight_inprocess(backend, model, kind)
+    if backend == "vllm" and gpu_free_gb() is None:
         raise NotMeasured(f"{BACKEND_SERVER[backend]} needs an NVIDIA GPU and this machine has none")
     if backend == "vllm":
-        import shutil
-        if not (server or shutil.which("vllm")):
-            raise NotMeasured("vLLM is not installed here")
+        ok, why = vllm_status(server)
+        if not ok:
+            raise NotMeasured(why)
         parser = (kind.get("tools") or {}).get("vllm_parser")
         if not parser:
             fam = (kind.get("tools") or {}).get("family", "none")
             raise NotMeasured(f"no vLLM --tool-call-parser reads the '{fam}' call syntax")
         check_gpu("vllm", need)
         return {"model": SERVED_NAME}
-    if backend == "exl3":
-        if not find_tabbyapi():
-            raise NotMeasured("no OpenAI-compatible exllamav3 server here (TabbyAPI not found; "
-                              "set POLLARD_TABBYAPI to its checkout)")
-        check_gpu("exl3", need)
-        return {}
     return {}
+
+
+# ---------------------------------------------------------------------------------------------- in-process backends
+
+#: quant_method -> the modules transformers needs to load it (any one of each tuple); None = nothing loads it here
+HF_QUANT_NEEDS = {
+    "gptq": [("gptqmodel", "auto_gptq")], "awq": [("gptqmodel", "awq")],
+    "compressed-tensors": [("compressed_tensors",)], "fp8": [], "mxfp4": [],
+    "bitsandbytes": [("bitsandbytes",)],
+    "modelopt": None, "modelopt_fp4": None, "nvfp4": None, "quark": None,
+}
+_HF_NO_LOADER = {
+    "modelopt": "a ModelOpt (TensorRT-LLM) checkpoint has no transformers loader -- serve it with vLLM / TensorRT-LLM",
+    "modelopt_fp4": "a ModelOpt NVFP4 checkpoint has no transformers loader -- serve it with vLLM / TensorRT-LLM",
+    "nvfp4": "a native NVFP4 checkpoint has no transformers loader (compressed-tensors NVFP4 does) -- serve it with vLLM",
+    "quark": "an AMD Quark checkpoint has no transformers loader on this stack -- serve it with vLLM",
+}
+
+
+def reader_family(kind):
+    """(family, reader key) for an in-process run: the template's family when Pollard has a reader for it; a template
+    with no call syntax of its own is read as plain JSON calls; a family with no reader cannot be measured here."""
+    from pollard_modelkind import CALL_READERS
+    fam = ((kind or {}).get("tools") or {}).get("family") or "none"
+    if fam in CALL_READERS:
+        return fam, fam
+    if fam == "none":
+        return fam, "json"
+    raise NotMeasured(f"no in-process reader for the '{fam}' call syntax here (serve it with --backend url)")
+
+
+def _gpu_or_none():
+    try:
+        return gpu_free_gb()
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def preflight_inprocess(backend, model, kind=None):
+    """exl3 / hf: what this machine can run in this process, and on which device. Returns {"device": ...} (the run
+    reads it, the request does not). Memory first, then the shared-GPU rule, as for the served backends."""
+    need = model_gb(model)
+    reader_family(kind)
+    if backend == "exl3":
+        if _gpu_or_none() is None:
+            raise NotMeasured("exllamav3 needs an NVIDIA GPU and this machine has none")
+        if not _has_module("exllamav3"):
+            raise NotMeasured("exllamav3 is not installed here (pip install exllamav3, with a CUDA torch)")
+        if not (_has_module("transformers") or _has_module("jinja2")):
+            raise NotMeasured("no chat-template renderer here (transformers or jinja2)")
+        check_gpu("exl3", need)
+        return {"device": "cuda"}
+    # hf
+    if not (_has_module("transformers") and _has_module("torch")):
+        raise NotMeasured("transformers + torch are not installed here")
+    meth = quant_method(model)
+    if meth:
+        if meth not in HF_QUANT_NEEDS or HF_QUANT_NEEDS[meth] is None:
+            raise NotMeasured(_HF_NO_LOADER.get(meth, f"transformers has no loader for a '{meth}' checkpoint here"))
+        for alts in HF_QUANT_NEEDS[meth]:
+            if not any(_has_module(m) for m in alts):
+                raise NotMeasured(f"transformers needs {' or '.join(alts)} to load a {meth} checkpoint "
+                                  f"(pip install {alts[0]})")
+        if _gpu_or_none() is None:
+            raise NotMeasured(f"a {meth} checkpoint runs in transformers on an NVIDIA GPU and this machine has none")
+        check_gpu("hf", need)
+        return {"device": "cuda"}
+    if _gpu_or_none() is not None:                               # unquantized: the GPU when it is free and fits
+        try:
+            check_gpu("hf", need)
+            return {"device": "cuda"}
+        except NotMeasured:
+            pass                                                 # someone is on it / too big: stay off it
+    if _apple():
+        check_ram(need)
+        return {"device": "mps"}
+    check_ram(need)
+    return {"device": "cpu"}
+
+
+def _windows_cuda_dlls():
+    """Python 3.8+ ignores PATH for extension DLLs on Windows: torch's own CUDA runtime (and the pip nvidia-* wheels)
+    must be on the DLL search path before exllamav3's extension loads."""
+    if sys.platform != "win32":
+        return
+    import glob
+    cands = []
+    try:
+        import torch
+        cands.append(os.path.join(os.path.dirname(torch.__file__), "lib"))
+        cands += glob.glob(os.path.join(os.path.dirname(os.path.dirname(torch.__file__)), "nvidia", "*", "bin"))
+    except Exception:                                            # noqa: BLE001
+        pass
+    for v in ("CUDA_PATH", "CUDA_HOME"):
+        if os.environ.get(v):
+            cands.append(os.path.join(os.environ[v], "bin"))
+    for d in cands:
+        if os.path.isdir(d):
+            try:
+                os.add_dll_directory(d)
+            except OSError:
+                pass
+
+
+class _Renderer:
+    """The model's own chat template with the probe's `tools`: transformers' apply_chat_template when it is here (the
+    renderer every HF harness uses), else pollard-modelkind's jinja2 renderer of the same template."""
+
+    def __init__(self, model, tokenizer=None):
+        self.model = model
+        self.tok = tokenizer
+        if self.tok is None and _has_module("transformers"):
+            try:
+                from transformers import AutoTokenizer
+                self.tok = AutoTokenizer.from_pretrained(model, trust_remote_code=_trust(model))
+            except Exception:                                    # noqa: BLE001 -- jinja2 below
+                self.tok = None
+        self.ct = None
+        if self.tok is None or not getattr(self.tok, "chat_template", None):
+            from pollard_modelkind import ChatTemplate, _template_and_arch, _special_tokens
+            tpl, _, conf = _template_and_arch(model)
+            if isinstance(tpl, list):
+                tpl = next((t.get("template") for t in tpl if t.get("name") == "tool_use"), tpl[0].get("template"))
+            if not tpl:
+                raise NotMeasured("the checkpoint ships no chat template")
+            self.ct = ChatTemplate(tpl, _special_tokens(model, conf))
+
+    def __call__(self, messages, tools, template_kwargs=None):
+        kw = dict(template_kwargs or {})
+        for msgs in (messages, _fold_system(messages)):            # a template that refuses a system turn
+            try:
+                if self.ct is not None:
+                    return self.ct.render(msgs, add_generation_prompt=True, tools=tools, **kw)
+                return self.tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False,
+                                                    **kw)
+            except Exception as e:                               # noqa: BLE001
+                err = e
+        raise err
+
+
+def _fold_system(messages):
+    if not messages or messages[0].get("role") != "system":
+        return messages
+    sys_txt, rest = messages[0]["content"], [dict(m) for m in messages[1:]]
+    if rest and rest[0].get("role") == "user":
+        rest[0]["content"] = f"{sys_txt}\n\n{rest[0]['content']}"
+    return rest
+
+
+class HFEngine:
+    """transformers in this process: the checkpoint (bf16, or GPTQ / AWQ / FP8 / compressed-tensors through the
+    loaders transformers dispatches to), greedy decoding, special tokens kept in the text (they ARE the call syntax)."""
+
+    def __init__(self, model, device="cpu", threads=None):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        if threads:
+            torch.set_num_threads(int(threads))
+        trc = _trust(model)
+        self.tok = AutoTokenizer.from_pretrained(model, trust_remote_code=trc)
+        self.render = _Renderer(model, self.tok)
+        kw = {"trust_remote_code": trc}
+        if device == "cuda":
+            kw["device_map"] = "cuda"
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto", **kw)
+        except TypeError:                                        # transformers 4.x spelling
+            self.model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto", **kw)
+        if device in ("cpu", "mps"):
+            self.model = self.model.to(device)
+        self.model.eval()
+        gc = getattr(self.model, "generation_config", None)
+        eos = getattr(gc, "eos_token_id", None)
+        eos = list(eos) if isinstance(eos, (list, tuple)) else ([eos] if eos is not None else [])
+        if self.tok.eos_token_id is not None and self.tok.eos_token_id not in eos:
+            eos.append(self.tok.eos_token_id)
+        self.eos = eos
+        self.eos_text = [self.tok.decode([e], skip_special_tokens=False) for e in eos]
+        self.device = device
+
+    def generate(self, prompt, max_tokens):
+        import torch
+        enc = self.tok(prompt, return_tensors="pt", add_special_tokens=False)
+        ids = enc["input_ids"].to(self.model.device)
+        with torch.no_grad():
+            out = self.model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=max_tokens,
+                                      do_sample=False, temperature=None, top_p=None, top_k=None,
+                                      eos_token_id=self.eos or None,
+                                      pad_token_id=self.tok.pad_token_id if self.tok.pad_token_id is not None
+                                      else (self.eos[0] if self.eos else None))
+        new = out[0, ids.shape[1]:].tolist()
+        stopped = bool(new) and new[-1] in self.eos
+        if stopped:
+            new = new[:-1]
+        text = _cut_at(self.tok.decode(new, skip_special_tokens=False), self.eos_text)
+        return text, ("stop" if stopped or len(new) < max_tokens else "length")
+
+    def close(self):
+        import gc
+        self.model = None
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+class EXL3Engine:
+    """exllamav3 in this process (Config / Model / Cache / Tokenizer / Generator, as of exllamav3 1.4.x): the EXL3
+    rung on one CUDA device, greedy (ArgmaxSampler), stopping on every EOS id the checkpoint declares (the generator
+    stops on none by default), special tokens decoded (they ARE the call syntax)."""
+
+    def __init__(self, model, ctx=8192):
+        _windows_cuda_dlls()
+        from exllamav3 import Cache, Config, Generator, Model, Tokenizer
+        from exllamav3.generator.sampler import ArgmaxSampler
+        self.config = Config.from_directory(model)
+        self.model = Model.from_config(self.config)
+        self.cache = Cache(self.model, max_num_tokens=max(256, (int(ctx) + 255) // 256 * 256))   # keep referenced
+        self.model.load()
+        self.tokenizer = Tokenizer.from_config(self.config)
+        self.generator = Generator(model=self.model, cache=self.cache, tokenizer=self.tokenizer)
+        self.sampler = ArgmaxSampler()
+        stops = list(getattr(self.config, "eos_token_id_list", None) or [])
+        if self.tokenizer.eos_token_id is not None and self.tokenizer.eos_token_id not in stops:
+            stops.append(self.tokenizer.eos_token_id)
+        self.stops = stops
+        self.render = _Renderer(model)
+        self.eos_text = [t for t in (getattr(self.tokenizer, "eos_token", None),) if t]
+
+    def generate(self, prompt, max_tokens):
+        out = self.generator.generate(prompt=prompt, max_new_tokens=max_tokens, sampler=self.sampler,
+                                      encode_special_tokens=True, decode_special_tokens=True,
+                                      stop_conditions=self.stops, add_bos=False, completion_only=True,
+                                      return_last_results=True, seed=0)
+        text, last = out if isinstance(out, tuple) else (out, {})
+        reason = (last or {}).get("eos_reason")
+        return _cut_at(text or "", self.eos_text), ("length" if reason == "max_new_tokens" else "stop")
+
+    def close(self):
+        try:
+            self.model.unload()
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.generator = self.cache = self.model = None
+        import gc
+        gc.collect()
+
+
+def _cut_at(text, stops):
+    """Text up to the first end-of-turn string the decoder left in."""
+    cut = min([text.find(s) for s in stops if s and s in text] or [len(text)])
+    return text[:cut]
+
+
+@contextlib.contextmanager
+def inprocess_engine(backend, model, device="cuda", threads=None, ctx=8192):
+    """The model loaded in this process for the duration, always released afterwards (one model at a time). A load
+    that fails -- a loader missing a kernel for this GPU, out of memory -- is not-measured with its reason."""
+    try:
+        eng = EXL3Engine(model, ctx) if backend == "exl3" else HFEngine(model, device, threads)
+    except NotMeasured:
+        raise
+    except Exception as e:                                       # noqa: BLE001
+        raise NotMeasured(f"{BACKEND_SERVER[backend]} could not load {os.path.basename(str(model).rstrip('/'))}: "
+                          f"{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}") from None
+    try:
+        yield eng
+    finally:
+        eng.close()
+
+
+def reply_from_text(raw, family, tools=None, finish="stop", reasoning=None, prefill=""):
+    """An in-process generation as the /v1/chat/completions reply a server would have returned: thinking split off
+    (reasoning_content), calls read by the family's reader (tool_calls, arguments as a JSON string), the prose left as
+    content -- so grade_reply grades it exactly like a served reply. `prefill` = the reasoning opener the prompt
+    already ended with (the model's text then starts mid-thought)."""
+    from pollard_modelkind import CALL_READERS, call_shaped, parse_tool_calls, split_reasoning
+    text = (prefill or "") + (raw or "")
+    rf = family if family in CALL_READERS else "json"
+    if rf == "harmony":                                          # analysis channel = thinking; calls ride commentary
+        think = " ".join(re.findall(r"<\|channel\|>\s*analysis\s*<\|message\|>(.*?)(?:<\|end\|>|$)", text, re.S))
+        body = re.sub(r"<\|channel\|>\s*analysis\s*<\|message\|>.*?(?:<\|end\|>|$)", "", text, flags=re.S)
+        fin = re.search(r"<\|channel\|>\s*final\s*<\|message\|>(.*?)(?:<\|return\|>|<\|end\|>|$)", body, re.S)
+        calls, _, attempted = parse_tool_calls(body, rf, tools)
+        answer = fin.group(1).strip() if fin else ("" if calls or think else body.strip())
+        unclosed = bool(think) and not fin and not calls and "<|channel|>" not in body
+    else:
+        think, answer, unclosed = split_reasoning(text, reasoning)
+        calls, content, attempted = ([], answer, call_shaped(answer)) if unclosed else \
+            parse_tool_calls(answer, rf, tools)
+        answer = content if calls else answer
+    msg = {"role": "assistant", "content": text if unclosed else answer}
+    if think and not unclosed:
+        msg["reasoning_content"] = think
+    if calls:
+        msg["tool_calls"] = [{"id": f"call_{i}", "type": "function",
+                              "function": {"name": c["name"],
+                                           "arguments": c["arguments"] if isinstance(c["arguments"], str)
+                                           else json.dumps(c["arguments"], ensure_ascii=False)}}
+                             for i, c in enumerate(calls)]
+    return {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else finish}],
+            "raw": raw}
+
+
+def _prefill_for(prompt, reasoning):
+    """The reasoning opener a rendered prompt already ends with (Qwen3.5 / R1-style templates open the thinking for the
+    model), so the generated text is split as the continuation it is."""
+    op = ((reasoning or {}).get("open") or "").strip()
+    return op if op and (prompt or "").rstrip().endswith(op) else ""
+
+
+def run_suite_inprocess(engine, probes=None, max_tokens=384, template_kwargs=None, progress=None, family=None,
+                        reasoning=None):
+    """The suite through an in-process engine: the SAME request a served backend gets (request_for), rendered by the
+    model's template, decoded greedily, read back by the family's reader, graded by grade_reply."""
+    rows = []
+    for i, p in enumerate(probes or SUITE):
+        body = request_for(p, max_tokens, template_kwargs)
+        try:
+            prompt = engine.render(body["messages"], body["tools"], template_kwargs)
+            raw, finish = engine.generate(prompt, max_tokens)
+            reply = reply_from_text(raw, family, body["tools"], finish, reasoning, _prefill_for(prompt, reasoning))
+        except NotMeasured:
+            raise
+        except Exception as e:                                   # noqa: BLE001 -- one probe, recorded
+            reply = {"error": f"{type(e).__name__}: {e}"[:200]}
+        rows.append(grade_reply(reply, p))
+        if progress:
+            progress(i + 1, len(probes or SUITE), rows[-1])
+    return rows
 
 
 @contextlib.contextmanager
@@ -1074,13 +1481,9 @@ def backend_server(backend, model, ngl="0", threads=None, server=None, url=None,
         import shutil
         parser = ((kind or {}).get("tools") or {}).get("vllm_parser")
         cmd = vllm_cmd(server or shutil.which("vllm"), model, port, parser, ctx, _trust(model))
-    elif backend == "exl3":
-        tabby = find_tabbyapi()
-        cmd = exl3_cmd(_tabby_python(tabby), tabby, model, port, ctx)
     else:
         raise NotMeasured(f"unknown backend {backend!r}")
-    with _launch(cmd, f"{BACKEND_SERVER[backend]} on {model}", port=port,
-                 cwd=find_tabbyapi() if backend == "exl3" else None) as base:
+    with _launch(cmd, f"{BACKEND_SERVER[backend]} on {model}", port=port) as base:
         yield base
 
 
@@ -1155,10 +1558,21 @@ def _ref_cache_path(ref, key):
     return os.path.join(d, f"{os.path.basename(ref)}.toolcall-{key}.json")
 
 
+def effective_backend(backend, server=None):
+    """(backend, note): vLLM where a usable one is installed; where it is not (Windows' kernel-less source build, not
+    installed) the in-process transformers backend measures the same checkpoint instead, and the note says why."""
+    if backend != "vllm":
+        return backend, None
+    ok, why = vllm_status(server)
+    if ok:
+        return backend, None
+    return "hf", f"{why} -- measured in-process with transformers instead"
+
+
 def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, quiet=False,
               backend="gguf", url=None):
-    """Serve one model with `backend` and run the suite on it. Returns (rows, meta); NotMeasured when this machine
-    cannot serve it that way."""
+    """Run the suite on one model with `backend` (served, or in this process). Returns (rows, meta); NotMeasured when
+    this machine cannot run it that way. meta["backend"] is the backend that actually ran (vllm -> hf fallback)."""
     kind = {}
     if model and os.path.exists(str(model)):
         try:
@@ -1166,6 +1580,7 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
             kind = classify(model)
         except (Exception, SystemExit):                          # noqa: BLE001
             kind = {}
+    backend, note = effective_backend(backend, server)
     extra = preflight(backend, model, ngl, kind, server) if backend != "url" else {}
     thinking = bool(kind.get("thinking"))
     budget = max_tokens or (N_PREDICT_REASONING if thinking and not no_think else 384)
@@ -1175,16 +1590,27 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
         tkw = dict(tog.get("off") or {}) or None
     fam = (kind.get("tools") or {}).get("family")
     if not quiet:
-        print(f"   {os.path.basename(str(model or url).rstrip('/'))}: {BACKEND_SERVER.get(backend, backend)}, "
+        if note:
+            print(f"   ({note})", flush=True)
+        where = f" on {extra['device']}" if backend in INPROCESS and extra.get("device") else ""
+        print(f"   {os.path.basename(str(model or url).rstrip('/'))}: {BACKEND_SERVER.get(backend, backend)}{where}, "
               f"tool syntax {fam or '?'}, budget {budget} tokens" + (", thinking off" if tkw else ""), flush=True)
 
     def prog(i, n, row):
         if not quiet and (i % 10 == 0 or i == n):
             print(f"     {i}/{n}", flush=True)
+    meta = {"family": fam, "budget": budget, "thinking": thinking, "template_kwargs": tkw, "backend": backend}
+    if note:
+        meta["backend_note"] = note
+    if backend in INPROCESS:
+        rfam, rkey = reader_family(kind)
+        meta.update(reader=rkey, device=extra.get("device"))
+        with inprocess_engine(backend, model, extra.get("device", "cuda"), threads) as eng:
+            rows = run_suite_inprocess(eng, probes, budget, tkw, prog, rkey, kind.get("reasoning"))
+        return rows, meta
     with backend_server(backend, model, ngl, threads, server, url, kind) as base:
         rows = run_suite(base, probes, budget, tkw, prog, extra)
-    return rows, {"family": fam, "budget": budget, "thinking": thinking, "template_kwargs": tkw,
-                  "backend": backend}
+    return rows, meta
 
 
 def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, refresh=False,
@@ -1192,6 +1618,7 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
     """The reference's rows, cached: every rung of a ladder is compared to the same reference, so it runs once."""
     if backend == "url":
         return run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend, url=url)
+    backend, _ = effective_backend(backend, server)             # key the cache on what actually runs
     key = suite_hash(probes, f"{fingerprint(ref)}:{max_tokens}:{no_think}:{backend}")
     path = _ref_cache_path(ref, key)
     if not refresh and os.path.isfile(path):
@@ -1284,6 +1711,14 @@ def main_quick(a):
     return 0 if verdict else 1
 
 
+def cross_backend(backend, ref_backend):
+    """Was the reference read a different way from the rung? Two in-process backends (exl3 rung, hf reference) render
+    with the same template code and read with the same reader: same path, not cross-backend."""
+    if not ref_backend or ref_backend == backend:
+        return False
+    return not (backend in INPROCESS and ref_backend in INPROCESS)
+
+
 def _same(rows, ref_rows):
     """Probes where the rung and the f16 had the same outcome: retention can sit at 100% while the rung trades
     false calls for missed ones, and this is the number that shows it."""
@@ -1325,7 +1760,7 @@ def _resolve_ref(a, backend, kw):
     try:
         rows, meta = run_ref_cached(a.ref, a.ngl, refresh=a.refresh_ref, backend=rb, url=a.ref_url,
                                     **dict(kw, server=_server_for(rb, a)))
-        return rows, meta, rb, None
+        return rows, meta, meta.get("backend", rb), None
     except NotMeasured as e:
         why = f"{BACKEND_SERVER.get(rb, rb)} reference not measured: {e}"
         print(f"   ({why})")
@@ -1334,6 +1769,7 @@ def _resolve_ref(a, backend, kw):
         try:
             rows, meta = run_ref_cached(a.ref_fallback, a.ngl, refresh=a.refresh_ref, backend=fb,
                                         **dict(kw, server=_server_for(fb, a)))
+            fb = meta.get("backend", fb)
             return rows, meta, fb, f"{why}; reference = {os.path.basename(a.ref_fallback)} via {BACKEND_SERVER[fb]}"
         except NotMeasured as e:
             why += f"; fallback {os.path.basename(a.ref_fallback)} not measured either: {e}"
@@ -1355,6 +1791,7 @@ def main_full(a):
         print(f"\n  NOT MEASURED ({backend}): {e}\n  -- recorded as such; nothing here is a tool-call result.")
         record_not_measured(a, rung, backend, e, lane)
         return 0
+    backend = meta.get("backend", backend)
     s = score_suite(rows)
     print_board(rung, s, rows, a.verbose)
     ref_rows, ref_meta, ref_backend, ref_note = _resolve_ref(a, backend, kw)
@@ -1369,7 +1806,7 @@ def main_full(a):
             print(f"\n  RETENTION {100 * ret[0]:.1f}%  (95% paired-bootstrap CI {100 * ret[1]:.1f}-{100 * ret[2]:.1f}%)"
                   f"   success {_pct(s['rate'])} vs {_pct(rs['rate'])}")
             print(f"  same outcome as the reference on {_same(rows, ref_rows)}/{len(rows)} probes")
-            if ref_backend != backend:
+            if cross_backend(backend, ref_backend):
                 print(f"  (cross-backend: rung via {BACKEND_SERVER.get(backend, backend)}, reference via "
                       f"{BACKEND_SERVER.get(ref_backend, ref_backend)} -- part of any gap is the server, not the quant)")
         else:
@@ -1390,11 +1827,15 @@ def main_full(a):
               "modes": s["modes"], "parse_rate": s["parse_rate"], "function_acc": s["function_acc"],
               "args_valid": s["args_valid"], "exact": s["exact"], "abstention": s["abstention"],
               "categories": s["categories"], "family": meta.get("family")}
+        if meta.get("backend_note"):
+            tc["backend_note"] = meta["backend_note"]
+        if meta.get("reader"):
+            tc["reader"] = meta["reader"]
         if lane:
             tc["lane"] = lane
         if rs is not None:
             tc.update({"ref_rate": rs["rate"], "ref_rate_ci": rs["rate_ci"], "ref_backend": ref_backend,
-                       "cross_backend": ref_backend != backend,
+                       "cross_backend": cross_backend(backend, ref_backend),
                        "drop": round((rs["rate"] or 0) - (s["rate"] or 0), 4)})
         if ref_note:
             tc["ref_note"] = ref_note
@@ -1416,14 +1857,16 @@ def main(argv=None):
                                     "MX / EXL3)")
     ap.add_argument("--gguf", help="the GGUF build to check (same as --model; --quick needs a GGUF)")
     ap.add_argument("--backend", default="auto", choices=("auto",) + BACKENDS,
-                    help="the server that serves the build: gguf (llama-server --jinja), mlx (mlx_lm.server), vllm "
-                         "(vllm serve --tool-call-parser <family>), exl3 (TabbyAPI), url (already running). "
+                    help="how the build is run: gguf (llama-server --jinja), mlx (mlx_lm.server), vllm (vllm serve "
+                         "--tool-call-parser <family>; falls back to hf where no usable vLLM is installed), exl3 "
+                         "(exllamav3 in-process), hf (transformers in-process), url (already running: TabbyAPI, ...). "
                          "auto (default) = from the file / the MANIFEST lane / config.json")
     ap.add_argument("--url", help="--backend url: the OpenAI-compatible server's base url")
     ap.add_argument("--ref", help="reference (the f16 GGUF, or the bf16 HF checkout for a directory lane), to report "
                                   "RETENTION rather than a bare rate")
     ap.add_argument("--ref-backend", default="auto", choices=("auto",) + BACKENDS,
-                    help="the reference's server (auto: the rung's own backend whenever it can load the reference)")
+                    help="the reference's backend (auto: the rung's own backend whenever it can load the reference; "
+                         "hf for an EXL3 rung)")
     ap.add_argument("--ref-url", help="--ref-backend url: where the reference is already served")
     ap.add_argument("--ref-fallback", help="when the reference cannot be served by the rung's backend here (no GPU, "
                                            "too big): use this one instead (the f16 GGUF) -- labelled cross-backend")

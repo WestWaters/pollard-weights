@@ -254,14 +254,16 @@ TOOLCALL_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "mx": "vllm", 
 
 def toolcall_cmd(c, lane, out, name, res):
     """pollard-toolcall for one directory-lane rung. The reference is the ORIGINAL bf16 checkout (not the smoothed
-    copy), served by the rung's own backend where it can be: mlx_lm.server for MLX, vLLM for GPTQ / MX. EXL3 has no
-    bf16 server of its own, so its reference goes through vLLM. When that cannot run here (no free GPU, too big) the
-    f16 GGUF through llama-server stands in, and the result is labelled cross-backend. A backend this machine
-    lacks records the rung as not measured and exits 0 -- never a fake number."""
+    copy), run the rung's own way where it can be: mlx_lm.server for MLX, vLLM for GPTQ / MX (both fall back to the
+    in-process transformers backend where no usable vLLM is installed, e.g. Windows). An EXL3 rung runs in-process
+    in exllamav3, so its reference runs in-process in transformers -- same template rendering, same call reader.
+    When that cannot run here (no free GPU, too big) the f16 GGUF through llama-server stands in, and the result is
+    labelled cross-backend. A backend this machine lacks records the rung as not measured and exits 0 -- never a
+    fake number."""
     cmd = ["pollard-toolcall", "--model", out, "--backend", TOOLCALL_BACKEND[lane], "--ref", c["hf_dir"],
            "--ngl", c["ngl"], "--results", res, "--rung", name]
     if lane == "exl3":
-        cmd += ["--ref-backend", "vllm"]
+        cmd += ["--ref-backend", "hf"]
     if lane != "mlx":
         cmd += ["--ref-fallback", c["f16"]]
     return cmd

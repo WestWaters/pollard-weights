@@ -892,7 +892,7 @@ def _toolcall_gate(a, since, lane_out=None):
     """An AGENTIC model (pollard-modelkind: its chat template writes tool calls in a known syntax) gets the tool-call
     gate on every rung this run built, in whichever lane it built: pollard-toolcall serves each rung with that
     lane's own server (llama-server --jinja for GGUF, mlx_lm.server for MLX, vllm serve --tool-call-parser for
-    GPTQ / MX, TabbyAPI for EXL3), asks 60 tool probes through OpenAI-style `tools`, and records retention vs the
+    GPTQ / MX, exllamav3 in-process for EXL3), asks 60 tool probes through OpenAI-style `tools`, and records retention vs the
     reference in results.json -- which the card turns into its Tool-ready column. A quant can keep its perplexity and
     lose the narrow band of layers that formats tool calls, and an agent harness is exactly where that shows.
     On by default; --no-toolcall skips it. A lane this machine cannot serve is recorded as not measured."""
@@ -1069,7 +1069,7 @@ def main():
                     help="skip the tool-call gate. By default an AGENTIC model (its chat template writes tool calls "
                          "in a syntax pollard-modelkind knows) gets pollard-toolcall on every rung this run built, in "
                          "every lane: 60 tool probes through the lane's own server (llama-server --jinja, "
-                         "mlx_lm.server, vllm serve --tool-call-parser, TabbyAPI), retention vs the reference, into "
+                         "mlx_lm.server, vllm serve --tool-call-parser, exllamav3 in-process), retention vs the reference, into "
                          "results.json and the card's Tool-ready column. A lane this machine cannot serve is recorded "
                          "as not measured, never faked.")
     ap.add_argument("--toolcall", dest="toolcall", action="store_true",

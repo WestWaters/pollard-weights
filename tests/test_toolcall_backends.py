@@ -32,6 +32,8 @@ def _dir(tmp_path, name, cfg):
 @pytest.fixture(autouse=True)
 def _no_workspace(monkeypatch):
     monkeypatch.setattr(ws, "find_build", lambda p: (None, None))
+    # a machine with a working vLLM unless a test says otherwise (vllm_status itself is tested below)
+    monkeypatch.setattr(TC, "vllm_status", lambda binary=None: (True, "vLLM with compiled kernels (fake)"))
 
 
 # ------------------------------------------------------------------ which backend a build gets
@@ -51,6 +53,11 @@ def test_lane_and_backend_from_the_files(tmp_path):
     # an unquantized checkpoint (a reference) is served by the rung's own backend when that backend loads HF weights
     assert TC.pick_backend(hf, prefer="mlx") == "mlx" and TC.pick_backend(hf, prefer="vllm") == "vllm"
     assert TC.pick_backend(str(g), url="http://x") == "url"
+    # exllamav3 loads only EXL3 weights: an EXL3 rung's bf16 reference runs in-process in transformers
+    assert TC.pick_backend(hf, prefer="exl3") == "hf" and TC.pick_backend(hf, prefer="hf") == "hf"
+    # no usable vLLM here (Windows' kernel-less source build, not installed): GPTQ / MX go in-process
+    assert [TC.pick_backend(p, vllm_ok=False) for p in (gptq, awq, mx, exl3)] == ["hf", "hf", "hf", "exl3"]
+    assert TC.pick_backend(hf, prefer="vllm", vllm_ok=False) == "hf"
 
 
 def test_the_workspace_manifest_lane_wins(tmp_path, monkeypatch):
@@ -80,18 +87,47 @@ def test_vllm_command_carries_the_familys_tool_parser():
     assert cmd[cmd.index("--max-model-len") + 1] == "4096" and cmd[cmd.index("--served-model-name") + 1] == TC.SERVED_NAME
 
 
-def test_exl3_command_is_tabbyapi_on_the_rung_folder(tmp_path):
-    cmd = TC.exl3_cmd("/py", "/opt/tabbyAPI", str(tmp_path / "rungs" / "M-EXL3-4.0bpw"), 9003)
-    assert cmd[1] == os.path.join("/opt/tabbyAPI", "main.py")
-    assert cmd[cmd.index("--model-dir") + 1] == str(tmp_path / "rungs")
-    assert cmd[cmd.index("--model-name") + 1] == "M-EXL3-4.0bpw" and "--disable-auth" in cmd
+def _fake_vllm(root, compiled):
+    pkg = root / "site" / "vllm"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "_custom_ops.py").write_text("")                  # what a case-blind `_C*` glob matched on Windows
+    if compiled:
+        (pkg / ("_C.pyd" if os.name == "nt" else "_C.abi3.so")).write_bytes(b"")
+    return root / "site"
 
 
-def test_tabbyapi_is_found_from_the_environment(tmp_path, monkeypatch):
-    monkeypatch.setenv("POLLARD_TABBYAPI", str(tmp_path))
-    assert TC.find_tabbyapi() is None
-    (tmp_path / "main.py").write_text("")
-    assert TC.find_tabbyapi() == str(tmp_path)
+@pytest.mark.parametrize("compiled, ok", [(True, True), (False, False)])
+def test_vllm_is_usable_only_with_its_compiled_kernels(tmp_path, monkeypatch, compiled, ok):
+    """`pip install vllm` on Windows builds a source dist with no vllm/_C: installed, but it serves nothing."""
+    monkeypatch.undo()                                                           # the real vllm_status
+    site = _fake_vllm(tmp_path, compiled)
+    monkeypatch.setenv("PYTHONPATH", str(site))
+    monkeypatch.setattr(TC, "_VLLM_STATUS", {})
+    monkeypatch.setattr(TC, "_has_module", lambda n: n == "vllm")
+    monkeypatch.setattr(__import__("shutil"), "which", lambda n: None)
+    monkeypatch.delenv("POLLARD_VLLM", raising=False)
+    got, why = TC.vllm_status()
+    assert got is ok
+    if not ok:
+        assert "no compiled CUDA kernels" in why
+
+
+def test_no_vllm_at_all(monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(TC, "_VLLM_STATUS", {})
+    monkeypatch.setattr(TC, "_has_module", lambda n: False)
+    monkeypatch.setattr(__import__("shutil"), "which", lambda n: None)
+    monkeypatch.delenv("POLLARD_VLLM", raising=False)
+    assert TC.vllm_status() == (False, "vLLM is not installed here")
+
+
+def test_an_unusable_vllm_falls_back_to_in_process_transformers(monkeypatch):
+    monkeypatch.setattr(TC, "vllm_status", lambda binary=None: (False, "the vLLM installed here has no compiled CUDA "
+                                                                       "kernels"))
+    b, note = TC.effective_backend("vllm")
+    assert b == "hf" and "in-process with transformers" in note and "compiled" in note
+    assert TC.effective_backend("exl3") == ("exl3", None) and TC.effective_backend("gguf") == ("gguf", None)
 
 
 def test_vllm_requests_name_the_served_model():
@@ -119,6 +155,13 @@ def test_a_game_on_the_gpu_is_a_user_and_the_desktop_shell_is_not():
     assert TC.gpu_users(SMI, "") == ["Game-Win64-Shipping.exe"]
     assert TC.gpu_users(SMI.replace("Game-Win64-Shipping.exe", "dwm.exe"), "") == []
     assert TC.gpu_users("", "4242, python.exe, 9000\n") == ["python.exe"]          # a compute job
+
+
+def test_the_box_owner_can_name_always_on_desktop_apps_but_a_game_still_counts(monkeypatch):
+    smi = SMI.replace("Game-Win64-Shipping.exe", "Discord.exe") + SMI
+    assert TC.gpu_users(smi, "") == ["Discord.exe", "Game-Win64-Shipping.exe"]
+    monkeypatch.setenv("POLLARD_GPU_IGNORE", "discord, medal")
+    assert TC.gpu_users(smi, "") == ["Game-Win64-Shipping.exe"]
 
 
 def test_gpu_backends_refuse_a_busy_missing_or_small_gpu():
@@ -151,14 +194,20 @@ def test_preflight_not_measured_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(TC, "_apple", lambda: False)
     with pytest.raises(TC.NotMeasured, match="Apple Silicon"):
         TC.preflight("mlx", d)
-    monkeypatch.setattr(TC.shutil if hasattr(TC, "shutil") else __import__("shutil"), "which", lambda n: None)
+    monkeypatch.setattr(TC, "vllm_status", lambda binary=None: (False, "vLLM is not installed here"))
     with pytest.raises(TC.NotMeasured, match="vLLM is not installed"):
         TC.preflight("vllm", d, kind={"tools": {"family": "hermes", "vllm_parser": "hermes"}})
+    monkeypatch.setattr(TC, "vllm_status", lambda binary=None: (True, "ok"))
     with pytest.raises(TC.NotMeasured, match="no vLLM --tool-call-parser"):
         TC.preflight("vllm", d, kind={"tools": {"family": "cohere_cmdr", "vllm_parser": None}}, server="/bin/vllm")
-    monkeypatch.setattr(TC, "find_tabbyapi", lambda: None)
-    with pytest.raises(TC.NotMeasured, match="TabbyAPI not found"):
+    monkeypatch.setattr(TC, "_has_module", lambda n: False)
+    with pytest.raises(TC.NotMeasured, match="exllamav3 is not installed"):
         TC.preflight("exl3", d)
+    with pytest.raises(TC.NotMeasured, match="transformers \\+ torch are not installed"):
+        TC.preflight("hf", d)
+    monkeypatch.setattr(TC, "_has_module", lambda n: True)
+    with pytest.raises(TC.NotMeasured, match="no in-process reader for the 'kimi_k3'"):
+        TC.preflight("exl3", d, kind={"tools": {"family": "kimi_k3"}})
     # vLLM present and a parser known: the GPU rule decides
     monkeypatch.setattr(TC, "gpu_users", lambda *a: ["Game.exe"])
     with pytest.raises(TC.NotMeasured, match="resident"):
@@ -313,6 +362,8 @@ def test_release_measures_tool_calls_on_every_lanes_rungs(monkeypatch, tmp_path,
         assert s.cmd[s.cmd.index("--ref") + 1] == str(tmp_path / "M")          # the ORIGINAL weights
         assert ("--ref-fallback" in s.cmd) == (lane != "mlx")
         assert ("--ref-backend" in s.cmd) == (lane == "exl3")
+        if lane == "exl3":                                  # exllamav3 in-process: its bf16 reference in-process too
+            assert s.cmd[s.cmd.index("--ref-backend") + 1] == "hf"
     monkeypatch.setattr(R, "toolcall_wanted", lambda cfg, c: False)
     assert not [s for s in R.lane_steps(cfg, _ctx(tmp_path), lane) if s.id.endswith("/toolcall")]
 

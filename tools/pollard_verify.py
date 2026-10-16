@@ -331,8 +331,9 @@ rungs:
     runtime: ik_llama
 # per model KIND (pollard-modelkind), applied after the rung entries. agentic = the chat template writes tool calls
 # in a syntax pollard-modelkind recognises; its rungs must keep their tool calling -- in EVERY lane (pollard-toolcall,
-# 60 probes through the lane's own server: llama-server --jinja / mlx_lm.server / vllm serve --tool-call-parser /
-# TabbyAPI; retention = rung success / reference success). The bit-width patterns below cover every lane's rung names.
+# 60 probes the lane's own way: llama-server --jinja / mlx_lm.server / vllm serve --tool-call-parser / exllamav3 or
+# transformers in-process; retention = rung success / reference success). The bit-width patterns below cover every
+# lane's rung names.
 kinds:
   agentic:
     toolcall_retention_min: 90
