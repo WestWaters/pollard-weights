@@ -230,3 +230,12 @@ def test_a_streamed_rung_that_fails_its_gate_keeps_the_repo_private(model, input
     pub = R.public_step(cfg, c, ["gptq"])
     with pytest.raises(RuntimeError, match="stays private"):
         R.go_public(pub, c, cfg, True, {"gptq/upload": "done"}, out=lambda *_: None)
+
+
+def test_the_complete_gate_sees_a_streamed_rungs_tensors(tmp_path, hub, monkeypatch):
+    import pollard_complete as PC
+    out = tmp_path / "rung"
+    _spec(monkeypatch, out)
+    _write(out)
+    keys = PC._out_tensors(str(out))
+    assert "model.layers.0.mlp.weight" in keys and "model.layers.4.mlp.weight" in keys

@@ -504,6 +504,20 @@ _CHECKS = {
 _RUNTIME_OK = {"stock": {"stock"}, "ik_llama": {"stock", "ik_llama"}}
 
 
+def complete_check(model, source, lane):
+    """The complete-model gate (pollard_complete) for a rung folder against its HF source folder: does the rung carry
+    every tower / projector / talker / side weight and processor file? None when it does not apply (a GGUF file --
+    the release checks the GGUF repo folder -- a draft, or no local source)."""
+    import pollard_complete as PC
+    if lane not in PC.LANES or lane == "gguf" or not (model and source):
+        return None
+    if not (os.path.isdir(str(model)) and os.path.isfile(os.path.join(str(source), "config.json"))):
+        return None
+    res = PC.check(str(source), str(model), lane)
+    PC.report(res)
+    return res
+
+
 def evaluate_gate(metrics, th, missing="fail"):
     """{pass, checks: [{check, value, want, ok, why}]} -- one row per threshold, PASS only if every
     row passes. A threshold whose number was never measured fails under missing: fail."""
@@ -552,6 +566,10 @@ def evaluate_gate(metrics, th, missing="fail"):
                 ok = v in _RUNTIME_OK.get(want, {want})
                 row("runtime", v, want, ok, "" if ok else
                     f"a rung published as {want} needs '{v}' -- the card and the runtime would disagree")
+    if metrics.get("complete") is not None:            # never a text-only rung, whatever the thresholds say
+        lost = metrics.get("complete_missing") or []
+        row("complete model", metrics["complete"], "every component of the source", metrics["complete"] is True,
+            "" if metrics["complete"] else "missing: " + "; ".join(lost))
     return {"pass": all(c["ok"] for c in checks), "checks": checks}
 
 
@@ -733,6 +751,12 @@ def main():
             measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
         print(f"   mean KLD {measured['kld']:.5f}   top-1 {measured.get('top1') or 0:.2f}%"
               + (f"   PPL {measured['ppl']:.4f}" if measured.get("ppl") else ""))
+    comp = complete_check(a.model, a.source, lane)
+    if comp is not None:
+        measured["complete"] = comp["ok"]
+        measured["complete_missing"] = comp["missing"]
+        if not comp["ok"]:
+            fails += 1
     if lane == "gguf" and a.gate is not None and str(a.model).endswith(".gguf"):
         measured["runtime"] = gguf_runtime(a.model)
     if a.coherence and lane == "gguf":

@@ -114,9 +114,10 @@ lanes:
 PRESETS = {
     # a plain text model: every lane, every rung
     "text": {},
-    # a vision-language / omni model: the GGUF lane ships the mmproj (pollard does that itself); MLX holds the tower
-    # high; the HF lanes quantize the language model and copy the towers through; EXL3 runs when exllamav3 has the
-    # architecture (or its language model as a plain causal LM -- text only) and is held with the reason otherwise
+    # a vision-language / omni model: every lane ships the whole model, gated by pollard-complete -- the GGUF lane the
+    # mmproj (+ source-precision sidecars for a talker); MLX through mlx-vlm; the HF lanes quantize the language model
+    # and copy the towers / talker through; EXL3 converts when exllamav3 has the architecture (or its language model as
+    # a plain causal LM, recomposed into the complete checkpoint) and is held with the reason otherwise
     "vlm": {"measure": {"taskeval": {"suite": "quick", "limit": 200}}},
     # a decision model answers on /v1/systemone from first-position logits: llama.cpp only, judged on decisions
     "decision": {"lanes": {"mlx": {"enabled": False}, "gptq": {"enabled": False}, "mx": {"enabled": False},
@@ -226,7 +227,8 @@ def machine():
 # ------------------------------------------------------------------------------- steps
 
 class Step(dict):
-    """id, lane, rung, kind (prep/build/measure/verify/card/upload/expand/note), requires, cmd or fn, out."""
+    """id, lane, rung, kind (prep/build/measure/verify/gate/card/upload/expand/note), requires, cmd or fn, out.
+    A `gate` is re-run on every resume (never skipped by a MANIFEST "verified"): the complete-model check."""
     def __getattr__(self, k):
         return self.get(k)
 
@@ -688,6 +690,15 @@ def draft_rung_steps(cfg, c, builds, targets=None):
     return steps
 
 
+def _has_weights(d):
+    """A local HF checkpoint folder (config + safetensors): the reference the complete-model gate reads."""
+    try:
+        return bool(d) and os.path.isfile(os.path.join(str(d), "config.json")) and any(
+            f.endswith(".safetensors") for f in os.listdir(str(d)))
+    except OSError:
+        return False
+
+
 def lane_steps(cfg, c, lane):
     lc = (cfg.get("lanes") or {}).get(lane) or {}
     import pollard_workspace as ws
@@ -702,16 +713,26 @@ def lane_steps(cfg, c, lane):
                "--calib-profile", str((cfg.get("calib") or {}).get("profile", "auto"))]
         if c.get("imatrix"):
             cmd += ["--imatrix", os.path.abspath(str(c["imatrix"]))]
+        complete = []
+        if _has_weights(c["hf_dir"]):                    # the GGUF repo carries the whole model: mmproj + sidecars
+            complete = [Step(id="gguf/complete", lane="gguf", kind="gate", requires="any", out=c["gguf_dir"],
+                             blocks=["gguf"],
+                             cmd=["pollard-complete", "--source", c["hf_dir"], "--out", c["gguf_dir"], "--lane",
+                                  "gguf", "--fill"],
+                             desc="every vision / audio tower in an mmproj, speech output and side weights as "
+                                  "source-precision sidecars -- never a text-only GGUF repo")]
         if not c.get("free"):
             return [Step(id="gguf/ladder", lane="gguf", kind="build", requires="any", cmd=cmd, out=c["f16"],
                          desc="convert -> imatrix -> measured publish ladder (+ IQ*_KT flagship where ik_llama builds)"),
-                    Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")]
+                    Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")] + complete
         # one rung at a time: build -> measure + gate -> upload -> free, so the peak disk is ONE rung, not the ladder
         steps = []
         for label, gb in gguf_ladder_labels(c):
             steps.append(Step(id=f"gguf/ladder-{label}", lane="gguf", rung=label, kind="build", requires="any",
                               cmd=cmd + ["--rung", label], out=None, disk_gb=gb,
                               desc=f"the {label} rung of the measured publish ladder"))
+            if complete and len(steps) == 1:             # the first build wrote the mmproj: check before any upload
+                steps += complete
             steps.append(Step(id=f"gguf/rungs-{label}", lane="gguf", kind="expand", requires="any"))
         return steps
     steps, res = [], results_path(c, lane)
@@ -727,8 +748,8 @@ def lane_steps(cfg, c, lane):
             return [Step(id="exl3/hold", lane="exl3", kind="hold", requires="any", blocks=["exl3"],
                          desc=f"exl3 held: {ep['why']}")]
         if ep["mode"] == "text":
-            steps.append(Step(id="exl3/text-backbone", lane="exl3", kind="note", requires="any",
-                              desc=f"EXL3 of the language model only: {ep['why']}"))
+            steps.append(Step(id="exl3/recompose", lane="exl3", kind="note", requires="any",
+                              desc=f"EXL3 shipped complete: {ep['why']}"))
     if lane == "exlr8":
         # the ONE encode every rung of this lane is a manifest over (resumable per layer inside pollard-exlr8)
         widths = ",".join(str(int(k)) for k in (lc.get("widths") or [2, 3, 4, 5, 6]))
@@ -776,13 +797,18 @@ def lane_steps(cfg, c, lane):
         rid = f"{lane}/{tag}"
         st_build = Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
                         out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
-                        held_codes=(EXIT_HELD,) if lane == "exl3" else ())
+                        held_codes=(EXIT_HELD,) if lane in ("exl3", "mlx") else ())
         if c.get("free") and lane in STREAMABLE:
             # bigger than the free disk: written + uploaded + confirmed + freed one shard at a time, not held
             from pollard_card import rung_subfolder
             st_build["stream_to"] = (repo_name(c["org"], c["src"]),
                                      f"{lane_folder(lane)}/{rung_subfolder({'name': name, 'tag': tag}, lane)}")
         steps.append(st_build)
+        if _has_weights(c["hf_dir"]):                    # never a text-only rung: the gate lists what is missing
+            steps.append(Step(id=f"{rid}/complete", lane=lane, rung=tag, kind="gate", requires="any", out=out,
+                              cmd=["pollard-complete", "--source", c["hf_dir"], "--out", out, "--lane", lane],
+                              desc="the rung carries every tower / projector / talker / side weight and processor "
+                                   "file of the source"))
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
                               cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1)))
@@ -1026,7 +1052,7 @@ def lane_expect(c, lane, builds, repo):
         else:
             out.add(f"{F}/{rung_subfolder(b, lane)}/config.json")
     if lane == "gguf" and os.path.isdir(c["gguf_dir"]):
-        out |= {f for f in os.listdir(c["gguf_dir"]) if f.startswith("mmproj-")}
+        out |= {f for f in os.listdir(c["gguf_dir"]) if f.startswith(("mmproj-", "components-"))}
     return out
 
 
@@ -1078,7 +1104,7 @@ def upload(step, c, cfg, run_upload):
             if os.path.exists(side):
                 api.upload_file(path_or_fileobj=side, path_in_repo=os.path.basename(side), repo_id=repo)
         for f in sorted(os.listdir(c["gguf_dir"])) if os.path.isdir(c["gguf_dir"]) else []:
-            if f.endswith(".imatrix") or f.startswith("mmproj-"):
+            if f.endswith(".imatrix") or f.startswith(("mmproj-", "components-")):
                 api.upload_file(path_or_fileobj=os.path.join(c["gguf_dir"], f), path_in_repo=f, repo_id=repo)
     else:
         for b in builds:
