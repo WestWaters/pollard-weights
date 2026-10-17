@@ -514,6 +514,38 @@ def test_mirror_is_sparse_headers_real_and_never_read_by_other_lanes(tmp_path, m
     assert (mir / f).read_bytes()[off + 4096:off + 8192] == bytes(4096), "evicted bytes are punched out"
 
 
+def test_build_preflight_counts_the_mirrors_cache_as_disk_and_evicts_it(tmp_path, monkeypatch):
+    """The 8-bit LFM2.5 rung was HELD for disk (25.5 GB needed, 22.6 GB free) beside ~42 GB of evictable mirror cache:
+    the release counted that cache, pollard-mlx's own preflight did not. Now the preflight counts it, and evicts what
+    the rung needs before the build starts (a build whose source is all cached never fetches, so never evicts)."""
+    _local_remote(monkeypatch)
+    import collections
+    import shutil
+    import pollard_stream as S
+    monkeypatch.setattr(S, "free_ram_gb", lambda: 64.0)
+    src = _lfm_like(tmp_path, experts=4, inter=2048, hidden=256)
+    mir = tmp_path / "mirror"
+    m = M.RemoteMirror.create(f"ssh://u@h{src}?python=py", str(mir), log=lambda *a: None)
+    m.ensure(set(m.entries))
+    m.done(set(m.entries))
+    cache = m.reclaimable_bytes()
+    assert cache == sum(n for _, _, n in m.entries.values()) and cache > 0
+    base = 10e9                                               # what the disk has besides the cache
+    du = collections.namedtuple("du", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: du(0, 0, int(base + m.evicted)))
+    m.free_bytes = lambda: int(base + m.evicted)
+    plan = {"peak_gb": 1.0, "largest": "x", "largest_gb": 0.0, "out_gb": (base - 1e9 + cache * 0.5) / 1e9}
+    out = str(tmp_path / "rung")
+    with pytest.raises(S.OutOfMemoryBudget, match="disk"):                # without the mirror: held, as before
+        M.preflight_build(plan, out, log=lambda *a: None)
+    M.preflight_build(plan, out, log=lambda *a: None, mirror=m)           # with it: fits, and room is made
+    assert m.evicted > 0 and base + m.evicted >= plan["out_gb"] * 1e9
+    assert m.reclaimable_bytes() == cache - m.evicted
+    big = dict(plan, out_gb=(base + cache * 2) / 1e9)                    # more than disk + cache: still held
+    with pytest.raises(S.OutOfMemoryBudget, match="mirror's cache can give back"):
+        M.preflight_build(big, out, log=lambda *a: None, mirror=m)
+
+
 def test_streamed_build_from_a_mirror_is_the_same_rung(tiny, monkeypatch):
     """Every tensor MLX reads is fetched first -- the Load nodes of its graph say which -- so a build from the sparse
     mirror writes exactly the bytes of the build from the real folder."""

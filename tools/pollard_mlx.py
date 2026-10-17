@@ -820,9 +820,11 @@ def plan_build(model_dir, low=4, high=8, method="search", encoded=False, avg_bit
             "encoded": bool(encoded)}
 
 
-def preflight_build(plan, out_dir, max_ram_gb=None, log=print):
+def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
     """Refuse (OutOfMemoryBudget, with the numbers) a streamed build whose peak does not fit free RAM minus the
-    floor, or whose output does not fit the disk."""
+    floor, or whose output does not fit the disk. A remote-source `mirror` on the same disk counts its cache as free:
+    what the rung needs is evicted from it here, before the first byte is written (a build whose source tensors are
+    all cached never fetches, so the writer alone would never make room)."""
     import shutil
     import pollard_stream as S
     floor = float(os.environ.get("POLLARD_MIN_FREE_GB", 2.0))
@@ -841,9 +843,18 @@ def preflight_build(plan, out_dir, max_ram_gb=None, log=print):
     while not os.path.exists(parent) and os.path.dirname(parent) != parent:
         parent = os.path.dirname(parent)
     disk = shutil.disk_usage(parent).free / 1e9
-    if disk < plan["out_gb"] + 1.0:
+    same_disk = mirror is not None and os.stat(parent).st_dev == os.stat(mirror.dir).st_dev
+    cache = mirror.reclaimable_bytes() / 1e9 if same_disk else 0.0
+    if disk + cache < plan["out_gb"] + 1.0:
         raise S.OutOfMemoryBudget(f"the MLX rung needs ~{plan['out_gb']:.1f} GB of disk at {out_dir} and "
-                                  f"{disk:.1f} GB is free")
+                                  f"{disk:.1f} GB is free" + (f" (+ {cache:.1f} GB the mirror's cache can give back)"
+                                                             if same_disk else ""))
+    # the room the build will want: the rung (+10%, as the writer reserves it) and one source unit fetched beside it
+    want = plan["out_gb"] * 1.1 + plan.get("largest_gb", 0.0) + 3.0
+    if same_disk and disk < want and cache:
+        freed = mirror.make_room(want)
+        disk = shutil.disk_usage(parent).free / 1e9
+        log(f"   disk: {freed / 1e9:.1f} GB of the mirror's cache evicted for the rung ({disk:.1f} GB free now)")
 
 
 # ----------------------------------------------------------------- streamed fidelity: block by block, in MLX
@@ -1321,6 +1332,29 @@ class RemoteMirror:
     def resident_gb(self):
         return sum(self.entries[k][2] for k in self.present) / 1e9
 
+    def reclaimable_bytes(self):
+        """Cache bytes eviction can give back (everything on disk that is not pinned)."""
+        return sum(self.entries[k][2] for k in self.present if k not in self.pinned)
+
+    def make_room(self, free_gb):
+        """Evict least-recently-used cache until `free_gb` of disk is free, or the cache is spent; bytes evicted."""
+        before, free, drop = self.evicted, self.free_bytes(), []
+        for k in list(self.present):                       # least recently used first
+            if free >= free_gb * 1e9:
+                break
+            if k not in self.pinned:
+                drop.append(k)
+                free += self.entries[k][2]
+        if drop:
+            for k in drop:                                 # forget first, punch second (as _evict_for)
+                del self.present[k]
+            self._save_state()
+            for k in drop:
+                f, off, n = self.entries[k]
+                punch(os.path.join(self.dir, f), off, n)
+                self.evicted += n
+        return self.evicted - before
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
@@ -1474,7 +1508,7 @@ def main():
     if stream and os.path.isdir(src_dir):
         try:
             bplan = plan_build(src_dir, low, high, a.range, bool(staging), avg_bits=avg)
-            preflight_build(bplan, a.out, a.max_ram_gb)
+            preflight_build(bplan, a.out, a.max_ram_gb, mirror=mirror)
         except S.OutOfMemoryBudget as e:
             if staging:
                 shutil.rmtree(staging, ignore_errors=True)
