@@ -782,6 +782,8 @@ def lane_steps(cfg, c, lane):
             cmd = ["pollard-mlx", "--model", c["hf_dir"]] + ([] if c.get("no_profile") else
                                                               ["--sensitivity", c["sens_raw"]]) + [
                    "--bits", str(int(rung)), "--out", out]
+            if c.get("imatrix"):                         # the range search weighted by activations, as GGUF's
+                cmd += ["--imatrix", os.path.abspath(str(c["imatrix"]))]
             src = c["hf_dir"]
         elif lane == "gptq":
             cmd = ["pollard-export", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"],

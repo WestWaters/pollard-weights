@@ -87,6 +87,19 @@ def test_gguf_imatrix_names_map_to_module_paths(tmp_path):
     assert M.gguf_name_to_path("blk.0.ffn_down.weight") == "model.layers.0.mlp.down_proj"
     assert M.gguf_name_to_path("output.weight") == "lm_head"
     assert M.gguf_name_to_path("token_embd.weight") is None
+    # LFM2 / LFM2-MoE (mlx-lm's names after sanitize): an LFM2 imatrix used to match NOTHING here
+    lfm = {"blk.0.shortconv.in_proj.weight": "model.layers.0.conv.in_proj",
+           "blk.0.shortconv.out_proj.weight": "model.layers.0.conv.out_proj",
+           "blk.2.attn_output.weight": "model.layers.2.self_attn.out_proj",
+           "blk.0.ffn_gate.weight": "model.layers.0.feed_forward.gate_proj",
+           "blk.0.ffn_down.weight": "model.layers.0.feed_forward.down_proj",
+           "blk.3.ffn_gate_inp.weight": "model.layers.3.feed_forward.gate",
+           "blk.3.ffn_gate_exps.weight": "model.layers.3.feed_forward.switch_mlp.gate_proj",
+           "blk.3.ffn_up_exps.weight": "model.layers.3.feed_forward.switch_mlp.up_proj",
+           "blk.3.ffn_down_exps.weight": "model.layers.3.feed_forward.switch_mlp.down_proj"}
+    for g, hf in lfm.items():
+        assert hf in M.gguf_name_to_paths(g), g
+    assert M.gguf_name_to_paths("blk.2.attn_output.weight")[0] == "model.layers.2.self_attn.o_proj"   # llama first
     p = tmp_path / "imp.npz"
     np.savez(p, **{"model.layers.0.mlp.up_proj": np.ones(64, np.float32)})
     assert set(M.load_importance(str(p))) == {"model.layers.0.mlp.up_proj"}

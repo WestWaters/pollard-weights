@@ -127,6 +127,69 @@ def test_lfm2_bit_policy_router_mixers_and_experts():
     assert M.bits_for("talker.model.layers.0.mlp.gate_proj", alloc, True, 64) is False
 
 
+class _Tok:
+    def __init__(self, bos=None, name=None, adds=False, template=""):
+        self.bos_token_id, self.bos_token, self.adds, self.chat_template = bos, name, adds, template
+
+    def encode(self, text):
+        return ([self.bos_token_id] if self.adds else []) + [ord(c) for c in text]
+
+
+def test_mlx_verify_scores_like_llama_perplexity_bos_led_chunks_second_half():
+    """LFM2.5-24B-A2B's 3-bit MLX rung read KLD 1.05 / top-1 56.6% beside the GGUF IQ3_S's 0.21: the MLX lane scored
+    256-token chunks cut from the middle of the corpus with NO BOS (LFM2's tokenizer does not add <|startoftext|>; the
+    model never sees text without it) from position 0, llama-perplexity scores BOS-led 2048-token chunks on their
+    second half. Same rung, LFM2.5-8B-A1B: 0.94 the old way, 0.53 this way -- one threshold now means one thing."""
+    import pollard_verify as V
+    lfm = _Tok(124894, "<|startoftext|>", template="{{- bos_token -}}{%- for m in messages %}")
+    assert V._bos_id(lfm) == 124894                                     # the template writes it
+    assert V._bos_id(_Tok(1, "<s>", adds=True)) == 1                    # the tokenizer adds it (llama)
+    assert V._bos_id(_Tok(None)) is None                                # none defined (qwen)
+    assert V._bos_id(_Tok(5, "<bos>", template="{% for m in messages %}")) is None   # defined, never used
+    ids = list(range(100, 100 + 40))
+    parts, starts = V._protocol_chunks(ids, 16, 2, 7)
+    assert parts == [[7] + ids[1:16], [7] + ids[17:32]] and starts == [8, 8]   # BOS overwrites the first token
+    parts2, _ = V._protocol_chunks([7] + ids, 16, 1, 7)                 # a tokenizer that added it: not doubled
+    assert parts2[0] == [7] + ids[1:16]
+    plain, st = V._protocol_chunks(ids, 16, 2, None)
+    assert plain == [ids[:16], ids[16:32]] and st == [8, 8]
+    rng = np.random.default_rng(0)
+    r, q = rng.normal(size=(16, 50)).astype(np.float32), rng.normal(size=(16, 50)).astype(np.float32)
+    chunk = list(rng.integers(0, 50, 16))
+    full = V._kl_chunk(r, q, chunk, rows=5)
+    half = V._kl_chunk(r[8:], q[8:], chunk, rows=3, start=8)
+    for a, b in zip(full, half):                                        # the scored half is the full chunk's tail
+        np.testing.assert_allclose(a[8:], b)
+    assert len(half[2]) == 7                                            # the last position predicts nothing
+    assert V.MLX_LENGTH == 2048                                         # llama-perplexity -c 2048, as measure_gguf
+    # a reference cached under the old protocol is never read for the new one
+    assert V._ref_cache("s", "e", 2048, 16, "mlx") != V._ref_cache("s", "e", 2048, 16, f"mlx-{V.MLX_PROTOCOL}")
+
+
+def test_an_mlx_lm_that_routes_lfm2_moe_wrong_is_refused_by_the_verify(tmp_path, monkeypatch):
+    """mlx-lm < 0.32.0 routes LFM2-MoE with a softmax and mixes with the selection bias added (the model: sigmoid,
+    bias for selection only). The rung's bytes do not depend on it -- every number measured through it does."""
+    d = _lfm_like(tmp_path)
+    fake = types.ModuleType("mlx_lm")
+    fake.__version__ = "0.31.3"
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+    why = M.mlx_runtime_problem(str(d))
+    assert why and "0.31.3" in why and "0.32.0" in why and "lfm2_moe" in why
+    fake.__version__ = "0.32.2"
+    assert M.mlx_runtime_problem(str(d)) is None
+    fake.__version__ = "0.31.3"
+    (d / "config.json").write_text(json.dumps({"model_type": "qwen3", "num_hidden_layers": 2}))
+    assert M.mlx_runtime_problem(str(d)) is None                        # only the architectures it runs wrong
+    import pollard_verify as V
+    (d / "config.json").write_text(json.dumps({"model_type": "lfm2_moe", "num_hidden_layers": 2}))
+    fake_mx = types.ModuleType("mlx.core")
+    monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
+    fake.load = lambda *a, **k: None
+    with pytest.raises(SystemExit, match="cannot measure this model"):
+        V.measure_mlx(str(tmp_path / "rung"), str(d), str(tmp_path / "e.txt"), log=lambda *a, **k: None)
+
+
 def test_mlx_vlm_is_the_lane_requirement_for_a_model_with_towers(tmp_path):
     import pollard_setup as S
     lane = S.LANES["mlx-vlm"]
@@ -205,6 +268,14 @@ def test_mlx_lane_steps_carry_their_memory_kind_and_rungs_only_publishes_nothing
     assert R.repo_name("PollardWeights", str(src)) == "PollardWeights/LFM2.5-24B-A2B-Pollard"
     with pytest.raises(SystemExit):
         R.main(["--hf", str(src), "--rungs-only"])                       # rung by rung only: needs the free flow
+    build = next(s for s in steps if s.id == "mlx/3bit/build")
+    assert "--imatrix" not in build.cmd
+    imx = tmp_path / "LFM2.5-24B-A2B-f16.imatrix"
+    imx.write_bytes(b"")
+    cfg["imatrix"] = str(imx)                       # given in the plan: the MLX range search is weighted by it too
+    _, _, steps = R.plan_steps(cfg, str(src), {"mlx"})
+    build = next(s for s in steps if s.id == "mlx/3bit/build")
+    assert build.cmd[build.cmd.index("--imatrix") + 1] == str(imx)
 
 
 def test_release_mirrors_a_remote_source_instead_of_fetching_it(tmp_path, monkeypatch):
@@ -442,7 +513,7 @@ def test_streamed_verify_gives_the_whole_model_numbers(tiny, kind, tmp_path, mon
     assert got["on"]["streamed"] and not got["off"]["streamed"]
     for k in ("kld", "top1", "ppl", "ref_ppl", "kld_p99"):
         assert got["on"][k] == pytest.approx(got["off"][k], rel=1e-5, abs=1e-7), k
-    assert got["on"]["n"] == 3 * 64 and got["on"]["kld"] > 0
+    assert got["on"]["n"] == 3 * 32 and got["on"]["kld"] > 0            # the second half of each chunk is scored
 
 
 def test_streamed_verify_of_the_omni_matches_its_whole_language_model(tiny, tmp_path, monkeypatch):
@@ -469,11 +540,12 @@ def test_streamed_verify_of_the_omni_matches_its_whole_language_model(tiny, tmp_
         want_q = np.array(full.language_model(mx.array([ids])).logits[0].astype(mx.float32))
         np.testing.assert_allclose(s.logits(b), want_s, rtol=1e-4, atol=1e-4)
         np.testing.assert_allclose(q.logits(b), want_q, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(q.logits(b, 40), want_q[40:], rtol=1e-4, atol=1e-4)   # the scored part only
     ev = tmp_path / "eval.txt"
     ev.write_text(" ".join(f"w{i % 50}" for i in range(3000)))
     monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))
     r = V.measure_mlx(str(rung), tiny["omni"], str(ev), 64, 2, "auto", log=lambda *a, **k: None)
-    assert r["streamed"] and r["n"] == 128 and r["kld"] > 0 and r["ppl"] > 1
+    assert r["streamed"] and r["n"] == 64 and r["kld"] > 0 and r["ppl"] > 1
 
 
 # --------------------------------------------------------------------------------------------- remote mirror

@@ -98,6 +98,41 @@ SPEECH_RE = re.compile(r"(^|\.)(talker|code2wav|token2wav|code_predictor|speech_
 EXIT_HELD = 3
 
 
+# Converter versions that run a model WRONG -- the rung's bytes are fine, but every number measured through them (and
+# every answer a user gets from them) is off. mlx-lm < 0.32.0 routes LFM2-MoE (LFM2 / LFM2.5 8B-A1B, 24B-A2B) with a
+# SOFTMAX over the experts and adds the selection bias into the mixing weights; the model (HF Transformers, llama.cpp)
+# routes with a sigmoid and uses the bias for selection only. Measured on LFM2.5-8B-A1B, mlx-lm 4-bit: KLD 0.47 through
+# the old routing, 0.39 through the right one (the source's own PPL 37.9 vs 32.2).
+RUNTIME_FIXES = {"lfm2_moe": ("mlx_lm", (0, 32, 0), "LFM2-MoE expert routing (sigmoid, bias for selection only)")}
+
+
+def _version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+
+
+def mlx_runtime_problem(model_dir):
+    """A sentence when the installed converter is known to run this checkpoint's architecture wrong, else None."""
+    try:
+        import pollard_workspace as _ws
+        mt = (_ws.text_config_dict(_ws.config_dict(model_dir)) or {}).get("model_type")
+    except Exception:                                       # noqa: BLE001
+        return None
+    fix = RUNTIME_FIXES.get(mt)
+    if not fix:
+        return None
+    pkg, need, what = fix
+    try:
+        import importlib
+        have = getattr(importlib.import_module(pkg), "__version__", None)
+    except Exception:                                       # noqa: BLE001
+        return None
+    if have is None or _version_tuple(have) >= need:
+        return None
+    want = ".".join(map(str, need))
+    return (f"{pkg.replace('_', '-')} {have} runs {mt} wrong ({what}; fixed in {want}) -- "
+            f'pip install -U "{pkg.replace("_", "-")}>={want}"')
+
+
 def mlx_engine(model_dir):
     """Which converter ships this checkpoint WHOLE: ("mlx_lm", None) for a text model; ("mlx_vlm", model_type) for a
     model with a vision / audio tower, projector or speech output (mlx-lm drops every one of them); or
@@ -433,15 +468,37 @@ _GGUF_TO_HF = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn
                "ffn_up_exps": "mlp.switch_mlp.up_proj", "ffn_down_exps": "mlp.switch_mlp.down_proj"}
 
 
-def gguf_name_to_path(name):
-    """blk.3.attn_q.weight -> model.layers.3.self_attn.q_proj ; output.weight -> lm_head ; else None."""
+# ... and the other layouts' names for the same GGUF tensors. LFM2 / LFM2-MoE: the short-conv mixer, `out_proj` for
+# attention output, `feed_forward` for the MLP (mlx-lm renames w1/w3/w2 to gate/up/down_proj and stacks the experts
+# into switch_mlp) and `feed_forward.gate` for the router. Without these an LFM2 imatrix matched nothing and the
+# "imatrix-weighted" search ran on plain weight error.
+_GGUF_TO_HF_ALT = {"attn_output": ("self_attn.out_proj",),
+                   "shortconv.in_proj": ("conv.in_proj",), "shortconv.out_proj": ("conv.out_proj",),
+                   "ffn_gate_inp": ("mlp.gate", "feed_forward.gate"),
+                   "ffn_gate": ("feed_forward.gate_proj",), "ffn_up": ("feed_forward.up_proj",),
+                   "ffn_down": ("feed_forward.down_proj",),
+                   "ffn_gate_exps": ("feed_forward.switch_mlp.gate_proj",),
+                   "ffn_up_exps": ("feed_forward.switch_mlp.up_proj",),
+                   "ffn_down_exps": ("feed_forward.switch_mlp.down_proj",)}
+
+
+def gguf_name_to_paths(name):
+    """Every module path a GGUF tensor name can stand for (a lookup only ever matches the model's own):
+    blk.3.attn_output.weight -> [model.layers.3.self_attn.o_proj, model.layers.3.self_attn.out_proj]."""
     n = name[:-len(".weight")] if name.endswith(".weight") else name
     if n == "output":
-        return "lm_head"
-    m = re.match(r"blk\.(\d+)\.(\w+)$", n)
-    if m and m.group(2) in _GGUF_TO_HF:
-        return f"model.layers.{m.group(1)}.{_GGUF_TO_HF[m.group(2)]}"
-    return None
+        return ["lm_head"]
+    m = re.match(r"blk\.(\d+)\.([\w.]+)$", n)
+    if not m:
+        return []
+    tails = ([_GGUF_TO_HF[m.group(2)]] if m.group(2) in _GGUF_TO_HF else []) + list(_GGUF_TO_HF_ALT.get(m.group(2), ()))
+    return [f"model.layers.{m.group(1)}.{t}" for t in tails]
+
+
+def gguf_name_to_path(name):
+    """blk.3.attn_q.weight -> model.layers.3.self_attn.q_proj ; output.weight -> lm_head ; else None."""
+    p = gguf_name_to_paths(name)
+    return p[0] if p else None
 
 
 def _read_imatrix(path):
@@ -476,8 +533,7 @@ def load_importance(path):
         return {k: np.asarray(v, np.float32) for k, v in load_file(path).items()}
     out = {}
     for name, vals in _read_imatrix(path).items():
-        p = gguf_name_to_path(name)
-        if p:
+        for p in gguf_name_to_paths(name):
             out[p] = np.asarray(vals, np.float32)
     return out
 
@@ -935,7 +991,7 @@ class StreamedLM:
         with (self.mirror.hook() if self.mirror is not None else contextlib.nullcontext()):
             self.model = _lazy_load(path, engine)
         self.lm, self.layers = _decoder(self.model)
-        self.mode, self.calls, self.h, self.final = None, {}, {}, {}
+        self.mode, self.calls, self.h, self.final, self.start = None, {}, {}, {}, 0
 
     def tap(self, i, x, args, kw):
         if self.mode == "record":
@@ -944,7 +1000,8 @@ class StreamedLM:
             self.calls[(self.b, i)] = (_materialize(list(args)), _materialize(dict(kw)))
             return x
         if self.mode == "final" and i == len(self.layers) - 1:
-            return self.final[self.b]
+            h = self.final[self.b]
+            return h[:, self.start:] if self.start else h   # norm + head are per position: only the scored ones
         return x
 
     def _forward(self, ids):
@@ -1001,22 +1058,24 @@ class StreamedLM:
             self.mode = None                               # the taps stay: logits() runs the head through them
         return self
 
-    def logits(self, b):
-        """float32 numpy [len(row), vocab] for row b: the model's own norm + head on the streamed final state."""
+    def logits(self, b, start=0):
+        """float32 numpy [len(row) - start, vocab] for row b from position `start`: the model's own norm + head on the
+        streamed final state."""
         import mlx.core as mx
         import numpy as np
-        self.mode, self.b = "final", b
+        self.mode, self.b, self.start = "final", b, int(start)
         try:
             out = self._forward(self.rows[b])[0].astype(mx.float32)
             mx.eval(out)
             return np.array(out)
         finally:
-            self.mode = None
+            self.mode, self.start = None, 0
 
 
-def plan_verify(source, rung=None, length=256, chunks=16, vocab=None):
+def plan_verify(source, rung=None, length=1024, chunks=16, vocab=None):
     """Peak RAM of the streamed verify: the biggest decoder block of the source (bf16, + one tensor's transient) and
-    its embeddings, the logits of one chunk (source + rung, float32 + the float64 KL math), the base process."""
+    its embeddings, the logits of one chunk's SCORED positions (`length`: the second half of a pollard_verify.MLX_LENGTH
+    chunk; source + rung, float32 + the float64 KL math), the base process."""
     import pollard_stream as S
     src = S.Source(source)
     blocks, outer, biggest, vocab_seen, embed = {}, 0, 0, 0, 0
@@ -1463,6 +1522,9 @@ def main():
         except Exception:
             sys.exit("ERROR: --out required unless --plan-only.")
     engine, why = mlx_engine(a.model)
+    bad = mlx_runtime_problem(a.model)
+    if bad:
+        print(f"   NOTE: {bad} (the rung's weights do not depend on it; measuring and running it do)")
     if engine == "hold":
         print(f"HELD: {why} -- an MLX build of the text alone would not be this model")
         sys.exit(EXIT_HELD)

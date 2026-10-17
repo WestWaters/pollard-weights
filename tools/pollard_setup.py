@@ -96,7 +96,7 @@ PY = {
     "xxhash": ("xxhash", "xxhash", []),
     "huggingface_hub": ("huggingface-hub", "huggingface-hub", []),
     "mlx": ("mlx", "mlx", []),
-    "mlx_lm": ("mlx-lm", "mlx-lm", []),
+    "mlx_lm": ("mlx-lm>=0.32.0", "mlx-lm", []),      # 0.32.0: LFM2-MoE routes like the model
     # Qwen3-Omni (qwen3_omni_moe) and Nemotron-3.5-Bolt (nemotron_h_omni) are on master, not on PyPI's 0.7.8
     "mlx_vlm": ("mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm", "mlx-vlm", []),
     "torchvision": ("torchvision", "torchvision", []),
