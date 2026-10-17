@@ -252,8 +252,11 @@ def test_a_rung_this_machine_cannot_serve_is_recorded_not_faked(monkeypatch, tmp
     assert m["toolcall_status"] == "not-measured"
     th = {"toolcall_retention_min": 90}
     row = V.evaluate_gate(m, th)["checks"][0]
-    assert row["ok"] is False and row["why"] == "not measured: vLLM is not installed here"
-    assert V.evaluate_gate(m, dict(th, toolcall_not_measured="skip"))["pass"] is True
+    assert row["ok"] is True and row["why"] == "not measured: vLLM is not installed here", \
+        "default: a rung whose tool calls could not be measured here publishes, with the reason"
+    assert V.evaluate_gate(m, th, missing="fail")["pass"] is True, "not-measured is its own policy, not `missing`"
+    failed = V.evaluate_gate(m, dict(th, toolcall_not_measured="fail"))
+    assert failed["pass"] is False and failed["checks"][0]["why"] == "not measured: vLLM is not installed here"
 
 
 def test_reference_falls_back_to_the_f16_gguf_cross_backend(monkeypatch, tmp_path):

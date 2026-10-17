@@ -388,8 +388,9 @@ DEFAULT_GATES = """\
 #   mt_retention_min mean chrF++ retention over the language pairs       pollard-taskeval --suite mt
 #   toolcall_pass    true = still emits valid tool calls                 pollard-toolcall --results
 #   toolcall_retention_min  tool-call success vs the reference's, percent pollard-toolcall --ref --results
-#   toolcall_not_measured   fail | skip: a rung pollard-toolcall recorded as NOT MEASURED (no server for its lane on
-#                    this machine, GPU not free, too big) -- default: the `missing` policy
+#   toolcall_not_measured   skip | fail: a rung pollard-toolcall recorded as NOT MEASURED (no server for its lane on
+#                    this machine, GPU not free, too big). skip (the default) PUBLISHES it and the card says
+#                    "tool calls: not measured (<reason>)"; fail holds it back
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
@@ -400,6 +401,7 @@ missing: fail
 default:
   kld_max: 0.5
   top1_min: 75
+  toolcall_not_measured: skip
 lanes:
   gguf:
     runtime: stock
@@ -510,9 +512,10 @@ def evaluate_gate(metrics, th, missing="fail"):
     def row(name, value, want, ok, why=""):
         checks.append({"check": name, "value": value, "want": want, "ok": bool(ok), "why": why})
     # a rung pollard-toolcall explicitly recorded as NOT MEASURED (no server for its lane here, GPU not free, too
-    # big) is held to `toolcall_not_measured` (default: the `missing` policy), with the reason on the row
+    # big) is held to `toolcall_not_measured`: skip by default (owner, 2026-10-16) -- the rung publishes and the card
+    # says "tool calls: not measured (<reason>)"; `fail` holds it back. The reason is on the row either way.
     tc_nm = metrics.get("toolcall_status") == "not-measured"
-    tc_policy = th.get("toolcall_not_measured", missing)
+    tc_policy = th.get("toolcall_not_measured", "skip")
     tc_why = f"not measured: {metrics.get('toolcall_reason') or 'no reason recorded'}"
     for key, want in th.items():
         if key in _CHECKS:

@@ -151,3 +151,25 @@ def test_exl3_lane_is_gated_on_the_forward_not_on_a_kld_it_cannot_measure():
     th = V.thresholds_for(V.load_gates(None), "M-Pollard-EXL3-4.0bpw", "exl3")
     assert "kld_max" not in th and "top1_min" not in th and th["e2e_acc_min"] == 0.3
     assert V.evaluate_gate({"e2e_acc": 0.6}, th)["pass"]
+
+
+def test_tool_calls_not_measured_publish_by_default_and_fail_stays_available():
+    """Owner decision (2026-10-16): an agentic rung whose tool-call gate is NOT MEASURED (no vLLM on Windows, too big
+    for in-process) publishes, and the card says 'not measured (<reason>)'. `fail` is still there to hold it back."""
+    import pollard_verify as V
+    import pollard_card as C
+    g = V.load_gates(None)
+    assert g["default"]["toolcall_not_measured"] == "skip"
+    th = V.thresholds_for(g, "int4", lane="gptq", kinds=("agentic",))
+    assert th.get("toolcall_retention_min") == 90 and th.get("toolcall_not_measured") == "skip"
+    m = {"kld": 0.01, "top1": 99.0, "toolcall_status": "not-measured", "toolcall_reason": "vLLM is not installed here"}
+    res = V.evaluate_gate(m, th, missing=g.get("missing", "fail"))
+    tc = [r for r in res["checks"] if "tool" in r["check"]]
+    assert res["pass"] is True and tc and all(r["ok"] and "not measured: vLLM" in r["why"] for r in tc)
+    held = V.evaluate_gate(m, dict(th, toolcall_not_measured="fail"), missing="fail")
+    assert held["pass"] is False
+    assert C.tool_ready_cell({"status": "not-measured", "reason": "vLLM is not installed here"}) == \
+        "not measured (vLLM is not installed here)"
+    shipped = (Path(V.__file__).resolve().parents[1] / "recipes" / "gates.yaml")
+    if shipped.exists():
+        assert V.load_gates(str(shipped))["default"]["toolcall_not_measured"] == "skip"
