@@ -46,7 +46,8 @@ def detect_moe(model_id, layers_hint=0):
     cfg = _ws.text_config_dict(_ws.config_dict(model_id))    # plain JSON: no checkpoint code runs to read it
     if not cfg:
         return False, layers_hint
-    n = cfg.get("num_hidden_layers", 0) or layers_hint
+    blocks = cfg.get("block_configs") or cfg.get("layers_block_type") or cfg.get("hybrid_override_pattern")
+    n = cfg.get("num_hidden_layers", 0) or (len(blocks) if blocks else 0) or layers_hint   # Bolt lists blocks only
     moe = any(isinstance(cfg.get(k), int) and cfg.get(k) > 1
               for k in ("num_experts", "num_local_experts", "n_routed_experts"))
     return bool(moe), int(n)
@@ -87,7 +88,8 @@ def layer_of(path):
 VISION_RE = re.compile(r"(^|\.)(visual|vision_tower|vision_model|vision_encoder|image_encoder"
                        r"|patch_embed|audio_tower|audio_encoder|speech_encoder)", re.I)
 PROJ_RE = re.compile(r"(multi_modal_projector|mm_projector|mm_proj|\bmerger\b"
-                     r"|modality_project|resampler|perceiver|connector)", re.I)
+                     r"|modality_project|resampler|perceiver|connector|(^|\.)mlp1\.|sound_projection)", re.I)
+# (`mlp1` is the InternVL-style projector Nemotron omni / Bolt ship; mlx-vlm keeps the name as mlp1.layers.N)
 # A speech-output stack (Qwen3-Omni's talker / code2wav) has decoder layers of its own: `talker.model.layers.3.`
 # would take the language layer 3's allocation. It is left at the checkpoint's precision.
 SPEECH_RE = re.compile(r"(^|\.)(talker|code2wav|token2wav|code_predictor|speech_decoder|vocoder)(\.|$)", re.I)
@@ -114,10 +116,68 @@ def mlx_engine(model_dir):
     cfg = _j.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
     mt = get_model_type(cfg)
     try:
-        importlib.import_module(f"mlx_vlm.models.{mt}")
+        mod = importlib.import_module(f"mlx_vlm.models.{mt}")
     except Exception as e:                                  # noqa: BLE001
-        return "hold", f"this model has {parts}; mlx-vlm has no {mt!r} model ({type(e).__name__})"
+        hint = f" -- {MLX_VLM_NEWER}" if cfg.get("model_type") == "nemotron_h_omni" else ""
+        return "hold", f"this model has {parts}; mlx-vlm has no {mt!r} model ({type(e).__name__}){hint}"
+    import pollard_workspace as _ws
+    if _ws.text_config_dict(cfg).get("block_configs"):
+        tc = getattr(mod, "TextConfig", None)
+        if tc is None or not hasattr(tc, "for_layer"):     # an older mlx-vlm built every layer from ONE config
+            return "hold", (f"this checkpoint gives each layer its own block config (NVIDIA puzzle: expert count / "
+                            f"width per layer) and this mlx-vlm's {mt!r} builds every layer from one -- "
+                            f"{MLX_VLM_NEWER}")
     return "mlx_vlm", mt
+
+
+#: Nemotron-3.5-Bolt (nemotron_h_omni over a nemotron_h_puzzle decoder) landed in mlx-vlm after 0.7.8 (#2528)
+MLX_VLM_NEWER = ('needs an mlx-vlm newer than 0.7.8: pip install -U "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm"')
+
+
+def encoded_source(model_dir):
+    """The checkpoint's already-quantized linears -- {module: encoding} (modelopt NVFP4 / FP8, ggml blocks packed in
+    safetensors as NVIDIA's Bolt-24GB ships its experts, ...); {} for a float checkpoint."""
+    if not os.path.isdir(model_dir):
+        return {}
+    try:
+        import pollard_stream as S
+        return S.Source(model_dir).modules
+    except (SystemExit, Exception):                         # noqa: BLE001 -- unreadable = let the converter say
+        return {}
+
+
+def decode_to_float(model_dir, out, log=print):
+    """A BF16 copy of an already-quantized checkpoint, for a converter that reads float weights: every encoded linear
+    decoded (pollard_stream's readers -- the same decode the streamed lanes use), every other tensor byte-for-byte,
+    side files copied, the quantization config dropped. The disk it needs is checked first."""
+    import shutil
+    import pollard_stream as S
+    src = S.Source(model_dir)
+    need = sum((S._prod(src.shape(k)) * 2 if src.encoding(k) else src.nbytes(k)) for k in src.logical)
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(out)) or ".").free
+    if free < need + (2 << 30):
+        raise SystemExit(f"ERROR: decoding the quantized source to BF16 for MLX needs {need / 1e9:.1f} GB at {out} "
+                         f"and {free / 1e9:.1f} GB is free. Free the space, or start from the float release "
+                         f"(for Bolt: nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16).")
+    log(f"   source is already quantized ({len(src.modules)} encoded linears): decoding to BF16 -> {out} "
+        f"({need / 1e9:.2f} GB) for mlx-vlm")
+    w = S.ShardWriter(out)
+    for k in sorted(src.logical):
+        if src.encoding(k) is None and src.dtype(k) not in S.FLOAT_DT:
+            S.copy_raw(src, w, k)                           # integer side tensors (RADIO's summary_idxs)
+        else:
+            S.write_float(src, w, k, "BF16")
+    w.close()
+    S.copy_side_files_of(src, out)
+    cfg_p = os.path.join(out, "config.json")
+    cfg = json.load(open(cfg_p, encoding="utf-8"))
+    cfg.pop("quantization_config", None)
+    json.dump(cfg, open(cfg_p, "w", encoding="utf-8"), indent=1)
+    hq = os.path.join(out, "hf_quant_config.json")
+    if os.path.exists(hq):
+        os.remove(hq)
+    return out
 
 
 def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
@@ -144,9 +204,9 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
     li = layer_of(path)
     if li is None or li not in alloc:
         return {"bits": LOW, "group_size": gsize}
-    if "self_attn" in path:
-        return {"bits": alloc[li]["attn"], "group_size": gsize}
-    if "mlp" in path or "block_sparse_moe" in path or "experts" in path:
+    if "self_attn" in path or re.search(r"\.mixer\.(q_proj|k_proj|v_proj|o_proj|in_proj|out_proj)$", path):
+        return {"bits": alloc[li]["attn"], "group_size": gsize}   # NemotronH: attention / Mamba2 token mixers
+    if "mlp" in path or "block_sparse_moe" in path or "experts" in path or "latent_proj" in path:
         return {"bits": alloc[li]["ffn"], "group_size": gsize}
     return {"bits": LOW, "group_size": gsize}
 
@@ -559,17 +619,27 @@ def main():
             rs.note(path, module)                          # the next mx.quantize is this module's weight
         return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high)
 
-    import contextlib
+    import contextlib, shutil
     import pollard_workspace as ws
-    trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
+    src_dir, staging = a.model, None
+    if engine == "mlx_vlm" and encoded_source(a.model):     # mlx-vlm reads float weights: decode first
+        staging = a.out.rstrip("/\\") + ".float-src"
+        shutil.rmtree(staging, ignore_errors=True)
+        src_dir = decode_to_float(a.model, staging)
+    # mlx-vlm builds the model from its own code: the checkpoint's modelling files are never needed there
+    trc = False if engine == "mlx_vlm" else ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     ckw = dict(mlx_path=a.out, quantize=True, q_bits=low, q_group_size=a.group_size, quant_predicate=predicate)
-    with (rs if rs is not None else contextlib.nullcontext()):
-        try:
-            convert(a.model, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
-        except TypeError:
-            if trc:
-                print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
-            convert(a.model, **ckw)
+    try:
+        with (rs if rs is not None else contextlib.nullcontext()):
+            try:
+                convert(src_dir, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
+            except TypeError:
+                if trc:
+                    print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
+                convert(src_dir, **ckw)
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
     if os.path.isdir(a.model):                             # the whole model or nothing: no silent text-only MLX
         import pollard_complete as PC
         PC.fill(a.model, a.out, "mlx")                      # processor files a converter did not write
