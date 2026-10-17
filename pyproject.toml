@@ -112,6 +112,8 @@ pollard-archfp = "pollard_archfp:main"
 pollard-errtype = "pollard_errtype:main"
 pollard-ls = "pollard_ls:main"
 pollard-hf-smooth = "pollard_hf_smooth:main"
+# the layer-streaming engine under every transformers lane: resolve the text backbone + preflight the memory
+pollard-stream = "pollard_stream:main"
 pollard-mx = "pollard_mx:main"
 pollard-mlx = "pollard_mlx:main"
 pollard-exl3 = "pollard_exl3:main"
@@ -150,7 +152,7 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "p
     "pollard_archfp", "pollard_errtype", "pollard_errsrc", "pollard_recard",
     "pollard_ggufcompat", "pollard_reclaim", "pollard_exl3_band", "pollard_refcheck",
     "pollard_runtime", "pollard_runtime_update", "pollard_kvbench", "pollard_passthrough", "pollard_fq",
-    "pollard_mxfp6",
+    "pollard_mxfp6", "pollard_stream", "pollard_gptqpack",
     # declared as entry points but never listed here, so `pollard-trellis` and friends installed
     # as a command with no module behind it
     "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis", "pollard_draft",

@@ -42,15 +42,14 @@ def rung_bits(bits, high=None):
 
 
 def detect_moe(model_id, layers_hint=0):
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        n = getattr(cfg, "num_hidden_layers", 0) or layers_hint
-        moe = any(getattr(cfg, k, 0) for k in
-                  ("num_experts", "num_local_experts", "n_routed_experts"))
-        return bool(moe), int(n)
-    except Exception:
+    import pollard_workspace as _ws
+    cfg = _ws.text_config_dict(_ws.config_dict(model_id))    # plain JSON: no checkpoint code runs to read it
+    if not cfg:
         return False, layers_hint
+    n = cfg.get("num_hidden_layers", 0) or layers_hint
+    moe = any(isinstance(cfg.get(k), int) and cfg.get(k) > 1
+              for k in ("num_experts", "num_local_experts", "n_routed_experts"))
+    return bool(moe), int(n)
 
 
 def allocate(sens, n_layers, hot_frac, focus=None, low=None, high=None):

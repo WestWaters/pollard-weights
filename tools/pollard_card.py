@@ -607,6 +607,43 @@ def lane_serve(lane, path, tools=None):
     return []
 
 
+def provenance_lines(lane, builds):
+    """What each rung was built FROM, read off its own sidecars: the streamed engine and text backbone, an NVFP4 source
+    tensor kept byte for byte, tensors quantized from an already-quantized source, an EXL3 of the language model only.
+    One line per fact, never a guess -- a rung without a sidecar says nothing here."""
+    import json as _j
+    out = []
+    for b in builds:
+        p = b.get("path", "")
+        if not p or not os.path.isdir(p):
+            continue
+        name = rung_subfolder(b, lane)
+        facts = []
+        for side in ("pollard_mx.json", "pollard-gptq.json", "pollard-exl3.json"):
+            f = os.path.join(p, side)
+            if not os.path.isfile(f):
+                continue
+            try:
+                m = _j.load(open(f, encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if m.get("passthrough"):
+                facts.append(f"{len(m['passthrough'])} linears kept byte for byte from the source's own NVFP4 "
+                             "(NVIDIA's QAT tensors)")
+            deq = m.get("dequantized_source") or {}
+            if deq:
+                facts.append("quantized from the dequantized source for " + ", ".join(
+                    f"{n} {a.replace('ggml:', '')} linears" for a, n in sorted(deq.items())))
+            if m.get("engine") == "pollard-stream":
+                how = (m.get("backbone") or {}).get("how") or ""
+                facts.append("streamed block by block" + (f" ({how})" if how else ""))
+            if m.get("input") == "text":
+                facts.append(f"language model only: {m.get('why')}")
+        if facts:
+            out.append(f"- `{name}/`: " + "; ".join(facts))
+    return (["How these rungs were made:", "", *out, ""] if out else [])
+
+
 def lane_folder_section(lane, builds, results, repo, tools=None):
     """One lane of the ONE-repo card: its rungs in <LANE>/<rung>/ with the measured numbers (PPL / KLD / top-1 /
     Tool-ready / gate, whichever were recorded), and the exact download + serve command."""
@@ -630,6 +667,7 @@ def lane_folder_section(lane, builds, results, repo, tools=None):
            "|---|---:|---:|---:|---:|---:|---|---|", *rows, "",
            "```bash", f'hf download {repo} --include "{F}/{pick}/*" --local-dir {here}', *lane_serve(lane, path, tools),
            "```", ""]
+    out += provenance_lines(lane, builds)
     if lane == "mx":
         import pollard_mxfp6 as M6
         extra = []

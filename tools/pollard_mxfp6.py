@@ -384,19 +384,39 @@ def layer_of(mod):
     return int(m.group(1)) if m else -1
 
 
+_SOURCES = {}
+
+
+def source(model_dir):
+    """The checkpoint as pollard_stream's Source: tensor-at-a-time reads, dequantized on read when the source is
+    already quantized (modelopt NVFP4 / FP8, ggml-packed, compressed-tensors NVFP4), smoothing overlays applied."""
+    import pollard_stream as S
+    key = os.path.abspath(model_dir)
+    if key not in _SOURCES:
+        _SOURCES[key] = S.Source(model_dir)
+    return _SOURCES[key]
+
+
+def _read(model_dir, name):
+    return source(model_dir).read(name).astype(np.float32, copy=False)
+
+
 def scan(model_dir, quantize_vision=False):
-    """[(shard, tensor name, module, shape, dtype)] for every quantizable linear, plus the skipped 2-D weights."""
+    """[(shard, tensor name, module, shape, dtype)] for every quantizable linear, plus the skipped 2-D weights. An
+    encoded source linear (NVIDIA's NVFP4 / ggml experts) is listed by its logical `<module>.weight` and the dtype
+    of its encoding."""
+    src = source(model_dir)
     lin, skipped = [], []
-    for sh in source_shards(model_dir):
-        hdr, _ = st_header(sh)
-        for name, info in hdr.items():
-            if name == "__metadata__":
-                continue
-            ok, mod = quantizable(name, info["shape"], quantize_vision)
-            if ok:
-                lin.append((sh, name, mod, tuple(info["shape"]), info["dtype"]))
-            elif len(info["shape"]) == 2 and name.endswith(".weight") and _LAYER.search(name):
-                skipped.append((name[: -len(".weight")], mod))      # (module, why)
+    for name in src.logical:
+        shape = tuple(src.shape(name))
+        ok, mod = quantizable(name, shape, quantize_vision)
+        kind, ref = src.logical[name]
+        sh = src.entries[ref][0] if kind == "raw" else src.entries[src.modules[ref]["keys"].get(
+            "weight", src.modules[ref]["keys"].get("weight_packed"))][0]
+        if ok:
+            lin.append((sh, name, mod, shape, src.dtype(name)))
+        elif len(shape) == 2 and name.endswith(".weight") and _LAYER.search(name):
+            skipped.append((name[: -len(".weight")], mod))      # (module, why)
     return lin, skipped
 
 
@@ -415,10 +435,8 @@ def _imp_for(importance, mod, K):
 def measure_errors(model_dir, lin, atoms, importance=None, rule="search", log=print):
     """{fused group: {"n": params, "layer": i, "members": [...], "w2": sum ||W||^2_imp, "err": {atom: sum err}}}."""
     groups = {}
-    hdrs = {}
     for k, (sh, name, mod, shape, dt) in enumerate(lin):
-        hdrs.setdefault(sh, st_header(sh))
-        w = to_f32(*st_read(sh, name, hdrs[sh]))
+        w = _read(model_dir, name)
         imp = _imp_for(importance, mod, shape[1])
         I = 1.0 if imp is None else imp[None, :]
         g = groups.setdefault(fused_key(mod), {"n": 0, "layer": layer_of(mod), "members": [], "w2": 0.0,
@@ -673,48 +691,15 @@ def build(model_dir, out, fmt=None, mix=None, layout="auto", fp6="auto", fp4=Non
     if plan_only:
         return meta
     os.makedirs(out, exist_ok=True)
-    nv_global = {}
-    if "nvfp4" in used:                                  # one tensor scale per fused NVFP4 layer
-        for k, g in groups.items():
-            if assign[k] == "nvfp4":
-                amax = 0.0
-                for sh, name, mod, shape, dt in lin:
-                    if mod in g["members"]:
-                        amax = max(amax, float(np.abs(to_f32(*st_read(sh, name))).max()))
-                nv_global[k] = 448.0 * 6.0 / (amax or 1.0)
+    src = source(model_dir)
+    nv_global, passthrough = nvfp4_globals(src, lin, groups, assign, lay)
+    meta["passthrough"] = sorted(passthrough)
+    meta["dequantized_source"] = _encoded_counts(src, lin, passthrough)
     by_name = {name: (mod, shape) for sh, name, mod, shape, dt in lin}
-    weight_map = {}
-    for sh in source_shards(model_dir):
-        hdr, _ = st_header(sh)
-        meta_in = hdr.get("__metadata__") or {}
-        tensors = {}
-        for name, info in hdr.items():
-            if name == "__metadata__":
-                continue
-            dt, arr = st_read(sh, name, (hdr, _))
-            if name not in by_name:
-                tensors[name] = (dt, arr)
-                continue
-            mod, shape = by_name[name]
-            atom = module_atoms[mod]
-            w = to_f32(dt, arr)
-            imp = _imp_for(importance, mod, shape[1])
-            parts, _dec = encode_atom(w, atom, imp, rule, nv_global.get(fused_key(mod)))
-            for suf, (sdt, a) in parts.items():
-                if lay == "compressed-tensors" and suf == "weight" and atom != "mxfp8":
-                    suf = "weight_packed"
-                tensors[f"{mod}.{suf}"] = (sdt, a)
-        dst = os.path.join(out, os.path.basename(sh))
-        st_write(dst, tensors, {**meta_in, "format": "pt"})
-        weight_map.update({n: os.path.basename(sh) for n in tensors})
-    if os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
-        json.dump({"metadata": {}, "weight_map": weight_map},
-                  open(os.path.join(out, "model.safetensors.index.json"), "w"), indent=2)
-    for f in os.listdir(model_dir):
-        p = os.path.join(model_dir, f)
-        if os.path.isfile(p) and not f.endswith(".safetensors") and f != "model.safetensors.index.json" \
-                and f != SIDECAR and not f.endswith(".tmp"):
-            shutil.copy2(p, os.path.join(out, f))
+    weight_map = write_shards(src, out, lin, lambda name, w, mod, shape: _encode_for(
+        src, name, w, mod, shape, module_atoms[mod], importance, rule, nv_global.get(fused_key(mod)), lay,
+        passthrough), by_name)
+    _finish_files(src, out, weight_map)
     cfgp = os.path.join(out, "config.json")
     cfg = json.load(open(cfgp)) if os.path.exists(cfgp) else {}
     ign = {m for m, _ in skipped}
@@ -722,6 +707,321 @@ def build(model_dir, out, fmt=None, mix=None, layout="auto", fp6="auto", fp4=Non
     json.dump(cfg, open(cfgp, "w"), indent=2)
     json.dump(meta, open(os.path.join(out, SIDECAR), "w"), indent=1)
     return meta
+
+
+def _encoded_counts(src, lin, skip=()):
+    """{source encoding: n linears re-quantized FROM its dequantized values} (passthrough ones excluded)."""
+    from collections import Counter
+    c = Counter()
+    for sh, name, mod, shape, dt in lin:
+        if mod in skip:
+            continue
+        enc = src.encoding(name)
+        if enc is not None:
+            c[enc["algo"]] += 1
+    return dict(c)
+
+
+def nvfp4_globals(src, lin, groups, assign, layout):
+    """One NVFP4 tensor scale per fused group (vLLM reads one per fused layer) -- and the NVFP4 PASSTHROUGH: a
+    group whose source tensors are already NVFP4 (NVIDIA's QAT checkpoint) keeps them byte for byte (packed codes
+    + E4M3 block scales), the group's tensor scale taken from them so any re-encoded partner matches. A group whose
+    NVFP4 members disagree on their tensor scale cannot pass through (vLLM would decode one with the other's
+    scale) and is re-encoded from the dequantized values. Returns ({group: global}, {passthrough modules})."""
+    nv_global, passthrough = {}, set()
+    if layout != "compressed-tensors":
+        return nv_global, passthrough
+    members = {}
+    for sh, name, mod, shape, dt in lin:
+        members.setdefault(fused_key(mod), []).append((name, mod))
+    for k, g in groups.items():
+        if assign[k] != "nvfp4":
+            continue
+        enc = [(n, m, src.encoding(n)) for n, m in members.get(k, [])]
+        nv = [(n, m, e) for n, m, e in enc if e is not None and e["algo"] == "nvfp4"]
+        if nv:
+            gs = {round(_nv_global(src, e), 12) for _, _, e in nv}
+            if len(gs) == 1:
+                nv_global[k] = float(next(iter(gs)))
+                passthrough.update(m for _, m, _ in nv)
+                continue
+        amax = 0.0
+        for n, m in members.get(k, []):
+            amax = max(amax, float(np.abs(src.read(n)).max()))
+        nv_global[k] = 448.0 * 6.0 / (amax or 1.0)
+    return nv_global, passthrough
+
+
+def _nv_global(src, enc):
+    """The compressed-tensors tensor scale (w = fp4 * s / g) of a stored NVFP4 tensor: its own, or 1 / modelopt's
+    weight_scale_2."""
+    k = enc["keys"]
+    if "weight_global_scale" in k:
+        return float(np.asarray(src._raw_f32(k["weight_global_scale"])).reshape(-1)[0])
+    s2 = float(np.asarray(src._raw_f32(k["weight_scale_2"])).reshape(-1)[0]) if "weight_scale_2" in k else 1.0
+    return 1.0 / s2 if s2 else 1.0
+
+
+def passthrough_parts(src, name):
+    """compressed-tensors NVFP4 tensors of a stored NVFP4 linear, BYTE FOR BYTE (codes + E4M3 block scales); the
+    tensor scale converted from modelopt's weight_scale_2 (g = 1 / s2) when the source is modelopt."""
+    enc = src.encoding(name)
+    k = enc["keys"]
+    packed = src.read_raw(k.get("weight_packed", k.get("weight")))
+    scale = src.read_raw(k["weight_scale"])
+    return {"weight_packed": packed, "weight_scale": scale,
+            "weight_global_scale": ("F32", np.array([_nv_global(src, enc)], np.float32))}
+
+
+def _encode_for(src, name, w, mod, shape, atom, importance, rule, gscale, layout, passthrough):
+    if mod in passthrough:
+        return passthrough_parts(src, name)
+    imp = _imp_for(importance, mod, shape[1])
+    parts, _dec = encode_atom(w, atom, imp, rule, gscale)
+    out = {}
+    for suf, v in parts.items():
+        if layout == "compressed-tensors" and suf == "weight" and atom != "mxfp8":
+            suf = "weight_packed"
+        out[suf] = v
+    return out
+
+
+def write_shards(src, out, lin, encode, by_name):
+    """One output shard per source shard (same names): every quantized linear through `encode`, every other
+    tensor copied as stored -- except a tensor the source ENCODED (a ggml Q8_0 embedding, a modelopt tensor outside
+    the decoder) or a smoothing overlay changed, which is written as bf16: an MX checkpoint holds no other
+    encoding. Returns the weight map."""
+    import pollard_stream as S
+    shard_of = {}
+    for name in src.logical:
+        kind, ref = src.logical[name]
+        raw = ref if kind == "raw" else src.modules[ref]["keys"].get("weight", src.modules[ref]["keys"].get("weight_packed"))
+        shard_of.setdefault(src.entries[raw][0], []).append(name)
+    weight_map = {}
+    for sh in src.files:
+        hdr, _ = st_header(sh)
+        meta_in = {k: v for k, v in (hdr.get("__metadata__") or {}).items() if k != "native_iq2_layers"}
+        tensors = {}
+        for name in shard_of.get(sh, []):
+            if name in by_name:
+                mod, shape = by_name[name]
+                for suf, v in encode(name, src.read(name).astype(np.float32, copy=False), mod, shape).items():
+                    tensors[f"{mod}.{suf}"] = v
+                continue
+            if src.encoding(name) is not None or src.modified(name):
+                a = src.read(name)
+                dt = src.dtype(name) if src.dtype(name) in ("BF16", "F16", "F32") else "BF16"
+                tensors[name] = (dt, S.to_storage(a, dt))
+                continue
+            tensors[name] = src.read_raw(src.logical[name][1])
+        dst = os.path.join(out, os.path.basename(sh))
+        st_write(dst, tensors, {**meta_in, "format": "pt"})
+        weight_map.update({n: os.path.basename(sh) for n in tensors})
+    return weight_map
+
+
+def _finish_files(src, out, weight_map):
+    """The index (when the source has one) and every side file, minus the source's own quantization records."""
+    if len(src.files) > 1 or os.path.exists(os.path.join(src.base_dir, "model.safetensors.index.json")):
+        json.dump({"metadata": {}, "weight_map": weight_map},
+                  open(os.path.join(out, "model.safetensors.index.json"), "w"), indent=2)
+    import pollard_stream as S
+    S.copy_side_files_of(src, out)
+    for f in (SIDECAR, "hf_quant_config.json", "pollard-smooth-report.json"):
+        if os.path.exists(os.path.join(out, f)):
+            os.remove(os.path.join(out, f))
+    cfgp = os.path.join(out, "config.json")
+    if os.path.exists(cfgp):
+        cfg = json.load(open(cfgp))
+        if cfg.pop("quantization_config", None) is not None:
+            json.dump(cfg, open(cfgp, "w"), indent=2)
+
+
+# ----------------------------------------------------------------------------------------------- scheme rungs
+
+#: the llm-compressor schemes the MX lane's NVFP4 / MXFP4 / FP8 rungs carry, written by Pollard's own encoder
+#: (compressed-tensors on disk, exactly the tensors and config llm-compressor's presets write)
+SCHEME_WEIGHTS = {
+    "NVFP4": {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16, "symmetric": True,
+              "dynamic": False, "scale_dtype": "torch.float8_e4m3fn", "zp_dtype": "torch.float8_e4m3fn"},
+    "MXFP4": {"num_bits": 4, "type": "float", "strategy": "group", "group_size": 32, "symmetric": True,
+              "dynamic": False, "scale_dtype": "torch.uint8", "zp_dtype": "torch.uint8"},
+    "FP8": {"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True, "dynamic": False},
+    "FP8_DYNAMIC": {"num_bits": 8, "type": "float", "strategy": "channel", "symmetric": True, "dynamic": False},
+}
+SCHEME_INPUTS = {
+    "NVFP4": {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16, "symmetric": True,
+              "dynamic": "local", "observer": "minmax"},
+    "MXFP4": {"num_bits": 4, "type": "float", "strategy": "group", "group_size": 32, "symmetric": True,
+              "dynamic": True, "scale_dtype": "torch.uint8", "zp_dtype": "torch.uint8"},
+    "FP8": {"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True, "dynamic": False,
+            "observer": "minmax"},
+    "FP8_DYNAMIC": {"num_bits": 8, "type": "float", "strategy": "token", "symmetric": True, "dynamic": True},
+}
+SCHEME_FORMAT = {"NVFP4": "nvfp4-pack-quantized", "MXFP4": "mxfp4-pack-quantized", "FP8": "float-quantized",
+                 "FP8_DYNAMIC": "float-quantized"}
+SCHEME_BPW = {"NVFP4": 4.5, "MXFP4": 4.25, "FP8": 8.0, "FP8_DYNAMIC": 8.0}
+NEEDS_INPUT_SCALE = ("NVFP4", "FP8")
+
+
+def _e4m3(x):
+    """float32 -> E4M3 code bytes (round to nearest, saturating at 448)."""
+    import pollard_mx as X
+    return quantize_elem(np.asarray(X.round_e4m3(x), np.float64), "e4m3").astype(np.uint8)
+
+
+def encode_scheme(w, scheme, gscale=None, input_amax=None):
+    """One [N, K] linear in a compressed-tensors scheme. Returns ({suffix: (dtype, array)}, decoded float32)."""
+    import pollard_mx as X
+    w = np.asarray(w, np.float32)
+    if scheme == "NVFP4":
+        parts, dec = encode_atom(w, "nvfp4", None, "search", gscale)
+        if input_amax is not None:
+            parts["input_global_scale"] = ("F32", np.array([448.0 * 6.0 / max(float(input_amax), 1e-12)], np.float32))
+        return parts, dec
+    if scheme == "MXFP4":
+        parts, dec = encode_atom(w, "mxfp4")
+        return {"weight_packed": parts["weight"], "weight_scale": parts["weight_scale"]}, dec
+    if scheme in ("FP8", "FP8_DYNAMIC"):
+        if scheme == "FP8":
+            sc = np.array([max(float(np.abs(w).max()), 1e-12) / 448.0], np.float32)
+            codes = _e4m3(w / sc[0])
+            dec = decode_elem(codes, "e4m3").astype(np.float32) * sc[0]
+            parts = {"weight": ("F8_E4M3", codes), "weight_scale": ("F32", sc)}
+            if input_amax is not None:
+                parts["input_scale"] = ("F32", np.array([max(float(input_amax), 1e-12) / 448.0], np.float32))
+            return parts, dec
+        sc = (np.abs(w).max(1, keepdims=True).clip(min=1e-12) / 448.0).astype(np.float32)
+        codes = _e4m3(w / sc)
+        dec = decode_elem(codes, "e4m3").astype(np.float32) * sc
+        return {"weight": ("F8_E4M3", codes), "weight_scale": ("F32", sc)}, dec
+    raise ValueError(scheme)
+
+
+def _layer_rx(i, side):
+    import pollard_gptqpack as G
+    return rf"re:.*\.layers\.{i}\.{G.ATTN_RX if side == 'attn' else G.FFN_RX}\..*"
+
+
+def build_scheme(model_dir, out, scheme, hot=(), protect="FP8", input_amax=None, moe_attn_only=False,
+                 quantize_vision=False, log=print, plan_only=False):
+    """An NVFP4 / MXFP4 / FP8 / FP8_DYNAMIC rung written by Pollard's own encoder (no llm-compressor, no model
+    load): the body linears in `scheme`, the measured-hot layers in `protect` (FP8), routers / lm_head / embeddings /
+    norms / towers / projectors at the checkpoint's precision. Activation scales (NVFP4's input_global_scale,
+    static FP8's input_scale) come from `input_amax` ({checkpoint weight key: max |x|}, pollard_stream's calibration
+    pass); MXFP4 and FP8_DYNAMIC quantize activations on the fly. An NVFP4 source tensor passes through byte for byte.
+    Fused groups (q/k/v, gate/up, a layer's experts) share one NVFP4 tensor scale and one input scale."""
+    import pollard_gptqpack as G
+    if scheme not in SCHEME_WEIGHTS:
+        raise SystemExit(f"--scheme {scheme}: the stream engine writes {sorted(SCHEME_WEIGHTS)}")
+    lin, skipped = scan(model_dir, quantize_vision)
+    if not lin:
+        raise SystemExit(f"no quantizable linears in {model_dir}")
+    if scheme in NEEDS_INPUT_SCALE and input_amax is None:
+        raise SystemExit(f"{scheme} needs activation scales: run the calibration pass (pollard-mx --calib)")
+    hot = {int(h) for h in hot}
+    assign = {}
+    for sh, name, mod, shape, dt in lin:
+        li = layer_of(mod)
+        side = G.side_of(name)
+        prot = li in hot and (side == "attn" or not moe_attn_only)
+        assign[mod] = protect if prot and protect != scheme else scheme
+    groups = {}
+    for sh, name, mod, shape, dt in lin:
+        g = groups.setdefault(fused_key(mod), {"n": 0, "layer": layer_of(mod), "members": []})
+        g["n"] += int(np.prod(shape))
+        g["members"].append(mod)
+    for k, g in groups.items():                              # one scheme per fused group (vLLM fuses them)
+        sch = {assign[m] for m in g["members"]}
+        if len(sch) > 1:
+            best = max(sch, key=lambda x: SCHEME_BPW[x])
+            for m in g["members"]:
+                assign[m] = best
+    used = sorted(set(assign.values()), key=lambda x: SCHEME_BPW[x])
+    if any(u in NEEDS_INPUT_SCALE for u in used) and input_amax is None:
+        raise SystemExit(f"{', '.join(u for u in used if u in NEEDS_INPUT_SCALE)} needs activation scales")
+    q_params = sum(int(np.prod(shape)) for *_, shape, dt in lin)
+    bpw = sum(SCHEME_BPW[assign[mod]] * int(np.prod(shape)) for sh, name, mod, shape, dt in lin) / max(q_params, 1)
+    meta = {"format": scheme.lower(), "scheme": scheme, "protect": protect if len(used) > 1 else None,
+            "layout": "compressed-tensors", "bpw": round(bpw, 4), "quantized_params": q_params,
+            "atoms": {u: round(sum(int(np.prod(sh_)) for _, _, m, sh_, _ in lin if assign[m] == u) / q_params, 4)
+                      for u in used},
+            "modules": {m: assign[m] for m in sorted(assign)}, "weight_only": False, "engine": "pollard-stream",
+            "skipped": dict(sorted(skipped)), "hot_layers": sorted(hot),
+            "runtimes": [["vLLM", "yes", "compressed-tensors " + ", ".join(SCHEME_FORMAT[u] for u in used)]],
+            "producer": "pollard-mx"}
+    log(f"   {scheme} (+{protect} on {len(hot)} hot layers) -> compressed-tensors: {bpw:.3f} bpw over "
+        f"{q_params / 1e6:.1f}M quantized params")
+    if plan_only:
+        return meta
+    os.makedirs(out, exist_ok=True)
+    src = source(model_dir)
+    nv_assign = {k: ("nvfp4" if assign[g["members"][0]] == "NVFP4" else "x") for k, g in groups.items()}
+    nv_global, passthrough = nvfp4_globals(src, lin, groups, nv_assign, "compressed-tensors")
+    amax_grp = {}
+    if input_amax is not None:
+        for sh, name, mod, shape, dt in lin:
+            v = input_amax.get(name)
+            if v is not None:
+                k = fused_key(mod)
+                amax_grp[k] = max(amax_grp.get(k, 0.0), float(v))
+    missing = [name for sh, name, mod, shape, dt in lin if assign[mod] in NEEDS_INPUT_SCALE
+               and fused_key(mod) not in amax_grp]
+    if missing:
+        raise SystemExit(f"no calibration activations reached {len(missing)} linears (e.g. {missing[0]}): their "
+                         f"{scheme} input scales cannot be set")
+    meta["passthrough"] = sorted(passthrough)
+    meta["dequantized_source"] = _encoded_counts(src, lin, passthrough)
+    by_name = {name: (mod, shape) for sh, name, mod, shape, dt in lin}
+
+    def enc(name, w, mod, shape):
+        sch = assign[mod]
+        if mod in passthrough:
+            parts = passthrough_parts(src, name)
+            if sch == "NVFP4" and fused_key(mod) in amax_grp:
+                parts["input_global_scale"] = ("F32", np.array([448.0 * 6.0 / max(amax_grp[fused_key(mod)], 1e-12)],
+                                                               np.float32))
+            return parts
+        parts, _ = encode_scheme(w, sch, nv_global.get(fused_key(mod)), amax_grp.get(fused_key(mod)))
+        return parts
+    weight_map = write_shards(src, out, lin, enc, by_name)
+    _finish_files(src, out, weight_map)
+    import pollard_mx as X
+    groups_cfg = {}
+    body = scheme
+    for gi, u in enumerate(used):
+        if u == body:
+            targets = ["Linear"]
+        else:
+            targets = sorted({_layer_rx(layer_of(m), G.side_of(m + ".weight")) for m, a in assign.items() if a == u})
+        groups_cfg[f"group_{gi}"] = {"targets": targets,
+                                     "weights": {**SCHEME_WEIGHTS[u], "actorder": None, "block_structure": None,
+                                                 "observer": "minmax", "observer_kwargs": {}},
+                                     "input_activations": dict(SCHEME_INPUTS[u]), "output_activations": None,
+                                     "format": SCHEME_FORMAT[u]}
+    qc = {"quant_method": "compressed-tensors", "quantization_status": "compressed",
+          "format": SCHEME_FORMAT[used[0]] if len(used) == 1 else "mixed-precision",
+          "config_groups": groups_cfg, "kv_cache_scheme": None, "global_compression_ratio": None,
+          "ignore": ["lm_head", "re:.*embed_tokens$"] + X.ROUTER_GLOBS + X.VISION_GLOBS + X.PROJECTOR_GLOBS
+          + sorted(m for m, _ in skipped), "producer": "pollard-mx"}
+    cfgp = os.path.join(out, "config.json")
+    cfg = json.load(open(cfgp)) if os.path.exists(cfgp) else {}
+    cfg["quantization_config"] = qc
+    json.dump(cfg, open(cfgp, "w"), indent=2)
+    json.dump(meta, open(os.path.join(out, SIDECAR), "w"), indent=1)
+    return meta
+
+
+def decode_scheme_parts(parts, scheme):
+    """Float32 [N, K] of a scheme-encoded linear's stored tensors ({suffix: array})."""
+    if scheme == "NVFP4":
+        return decode_atom(parts, "nvfp4")
+    if scheme == "MXFP4":
+        return decode_atom({"weight": parts["weight_packed"], "weight_scale": parts["weight_scale"]}, "mxfp4")
+    codes = np.asarray(parts["weight"], np.uint8)
+    sc = np.asarray(parts["weight_scale"], np.float32)
+    v = decode_elem(codes, "e4m3").astype(np.float32)
+    return v * (sc.reshape(-1, 1) if sc.size == codes.shape[0] and sc.size > 1 else sc.reshape(-1)[0])
 
 
 # ----------------------------------------------------------------------------------------------- read back
@@ -755,7 +1055,8 @@ def dequantized_weights(rung_dir):
     for mod, atom in mods.items():
         if mod not in found:
             raise SystemExit(f"{rung_dir}: {mod} is in {SIDECAR} but not in the shards")
-        out[mod + ".weight"] = decode_atom(found[mod], atom)
+        out[mod + ".weight"] = decode_scheme_parts(found[mod], atom) if atom in SCHEME_WEIGHTS else \
+            decode_atom(found[mod], atom)
     return out
 
 
