@@ -1527,6 +1527,19 @@ def _toolcall_not_measured(st, why):
     return "done"
 
 
+#: tools that take --device (the streamed HF lanes and their gate) and the ones with no CPU path at all
+DEVICE_TOOLS = ("pollard-export", "pollard-mx", "pollard-exlr8", "pollard-hf-smooth", "pollard-verify", "pollard-probe")
+GPU_ONLY_TOOLS = ("pollard-exl3",)
+
+
+def gpu_returned():
+    """True once POLLARD_GPU_UNTIL has passed (pollard_llamaserve.gpu_lent) on a CUDA machine."""
+    if not os.environ.get("POLLARD_GPU_UNTIL"):
+        return False
+    import pollard_llamaserve as LS
+    return not LS.gpu_lent()
+
+
 def run_cmd(cmd, ok_codes=(0,), env=None):
     from pollard_auto import _resolve_tool
     r = subprocess.run(_resolve_tool(list(cmd)), env=env) if env else subprocess.run(_resolve_tool(list(cmd)))
@@ -1647,6 +1660,20 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             out(f"{head}: [{why}] {what}")
             statuses[st.id] = f"skipped: {why}"
             continue
+        if run and st.cmd and gpu_returned():
+            # POLLARD_GPU_UNTIL passed: the GPU goes back to its owner. The streamed tools move to the CPU; work that
+            # only runs on a GPU (EXL3, training a drafter) is HELD -- resumable on the next run -- never squeezed in
+            if str(st.cmd[0]) in GPU_ONLY_TOOLS or st.id == "draft/train":
+                msg = "held: GPU-only step and the GPU is not ours after POLLARD_GPU_UNTIL -- re-run the plan to resume"
+                out(f"{head}: {msg} -- {what}")
+                statuses[st.id] = msg
+                if st.rung:
+                    failed_rungs.add((st.lane, st.rung))
+                else:
+                    failed_lanes.add(st.lane)
+                continue
+            if str(st.cmd[0]) in DEVICE_TOOLS and "--device" not in st.cmd:
+                st = Step(st, cmd=list(st.cmd) + ["--device", "cpu"])
         out(f"{head}: {what}")
         if not run:
             statuses[st.id] = "planned"

@@ -146,3 +146,18 @@ def test_rung_chains_group_build_and_expand_and_keep_lane_steps():
     assert ch[("gguf", "Q6_K")] == ["gguf/ladder-Q6_K", "gguf/rungs-Q6_K"]
     assert ch[("exlr8", "_lane")] == ["exlr8/encode"]
     assert ch[("gptq", "int4")] == ["gptq/int4/build", "gptq/int4/verify", "gptq/int4/publish"]
+
+
+def test_after_the_gpu_deadline_hf_lanes_go_to_the_cpu_and_gpu_only_steps_hold(tmp_path, monkeypatch):
+    monkeypatch.setenv("POLLARD_GPU_UNTIL", "22:45")
+    monkeypatch.setattr(R, "gpu_returned", lambda: True)
+    ran = []
+    monkeypatch.setattr(R, "run_cmd", lambda cmd, ok=(0,), **k: ran.append(list(cmd)))
+    c = {"mdir": str(tmp_path), "state": str(tmp_path / "st.json"), "ngl": "auto"}
+    steps = [S(id="gptq/int4/build", lane="gptq", rung="int4", kind="build", requires="any", cmd=["pollard-export", "--bits", "4"]),
+             S(id="exl3/3.0bpw/build", lane="exl3", rung="3.0bpw", kind="build", requires="any", cmd=["pollard-exl3", "--bpw", "3"]),
+             S(id="exl3/3.0bpw/verify", lane="exl3", rung="3.0bpw", kind="verify", requires="any", cmd=["pollard-verify"])]
+    st = R.execute(steps, c, {}, run=True, have={"any": True, "cuda": True}, out=lambda *_: None)
+    assert ran[0][-2:] == ["--device", "cpu"], "the streamed GPTQ build moves to the CPU"
+    assert st["exl3/3.0bpw/build"].startswith("held: GPU-only") and len(ran) == 1
+    assert st["exl3/3.0bpw/verify"] == "skipped: upstream failed"
