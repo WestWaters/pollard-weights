@@ -190,7 +190,7 @@ def reference_nll(model_id, rows, max_rows=16, seq=1024, dtype="bfloat16", devic
     tok = AutoTokenizer.from_pretrained(model_id)
     model = load_backbone(
         model_id, getattr(torch, dtype),
-        device_map=device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        device_map=device or __import__("pollard_device").pick("auto", torch))
 
     tot, ntok, head, head_n, tail, tail_n = 0.0, 0, 0.0, 0, 0.0, 0
     with torch.no_grad():

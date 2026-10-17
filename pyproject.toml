@@ -56,6 +56,9 @@ pollard-studio = "pollard_studio.app:main"
 # run this on every box in a cluster so Studio can total up its RAM, GPUs and disk -- ggml's RPC
 # protocol reports device memory and nothing else about the host
 pollard-node = "pollard_studio.node:main"
+# what each lane needs on this machine, working (import + a tiny op on the device); offers to install it
+# (also `pollard setup`, and `pollard-doctor --env`)
+pollard-setup = "pollard_setup:main"
 pollard-calc = "pollard_calc:main"
 pollard-fit = "pollard_fit:main"
 pollard-ngram = "pollard_ngram:main"
@@ -156,7 +159,9 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "p
     # declared as entry points but never listed here, so `pollard-trellis` and friends installed
     # as a command with no module behind it
     "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis", "pollard_draft",
-    "pollard_draft_train"]
+    "pollard_draft_train",
+    # the setup checker and the one device helper every tool resolves --device through
+    "pollard_setup", "pollard_device"]
 
 # the window's own HTML/CSS/JS and the bear it puts in the dock
 [tool.setuptools.package-data]

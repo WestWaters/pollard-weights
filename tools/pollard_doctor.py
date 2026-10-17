@@ -18,6 +18,7 @@ Three things it checks:
   pollard-doctor --source ./M-fp16 --predict                        # will low-bit break? which layers?
   pollard-doctor --source ./M-fp16 --repair --lane exl3 --bpw 4.0   # smooth -> reconvert -> verify
   pollard-doctor --cal-response --model buildA --compare buildB --eval-dir ./domains  # WHY did cal change move it?
+  pollard-doctor --env [--lanes gptq] [--dry-run|--yes]            # the MACHINE: what each lane needs (= pollard setup)
 
 Cal-response (why a calibration change helped/hurt): diffs the two builds' per-tensor bit allocation
 (big shift = the allocator re-deciding from the cal = NON-MONOTONIC response, not fixable by mix), then
@@ -223,6 +224,12 @@ def _ppl_on(model_dir, source, eval_file, device, length=2048, rows=8):
 
 
 def main():
+    # `pollard-doctor --env [setup flags]` (or no model at all): the machine, not a model -- the same report and
+    # the same offer to install as `pollard setup`, so there is one checker, not two that drift apart.
+    argv = sys.argv[1:]
+    if "--env" in argv or not argv:
+        import pollard_setup
+        sys.exit(pollard_setup.run_setup([x for x in argv if x != "--env"]))
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", help="converted model dir to diagnose (with --source)")
@@ -242,12 +249,15 @@ def main():
                     help="dir of per-domain eval files (<domain>.txt) for --cal-response dilution test")
     ap.add_argument("--calib", help="calibration text (risk scan / repair)")
     ap.add_argument("--out", help="output dir for --repair (default: <source>-sm-<lane>)")
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--device", default="auto", help="auto (CUDA > MPS > CPU) | cuda[:N] | mps | cpu")
     ap.add_argument("--rows", type=int, default=12)
     ap.add_argument("--cols", type=int, default=512)
     ap.add_argument("--outlier-thresh", type=float, default=50.0,
                     help="max|activation| above this flags a massive-activation channel (break risk)")
+    ap.add_argument("--env", action="store_true", help="check this machine instead (same as `pollard setup`)")
     a = ap.parse_args()
+    import pollard_device
+    a.device = pollard_device.pick(a.device)
     print(f"== pollard-doctor (DrDiag) :: lane={a.lane} ==")
 
     if a.cal_response:

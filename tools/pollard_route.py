@@ -153,7 +153,7 @@ def main() -> None:
                          "understate concentration)")
     ap.add_argument("--limit", type=int, default=0, help="use only the first N prompts")
     ap.add_argument("--top-k", type=int, default=0, help="override experts-per-token")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="auto", help="auto (CUDA > MPS > CPU) | cuda[:N] | mps | cpu")
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     a = ap.parse_args()
 
@@ -169,6 +169,8 @@ def main() -> None:
     dt = {"auto": "auto", "float16": torch.float16,
           "bfloat16": torch.bfloat16, "float32": torch.float32}[a.dtype]
     tok = AutoTokenizer.from_pretrained(a.model)
+    import pollard_device
+    a.device = pollard_device.pick(a.device, torch)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=dt).to(a.device).eval()
     capture(model, tok, prompts, a.gen, a.device, a.out, a.top_k or None)
 

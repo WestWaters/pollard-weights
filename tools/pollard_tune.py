@@ -1510,7 +1510,7 @@ class HFModel:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
-        self.dev = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        self.dev = device or __import__("pollard_device").pick("auto", torch)
         self.tok = AutoTokenizer.from_pretrained(path)
         self.model = AutoModelForCausalLM.from_pretrained(
             path, dtype=torch.bfloat16 if self.dev == "cuda" else torch.float16 if self.dev == "mps" else torch.float32).to(self.dev).eval()
