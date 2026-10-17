@@ -102,7 +102,9 @@ def exl3_archs():
 def exl3_input_plan(model_dir):
     """What exllamav3 converts for this checkpoint, decided from config.json alone:
     {"mode": "direct" | "text" | "hold", "arch": ..., "why": ...}. `text` = the wrapper's language model lifted out
-    as the plain causal LM exllamav3 knows (pollard_stream.TEXT_EQUIV, verified token for token): a text-only EXL3.
+    as the plain causal LM exllamav3 knows (pollard_stream.TEXT_EQUIV, verified token for token) for the convert, then
+    recomposed into the COMPLETE checkpoint (recompose_complete: the quantized language model back under the source's
+    names, the source's config, every tower / talker / processor file at source precision) -- never shipped alone.
     `hold` carries the exact reason no EXL3 of this model would load in exllamav3."""
     import json as _j
     try:
@@ -118,8 +120,10 @@ def exl3_input_plan(model_dir):
     import pollard_stream as S
     eq = S.TEXT_EQUIV.get(cfg.get("model_type"))
     if eq and eq["arch"] in archs:
-        return {"mode": "text", "arch": eq["arch"], "why": f"exllamav3 has no {arch}; its language model is "
-                                                           f"{eq['arch']} ({eq['why']}) -- a text-only EXL3"}
+        return {"mode": "text", "arch": eq["arch"], "why": f"exllamav3 here has no {arch}; its language model is "
+                                                           f"{eq['arch']} ({eq['why']}): converted as that, then "
+                                                           "recomposed into the complete checkpoint (towers, talker "
+                                                           "and processor files at source precision)"}
     inner = None
     for k in ("llm_config", "text_config", "language_config"):
         v = cfg.get(k)
@@ -151,7 +155,7 @@ def exl3_input(model_dir, log=print):
     plan = exl3_input_plan(S.read_overlay(model_dir)["base"] if S.is_overlay(model_dir) else model_dir)
     if plan["mode"] == "hold":
         return None, plan
-    if plan["mode"] == "text":                 # lifted straight out of the (overlay) source: one copy, text only
+    if plan["mode"] == "text":                 # the convert's input only: lifted out of the (overlay) source, one copy
         txt = model_dir.rstrip("/\\") + ".text"
         if not os.path.exists(os.path.join(txt, ".pollard-text-backbone.json")):
             _need_disk(model_dir, txt, text_only=True)
@@ -187,6 +191,94 @@ def _need_disk(src, out, text_only=False):
 
 
 EXIT_HELD = 3
+
+
+def _rename_safetensors(path, rename):
+    """Rewrite one safetensors file's header with renamed keys (the data bytes are copied unchanged)."""
+    import json as _j, shutil, struct
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = _j.loads(f.read(n))
+        new = {(k if k == "__metadata__" else rename(k)): v for k, v in hdr.items()}
+        if list(new) == list(hdr):
+            return False
+        hb = _j.dumps(new, separators=(",", ":")).encode()
+        hb += b" " * (-len(hb) % 8)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as g:
+            g.write(struct.pack("<Q", len(hb)))
+            g.write(hb)
+            f.seek(8 + n)
+            shutil.copyfileobj(f, g, 64 << 20)
+    os.replace(tmp, path)
+    return True
+
+
+def _rename_json(obj, rename):
+    """Rename every dict key that is a tensor / module name (tensor_storage maps, weight_map). Values are left alone:
+    weight_map's values are file names ("model.safetensors" is not a module)."""
+    if isinstance(obj, dict):
+        return {(rename(k) if isinstance(k, str) else k): _rename_json(v, rename) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_rename_json(v, rename) for v in obj]
+    return obj
+
+
+def recompose_complete(source_dir, out, log=print):
+    """Turn the EXL3 of a wrapper's lifted-out language model (exl3_input mode `text`) into the COMPLETE checkpoint,
+    in place: the quantized tensors renamed back to the source's namespace (thinker.model.* / thinker.lm_head),
+    the source's own config.json (+ the EXL3 quantization_config, its tensor names renamed the same way), every
+    non-text component (vision / audio tower, projector, talker, code2wav, side weights) at source precision, and
+    every processor / preprocessor / template file. Exactly what exllamav3 writes when it converts the source
+    directly with the architecture present (Qwen3OmniMoeForConditionalGeneration: get_additional_compiled_tensors)."""
+    import glob, json as _j
+    import pollard_stream as S
+    import pollard_complete as PC
+    base = S.read_overlay(source_dir)["base"] if S.is_overlay(source_dir) else source_dir
+    cfg = S.config_json(base)
+    spec = S.TEXT_EQUIV.get(cfg.get("model_type"))
+    if not spec:
+        raise SystemExit(f"{base}: no text equivalent recorded, nothing to recompose")
+    back = [(b, a) for a, b in spec["renames"]]                 # model. -> thinker.model., lm_head. -> thinker.lm_head.
+
+    def rename(k):
+        for b, a in back:
+            if k.startswith(b) and not k.startswith(a):
+                return a + k[len(b):]
+            if k == b.rstrip(".") and b.startswith("lm_head"):   # the head's module key has no tensor suffix
+                return a.rstrip(".")
+        return k
+    n = sum(_rename_safetensors(p, rename) for p in glob.glob(os.path.join(out, "*.safetensors")))
+    exl_cfg = _j.load(open(os.path.join(out, "config.json"), encoding="utf-8"))
+    qcfg = _rename_json(exl_cfg.get("quantization_config") or {}, rename)
+    for f in ("quantization_config.json", "model.safetensors.index.json"):
+        p = os.path.join(out, f)
+        if os.path.isfile(p):
+            d = _j.load(open(p, encoding="utf-8"))
+            _j.dump(_rename_json(d, rename), open(p, "w", encoding="utf-8"), indent=4)
+    # the source's side files (tokenizer, templates, processor configs, custom code) -- then its own config
+    S.copy_side_files(base, out)
+    full = dict(cfg)
+    if qcfg:
+        if full.get("quantization_config"):
+            qcfg = dict(qcfg, original_quantization_config=full["quantization_config"])
+        full["quantization_config"] = qcfg
+    _j.dump(full, open(os.path.join(out, "config.json"), "w", encoding="utf-8"), indent=2)
+    wrote = PC.fill(source_dir, out, "exl3")
+    idx = os.path.join(out, "model.safetensors.index.json")
+    if os.path.isfile(idx):                                     # keep the index whole: the sidecars are shards too
+        d = _j.load(open(idx, encoding="utf-8"))
+        for f in wrote:
+            if f.endswith(".safetensors"):
+                for k in PC._st_keys(os.path.join(out, f)):
+                    d.setdefault("weight_map", {})[k] = f
+        _j.dump(d, open(idx, "w", encoding="utf-8"), indent=4)
+    res = PC.check(source_dir, out, "exl3")
+    log(f"   [complete] {n} shard(s) renamed back to {', '.join(a for _, a in back)}; config = the source's "
+        f"({cfg.get('architectures', ['?'])[0]}); added {', '.join(wrote) or 'nothing'}")
+    if not res["ok"]:
+        raise SystemExit("   [complete] still missing: " + "; ".join(res["missing"]))
+    return res
 
 
 def pack_calib(model, text_path, out_path, rows=256, cols=2048):
@@ -623,11 +715,24 @@ def main():
     if r.returncode != 0 or not made:
         sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
                  f"-- see console above.")
-    if getattr(a, "exl3_plan", None):
+    plan = getattr(a, "exl3_plan", None)
+    if plan and plan["mode"] == "text":                     # never ship the lifted-out text model alone
+        recompose_complete(a.recorded_as, a.out)
+    elif plan and os.path.isdir(a.recorded_as):             # a direct convert: anything exllamav3 left out goes beside
+        import pollard_complete as PC
+        wrote = PC.fill(a.recorded_as, a.out, "exl3")
+        if wrote:
+            print(f"   [complete] exllamav3 left out {', '.join(wrote)}: added at source precision")
+        res = PC.check(a.recorded_as, a.out, "exl3")
+        if not res["ok"]:
+            sys.exit("   [complete] the EXL3 is missing: " + "; ".join(res["missing"]))
+    if plan:
         import json as _j
         with open(os.path.join(a.out, "pollard-exl3.json"), "w", encoding="utf-8") as f:
-            _j.dump({"input": a.exl3_plan["mode"], "arch": a.exl3_plan.get("arch"), "why": a.exl3_plan.get("why"),
-                     "converted_from": a.model}, f, indent=1)
+            _j.dump({"input": plan["mode"], "arch": plan.get("arch"), "why": plan.get("why"),
+                     "converted_from": a.model, "shipped": "complete",
+                     "runtime": "exllamav3 with this architecture" if plan["mode"] == "text" else "exllamav3"},
+                    f, indent=1)
     try:
         import pollard_workspace as ws
         ws.record_build(getattr(a, "recorded_as", a.model), "exl3", a.out, tag=f"{a.bpw}bpw", bpw=a.bpw)

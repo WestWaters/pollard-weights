@@ -185,9 +185,25 @@ def bits_for(key, alloc, low):
     return g.get(side_of(key), low)
 
 
-def dynamic_rules(keys_bits, skipped, low):
+def component_roots(keys):
+    """The roots of the non-text components among `keys` (thinker.visual, thinker.audio_tower, talker, code2wav, mlp1,
+    vision_model ...): the part of each key up to and including the component's own name."""
+    import pollard_complete as PC
+    roots = set()
+    for k in keys:
+        for _, rx in PC.COMPONENTS:
+            m = rx.search(k)
+            if m:
+                roots.add(k[:m.end() - 1])
+                break
+    return sorted(roots)
+
+
+def dynamic_rules(keys_bits, skipped, low, components=()):
     """gptqmodel / vLLM `dynamic`: a `+:` override per (layer, side) whose bits differ from the base, and a `-:`
-    rule per layer linear left unquantized. Per (layer, side) patterns keep the map small on a 128-expert model."""
+    rule per layer linear left unquantized. Per (layer, side) patterns keep the map small on a 128-expert model.
+    `components`: roots of the towers / projector / talker copied at source precision -- one `-:` rule each, so a
+    loader that hands the quant config to the vision or speech modules builds them unquantized."""
     over = {}
     for k, b in keys_bits.items():
         if b == low:
@@ -201,7 +217,8 @@ def dynamic_rules(keys_bits, skipped, low):
         over[rf"+:.*\.layers\.{int(m.group(1))}\.{rx}.*"] = {"bits": b}
     # vLLM / gptqmodel take the FIRST matching rule: the `-:` exclusions go first, or a layer's `+:` override would
     # claim its router too
-    out = {r"-:^" + re.escape(mod) + "$": {} for mod in sorted(skipped)}
+    out = {r"-:^" + re.escape(root) + r"\..*": {} for root in components}
+    out.update({r"-:^" + re.escape(mod) + "$": {} for mod in sorted(skipped)})
     out.update(dict(sorted(over.items())))
     return out
 
@@ -331,7 +348,8 @@ def build_stream(model, out, calib, alloc=None, low=4, group=128, nsamples=128, 
     S.copy_side_files_of(src, out)
     qcfg = {"quant_method": "gptq", "bits": low, "group_size": group, "desc_act": False, "sym": True,
             "lm_head": False, "checkpoint_format": "gptq", "pack_dtype": "int32", "true_sequential": True,
-            "damp_percent": percdamp, "dynamic": dynamic_rules(keys_bits, skipped, low) or None,
+            "damp_percent": percdamp, "dynamic": dynamic_rules(keys_bits, skipped, low,
+                                                                   component_roots(bb.outer_keys + bb.other_keys)) or None,
             "meta": {"quantizer": ["pollard-export:stream"]}}
     write_config(src.base_dir, out, qcfg)
     n_par = sum(_numel(src.shape(k)) for k in keys_bits)

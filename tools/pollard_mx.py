@@ -81,9 +81,14 @@ def allocate(sens, n_layers, hot_frac, focus=None):
 # Both go in `ignore`, which keeps them at the checkpoint's original precision. The projector is
 # never negotiable; the tower can be included deliberately with --quantize-vision.
 VISION_GLOBS = [r"re:.*(visual|vision_tower|vision_model|vision_encoder|image_encoder|patch_embed"
-                r"|audio_tower|audio_encoder|speech_encoder).*"]
+                r"|audio_tower|audio_encoder|speech_encoder|sound_encoder).*"]
+# A speech-output stack (Qwen3-Omni's talker + code2wav) has decoder layers of its own: `talker.model.layers.<n>.`
+# matched the decoder-layer rule and took the TEXT layer n's allocation (and NVFP4 then died for want of activation
+# scales, which only the thinker's calibration pass collects). It stays at the checkpoint's precision, as the
+# projector does. Bolt's projector is `mlp1.*`, its audio one `sound_projection.*`.
+SPEECH_GLOBS = [r"re:(talker|code2wav|token2wav|speech_decoder|vocoder)\..*"]
 PROJECTOR_GLOBS = [r"re:.*(multi_modal_projector|mm_projector|mm_proj|merger|modality_project"
-                   r"|resampler|perceiver|connector).*"]
+                   r"|resampler|perceiver|connector|sound_projection).*", r"re:(.*\.)?mlp1\..*"] + SPEECH_GLOBS
 
 
 # MoE routers are nn.Linear too, so targets="Linear" was sending them to FP4 with the experts. A router

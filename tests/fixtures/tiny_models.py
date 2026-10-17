@@ -90,8 +90,8 @@ def custom_code(out):
 
 
 def omni(out):
-    """A 2-layer Qwen3-Omni-MoE thinker (as clef-omni) with a token audio tower / visual tensor and a talker tensor
-    the text lanes must copy through untouched."""
+    """A 2-layer Qwen3-Omni-MoE thinker (as clef-omni) with a token audio tower / visual tensor, a talker and a
+    code2wav tensor and the release's processor files -- everything a lane must ship next to the language model."""
     import torch
     from safetensors.torch import load_file, save_file
     import make_tiny_clef_omni as M
@@ -105,5 +105,23 @@ def omni(out):
     W["thinker.audio_tower.layers.0.self_attn.q_proj.weight"] = torch.randn(32, 32, generator=g).to(torch.bfloat16)
     W["thinker.visual.blocks.0.attn.qkv.weight"] = torch.randn(96, 32, generator=g).to(torch.bfloat16)
     W["talker.model.layers.0.self_attn.q_proj.weight"] = torch.randn(32, 32, generator=g).to(torch.bfloat16)
+    W["code2wav.decoder.0.conv.weight"] = torch.randn(16, 8, 7, generator=g).to(torch.bfloat16)
     save_file(W, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
+    write_omni_processor_files(out)
+    return out
+
+
+#: what the real Qwen3-Omni release ships next to its weights for the audio / image / video inputs
+OMNI_PREPROCESSOR = {"feature_extractor_type": "WhisperFeatureExtractor", "feature_size": 128, "hop_length": 160,
+                     "n_fft": 400, "sampling_rate": 16000, "image_processor_type": "Qwen2VLImageProcessor",
+                     "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5], "min_pixels": 3136,
+                     "max_pixels": 65536, "merge_size": 2, "patch_size": 16, "temporal_patch_size": 2,
+                     "processor_class": "Qwen3OmniMoeProcessor"}
+
+
+def write_omni_processor_files(out):
+    json.dump(OMNI_PREPROCESSOR, open(os.path.join(out, "preprocessor_config.json"), "w"), indent=1)
+    json.dump({"processor_class": "Qwen3OmniMoeProcessor"}, open(os.path.join(out, "processor_config.json"), "w"))
+    json.dump({"video_processor_type": "Qwen2VLVideoProcessor", "merge_size": 2},
+              open(os.path.join(out, "video_preprocessor_config.json"), "w"))
     return out
