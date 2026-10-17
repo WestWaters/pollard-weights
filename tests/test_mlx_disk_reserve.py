@@ -2,7 +2,7 @@
 down to a FIXED 3 GB reserve that ignored swap growth and the state / result writes, results-mlx.json and
 release-state.json failed with ENOSPC, and the OS ran with a full disk for minutes.
 
-Now: the reserve is never under the plan's disk_margin_gb, and on macOS never under max(10 GB, 10% of the volume);
+Now: the reserve is never under the plan's disk_margin_gb, and on macOS never under 10 GB (plus an optional share of the volume);
 free disk is re-checked before EACH tensor lands (least recently used cache evicted first); a disk that is still short
 holds the step (pollard-verify exit 3 -> release HELD, rung kept), never ENOSPC; and every JSON the step writes goes
 through tmp + rename, so a full disk leaves the previous file whole. numpy-only: every CI shape."""
@@ -31,10 +31,12 @@ GB = 1e9
 
 # ----------------------------------------------------------------------------------------------- the floor
 
-def test_floor_is_margin_off_mac_and_max_10gb_10pct_on_mac(monkeypatch):
+def test_floor_is_margin_off_mac_and_10gb_on_mac(monkeypatch):
     monkeypatch.delenv("POLLARD_DISK_MARGIN_GB", raising=False)
     assert M.disk_reserve_gb(total_bytes=245 * GB, platform="linux") == 3.0
-    assert M.disk_reserve_gb(total_bytes=245 * GB, platform="darwin") == pytest.approx(24.5)   # 10% of the volume
+    assert M.disk_reserve_gb(total_bytes=245 * GB, platform="darwin") == pytest.approx(10.0)   # flat floor by default
+    monkeypatch.setattr(M, "MAC_DISK_FLOOR_FRAC", 0.10)
+    assert M.disk_reserve_gb(total_bytes=245 * GB, platform="darwin") == pytest.approx(24.5)   # opt-in share of the volume
     assert M.disk_reserve_gb(total_bytes=50 * GB, platform="darwin") == 10.0                   # never under 10 GB
     monkeypatch.setenv("POLLARD_DISK_MARGIN_GB", "40")                                        # the plan's margin
     assert M.disk_reserve_gb(total_bytes=245 * GB, platform="darwin") == 40.0

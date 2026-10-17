@@ -99,11 +99,12 @@ EXIT_HELD = 3
 
 #: Free disk the streamed MLX steps (the build's writer, the verify, a remote mirror's cache) never fill: the plan's
 #: disk_margin_gb (POLLARD_DISK_MARGIN_GB; 3 GB by default) -- and on macOS, where swap, the system and every other
-#: app's writes share the data volume's APFS container, never under max(10 GB, 10% of the volume). A fixed 3 GB took a
+#: app's writes share the data volume's APFS container, never under 10 GB (MAC_DISK_FLOOR_FRAC can add a share of
+#: the volume; off by default -- 10% of a 500 GB Mac would hold every big-model step). A fixed 3 GB took a
 #: 16 GB Mac to 0 bytes free during a mirrored verify: swap grew into the last gigabytes and results-mlx.json /
 #: release-state.json could not be written.
 DISK_MARGIN_GB = 3.0
-MAC_DISK_FLOOR_GB, MAC_DISK_FLOOR_FRAC = 10.0, 0.10
+MAC_DISK_FLOOR_GB, MAC_DISK_FLOOR_FRAC = 10.0, 0.0
 
 
 def disk_reserve_gb(path=None, total_bytes=None, platform=None):
