@@ -1189,9 +1189,41 @@ def _gpu_or_none():
         return None
 
 
+#: quant methods Pollard's own reader decodes into a plain float model (pollard_stream.decoded_hf_model): runs on any
+#: device with no quantization kernel. GPTQ ALWAYS goes this way -- transformers' GPTQ loader ignores the per-layer
+#: `dynamic` bits, so a Pollard 4/8 mix through from_pretrained is noise (tool retention 33% on a rung gptqmodel
+#: scores at KLD 0.089); the others go this way on the CPU, where their transformers loaders want a GPU kernel
+DECODED_METHODS = ("gptq", "compressed-tensors", "fp8")
+#: CPU decode speed assumed for the time estimate: GB of weights streamed per generated token (POLLARD_CPU_GBPS)
+CPU_GBPS = 20.0
+
+
+def decoded_gb(model):
+    """GB the rung takes decoded to bf16 (what the decoded loader holds), else its size on disk."""
+    try:
+        import pollard_stream as S
+        return S.decoded_bytes(model) / 1e9
+    except Exception:                                            # noqa: BLE001 -- unreadable: size on disk
+        return model_gb(model)
+
+
+def cpu_estimate(gb, n_probes, budget, gbps=None):
+    """(low, high) minutes for the suite on the CPU: every generated token reads the whole decoded model once
+    (memory-bound), a tool call is ~a quarter of the budget, a reasoning model or a runaway reply the whole budget."""
+    try:
+        gbps = float(gbps or os.environ.get("POLLARD_CPU_GBPS") or CPU_GBPS)
+    except ValueError:
+        gbps = CPU_GBPS
+    tok_s = gbps / max(gb, 0.05)
+    per_tok_min = 1.0 / tok_s / 60.0
+    return n_probes * budget * 0.25 * per_tok_min, n_probes * budget * per_tok_min
+
+
 def preflight_inprocess(backend, model, kind=None):
-    """exl3 / hf: what this machine can run in this process, and on which device. Returns {"device": ...} (the run
-    reads it, the request does not). Memory first, then the shared-GPU rule, as for the served backends."""
+    """exl3 / hf: what this machine can run in this process, and on which device. Returns {"device": ..., "loader":
+    "decoded" | "transformers", "decoded_gb": ...} (the run reads it, the request does not). Memory first, then the
+    shared-GPU rule, as for the served backends. A quantized rung with no free GPU runs on the CPU through the decoded
+    loader -- slow, and the run prints how slow, but a valid measurement of the same weights."""
     need = exlr8_decoded_gb(model) if lane_of(model) == "exlr8" else model_gb(model)
     reader_family(kind)
     if backend == "exl3":
@@ -1211,14 +1243,28 @@ def preflight_inprocess(backend, model, kind=None):
     if meth:
         if meth not in HF_QUANT_NEEDS or HF_QUANT_NEEDS[meth] is None:
             raise NotMeasured(_HF_NO_LOADER.get(meth, f"transformers has no loader for a '{meth}' checkpoint here"))
-        for alts in HF_QUANT_NEEDS[meth]:
-            if not any(_has_module(m) for m in alts):
-                raise NotMeasured(f"transformers needs {' or '.join(alts)} to load a {meth} checkpoint "
-                                  f"(pip install {alts[0]})")
+        decodable = meth in DECODED_METHODS
+        lacking = [alts for alts in HF_QUANT_NEEDS[meth] if not any(_has_module(m) for m in alts)]
+        loader = "decoded" if meth == "gptq" or (decodable and lacking) else "transformers"
+        if lacking and loader != "decoded":
+            alts = lacking[0]
+            raise NotMeasured(f"transformers needs {' or '.join(alts)} to load a {meth} checkpoint "
+                              f"(pip install {alts[0]})")
+        dec = decoded_gb(model) if decodable else need
+        gpu_need = dec if loader == "decoded" else need
         if _gpu_or_none() is None:
-            raise NotMeasured(f"a {meth} checkpoint runs in transformers on an NVIDIA GPU and this machine has none")
-        check_gpu("hf", need)
-        return {"device": "cuda"}
+            why = "no NVIDIA GPU here"
+        else:
+            try:
+                check_gpu("hf", gpu_need)
+                return {"device": "cuda", "loader": loader, "decoded_gb": round(dec, 3)}
+            except NotMeasured as e:
+                why = str(e)
+        if not decodable:
+            raise NotMeasured(f"a {meth} checkpoint runs in transformers on an NVIDIA GPU and {why}")
+        check_ram(dec)
+        return {"device": "cpu", "loader": "decoded", "decoded_gb": round(dec, 3),
+                "cpu_note": f"{why}: on the CPU through the decoded loader -- slow but valid"}
     if _gpu_or_none() is not None:                               # unquantized: the GPU when it is free and fits
         try:
             check_gpu("hf", need)
@@ -1305,7 +1351,7 @@ class HFEngine:
     """transformers in this process: the checkpoint (bf16, or GPTQ / AWQ / FP8 / compressed-tensors through the
     loaders transformers dispatches to), greedy decoding, special tokens kept in the text (they ARE the call syntax)."""
 
-    def __init__(self, model, device="cpu", threads=None):
+    def __init__(self, model, device="cpu", threads=None, loader=None):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         if threads:
@@ -1322,6 +1368,11 @@ class HFEngine:
             self.model = X.load_model(model, device, trust_remote_code=trc)
         elif pollard_mxfp6.read_meta(model):                     # pollard-mx MXFP6 / mix: its own bytes, decoded
             self.model = pollard_mxfp6.load_hf_model(model, "cuda" if device == "cuda" else "cpu", trc)
+        elif loader == "decoded" or (loader is None and quant_method(model) == "gptq"):
+            # GPTQ (transformers ignores its per-layer `dynamic` bits) / a CPU run of compressed-tensors: every module
+            # decoded from the rung's own bytes into a plain model
+            import pollard_stream as S
+            self.model = S.decoded_hf_model(model, "cuda" if device == "cuda" else "cpu", trc)
         else:
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(model, dtype="auto", **kw)
@@ -1417,11 +1468,11 @@ def _cut_at(text, stops):
 
 
 @contextlib.contextmanager
-def inprocess_engine(backend, model, device="cuda", threads=None, ctx=8192):
+def inprocess_engine(backend, model, device="cuda", threads=None, ctx=8192, loader=None):
     """The model loaded in this process for the duration, always released afterwards (one model at a time). A load
     that fails -- a loader missing a kernel for this GPU, out of memory -- is not-measured with its reason."""
     try:
-        eng = EXL3Engine(model, ctx) if backend == "exl3" else HFEngine(model, device, threads)
+        eng = EXL3Engine(model, ctx) if backend == "exl3" else HFEngine(model, device, threads, loader)
     except NotMeasured:
         raise
     except Exception as e:                                       # noqa: BLE001
@@ -1631,8 +1682,15 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
         if note:
             print(f"   ({note})", flush=True)
         where = f" on {extra['device']}" if backend in INPROCESS and extra.get("device") else ""
+        if extra.get("loader") == "decoded":
+            where += f" (decoded loader, {extra.get('decoded_gb') or 0:.1f} GB)"
         print(f"   {os.path.basename(str(model or url).rstrip('/'))}: {BACKEND_SERVER.get(backend, backend)}{where}, "
               f"tool syntax {fam or '?'}, budget {budget} tokens" + (", thinking off" if tkw else ""), flush=True)
+        if extra.get("cpu_note"):
+            lo, hi = cpu_estimate(extra.get("decoded_gb") or model_gb(model), len(probes or SUITE), budget)
+            print(f"   {extra['cpu_note']}: ~{lo:.0f}-{hi:.0f} min for {len(probes or SUITE)} probes "
+                  f"(~{float(os.environ.get('POLLARD_CPU_GBPS') or CPU_GBPS):g} GB/s of weights per token; "
+                  "POLLARD_CPU_GBPS sets it)", flush=True)
 
     def prog(i, n, row):
         if not quiet and (i % 10 == 0 or i == n):
@@ -1643,7 +1701,10 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
     if backend in INPROCESS:
         rfam, rkey = reader_family(kind)
         meta.update(reader=rkey, device=extra.get("device"))
-        with inprocess_engine(backend, model, extra.get("device", "cuda"), threads) as eng:
+        if extra.get("loader"):
+            meta["loader"] = extra["loader"]
+        with inprocess_engine(backend, model, extra.get("device", "cuda"), threads,
+                              **({"loader": extra["loader"]} if extra.get("loader") else {})) as eng:
             rows = run_suite_inprocess(eng, probes, budget, tkw, prog, rkey, kind.get("reasoning"))
         return rows, meta
     with backend_server(backend, model, ngl, threads, server, url, kind) as base:

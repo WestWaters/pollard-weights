@@ -1,6 +1,7 @@
 # pollard release plan -- every lane, each a ladder of rungs. `pollard release --hf <model> --plan this.yaml`
 # prints the plan; add --run to build, --upload to publish (and set upload: true below).
 org: PollardWeights            # the HF account the lane repos go to
+base_model: null               # the HF repo id the card names as base_model (null = the --hf id / its config)
 preset: decision                   # text | vlm | decision | moe -- fills anything not set here
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line

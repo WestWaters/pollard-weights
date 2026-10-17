@@ -372,6 +372,20 @@ def _numel(shape):
     return n
 
 
+def module_bits(qcfg, mod):
+    """The bits module `mod` is stored at under a GPTQ quantization_config: the FIRST `dynamic` rule whose regex
+    re.match()es the module decides (vLLM's and gptqmodel's rule: `-:` = left unquantized -> None, `+:` or no prefix =
+    an override), else the base `bits`."""
+    bits = qcfg.get("bits")
+    for rx, ov in (qcfg.get("dynamic") or {}).items():
+        if rx.startswith("-:"):
+            if re.match(rx[2:], mod):
+                return None
+        elif re.match(rx[2:] if rx.startswith("+:") else rx, mod):
+            return (ov or {}).get("bits") or bits
+    return bits
+
+
 def dequantized_state(rung_dir):
     """{checkpoint key: float32} of a GPTQ v1 checkpoint (every quantized module decoded) -- the reference loader
     for verify on a machine with no GPTQ kernels."""
@@ -382,17 +396,12 @@ def dequantized_state(rung_dir):
     src = S.Source(rung_dir)
     out = {}
     mods = {k[:-len(".qweight")] for k in src.entries if k.endswith(".qweight")}
-    dyn = q.get("dynamic") or {}
     for k in src.entries:
         if any(k.endswith(s) for s in (".qweight", ".qzeros", ".scales", ".g_idx")):
             continue
         out[k] = src.read(k)
     for m in mods:
         t = {s: src.read_raw(f"{m}.{s}")[1] for s in ("qweight", "qzeros", "scales", "g_idx")}
-        bits = q["bits"]
-        for rx, ov in dyn.items():
-            if rx.startswith("+:") and re.match(rx[2:], m) and ov.get("bits"):
-                bits = ov["bits"]
-                break
+        bits = module_bits(q, m) or q["bits"]      # unprefixed rules too (pollard-export / gptqmodel write those)
         out[m + ".weight"] = dequant_module(t, bits, t["g_idx"].shape[0]).astype(np.float32)
     return out

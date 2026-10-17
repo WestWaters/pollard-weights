@@ -314,27 +314,43 @@ def test_hf_preflight_per_quant_format(monkeypatch, tmp_path):
     monkeypatch.setattr(TC, "_has_module", lambda n: n in have)
     monkeypatch.setattr(TC, "gpu_users", lambda *a: [])
     monkeypatch.setattr(TC, "gpu_free_gb", lambda *a: 15.0)
-    assert TC.preflight("hf", _qdir(tmp_path, "gptq"), kind=HERMES) == {"device": "cuda"}
-    with pytest.raises(TC.NotMeasured, match="needs compressed_tensors"):
-        TC.preflight("hf", _qdir(tmp_path, "compressed-tensors"), kind=HERMES)
+    # GPTQ always through the decoded loader (transformers ignores the per-layer `dynamic` bits)
+    assert TC.preflight("hf", _qdir(tmp_path, "gptq"), kind=HERMES)["loader"] == "decoded"
+    # compressed-tensors without its package: Pollard's reader decodes it instead of refusing
+    ct = TC.preflight("hf", _qdir(tmp_path, "compressed-tensors"), kind=HERMES)
+    assert ct["device"] == "cuda" and ct["loader"] == "decoded"
+    have.add("compressed_tensors")
+    assert TC.preflight("hf", str(tmp_path / "m-compressed-tensors"), kind=HERMES)["loader"] == "transformers"
     with pytest.raises(TC.NotMeasured, match="ModelOpt"):
         TC.preflight("hf", _qdir(tmp_path, "modelopt"), kind=HERMES)
     with pytest.raises(TC.NotMeasured, match="no transformers loader"):
         TC.preflight("hf", _qdir(tmp_path, "nvfp4"), kind=HERMES)
-    assert TC.preflight("hf", _qdir(tmp_path, "mxfp4"), kind=HERMES) == {"device": "cuda"}
-    # a game on the GPU: a quantized rung is not measured, a bf16 reference stays off the GPU
+    assert TC.preflight("hf", _qdir(tmp_path, "mxfp4"), kind=HERMES)["device"] == "cuda"
+    # a game on the GPU (the box, 2026-10-17): a quantized rung runs on the CPU through the decoded loader -- slow but
+    # valid, with the reason -- instead of "not measured"; a bf16 reference stays off the GPU too
     monkeypatch.setattr(TC, "gpu_users", lambda *a: ["Game.exe"])
-    with pytest.raises(TC.NotMeasured, match="resident"):
-        TC.preflight("hf", _qdir(tmp_path, "fp8"), kind=HERMES)
-    monkeypatch.setattr(TC, "_apple", lambda: False)
     monkeypatch.setattr(TC, "_free_ram_gb", lambda: 32.0)
+    for meth in ("fp8", "gptq", "compressed-tensors"):
+        cpu = TC.preflight("hf", _qdir(tmp_path, meth) if meth == "fp8" else str(tmp_path / f"m-{meth}"), kind=HERMES)
+        assert cpu["device"] == "cpu" and cpu["loader"] == "decoded" and "resident" in cpu["cpu_note"]
+    # a format Pollard cannot decode still needs the GPU
+    with pytest.raises(TC.NotMeasured, match="resident"):
+        TC.preflight("hf", _qdir(tmp_path, "awq"), kind=HERMES)
+    # and the CPU path still has to fit the RAM
+    monkeypatch.setattr(TC, "_free_ram_gb", lambda: 0.5)
+    monkeypatch.setattr(TC, "decoded_gb", lambda m: 9.0)
+    with pytest.raises(TC.NotMeasured, match="RAM"):
+        TC.preflight("hf", str(tmp_path / "m-gptq"), kind=HERMES)
+    monkeypatch.setattr(TC, "_free_ram_gb", lambda: 32.0)
+    monkeypatch.setattr(TC, "decoded_gb", lambda m: 0.001)
+    monkeypatch.setattr(TC, "_apple", lambda: False)
     assert TC.preflight("hf", _qdir(tmp_path, ""), kind=HERMES) == {"device": "cpu"}
-    # no NVIDIA GPU (a Mac): bf16 on mps, a GPTQ rung not measured
+    # no NVIDIA GPU (a Mac): bf16 on mps, a GPTQ rung on the CPU through the decoded loader
     monkeypatch.setattr(TC, "gpu_free_gb", lambda *a: None)
     monkeypatch.setattr(TC, "_apple", lambda: True)
     assert TC.preflight("hf", str(tmp_path / "m-bf16"), kind=HERMES) == {"device": "mps"}
-    with pytest.raises(TC.NotMeasured, match="NVIDIA GPU"):
-        TC.preflight("hf", str(tmp_path / "m-gptq"), kind=HERMES)
+    mac = TC.preflight("hf", str(tmp_path / "m-gptq"), kind=HERMES)
+    assert mac["device"] == "cpu" and "no NVIDIA GPU" in mac["cpu_note"]
 
 
 def test_exl3_preflight(monkeypatch, tmp_path):

@@ -1906,13 +1906,8 @@ class RungReader:
         self.kind = "gptq" if self.gptq else ("pollard-mx" if self.mx else "checkpoint")
 
     def _gptq_bits(self, mod):
-        bits = self.gptq["bits"]
-        for rx, ov in (self.gptq.get("dynamic") or {}).items():
-            if rx.startswith("-:") and re.match(rx[2:], mod):
-                return None
-            if re.match(rx[2:] if rx.startswith("+:") else rx, mod) and (ov or {}).get("bits"):
-                return ov["bits"]
-        return bits
+        import pollard_gptqpack as G
+        return G.module_bits(self.gptq, mod)
 
     def read_torch(self, key, dtype=None):
         import numpy as np, torch
@@ -1976,6 +1971,84 @@ class RungReader:
         if key in self._vocab:
             return self._vocab[key]
         raise KeyError(f"{self.dir}: no tensor for {key}")
+
+
+def decoded_bytes(rung_dir, bytes_per_param=2):
+    """Bytes the rung takes once every quantized module is decoded to a plain float model (bf16 by default), from the
+    safetensors headers alone: a GPTQ module is in_features x out_features, an encoded one its logical shape."""
+    rd = RungReader(rung_dir)
+    if rd.kind == "exlr8":
+        raise ValueError("an EXLR8 rung: pollard_exlr8.decoded_bytes")
+    src, n = rd.src, 0
+    hidden = set()
+    for k, ent in src.entries.items():
+        if k.endswith(".qweight") and rd.gptq:
+            mod = k[:-len(".qweight")]
+            gi = src.entries.get(mod + ".g_idx")
+            n += int(_prod(gi[2]) if gi else 0) * int(ent[2][-1])
+            hidden.update(f"{mod}.{x}" for x in ("qweight", "qzeros", "scales", "g_idx"))
+    for k in src.logical:
+        if k in hidden:
+            continue
+        try:
+            n += int(_prod(src.shape(k)))
+        except Exception:                                                # noqa: BLE001 -- a part we cannot size
+            continue
+    return n * bytes_per_param
+
+
+def decoded_hf_model(rung_dir, device="cpu", trust_remote_code=False, dtype=None, log=None):
+    """A plain transformers model of this rung with NO quantization loader: the architecture from the rung's own
+    config, every module read through RungReader -- a GPTQ module dequantized at the bits ITS `dynamic` rule gives it,
+    a compressed-tensors NVFP4 / FP8 or Pollard-MX module decoded from its bytes, everything else as stored.
+
+    Why it exists: transformers' GPTQ loader (optimum's GPTQQuantizer.convert_model) builds every linear at the BASE
+    bits and never reads `dynamic`, so a Pollard 4/8 mix loaded with from_pretrained is noise (KLD 14, top-1 0% on
+    Qwen2.5-0.5B, 2026-10-17) while gptqmodel and vLLM honour the map. Weight-only formats, so this is the math those
+    runtimes do with the same bytes, on any device, with no GPTQ kernel installed."""
+    import numpy as np, torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+    rd = RungReader(rung_dir)
+    cfg = AutoConfig.from_pretrained(rung_dir, trust_remote_code=trust_remote_code)
+    for sub in (cfg, getattr(cfg, "text_config", None)):
+        if sub is not None and hasattr(sub, "quantization_config"):
+            delattr(sub, "quantization_config")
+    if dtype is None:
+        dtype = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None) or torch.bfloat16
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype, torch.bfloat16)
+    try:
+        model = AutoModelForCausalLM.from_config(cfg, dtype=dtype, trust_remote_code=trust_remote_code)
+    except TypeError:                                                    # transformers 4.x spelling
+        model = AutoModelForCausalLM.from_config(cfg, torch_dtype=dtype, trust_remote_code=trust_remote_code)
+    names = set(rd.src.logical) if rd.kind != "exlr8" else set()
+    if rd.gptq:
+        names |= {k[:-len(".qweight")] + ".weight" for k in rd.src.entries if k.endswith(".qweight")}
+    by_tail = {}
+    for n in names:                                                      # a wrapper prefix the model names apart
+        by_tail.setdefault(n.split(".", 1)[-1], n)
+    sd, missing = model.state_dict(), []
+    with torch.no_grad():
+        for key, t in sd.items():
+            name = key if key in names else by_tail.get(key.split(".", 1)[-1])
+            if name is None:
+                if not (key.endswith("lm_head.weight") or "rotary" in key):
+                    missing.append(key)
+                continue
+            a = np.asarray(rd.read(name))
+            if tuple(a.shape) != tuple(t.shape):
+                raise SystemExit(f"{rung_dir}: {name} decodes to {tuple(a.shape)}, the model wants {tuple(t.shape)}")
+            t.copy_(torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(t.dtype))
+    if missing:
+        raise SystemExit(f"{rung_dir}: no tensor for {missing[:3]}{'...' if len(missing) > 3 else ''}")
+    head_stored = any(k.endswith("lm_head.weight") for k in names)
+    if getattr(cfg, "tie_word_embeddings", False) or not head_stored:
+        if not getattr(cfg, "tie_word_embeddings", False) and any(k.endswith("lm_head.weight") for k in sd):
+            raise SystemExit(f"{rung_dir}: no lm_head tensor and the config does not tie it")
+        model.tie_weights()
+    if log:
+        log(f"   decoded {os.path.basename(str(rung_dir).rstrip('/'))} ({rd.kind}) into a plain {dtype} model")
+    return model.to(device).eval()
 
 
 def _final_head(bb):

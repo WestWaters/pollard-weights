@@ -305,25 +305,51 @@ _SERVER_PROC = [None]
 SERVER_BIN = None          # set from --llama-server; the caller usually knows where it is
 
 
-def _server_bin():
+def _needs_ik(model):
+    try:
+        import pollard_ggufcompat as gc
+        return gc.runtime_of(model)[0] == "ik_llama"
+    except Exception:                                             # noqa: BLE001 -- unreadable: stock
+        return False
+
+
+def _server_bin(model=None):
     """Where llama-server is. Told, found, or searched -- in that order.
 
     find_llama_bin covers a llama.cpp checkout and PATH, but the trellis atoms need ik_llama,
     which people build wherever they like. When it comes back empty the gate used to hand
     Popen the bare name "llama-server", fail to start, and fall back to raw completion -- which
     for an instruct model reads as a model that loops. Look properly instead.
+
+    `model`: a GGUF that only ik_llama.cpp loads (IQ*_KT atoms, pollard-ggufcheck) gets ik's
+    llama-server, never the stock one -- served by stock it fails to load and the gate reads
+    NO_SERVER for a build that is fine (LFM2.5-24B-A2B IQ1_KT, 2026-10-17).
     """
     if SERVER_BIN and os.path.isfile(SERVER_BIN):
         return SERVER_BIN
-    got = find_llama_bin("llama-server")
-    if got:
-        return got
     exe = ".exe" if os.name == "nt" else ""
     home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for base in (os.getcwd(), home, os.path.dirname(home), here, os.path.expanduser("~")):
-        for sub in ("ik_llama.cpp/build/bin", "ik_llama/build/bin", "bin",
-                    "runtime/ik_llama.cpp/build/bin", "llama.cpp/build/bin"):
+    bases = (os.getcwd(), home, os.path.dirname(home), here, os.path.expanduser("~"))
+    ik_subs = ("ik_llama.cpp/build/bin", "ik_llama/build/bin", "runtime/ik_llama.cpp/build/bin")
+    if model and _needs_ik(model):
+        try:
+            from pollard_auto import _bin_in, find_ik_build
+            ik = find_ik_build(None)
+            if ik and os.path.isfile(_bin_in(ik, "llama-server")):
+                return _bin_in(ik, "llama-server")
+        except Exception:                                         # noqa: BLE001 -- search below
+            pass
+        for base in bases:
+            for sub in ik_subs:
+                cand = os.path.join(base, *sub.split("/"), "llama-server" + exe)
+                if os.path.isfile(cand):
+                    return cand
+    got = find_llama_bin("llama-server")
+    if got:
+        return got
+    for base in bases:
+        for sub in ik_subs[:2] + ("bin",) + ik_subs[2:] + ("llama.cpp/build/bin",):
             cand = os.path.join(base, *sub.split("/"), "llama-server" + exe)
             if os.path.isfile(cand):
                 return cand
@@ -352,7 +378,7 @@ def _served(model, ngl, ctx=4096, port=0, extra=()):
     """llama-server for the duration, yielding its base url (or None if it will not start)."""
     if not port:
         s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-    binary = _server_bin()
+    binary = _server_bin(model)
     cmd = [binary, "-m", model, "--host", "127.0.0.1", "--port", str(port),
            "-ngl", str(ngl), "-c", str(ctx),
            # -np 1 IS THE FIX for a server that dies mid-gate. Upstream's default is auto, which
@@ -621,7 +647,7 @@ def coherence_gate(cli_bin, model, ngl, quick=False, ctx=4096, gate_tokens=0, re
             # no verdict -- it condemns builds that are fine.
             return {"verdict": "NO_SERVER", "config": None, "rows": [{
                 "prompt": "(not run)", "loop": None,
-                "reason": (f"llama-server would not start ({_server_bin()}), so this instruct "
+                "reason": (f"llama-server would not start ({_server_bin(model)}), so this instruct "
                            "model could not be scored on its own chat turn. Point "
                            "--llama-server at your build; see " + _SERVER_LOG),
                 "sample": ""}]}

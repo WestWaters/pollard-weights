@@ -24,8 +24,11 @@ import argparse, json, os, re
 DIFFUSION_ARCHS = frozenset({"dream", "llada", "llada-moe", "rnd1", "diffusion-gemma"})
 
 # How many tokens the coherence gate must allow. A thinking model spends its first hundred-odd
-# tokens reasoning, so a short budget reads as incoherence.
-TOKENS_PLAIN, TOKENS_THINKING = 96, 220
+# tokens reasoning, so a short budget reads as incoherence. 220 was not enough: LFM2.5-24B-A2B's IQ3_S
+# (2026-10-17) was still "Analyze the user's input" at token 220 and read as BELOW FLOOR, then passed
+# the same gate at 1024. A thinking model gets the tool-call test's budget (pollard-toolcall's
+# N_PREDICT_REASONING): the same room to think before it answers.
+TOKENS_PLAIN, TOKENS_THINKING = 96, 1024
 
 
 def _template_and_arch(model):
