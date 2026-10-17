@@ -294,7 +294,7 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     return kld_top1(ref, logits(model, loader))
 
 
-def stream_wanted(source, mode="auto"):
+def stream_wanted(source, mode="auto", rung=None):
     """(True, why) when the transformers lanes are measured STREAMED (pollard_stream: source and rung one block at a
     time) -- for a source transformers' AutoModelForCausalLM cannot load whole here: a VLM / omni wrapper, custom
     code, an already-quantized or overlay source, or weights bigger than free RAM can hold twice over."""
@@ -302,6 +302,12 @@ def stream_wanted(source, mode="auto"):
         return True, "asked for"
     if mode in ("off", False):
         return False, ""
+    for side in ("pollard_mx.json", "pollard-gptq.json", "pollard-exlr8.json"):
+        if rung and os.path.isfile(os.path.join(str(rung), side)):
+            # a Pollard rung stores EVERY tensor it was built with (a smoothed rung's folded norms too): read it
+            # whole, block by block -- swapping only its linears into the original source would pair smoothed
+            # weights with unsmoothed norms
+            return True, f"a Pollard rung ({side}): every tensor read from the rung"
     if not os.path.isdir(str(source)):
         return False, ""
     try:
@@ -693,7 +699,7 @@ def main():
             ap.error(f"--lane {lane} measures against the source: pass --source (--ref for a GGUF)")
         print(f"-- fidelity vs {os.path.basename(str(a.source).rstrip('/'))} on {a.eval} --")
         trc = a.trust_remote_code
-        streamed, why = stream_wanted(a.source, a.stream) if lane in ("gptq", "mx", "exlr8") else (False, "")
+        streamed, why = stream_wanted(a.source, a.stream, a.model) if lane in ("gptq", "mx", "exlr8") else (False, "")
         if lane == "gguf":
             measured = measure_gguf(a.model, a.source, a.eval, a.ngl, a.chunks)
         elif lane == "mlx":

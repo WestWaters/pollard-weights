@@ -577,3 +577,16 @@ def test_streamed_exlr8_encode_and_reference_decode(tiny, monkeypatch):
         assert torch.isfinite(m(torch.tensor([ROWS[0][:16]])).logits).all()
     r = S.stream_fidelity(d, rung, [ROWS[0][:24]], trust_remote_code="off", log=lambda *_: None)
     assert np.isfinite(r["kld"]) and r["n"] == 24
+
+
+def test_verify_streams_every_pollard_rung(tmp_path):
+    import pollard_verify as V
+    r = tmp_path / "rung"
+    r.mkdir()
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    if V.stream_wanted(str(tmp_path), "auto", None)[0] is False:     # a plain small source: transformers path
+        assert V.stream_wanted(str(tmp_path), "auto", str(r)) == (False, "")
+    (r / "pollard_mx.json").write_text("{}")
+    ok, why = V.stream_wanted(str(tmp_path), "auto", str(r))
+    assert ok and "unsmoothed norms" not in why and "pollard_mx.json" in why
+    assert V.stream_wanted(str(tmp_path), "off", str(r)) == (False, "")
