@@ -21,7 +21,7 @@ Apple Silicon (this box has `mlx`).
 
 --range search (default) picks each group's scale/bias by an imatrix-weighted range search instead of min/max;
 the files are standard MLX affine (mlx-lm loads them unchanged). --range minmax = MLX's own choice."""
-import argparse, json, re, sys
+import argparse, json, os, re, sys
 
 HIGH, LOW = 8, 4
 MLX_BITS = (2, 3, 4, 5, 6, 8)
@@ -88,6 +88,36 @@ VISION_RE = re.compile(r"(^|\.)(visual|vision_tower|vision_model|vision_encoder|
                        r"|patch_embed|audio_tower|audio_encoder|speech_encoder)", re.I)
 PROJ_RE = re.compile(r"(multi_modal_projector|mm_projector|mm_proj|\bmerger\b"
                      r"|modality_project|resampler|perceiver|connector)", re.I)
+# A speech-output stack (Qwen3-Omni's talker / code2wav) has decoder layers of its own: `talker.model.layers.3.`
+# would take the language layer 3's allocation. It is left at the checkpoint's precision.
+SPEECH_RE = re.compile(r"(^|\.)(talker|code2wav|token2wav|code_predictor|speech_decoder|vocoder)(\.|$)", re.I)
+
+
+EXIT_HELD = 3
+
+
+def mlx_engine(model_dir):
+    """Which converter ships this checkpoint WHOLE: ("mlx_lm", None) for a text model; ("mlx_vlm", model_type) for a
+    model with a vision / audio tower, projector or speech output (mlx-lm drops every one of them); or
+    ("hold", why) when mlx-vlm is missing or has no such model."""
+    import pollard_complete as PC
+    comps = PC.inventory(model_dir)["components"] if os.path.isdir(model_dir) else {}
+    if not comps:
+        return "mlx_lm", None
+    parts = ", ".join(f"{k} ({len(v)} tensors)" for k, v in comps.items())
+    try:
+        from mlx_vlm.utils import get_model_type
+    except Exception:                                       # noqa: BLE001
+        return "hold", (f"this model has {parts}; mlx-lm would drop them and mlx-vlm is not installed "
+                        "(pip install mlx-vlm)")
+    import importlib, json as _j
+    cfg = _j.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
+    mt = get_model_type(cfg)
+    try:
+        importlib.import_module(f"mlx_vlm.models.{mt}")
+    except Exception as e:                                  # noqa: BLE001
+        return "hold", f"this model has {parts}; mlx-vlm has no {mt!r} model ({type(e).__name__})"
+    return "mlx_vlm", mt
 
 
 def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
@@ -98,6 +128,8 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
     they are matched FIRST, because `vision_tower.encoder.layers.2.` also matches the language
     layer pattern and would otherwise be given a text layer's allocation."""
     LOW, HIGH = low or globals()["LOW"], high or globals()["HIGH"]
+    if SPEECH_RE.search(path):                          # speech output: its own layers, not the text profile
+        return False
     if PROJ_RE.search(path):                            # modality alignment: never crushed, any rung
         return {"bits": globals()["HIGH"], "group_size": gsize}
     if VISION_RE.search(path):
@@ -501,10 +533,19 @@ def main():
             print(f"   (no --out) -> workspace: {a.out}")
         except Exception:
             sys.exit("ERROR: --out required unless --plan-only.")
+    engine, why = mlx_engine(a.model)
+    if engine == "hold":
+        print(f"HELD: {why} -- an MLX build of the text alone would not be this model")
+        sys.exit(EXIT_HELD)
     try:
-        from mlx_lm import convert
+        if engine == "mlx_vlm":                             # towers / projector / talker ship inside the MLX model
+            from mlx_vlm import convert
+            print(f"   mlx-vlm ({why}): the whole model -- towers and projector at {a.vision_bits or HIGH}-bit, "
+                  "speech output at the checkpoint's precision")
+        else:
+            from mlx_lm import convert
     except Exception:
-        sys.exit("ERROR: mlx_lm not installed. On Apple Silicon: pip install mlx_lm ; then rerun.")
+        sys.exit(f"ERROR: {engine} not installed. On Apple Silicon: pip install {engine.replace('_', '-')} ; then rerun.")
 
     rs = None
     if a.range == "search":
@@ -529,6 +570,12 @@ def main():
             if trc:
                 print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
             convert(a.model, **ckw)
+    if os.path.isdir(a.model):                             # the whole model or nothing: no silent text-only MLX
+        import pollard_complete as PC
+        PC.fill(a.model, a.out, "mlx")                      # processor files a converter did not write
+        res = PC.check(a.model, a.out, "mlx")
+        if not res["ok"]:
+            sys.exit("ERROR: the MLX build is missing " + "; ".join(res["missing"]))
     if rs is not None:
         print(f"   range search: {rs.stats['searched']} tensors searched "
               f"({rs.stats['weighted']} imatrix-weighted)")

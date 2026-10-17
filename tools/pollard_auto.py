@@ -891,6 +891,14 @@ def _emit_mmproj(a, conv, hf_dir, gguf_out):
     except Exception:
         return
     mods = [m for m in k.get("modalities", []) if m != "speech_out"]
+    try:                                    # the weights decide too: a tower in the checkpoint is a tower to ship,
+        import pollard_complete as PC       # whatever the config text happened to show the classifier
+        comps = PC.inventory(str(hf_dir))["components"]
+        for m, c in (("image", "vision"), ("audio", "audio")):
+            if c in comps and m not in mods:
+                mods.append(m)
+    except Exception:                       # noqa: BLE001
+        pass
     if not mods:
         return
     out = os.path.join(os.path.dirname(os.path.abspath(gguf_out)) or ".",
