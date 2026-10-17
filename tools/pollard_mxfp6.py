@@ -798,6 +798,7 @@ def write_shards(src, out, lin, encode, by_name):
         raw = ref if kind == "raw" else src.modules[ref]["keys"].get("weight", src.modules[ref]["keys"].get("weight_packed"))
         shard_of.setdefault(src.entries[raw][0], []).append(name)
     weight_map = {}
+    spec = S.shard_upload_spec(out)                   # a rung bigger than the disk: each shard up + confirmed + freed
     for sh in src.files:
         hdr, _ = st_header(sh)
         meta_in = {k: v for k, v in (hdr.get("__metadata__") or {}).items() if k != "native_iq2_layers"}
@@ -817,12 +818,17 @@ def write_shards(src, out, lin, encode, by_name):
         dst = os.path.join(out, os.path.basename(sh))
         st_write(dst, tensors, {**meta_in, "format": "pt"})
         weight_map.update({n: os.path.basename(sh) for n in tensors})
+        del tensors
+        if spec:
+            S.stream_shard(out, dst, spec)
     return weight_map
 
 
 def _finish_files(src, out, weight_map):
     """The index (when the source has one) and every side file, minus the source's own quantization records."""
-    if len(src.files) > 1 or os.path.exists(os.path.join(src.base_dir, "model.safetensors.index.json")):
+    import pollard_stream as S
+    if len(src.files) > 1 or os.path.exists(os.path.join(src.base_dir, "model.safetensors.index.json")) \
+            or S.read_streamed(out):                  # a streamed rung always carries its index (uploaded last)
         json.dump({"metadata": {}, "weight_map": weight_map},
                   open(os.path.join(out, "model.safetensors.index.json"), "w"), indent=2)
     import pollard_stream as S

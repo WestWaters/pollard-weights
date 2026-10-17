@@ -713,9 +713,15 @@ def lane_steps(cfg, c, lane):
                    "--out", out]
             src = c["smooth_dir"]
         rid = f"{lane}/{tag}"
-        steps.append(Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
-                          out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
-                          held_codes=(EXIT_HELD,) if lane == "exl3" else ()))
+        st_build = Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
+                        out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
+                        held_codes=(EXIT_HELD,) if lane == "exl3" else ())
+        if c.get("free") and lane in STREAMABLE:
+            # bigger than the free disk: written + uploaded + confirmed + freed one shard at a time, not held
+            from pollard_card import rung_subfolder
+            st_build["stream_to"] = (repo_name(c["org"], c["src"]),
+                                     f"{lane_folder(lane)}/{rung_subfolder({'name': name, 'tag': tag}, lane)}")
+        steps.append(st_build)
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
                               cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1)))
@@ -734,6 +740,13 @@ def lane_steps(cfg, c, lane):
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
             steps.append(st)
     return steps
+
+
+#: directory lanes whose writers can stream a rung to the Hub shard by shard (pollard_stream.ShardWriter: GPTQ;
+#: pollard_mxfp6.write_shards: every pollard-engine MX rung)
+STREAMABLE = ("gptq", "mx")
+#: free disk a streamed build still needs: the shard being written (a source shard can be ~5 GB) + the margin
+STREAM_SHARD_GB = 6.0
 
 
 def gguf_ladder_labels(c):
@@ -1034,6 +1047,14 @@ def go_public(step, c, cfg, run_upload, statuses, out=print):
     if not shipped:
         out(f"      (nothing shipped this run -- {step.repo} stays as it is)")
         return "held"
+    import pollard_workspace as ws
+    stranded = [p for l in LANES for b in ws.read_manifest(lane_key(c, l)).get("builds", [])
+                if b.get("lane") == l and b.get("streamed_unverified") and b.get("verified") is not True
+                for p in b["streamed_unverified"][:1]]
+    if stranded:
+        raise RuntimeError(f"{step.repo} stays private: it holds streamed shards of a rung that did not pass its gate "
+                           f"({', '.join(sorted({os.path.dirname(p) for p in stranded}))}) -- verify it or remove that "
+                           "folder, then re-run")
     from huggingface_hub import HfApi
     api = HfApi()
     want = {"README.md"}
@@ -1130,23 +1151,14 @@ def _free_local(c, b, out=print):
     return True
 
 
-def _sha256(path, bufsize=1 << 24):
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(bufsize), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _sha256(path):
+    import pollard_hubcheck as H
+    return H.sha256_file(path)
 
 
 def _git_blob_sha1(path):
-    """The id git (and the Hub) gives a small, non-LFS file: sha1 of "blob <size>\\0" + its bytes."""
-    import hashlib
-    h = hashlib.sha1(f"blob {os.path.getsize(path)}\0".encode())
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 24), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    import pollard_hubcheck as H
+    return H.git_blob_sha1(path)
 
 
 def _local_pairs(path, path_in_repo):
@@ -1163,36 +1175,10 @@ def _local_pairs(path, path_in_repo):
 
 
 def remote_mismatches(api, repo, pairs):
-    """[why] for every (path in repo, local file) the Hub does NOT hold byte-for-byte: missing, a different size,
-    or a different hash (the LFS sha256, or the git blob id of a small file). [] = every file is there, intact.
-    A Hub that cannot be asked counts as a mismatch: nothing is freed on a guess."""
-    if not pairs:
-        return ["nothing to check"]
-    try:
-        info = {f.path: f for f in api.get_paths_info(repo, [p for p, _ in pairs])}
-    except Exception as e:                                       # noqa: BLE001
-        return [f"could not read the file list of {repo} back ({type(e).__name__}: {e})"]
-    bad = []
-    for rp, local in pairs:
-        f = info.get(rp)
-        size = os.path.getsize(local)
-        if f is None:
-            bad.append(f"{rp}: not on the Hub")
-            continue
-        if getattr(f, "size", None) != size:
-            bad.append(f"{rp}: {getattr(f, 'size', None)} bytes on the Hub, {size} here")
-            continue
-        lfs = getattr(f, "lfs", None)
-        sha = (lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)) if lfs else None
-        if sha:
-            if sha != _sha256(local):
-                bad.append(f"{rp}: sha256 differs from the local file")
-        elif getattr(f, "blob_id", None):
-            if f.blob_id != _git_blob_sha1(local):
-                bad.append(f"{rp}: git blob id differs from the local file")
-        else:
-            bad.append(f"{rp}: the Hub gave no hash to check against")
-    return bad
+    """[why] for every (path in repo, local file | recorded {size, sha256}) the Hub does NOT hold intact (missing,
+    another size, another hash, no hash); [] = every file is there. See pollard_hubcheck."""
+    import pollard_hubcheck as H
+    return H.mismatches(api, repo, pairs)
 
 
 def _keep(c, lane, key, man, b, why, out):
@@ -1231,9 +1217,14 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         raise RuntimeError(f"{step.out} is not in the MANIFEST")
     if b.get("uploaded") and not os.path.exists(b.get("path", "")):
         return "done"
+    import pollard_stream as PS
+    streamed = PS.read_streamed(b["path"]) if lane != "gguf" and os.path.isdir(b.get("path", "")) else {}
     if b.get("verified") is not True:
-        _keep(c, lane, key, man, b, "not verified (measure / verify / gate failed or did not run) -- not published",
-              out)
+        if streamed:
+            b["streamed_unverified"] = sorted(e["path_in_repo"] for e in streamed.values())
+        _keep(c, lane, key, man, b, "not verified (measure / verify / gate failed or did not run) -- not published"
+              + (f"; its {len(streamed)} streamed shard(s) stay in the PRIVATE repo, which will not go public "
+                 "until they are verified or removed" if streamed else ""), out)
         return "kept: not verified"
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
@@ -1254,15 +1245,28 @@ def publish_rung(step, c, cfg, run_upload, out=print):
             api.upload_file(path_or_fileobj=b["path"], path_in_repo=dest, repo_id=repo)
     else:
         dest = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
-        if not b.get("uploaded"):
+        if not b.get("uploaded") and streamed:
+            # the shards are already there (streamed + confirmed one by one); the rest, then the index LAST -- a
+            # loader sees the rung only once every shard it maps is in place
+            api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo,
+                              ignore_patterns=["model.safetensors.index.json", PS.STREAMED, "*.tmp"])
+            if os.path.isfile(os.path.join(b["path"], "model.safetensors.index.json")):
+                api.upload_file(path_or_fileobj=os.path.join(b["path"], "model.safetensors.index.json"),
+                                path_in_repo=f"{dest}/model.safetensors.index.json", repo_id=repo)
+        elif not b.get("uploaded"):
             api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo)
     b["uploaded_as"] = dest
-    bad = remote_mismatches(api, repo, _local_pairs(b["path"], dest))
+    pairs = [(rp, lp) for rp, lp in _local_pairs(b["path"], dest) if os.path.basename(lp) != PS.STREAMED]
+    pairs += [(e["path_in_repo"], {"size": e["size"], "sha256": e["sha256"], "git_sha1": e.get("git_sha1")})
+              for e in streamed.values()]
+    bad = remote_mismatches(api, repo, pairs)
     if bad:
         _keep(c, lane, key, man, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
         raise RuntimeError(f"{dest} is not intact in {repo} after the upload ({bad[0]}) -- keeping the local copy")
     b["uploaded"] = repo
     b.pop("kept", None)
+    if streamed:
+        b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
     ws._write_manifest(key, man)
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if _free_local(c, b, out):
@@ -1413,9 +1417,19 @@ class Held(Exception):
     pass
 
 
-def run_cmd(cmd, ok_codes=(0,)):
+def _toolcall_not_measured(st, why):
+    """Record a rung's tool calls as NOT MEASURED, with the reason, the way pollard-toolcall does (the gate's
+    toolcall_not_measured policy and the card read it from there)."""
+    cmd = list(st.cmd)
+    res, rung = cmd[cmd.index("--results") + 1], cmd[cmd.index("--rung") + 1]
+    from pollard_taskeval import save_results
+    save_results(res, rung, {"toolcall": {"status": "not-measured", "reason": why, "lane": st.lane}})
+    return "done"
+
+
+def run_cmd(cmd, ok_codes=(0,), env=None):
     from pollard_auto import _resolve_tool
-    r = subprocess.run(_resolve_tool(list(cmd)))
+    r = subprocess.run(_resolve_tool(list(cmd)), env=env) if env else subprocess.run(_resolve_tool(list(cmd)))
     if r.returncode not in ok_codes:
         raise RuntimeError(f"exit {r.returncode}")
 
@@ -1426,6 +1440,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
     state = load_state(c["state"])
     statuses, failed_rungs, failed_lanes, unbuildable = {}, set(), set(), set()
     kept = []                                        # (lane, rung, path) left on disk unpublished -- reported at the end
+    streamed = set()                                 # (lane, rung) built in streaming mode (shards already on the Hub)
     queue, n = list(steps), 0
     while queue:
         st = queue.pop(0)
@@ -1500,10 +1515,19 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             statuses[st.id] = "skipped: upstream failed"
             continue
         need = st.disk_gb or 0
+        stream_env = None
         if run and need and st.kind in ("build", "prep") and resume_reason(st, state, redo) is None:
             free = disk_free_gb(st.out or c["mdir"])
             margin = float(cfg.get("disk_margin_gb", 3))
-            if free < need + margin:
+            if free < need + margin and st.stream_to and run_upload and free >= STREAM_SHARD_GB + margin:
+                import pollard_stream as PS
+                repo, sub = st.stream_to
+                stream_env = dict(os.environ, **{PS.SHARD_UPLOAD_ENV: json.dumps(
+                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub})})
+                streamed.add((st.lane, st.rung))
+                out(f"{head}: ~{need:.1f} GB > {free:.1f} GB free -- STREAMING: each shard written -> uploaded to "
+                    f"{repo}/{sub}/ -> confirmed -> freed before the next (the repo stays private)")
+            elif free < need + margin:
                 msg = f"held: disk (needs ~{need:.1f} GB + {margin:g} margin, {free:.1f} GB free)"
                 out(f"{head}: {msg} -- {what}")
                 statuses[st.id] = msg
@@ -1536,9 +1560,13 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 res = "done"
             elif st.fn == "publish_rung":
                 res = publish_rung(st, c, cfg, run_upload, out)
+            elif st.kind == "measure" and (st.lane, st.rung) in streamed and "pollard-toolcall" in str(st.cmd[0]):
+                res = _toolcall_not_measured(st, "the rung was streamed to the Hub shard by shard while it was built "
+                                                 "(bigger than the free disk); the tool-call probe needs it on disk")
+                out("      tool calls: not measured (streamed rung)")
             else:
                 try:
-                    run_cmd(st.cmd, st.ok_codes or (0,))
+                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": stream_env} if stream_env else {}))
                 except RuntimeError as e:
                     if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
                         raise Held(f"{e} (the reason is the HELD: line above)") from None
