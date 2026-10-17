@@ -280,11 +280,9 @@ def main():
     if a.materialize:
         materialize(a.materialize, a.out or (a.materialize.rstrip("/\\") + "-full"))
         return
-    import torch
+    import pollard_stream as S
+    dev = S.stream_device(a.device)                     # before torch: an explicit cpu hides the shared GPU
     import pollard_workspace as ws
-    dev = a.device
-    if dev == "auto":
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
     if not a.out:
         a.out = os.path.join(ws.model_dir(a.model, create=True), ws.model_basename(a.model) + "-smoothed")
         print(f"   (no --out) -> workspace: {a.out}")

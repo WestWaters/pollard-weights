@@ -551,8 +551,9 @@ def test_exl3_converts_the_omni_language_model_lifted_out_of_its_smoothing_overl
     x = torch.tensor([ROWS[3]])
     with torch.no_grad():
         a, b = bb.root(input_ids=x).logits, m(x).logits
-    # smoothing is an identity; what is left is the bf16 rounding of the folded q/k/v and norms
-    assert (a - b).abs().max() < 0.02 * a.abs().max()
+    # smoothing is an identity; what is left is the bf16 rounding of the folded q/k/v and norms (on a random tiny
+    # MoE that can flip a near-tied expert choice at a token or two, hence mean + top-1, not max)
+    assert (a - b).abs().mean() < 0.01 and (a.argmax(-1) == b.argmax(-1)).float().mean() > 0.9
     q = S.Source(src).read("model.layers.0.self_attn.q_proj.weight")
     assert not np.array_equal(q, S.Source(tiny["omni"]).read("thinker.model.layers.0.self_attn.q_proj.weight"))
 

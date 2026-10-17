@@ -1526,6 +1526,20 @@ def ram_budget(max_ram_gb=None):
     return min(caps) if caps else 16.0
 
 
+def stream_device(want="auto"):
+    """Where a streamed lane runs (pollard_device decides what works here): CUDA when asked or `auto` finds a usable
+    card, else the CPU. An explicit `cpu` hides CUDA from torch BEFORE it is imported -- the shared box's GPU is
+    someone else's -- and MPS is not used (fp64 Cholesky / index ops the GPTQ and EXLR8 solvers need)."""
+    import pollard_device as D
+    w = (want or "auto").strip().lower()
+    if w == "cpu":
+        if "torch" not in sys.modules:
+            D.hide_cuda()
+        return "cpu"
+    d = D.pick(w)
+    return "cpu" if d.startswith("mps") else d
+
+
 # ----------------------------------------------------------------------------------------------- calibration
 
 
@@ -1878,32 +1892,43 @@ def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", 
         hidden_q = eq.run_layer(i)
         bb.free_layer(i)
     norm, head = _final_head(bb)
-    out = {"kl": [], "top1": []}
-    for which, hidden, reader in (("s", hidden_s, None), ("q", hidden_q, rd)):
-        keys = bb.outer_keys + head_keys
-        bb.load(keys, device, tensors=None if reader is None else {k: reader.read_torch(k) for k in keys})
-        if tied and hasattr(bb.root, "tie_weights"):
-            bb.root.tie_weights()
-        with torch.no_grad():
+    # both output projections side by side (source + rung), logits one row at a time: never the [rows x vocab]
+    # logits of a whole eval set in memory
+    keys = bb.outer_keys + head_keys
+    bb.load(keys, device)
+    if tied and hasattr(bb.root, "tie_weights"):
+        bb.root.tie_weights()
+    names = {n: p for n, p in bb.root.named_parameters()}
+    head_name = next((n for n, p in names.items() if p is head.weight), None)
+    norm_name = next((n for n, p in names.items() if norm is not None and p is norm.weight), None)
+    rev = {t: k for k, (t, _) in bb.kmap.items()}
+    w_s = head.weight.detach().clone()
+    n_s = norm.weight.detach().clone() if norm is not None else None
+    hk = rev.get(head_name) or next(k for k in bb.outer_keys if bb.kmap[k][0].endswith(("embed_tokens.weight",
+                                                                                          "embeddings.weight")))
+    w_q = rd.read_torch(hk, w_s.dtype).to(device)
+    n_q = rd.read_torch(rev[norm_name], n_s.dtype).to(device) if norm is not None and norm_name in rev else n_s
+    kls, top = [], []
+    with torch.no_grad():
+        for hs, hq in zip(hidden_s, hidden_q):
             lg = []
-            for h in hidden:
+            for h, w, nw in ((hs, w_s, n_s), (hq, w_q, n_q)):
                 x = h.to(device, bb.dtype)
                 if norm is not None:
+                    norm.weight.data = nw
                     x = norm(x)
-                lg.append(head(x)[0].float().cpu().numpy())
-        out[which] = lg
-    kls, top = [], []
-    for a, b in zip(out["s"], out["q"]):
-        a = a - a.max(-1, keepdims=True)
-        b = b - b.max(-1, keepdims=True)
-        la = a - np.log(np.exp(a).sum(-1, keepdims=True))
-        lb = b - np.log(np.exp(b).sum(-1, keepdims=True))
-        kls.append((np.exp(la) * (la - lb)).sum(-1))
-        top.append(a.argmax(-1) == b.argmax(-1))
+                lg.append(torch.nn.functional.linear(x, w)[0].double())
+            a = torch.log_softmax(lg[0], -1)
+            b = torch.log_softmax(lg[1], -1)
+            kls.append((a.exp() * (a - b)).sum(-1).cpu().numpy())
+            top.append((a.argmax(-1) == b.argmax(-1)).cpu().numpy())
+            del lg, a, b
+    if norm is not None:
+        norm.weight.data = n_s
     kl = np.concatenate(kls)
     return {"kld": float(kl.mean()), "top1": float(np.concatenate(top).mean() * 100.0),
             "kld_p99": float(np.percentile(kl, 99)), "n": int(kl.size), "how": "streamed",
-            "peak_rss_gb": round(max(es.peak_rss, eq.peak_rss) / 1e9, 2)}
+            "peak_rss_gb": round(max(es.peak_rss, eq.peak_rss, peak_rss_bytes()) / 1e9, 2)}
 
 
 # ----------------------------------------------------------------------------------------------- text extraction

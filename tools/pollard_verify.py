@@ -336,14 +336,11 @@ def measure_stream(model, source, eval_path, device="cpu", length=512, chunks=8,
     """The rung against its source, both streamed block by block (pollard_stream.stream_fidelity): any size, any
     backbone the stream engine resolves, every Pollard rung format decoded from its bytes."""
     import pollard_stream as S
+    dev = S.stream_device(device)
     from transformers import AutoTokenizer
     src = S.Source(source)
     tok = AutoTokenizer.from_pretrained(src.base_dir, trust_remote_code=trust_remote_code in (True, "on"))
     parts = _chunks(tok(_eval_text(eval_path))["input_ids"], length, chunks)
-    dev = device
-    if str(dev).startswith("cuda"):
-        import torch
-        dev = dev if torch.cuda.is_available() else "cpu"
     return S.stream_fidelity(source, model, parts, dev, trust_remote_code)
 
 

@@ -474,10 +474,7 @@ def stream_main(a, hot, protect_down):
     if need:
         if not a.calib:
             sys.exit(f"ERROR: --calib required ({', '.join(sorted(need))} activation scales need calibration)")
-        dev = a.device
-        if dev == "auto":
-            import torch
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        dev = S.stream_device(a.device)
         print(f"   calibration pass (streamed, {dev}) for the {', '.join(sorted(need))} activation scales ...")
         amax, cal = S.collect_input_amax(a.model, a.calib, a.nsamples, a.seqlen, dev, a.trust_remote_code,
                                          a.max_ram_gb)

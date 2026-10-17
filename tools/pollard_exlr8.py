@@ -960,11 +960,10 @@ def encode_model(model_dir, store, widths=DEFAULT_WIDTHS, calib=None, device="au
     is encoded at every width. MoE experts are encoded one dense record per expert matrix (checkpoint names), so a
     MoE rung decodes to the source's own checkpoint layout. Towers / talkers / projectors go to the extra file at
     source precision."""
-    import torch
     import pollard_stream as S
+    device = S.stream_device(device)                    # before torch: an explicit cpu hides the shared GPU
+    import torch
     from transformers import AutoTokenizer
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
     widths = sorted({int(k) for k in widths})
     if any(k < 1 or k > 8 for k in widths):
         raise SystemExit("widths must be 1..8 bits")

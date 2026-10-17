@@ -313,10 +313,8 @@ def main():
             a.out = ws.resolve_out(a.model, "gptq", tag=tag)
             print(f"   (no --out) -> workspace: {a.out}")
         import pollard_gptqpack as GP
-        dev = a.device
-        if dev == "auto":
-            import torch
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        import pollard_stream as S
+        dev = S.stream_device(a.device)
         side = GP.build_stream(a.model, a.out, a.calib, alloc=None if uniform else alloc, low=low,
                                group=a.group_size, nsamples=a.nsamples, seqlen=a.seqlen, device=dev,
                                trust_remote_code=a.trust_remote_code, max_ram_gb=a.max_ram_gb)
