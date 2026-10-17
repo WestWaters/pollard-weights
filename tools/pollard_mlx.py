@@ -995,7 +995,7 @@ def plan_verify(source, rung=None, length=256, chunks=16, vocab=None):
     its embeddings, the logits of one chunk (source + rung, float32 + the float64 KL math), the base process."""
     import pollard_stream as S
     src = S.Source(source)
-    blocks, outer, biggest, vocab_seen = {}, 0, 0, 0
+    blocks, outer, biggest, vocab_seen, embed = {}, 0, 0, 0, 0
     for k in src.logical:
         n = S._prod(src.shape(k))
         b = n * 2 if src.encoding(k) else src.nbytes(k)
@@ -1008,13 +1008,18 @@ def plan_verify(source, rung=None, length=256, chunks=16, vocab=None):
             blocks[(g, -1)] = blocks.get((g, -1), 0) + b
         elif "embed" in k or k.endswith("lm_head.weight"):
             outer += b
+            embed = max(embed, b) if "embed" in k else embed
             if len(src.shape(k)) == 2 and not vocab:
                 vocab_seen = max(vocab_seen, src.shape(k)[0])
     stacks = [v for (g, i), v in blocks.items() if i == -1]
     layer = max([v for (g, i), v in blocks.items() if i != -1] or [0])
     V = vocab or vocab_seen or 152064
     logits = length * V * 4 * 3 + 64 * V * 8 * 5            # rung + reference + head output; KL 64 rows at a time
-    peak = (layer + max(stacks or [biggest]) + outer + logits) / 1e9 + BASE_GB
+    # two phases: the blocks (the embeddings read by the record pass + one block + one tensor's transient), then the
+    # head (embeddings + head + one chunk's logits) -- the head is never evaluated while a block is in memory
+    blocks_phase = embed + layer + max(stacks or [biggest])
+    head_phase = outer + logits
+    peak = max(blocks_phase, head_phase) / 1e9 + BASE_GB
     return {"layer_gb": round(layer / 1e9, 2), "outer_gb": round(outer / 1e9, 2),
             "logits_gb": round(logits / 1e9, 2), "peak_gb": round(peak, 2)}
 

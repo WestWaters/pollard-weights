@@ -219,6 +219,11 @@ def test_release_mirrors_a_remote_source_instead_of_fetching_it(tmp_path, monkey
     st = steps[ids.index("prep/mirror")]
     assert st.cmd[:2] == ["pollard-mlx", "--model"] and st.cmd[-3:] == ["--remote-source", url, "--mirror-only"]
     assert R.repo_name("PollardWeights", c["src"]) == "PollardWeights/clef-omni-Pollard"
+    cfg.pop("sensitivity")                         # none given: never the forward probe on a mirror's holes
+    c, lanes, steps = R.plan_steps(cfg, str(tmp_path / "src" / "clef-omni"), {"mlx"})
+    probe = next(s for s in steps if s.id == "prep/probe")
+    assert probe.kind == "note" and "remote mirror" in probe.desc
+    assert "--sensitivity" not in next(s for s in steps if s.id == "mlx/4bit/build").cmd
 
 
 class _FakeRelay:

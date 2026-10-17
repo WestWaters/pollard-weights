@@ -397,6 +397,12 @@ def prep_steps(cfg, c, lanes):
     if raw_probe and cfg.get("sensitivity"):
         steps.append(Step(id="prep/probe", lane="prep", kind="note", requires="any",
                           desc=f"sensitivity profile given in the plan: {c['sens_raw']}"))
+    elif raw_probe and cfg.get("remote_source") and not os.path.exists(c["sens_raw"]):
+        c["no_profile"] = True                       # the forward probe would read the mirror's holes: never run it
+        steps.append(Step(id="prep/probe", lane="prep", kind="note", requires="any",
+                          desc="no sensitivity profile (none in the plan, and the HF weights are a remote mirror the "
+                               "forward probe cannot read): the MLX rungs allocate without one -- router, embeddings, "
+                               "towers and projector held high, the body at the rung's bits"))
     elif raw_probe and route == "imatrix":
         print(f"   probe: from the imatrix on {c['f16']} -- {why}")
         steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", out=c["sens_raw"],
@@ -708,8 +714,9 @@ def lane_steps(cfg, c, lane):
         out = ws.resolve_out(c["src"], lane, tag, create_parent=False)
         name = os.path.basename(out)
         if lane == "mlx":
-            cmd = ["pollard-mlx", "--model", c["hf_dir"], "--sensitivity", c["sens_raw"], "--bits", str(int(rung)),
-                   "--out", out]
+            cmd = ["pollard-mlx", "--model", c["hf_dir"]] + ([] if c.get("no_profile") else
+                                                              ["--sensitivity", c["sens_raw"]]) + [
+                   "--bits", str(int(rung)), "--out", out]
             src = c["hf_dir"]
         elif lane == "gptq":
             cmd = ["pollard-export", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"],
