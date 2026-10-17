@@ -128,6 +128,24 @@ def slot_args(gguf=None):
     return ["-np", "1"]
 
 
+def bin_for(gguf, name):
+    """The llama.cpp binary `name` (llama-server / llama-perplexity / llama-cli) that can LOAD this GGUF: the
+    ik_llama.cpp build when pollard-ggufcheck says the file needs it (the IQ*_KT trellis flagship -- stock llama.cpp
+    stops at "failed to load model"), else the managed / stock one. None when nothing is found."""
+    from pollard_calc import find_llama_bin
+    try:
+        import pollard_ggufcompat as gc
+        needs_ik = gc.runtime_of(gguf)[0] == "ik_llama"
+    except Exception:                                             # noqa: BLE001 -- unreadable: the stock binary
+        needs_ik = False
+    if needs_ik:
+        from pollard_auto import _bin_in, find_ik_build
+        ik = find_ik_build(None)
+        if ik and os.path.isfile(_bin_in(ik, name)):
+            return _bin_in(ik, name)
+    return find_llama_bin(name)
+
+
 def load_timeout_s(gguf, base_s=180, per_gb_s=25):
     """How long to wait for /health: a fixed start-up plus the time to read the file at a slow-disk rate."""
     try:
@@ -242,8 +260,7 @@ def serve(gguf, ngl="auto", ctx=4096, port=None, binary=None, extra=(), log_path
           retry_cpu=True, out=print, _start_fn=None):
     """llama-server on `gguf` for the duration; yields a Server. -ngl from resolve_ngl; a GPU start that fails is
     retried once with -ngl 0; ServerFailed (with the server's own words) when neither comes up."""
-    from pollard_calc import find_llama_bin
-    binary = binary or find_llama_bin("llama-server") or shutil.which("llama-server") or "llama-server"
+    binary = binary or bin_for(gguf, "llama-server") or shutil.which("llama-server") or "llama-server"
     first = resolve_ngl(gguf, ngl)
     attempts = [first] + (["0"] if retry_cpu and first != "0" else [])
     timeout_s = timeout_s or load_timeout_s(gguf)

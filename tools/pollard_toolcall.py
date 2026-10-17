@@ -1092,7 +1092,8 @@ def served(model, ngl, ctx=4096, threads=None, server=None, log_path=None):
     """llama-server --jinja for the duration; yields its base url."""
     from pollard_calc import find_llama_bin
     import shutil
-    binary = server or find_llama_bin("llama-server") or shutil.which("llama-server")
+    import pollard_llamaserve as LS
+    binary = server or LS.bin_for(model, "llama-server") or shutil.which("llama-server")
     if not binary:
         raise NotMeasured("llama-server not found (install llama.cpp or pass --llama-server)")
     # pollard_llamaserve: -ngl from free VRAM (a bare `auto` is never handed to the server), one slot, a wait scaled

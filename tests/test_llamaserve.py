@@ -245,3 +245,23 @@ def test_threads_follow_pollard_threads(monkeypatch):
     assert cmd.count("-t") == 1, "an explicit -t wins"
     monkeypatch.delenv("POLLARD_THREADS")
     assert "-t" not in LS.server_cmd("llama-server", "m.gguf", 9000, "0", 4096)
+
+
+def test_an_ik_only_rung_is_measured_with_the_ik_llama_binaries(tmp_path, monkeypatch):
+    """The LFM2.5 IQ1_KT flagship: stock llama-perplexity 'failed to load model' -- verify / toolcall / taskeval must
+    use ik_llama's binaries for a file pollard-ggufcheck says needs ik_llama."""
+    import pollard_ggufcompat as gc
+    import pollard_auto as A
+    import pollard_calc as PC
+    ik = tmp_path / "ik"
+    ik.mkdir()
+    for n in ("llama-server", "llama-perplexity"):
+        (ik / n).write_text("")
+    monkeypatch.setattr(A, "find_ik_build", lambda d=None: str(ik))
+    monkeypatch.setattr(PC, "find_llama_bin", lambda n: f"/stock/{n}")
+    monkeypatch.setattr(gc, "runtime_of", lambda p: ("ik_llama", {}) if "KT" in p else ("stock", {}))
+    assert LS.bin_for("M-Pollard-IQ1_KT.gguf", "llama-perplexity") == str(ik / "llama-perplexity")
+    assert LS.bin_for("M-Pollard-Q6_K.gguf", "llama-server") == "/stock/llama-server"
+    src = (ROOT / "tools" / "pollard_verify.py").read_text(encoding="utf-8")
+    seg = src[src.index("def measure_gguf("):src.index("def measure_mlx(")]
+    assert 'LS.bin_for(model, "llama-perplexity")' in seg and "ref_bin" in seg, "the f16 base stays on stock"

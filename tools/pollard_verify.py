@@ -199,7 +199,12 @@ def measure_gguf(model, ref, eval_path, ngl="0", chunks=16, ppl_bin=None):
     import shutil
     from pollard_calc import find_llama_bin
     from pollard_bench import _ppl_kl
-    ppl_bin = ppl_bin or find_llama_bin("llama-perplexity") or "llama-perplexity"
+    import pollard_llamaserve as LS
+    # the rung's own runtime: an ik_llama-only file (the IQ*_KT flagship) is measured by ik_llama's perplexity, which
+    # reads the stock-written KL base (same format) -- stock llama.cpp cannot load it at all
+    given = ppl_bin
+    ppl_bin = ppl_bin or LS.bin_for(model, "llama-perplexity") or find_llama_bin("llama-perplexity") or "llama-perplexity"
+    ref_bin = given or find_llama_bin("llama-perplexity") or ppl_bin
     try:
         import pollard_workspace as ws
         base = os.path.join(ws.cache_dir(create=True), os.path.splitext(os.path.basename(ref))[0]
@@ -216,7 +221,7 @@ def measure_gguf(model, ref, eval_path, ngl="0", chunks=16, ppl_bin=None):
 
     if not (os.path.exists(base) and os.path.getsize(base) > 0):
         for n in tries(ref):
-            cmd = [ppl_bin, "-m", ref, "-f", eval_path, "-c", "2048", "-ngl", str(n),
+            cmd = [ref_bin, "-m", ref, "-f", eval_path, "-c", "2048", "-ngl", str(n),
                    "--kl-divergence-base", base] + (["--chunks", str(chunks)] if chunks else [])
             print("   KL base: $ " + " ".join(cmd), flush=True)
             r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -763,7 +768,8 @@ def main():
         from pollard_bench import coherence_gate
         from pollard_calc import find_llama_bin
         import pollard_llamaserve as LS
-        res = coherence_gate(find_llama_bin("llama-cli") or "llama-cli", a.model, LS.resolve_ngl(a.model, a.ngl),
+        res = coherence_gate(LS.bin_for(a.model, "llama-cli") or find_llama_bin("llama-cli") or "llama-cli", a.model,
+                             LS.resolve_ngl(a.model, a.ngl),
                              quick=True)
         measured["coherence"] = res.get("verdict")
 
