@@ -25,6 +25,15 @@ int8). 4 and 8 run on Marlin; 2- and 3-bit GPTQ load in vLLM through its plain G
 slower, and SGLang does not take them -- so they are the small-VRAM rungs, not the fast ones.
 
     pollard-export --model <hf> --sensitivity s.json --calib calib.txt --bits 3 --out ./M-Pollard-GPTQ-int3
+
+ENGINES (--engine): `gptqmodel` loads the model through transformers and runs gptqmodel's GPTQ (disk offload on,
+one layer at a time, where the gptqmodel version has it). `pollard` is Pollard's own sequential GPTQ streamed
+block by block from disk (pollard_stream + pollard_gptqpack): any size the machine can stream (peak = one block +
+its Hessians + the activations, preflighted against free RAM / --max-ram-gb), a VLM / omni checkpoint through its
+language model (towers, talkers and projectors copied through at source precision), the checkpoint's own code only
+with consent (--trust-remote-code on), and an already-quantized source (modelopt NVFP4 / ggml blocks) dequantized
+on read. It writes the same GPTQ v1 layout (qweight / qzeros / scales / g_idx, sym, group 128, desc_act False) vLLM
+loads, with Pollard's allocation in `dynamic`. `auto` keeps gptqmodel for a plain causal LM that fits in RAM.
 """
 import argparse, json, os, re, sys
 import pollard_workspace as ws
@@ -39,15 +48,14 @@ FREE = {"attn_o": ["o_proj"], "ffn_down": ["down_proj"]}
 def detect_moe(model_id, layers_hint=0):
     """Return (is_moe, n_layers). MoE if the config advertises experts (Qwen-MoE
     num_experts / Mixtral num_local_experts / DeepSeek n_routed_experts)."""
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        n = getattr(cfg, "num_hidden_layers", 0) or layers_hint
-        moe = any(getattr(cfg, k, 0) for k in
-                  ("num_experts", "num_local_experts", "n_routed_experts"))
-        return bool(moe), int(n)
-    except Exception:
+    cfg = ws.text_config_dict(ws.config_dict(model_id))      # plain JSON: no checkpoint code runs to read it
+    if not cfg:
         return False, layers_hint
+    n = cfg.get("num_hidden_layers", 0) or layers_hint
+    moe = any(isinstance(cfg.get(k), int) and cfg.get(k) > 1
+              for k in ("num_experts", "num_local_experts", "n_routed_experts"))
+    moe = moe or any(b.get("block_type") == "moe" for b in (cfg.get("block_configs") or []) if isinstance(b, dict))
+    return bool(moe), int(n)
 
 
 resolve_trust_remote_code = ws.resolve_trust_remote_code   # shared across every export lane
@@ -57,12 +65,7 @@ def detect_mla(model_id):
     """True if the model uses Multi-head Latent Attention (DeepSeek-V2/V3, GLM-4.5/5.3) -- its
     attention is q_a/q_b/kv_a/kv_b_proj, not q/k/v_proj. ATTN_PROJ matches both; this is only
     for the user-facing note. Detected from the low-rank KV config field."""
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        return getattr(cfg, "kv_lora_rank", None) is not None
-    except Exception:
-        return False
+    return ws.text_config_dict(ws.config_dict(model_id)).get("kv_lora_rank") is not None
 
 
 parse_layers = ws.parse_layers   # shared layer-spec parser
@@ -172,6 +175,38 @@ def print_shard_plan(model_id, n_layers, n_nodes, bf16_gb):
           " is usually the wall-clock wall, not compute.")
 
 
+def pick_engine(model, want="auto"):
+    """('pollard' | 'gptqmodel', why). auto keeps gptqmodel for what it always handled -- a plain causal LM, no
+    custom code, unquantized, that fits in RAM -- and streams everything else through Pollard's engine."""
+    if want != "auto":
+        return want, "asked for"
+    try:
+        import gptqmodel  # noqa: F401
+    except Exception:                                                     # noqa: BLE001
+        return "pollard", "gptqmodel is not installed here"
+    if not os.path.isdir(model):
+        return "gptqmodel", ""
+    import pollard_stream as S
+    if S.is_overlay(model):
+        return "pollard", "a smoothing overlay (scales over the source) -- only the stream reader applies it"
+    if S.needs_remote_code(model):
+        return "pollard", "custom code: the stream engine runs a native mapping where one exists"
+    cfg = ws.config_dict(model)
+    if cfg.get("quantization_config"):
+        return "pollard", "the source is already quantized: the stream reader dequantizes it"
+    try:
+        from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES as LM
+        if cfg.get("model_type") not in LM:
+            return "pollard", f"transformers has no causal-LM class for {cfg.get('model_type')!r} (VLM / omni)"
+    except Exception:                                                     # noqa: BLE001
+        return "pollard", "transformers is not importable"
+    w = sum(os.path.getsize(p) for p in S.weight_files(model)) / 1e9
+    free = S.free_ram_gb() or 0
+    if w * 1.2 > free:
+        return "pollard", f"{w:.1f} GB of weights vs {free:.1f} GB free RAM: streamed"
+    return "gptqmodel", ""
+
+
 def kv_note(model_id):
     """Victor's point: vLLM pre-allocates KV hard (gpu_memory_utilization ~0.9, paged
     attention) -- far more headroom than llama.cpp. Flag it so the target VRAM is realistic."""
@@ -203,6 +238,17 @@ def main():
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs like Spark2_5). 'auto' enables it "
                          "only when config.json has an auto_map (default)")
+    ap.add_argument("--engine", default="auto", choices=["auto", "pollard", "gptqmodel"],
+                    help="who runs GPTQ: 'pollard' = Pollard's own sequential GPTQ streamed block by block from disk "
+                         "(any size the machine can stream, VLM / omni text backbones, custom code with consent, "
+                         "already-quantized sources); 'gptqmodel' = the gptqmodel library (loads through "
+                         "transformers); 'auto' = gptqmodel for a plain causal LM that fits in RAM when it is "
+                         "installed, Pollard's engine for everything else")
+    ap.add_argument("--device", default="auto", help="pollard engine: auto (CUDA when present) | cpu | cuda[:N]")
+    ap.add_argument("--nsamples", type=int, default=128, help="pollard engine: calibration rows (the memory "
+                    "preflight lowers it when the activations would not fit)")
+    ap.add_argument("--seqlen", type=int, default=2048, help="pollard engine: tokens per calibration row")
+    ap.add_argument("--max-ram-gb", type=float, help="pollard engine: cap the run's RAM (default 85%% of free)")
     ap.add_argument("--moe", dest="moe", action="store_true", default=None,
                     help="force the MoE dynamic map (default: auto-detect from config)")
     ap.add_argument("--dense", dest="moe", action="store_false",
@@ -258,6 +304,30 @@ def main():
             print(f"     ... +{len(dyn)-8} more")
         return
 
+    engine, why = pick_engine(a.model, a.engine)
+    print(f"   engine: {engine}" + (f"  ({why})" if why else ""))
+    if engine == "pollard":
+        if not a.calib:
+            sys.exit("ERROR: --calib is required to build (use --plan-only / --shard-plan for planning only).")
+        if not a.out:
+            a.out = ws.resolve_out(a.model, "gptq", tag=tag)
+            print(f"   (no --out) -> workspace: {a.out}")
+        import pollard_gptqpack as GP
+        import pollard_stream as S
+        dev = S.stream_device(a.device)
+        side = GP.build_stream(a.model, a.out, a.calib, alloc=None if uniform else alloc, low=low,
+                               group=a.group_size, nsamples=a.nsamples, seqlen=a.seqlen, device=dev,
+                               trust_remote_code=a.trust_remote_code, max_ram_gb=a.max_ram_gb)
+        ab = side["avg_bits"] - 16.0 / a.group_size
+        json.dump({"model": a.model, "kind": kind, "layers": n_layers, "group_size": a.group_size,
+                   "low_bits": low, "high_bits": high, "uniform": bool(uniform), "avg_bits": round(ab, 3),
+                   "dynamic": dyn, "engine": "pollard-stream"},
+                  open(os.path.join(a.out, "pollard-allocation.json"), "w"), indent=2)
+        ws.record_build(a.model, "gptq", a.out, tag=f"GPTQ-{tag}", bpw=round(ab, 2))
+        print(f"   peak RSS {side['peak_rss_gb']} GB (plan {side['memory_plan']['peak_gb']} GB), {side['minutes']} min")
+        print(f"wrote GPTQ checkpoint -> {a.out}\n"
+              f"  vLLM:   vllm serve {a.out} --quantization gptq")
+        return
     # ---- build with gptqmodel (runs on a CUDA box; produces a vLLM/SGLang GPTQ checkpoint)
     try:
         from gptqmodel import GPTQModel, QuantizeConfig
@@ -268,8 +338,15 @@ def main():
     if not a.calib:
         sys.exit("ERROR: --calib is required to build (use --plan-only / --shard-plan for planning only).")
     calib = ws.calib_samples(a.calib)            # whole samples: an agent trace keeps its tool call in one piece
-    qcfg = QuantizeConfig(bits=low, group_size=a.group_size, desc_act=False, sym=True,
-                          dynamic=(dyn or None))
+    qkw = dict(bits=low, group_size=a.group_size, desc_act=False, sym=True, dynamic=(dyn or None))
+    try:                                         # gptqmodel >= 4: onload one layer at a time from disk
+        import inspect
+        if "offload_to_disk" in inspect.signature(QuantizeConfig).parameters or \
+                "offload_to_disk" in getattr(QuantizeConfig, "__dataclass_fields__", {}):
+            qkw["offload_to_disk"] = True
+    except (TypeError, ValueError):
+        pass
+    qcfg = QuantizeConfig(**qkw)
     trc = resolve_trust_remote_code(a.model, a.trust_remote_code)
     model = GPTQModel.load(a.model, qcfg, trust_remote_code=trc)
     model.quantize(calib)

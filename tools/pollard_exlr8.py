@@ -926,14 +926,44 @@ def _decoder_layers(model):
     raise SystemExit("could not find the decoder layers (model.layers / transformer.h ...)")
 
 
+def _trc_mode(trust_remote_code):
+    return {True: "on", False: "auto", None: "auto"}.get(trust_remote_code, trust_remote_code) \
+        if not isinstance(trust_remote_code, str) else trust_remote_code
+
+
+def _float_record(arr, src_dt):
+    a = np.asarray(arr, np.float32)
+    if src_dt in ("BF16",) or src_dt not in ("F16", "F32", "F64"):
+        return (f32_to_bf16_bits(a), "BF16")
+    return a.astype(np.float16) if src_dt == "F16" else a
+
+
+def _block_matrix(rel, shape):
+    """A block tensor the trellis encodes: 2-D, tile-shaped, not a norm and not a MoE router."""
+    if not rel.endswith(".weight") or len(shape) != 2 or not is_trellis_shape(tuple(shape)):
+        return False
+    mod = rel[:-len(".weight")]
+    if "norm" in mod.rsplit(".", 1)[-1] or re.search(r"(^|\.)(gate|router)$", mod):
+        return False
+    return True
+
+
 def encode_model(model_dir, store, widths=DEFAULT_WIDTHS, calib=None, device="auto", probe_bits=4,
                  cal_rows=128, cal_seqlen=2048, cal_tokens=131072, embed="fp8", mem_gb=1.0, align=ALIGN,
-                 trust_remote_code=False, log=print):
-    """Encode every decoder-layer matrix of `model_dir` once at each width into `store`. Resumable per layer."""
+                 trust_remote_code=False, log=print, max_ram_gb=None):
+    """Encode every decoder-block matrix of `model_dir` once at each width into `store`. Resumable per layer.
+
+    STREAMED (pollard_stream): the model is never loaded whole -- the text backbone is resolved from config.json
+    (native class, a VLM / omni's language model, a *_puzzle per-layer config, or the checkpoint's own code with
+    consent), the calibration rows go through one block at a time read from disk (dequantized on read when the
+    source is already quantized), each block's Hessians are taken from its real inputs and every matrix of the block
+    is encoded at every width. MoE experts are encoded one dense record per expert matrix (checkpoint names), so a
+    MoE rung decodes to the source's own checkpoint layout. Towers / talkers / projectors go to the extra file at
+    source precision."""
+    import pollard_stream as S
+    device = S.stream_device(device)                    # before torch: an explicit cpu hides the shared GPU
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    from transformers import AutoTokenizer
     widths = sorted({int(k) for k in widths})
     if any(k < 1 or k > 8 for k in widths):
         raise SystemExit("widths must be 1..8 bits")
@@ -942,23 +972,27 @@ def encode_model(model_dir, store, widths=DEFAULT_WIDTHS, calib=None, device="au
     if meta and (sorted(meta.get("widths", [])) != widths or meta.get("source") != os.path.abspath(model_dir)):
         raise SystemExit(f"{store} holds a different encode ({meta.get('source')}, widths {meta.get('widths')}); "
                          "pass another --store")
-    dtype = torch.bfloat16 if device != "cpu" else torch.float32
-    log(f"   loading {model_dir} on {device} ({dtype}) ...")
-    model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=dtype, trust_remote_code=trust_remote_code)
-    model.to(device).eval()
-    tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
-    prefix, layers = _decoder_layers(model)
+    bb = S.Backbone(model_dir, _trc_mode(trust_remote_code), log=log)
+    src = bb.src
+    log(f"   backbone: {bb.how}  ({bb.n_layers} blocks, streamed on {device})")
+    tok = AutoTokenizer.from_pretrained(src.base_dir if src.overlay else model_dir, trust_remote_code=bb.remote)
     rows = _calib_rows(tok, calib, cal_rows, cal_seqlen, cal_tokens) if calib else []
+    plan = S.fit_memory(bb, max(1, len(rows)), cal_seqlen, S.ram_budget(max_ram_gb), log=log)
+    rows = rows[:plan["nsamples"]] if rows else rows
     log(f"   calibration: {len(rows)} rows / {sum(len(r) for r in rows)} tokens"
-        + (f" from {os.path.basename(calib)}" if calib else " (none: plain Viterbi, no Hessian feedback)"))
+        + (f" from {os.path.basename(calib)}" if calib else " (none: plain Viterbi, no Hessian feedback)")
+        + f"; memory plan peak ~{plan['peak_gb']} GB")
+    prefix = bb.layer_ckpt_prefix
     if not meta:
-        cfg = json.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
+        cfg = json.load(open(os.path.join(src.base_dir if src.overlay else model_dir, "config.json"),
+                             encoding="utf-8"))
         meta = {"format": STORE_FORMAT, "version": 1, "source": os.path.abspath(model_dir), "widths": widths,
-                "tensor_prefix": prefix, "num_layers": len(layers), "probe": f"rtn{probe_bits}",
+                "tensor_prefix": prefix, "num_layers": bb.n_layers, "probe": f"rtn{probe_bits}",
                 "calib": os.path.abspath(calib) if calib else None, "cal_rows": len(rows),
                 "cal_tokens": sum(len(r) for r in rows), "embed": embed, "align": align,
                 "architecture": (cfg.get("architectures") or [None])[0], "tensors": {}, "layers_done": [],
-                "complete": False, "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                "complete": False, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "backbone": bb.describe(), "engine": "pollard-stream"}
         _write_store(store, meta)
     for K in widths:
         os.makedirs(os.path.join(store, f"k{K}"), exist_ok=True)
@@ -967,33 +1001,51 @@ def encode_model(model_dir, store, widths=DEFAULT_WIDTHS, calib=None, device="au
           "encoder": "pollard-exlr8", "model": meta["architecture"] or "", "tensor_prefix": prefix}
     mem = int(mem_gb * (1 << 30))
     t0 = time.time()
-    for L, layer in enumerate(layers):
+    bb.dtype = S.plan_dtype(plan)
+    eng = S.Engine(bb, device=device, log=log)
+    if rows:
+        eng.record(rows)
+    for L in range(bb.n_layers):
+        if L in meta["layers_done"] and not rows:
+            continue
         if L in meta["layers_done"]:
+            # resuming: the block's outputs still have to be propagated for the blocks after it
+            eng.load_layer(L)
+            eng.hidden = eng.run_layer(L)
+            bb.free_layer(L)
             continue
         lp = f"{prefix}{L}."
-        params = {n: p for n, p in layer.named_parameters()}
-        linears = {n: m for n, m in layer.named_modules()
-                   if isinstance(m, torch.nn.Linear) and is_trellis_shape(tuple(m.weight.shape))}
-        Hs, ntok = _layer_hessians(model, layer, linears, rows, device) if rows else ({n: None for n in linears}, 0)
+        if rows:
+            eng.load_layer(L)
+            with S.InputStats(eng, L, hessian=True, amax=False) as st:
+                outs = eng.run_layer(L)
+        else:
+            st, outs = None, None
         base, per_k = {}, {K: {} for K in widths}
-        for pname, p in params.items():
-            stored = pname[:-len(".weight")] if pname.endswith(".weight") else pname
-            if pname.endswith(".weight") and stored in linears:
+        n_mat = 0
+        for k in bb.layer_keys[L]:
+            rel = k[len(lp):] if k.startswith(lp) else k
+            shape = src.shape(k)
+            stored = rel[:-len(".weight")] if rel.endswith(".weight") else rel
+            if not _block_matrix(rel, shape):
+                arr = src.read(k)
+                if rel.endswith(".weight") and arr.ndim == 2:
+                    base.update(_record_tensors(stored, bf16_record(arr)))
+                elif arr.dtype.kind == "f":
+                    base[rel] = _float_record(arr, src.dtype(k))
+                else:
+                    base[rel] = arr
                 continue
-            arr = p.detach().float().cpu().numpy()
-            if pname.endswith(".weight") and arr.ndim == 2:
-                base.update(_record_tensors(stored, bf16_record(arr)))     # a matrix the tiles cannot cover
-            else:
-                base[pname] = (f32_to_bf16_bits(arr), "BF16") if p.dtype == torch.bfloat16 else \
-                    (arr.astype(np.float16) if p.dtype == torch.float16 else arr.astype(np.float32))
-        for stored, lin in linears.items():
-            Wg = lin.weight.detach().float()
-            H = Hs.get(stored)
+            Wg = src.read_torch(k, torch.float32).to(device)
+            H, ntok = (st.hessian_for(k) if st is not None else (None, 0))
+            H = H.to(device) if H is not None else None
             ref = _rtn_rows(Wg, probe_bits)
             e_rtn = rel_err(Wg, ref, H)
             side = side_of(stored)
             entry = {"layer": L, "stored": stored, "shape": list(Wg.shape), "numel": int(Wg.numel()), "side": side,
                      "err_rtn": e_rtn, "err": {}, "bytes": {}, "hessian_tokens": ntok}
+            if src.encoding(k) is not None:
+                entry["source_encoding"] = src.encoding(k)["algo"]
             for K in widths:
                 enc = encode_matrix(Wg, K, H, lp + stored, mem_bytes=mem)
                 rec = trellis_record(enc, Wg.shape[0], Wg.shape[1], K, side)
@@ -1002,54 +1054,61 @@ def encode_model(model_dir, store, widths=DEFAULT_WIDTHS, calib=None, device="au
                 entry["bytes"][str(K)] = int(rec["trellis"].nbytes)
                 del enc
             meta["tensors"][lp + stored + ".weight"] = entry
+            n_mat += 1
         for K in widths:
             write_safetensors(os.path.join(store, f"k{K}", f"exlr8-dense-{L:03d}.safetensors"), per_k[K],
                               {**md, "layer": str(L), "k": str(K)}, align)
         write_safetensors(os.path.join(store, "base", "dense", f"exlr8-dense-{L:03d}.safetensors"), base,
                           {**md, "layer": str(L)}, align)
+        if rows:
+            bb.free_layer(L)
+            eng.hidden = outs                      # every width is encoded from the ORIGINAL block's inputs
         meta["layers_done"].append(L)
+        meta["peak_rss_gb"] = round(max(eng.peak_rss, S.peak_rss_bytes()) / 1e9, 2)
         _write_store(store, meta)
-        el = time.time() - t0
-        log(f"   layer {L + 1}/{len(layers)}: {len(linears)} matrices x {len(widths)} widths "
-            f"({el / 60:.1f} min so far)")
-        if device.startswith("cuda"):
+        log(f"   layer {L + 1}/{bb.n_layers}: {n_mat} matrices x {len(widths)} widths "
+            f"({(time.time() - t0) / 60:.1f} min so far, peak RSS {meta['peak_rss_gb']} GB)")
+        if str(device).startswith("cuda"):
             torch.cuda.empty_cache()
-    # vocab + everything outside the decoder layers
-    sd = {n: p for n, p in model.named_parameters()}
+    # vocab + everything outside the decoder blocks
     vocab, extra, names = {}, {}, {}
-    tied = bool(getattr(model.config, "tie_word_embeddings", False))
-    for n, p in sd.items():
-        if n.startswith(prefix):
-            continue
-        arr = p.detach().float().cpu().numpy()
-        if n.endswith("embed_tokens.weight") or n in ("transformer.wte.weight",):
+    cfg_t = bb.text_config()
+    tied = bool(getattr(cfg_t, "tie_word_embeddings", False) or getattr(bb.root_config, "tie_word_embeddings", False))
+    for n in bb.outer_keys + bb.other_keys:
+        arr = src.read(n)
+        if n.endswith(("embed_tokens.weight", "embeddings.weight", "wte.weight")) and n in bb.outer_keys:
             stored = "embed_tokens"
-        elif n == "lm_head.weight":
+        elif n.endswith("lm_head.weight") and arr.ndim == 2 and n.count("lm_head") == 1 \
+                and not any(t in n for t in ("talker", "code2wav", "audio", "visual", "vision")):
             if tied:
                 continue
             stored = "lm_head"
-        elif re.fullmatch(r"(model\.|model\.language_model\.|transformer\.)?(norm|ln_f|final_layernorm)\.weight", n):
+        elif n in bb.outer_keys and arr.ndim == 1 and re.search(r"(^|\.)(norm|norm_f|ln_f|final_layernorm)\.weight$", n):
             stored = "norm.weight"
         else:
-            extra[n] = (f32_to_bf16_bits(arr), "BF16") if p.dtype == torch.bfloat16 else arr.astype(np.float32)
+            extra[n] = _float_record(arr, src.dtype(n)) if arr.dtype.kind == "f" else arr
             continue
         names[stored] = n[:-len(".weight")] if stored != "norm.weight" else n
         if stored in ("embed_tokens", "lm_head"):
             vocab.update(_record_tensors(stored, fp8_row_record(arr) if embed == "fp8" else bf16_record(arr)))
         else:
-            vocab[stored] = (f32_to_bf16_bits(arr), "BF16") if p.dtype == torch.bfloat16 else arr.astype(np.float32)
+            vocab[stored] = _float_record(arr, src.dtype(n))
     write_safetensors(os.path.join(store, "base", "dense", "exlr8-vocab.safetensors"), vocab,
                       {**md, "hf_names": names, "tie_word_embeddings": str(tied).lower()}, align)
     if extra:
         write_safetensors(os.path.join(store, "base", "dense", "exlr8-extra-model.safetensors"), extra, md, align)
-    for fn in _COPY_FILES:
-        src = os.path.join(model_dir, fn)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(store, "base", fn))
+    S.copy_side_files_of(src, os.path.join(store, "base"))
+    cfgp = os.path.join(store, "base", "config.json")
+    if os.path.exists(cfgp):                               # decoded rungs are plain float checkpoints
+        c = json.load(open(cfgp, encoding="utf-8"))
+        if c.pop("quantization_config", None) is not None:
+            json.dump(c, open(cfgp, "w", encoding="utf-8"), indent=2)
+    hq = os.path.join(store, "base", "hf_quant_config.json")
+    if os.path.exists(hq):
+        os.remove(hq)
     meta["complete"] = True
     meta["encode_minutes"] = round((time.time() - t0) / 60, 2)
     _write_store(store, meta)
-    del model
     return meta
 
 
@@ -1173,43 +1232,39 @@ def decoded_bytes(rung, bytes_per=2):
 
 
 def load_model(rung, device="cpu", dtype=None, trust_remote_code=False):
-    """A transformers model holding the rung's decoded weights (bit-exact to the stored codes)."""
+    """A transformers model holding the rung's decoded weights (bit-exact to the stored codes) -- built the way
+    pollard_stream builds any backbone (native class, VLM / omni language model, *_puzzle per-layer configs, or the
+    checkpoint's own code with consent), loaded through transformers' own key conversion (MoE experts fused)."""
     import torch
-    from transformers import AutoConfig, AutoModelForCausalLM
-    import contextlib
+    import pollard_stream as S
     dtype = dtype or torch.bfloat16
-    cfg = AutoConfig.from_pretrained(rung, trust_remote_code=trust_remote_code)
-    try:                                                    # skip the random init: every weight is replaced
-        from transformers.initialization import no_init_weights
-    except ImportError:
-        try:
-            from transformers.modeling_utils import no_init_weights
-        except ImportError:
-            no_init_weights = contextlib.nullcontext
-    with no_init_weights():                                 # on CPU, so computed buffers (rotary) are real
-        model = AutoModelForCausalLM.from_config(cfg, torch_dtype=dtype, trust_remote_code=trust_remote_code)
-    sd = {n: torch.from_numpy(np.ascontiguousarray(v)).to(dtype) for n, v in iter_rung_tensors(rung)}
-    missing, _unexpected = model.load_state_dict(sd, strict=False, assign=True)
-    if getattr(cfg, "tie_word_embeddings", False):
-        model.tie_weights()
-        missing = [m for m in missing if m != "lm_head.weight"]
-    missing = [m for m in missing if "rotary" not in m and not m.endswith("inv_freq")]
-    if missing:
-        raise SystemExit(f"{rung}: decoded weights miss {missing[:5]}")
-    return model.to(device).eval()
+    dec = dict(iter_rung_tensors(rung))
+    bb = S.Backbone(rung, _trc_mode(trust_remote_code), source=S.MemSource(rung, dec), dtype=dtype)
+    keys = [k for k in dec if k in bb.kmap]
+    bb.load(keys, device, dtype)
+    if getattr(bb.root_config, "tie_word_embeddings", False) and hasattr(bb.root, "tie_weights"):
+        bb.root.tie_weights()
+    left = [n for n, p in bb.root.named_parameters() if p.is_meta]
+    text_left = [n for n in left if n.startswith(bb.text_root_path) or "lm_head" in n]
+    if text_left:
+        raise SystemExit(f"{rung}: decoded weights miss {text_left[:5]}")
+    return bb.root.eval()
 
 
 def materialize(rung, out, dtype="bf16"):
     """Write the decoded rung as a plain HF checkpoint (bf16 safetensors + config/tokenizer) -- what transformers
-    and vLLM load. Bit-exact to the stored codes up to the bf16 cast."""
+    and vLLM load. Bit-exact to the stored codes up to the bf16 cast. Written shard by shard (bounded memory)."""
+    import pollard_stream as S
     os.makedirs(out, exist_ok=True)
-    tensors = {}
+    w = S.ShardWriter(out)
     for n, v in iter_rung_tensors(rung):
         if dtype == "bf16" and v.dtype in (np.float32, np.float16, np.float64):
-            tensors[n] = (f32_to_bf16_bits(v.astype(np.float32)), "BF16")
+            w.add(n, "BF16", f32_to_bf16_bits(v.astype(np.float32)))
         else:
-            tensors[n] = v
-    write_safetensors(os.path.join(out, "model.safetensors"), tensors, {"format": "pt"}, align=8)
+            dt = {np.dtype(np.float32): "F32", np.dtype(np.float16): "F16", np.dtype(np.uint16): "BF16",
+                  np.dtype(np.int64): "I64", np.dtype(np.int32): "I32", np.dtype(np.uint8): "U8"}.get(v.dtype, "F32")
+            w.add(n, dt, v)
+    w.close()
     for fn in os.listdir(rung):
         if os.path.isfile(os.path.join(rung, fn)) and fn != MARKER and not fn.endswith(".safetensors"):
             shutil.copy2(os.path.join(rung, fn), os.path.join(out, fn))
@@ -1286,7 +1341,10 @@ def main(argv=None):
                     "every rung's widths / size / predicted KL), build nothing")
     ap.add_argument("--decode", metavar="RUNG", help="write RUNG decoded as a bf16 HF checkpoint to --out")
     ap.add_argument("--inspect", metavar="PATH", help="print a rung's or a store's summary")
-    ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--trust-remote-code", nargs="?", const="on", default="auto", choices=["auto", "on", "off"],
+                    help="run the checkpoint's own code when no native transformers class covers it (never silent: "
+                         "'auto' asks on a terminal, refuses elsewhere naming the files)")
+    ap.add_argument("--max-ram-gb", type=float, help="cap the encode's RAM (default 85%% of what is free)")
     a = ap.parse_args(argv)
 
     if a.inspect:
@@ -1327,7 +1385,7 @@ def main(argv=None):
             print("   !! no --calib: encoding WITHOUT Hessian feedback (plain Viterbi) -- pass the pollard-calib corpus")
         encode_model(a.model, store, widths, a.calib, a.device, cal_rows=a.cal_rows, cal_seqlen=a.cal_seqlen,
                      cal_tokens=a.cal_tokens, embed=a.embed, mem_gb=a.mem_gb, align=a.align or ALIGN,
-                     trust_remote_code=a.trust_remote_code)
+                     trust_remote_code=a.trust_remote_code, max_ram_gb=a.max_ram_gb)
     else:
         print("   encode: complete -- reusing it (one encode, many rungs)")
     if a.encode_only:

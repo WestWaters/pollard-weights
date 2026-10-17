@@ -56,9 +56,17 @@ How it runs -- and why:
     weights cannot be used -- transformers has no class for the architecture, the checkpoint needs custom code,
     the folder holds no weights, or the weights are bigger than free RAM + accelerator -- and builds the imatrix
     first when the plan names none (on the GGUF itself, or on a Q8_0 host when an f16 is bigger than RAM, at a
-    partial -ngl; `imatrix_host:`, `imatrix_ngl:`, `imatrix_chunks:` override). When transformers cannot load the
-    model, the lanes that export from HF weights (gptq / mx / exl3 / exlr8) are HELD with that reason and the
-    release carries on with the rest.
+    partial -ngl; `imatrix_host:`, `imatrix_ngl:`, `imatrix_chunks:` override).
+  * the lanes that export from HF weights (gptq / mx / exl3 / exlr8) STREAM the model block by block from disk
+    (pollard_stream): SmoothQuant, GPTQ, the MX calibration pass, the EXLR8 encode and the verify gate each hold
+    one block + the activations, preflighted against free RAM (`max_ram_gb:` caps it). A VLM / omni checkpoint is
+    built through its language model (towers, talkers and projectors copied through at source precision); a
+    checkpoint with its own code runs it only with consent (`trust_remote_code: true` here, or y/N on a terminal),
+    unless transformers' native classes cover it (Bolt: native NemotronH blocks, one config per layer);
+    `hf_weights:` names the checkpoint the HF lanes read when the --hf folder holds no weights (an already-quantized
+    one is dequantized on read -- and an NVFP4 source tensor passes through the MX NVFP4 rung byte for byte). A lane
+    is held only for an exact reason: no consent for custom code, exllamav3 has no architecture for the model,
+    no weights to read, the disk.
 """
 from __future__ import annotations
 
@@ -72,6 +80,9 @@ preset: text                   # text | vlm | decision | moe -- fills anything n
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line
 gates: null                    # gates.yaml for pollard-verify --gate (null = the built-in defaults)
+trust_remote_code: false       # true = consent to run the checkpoint's own .py files (only used where no native class fits)
+hf_weights: null               # the checkpoint the HF lanes read (dir or repo id) when the --hf folder holds no weights
+max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300
@@ -102,20 +113,20 @@ lanes:
 PRESETS = {
     # a plain text model: every lane, every rung
     "text": {},
-    # a vision-language model: the GGUF lane ships the mmproj (pollard does that itself); MLX holds the tower
-    # high; EXL3 is off because exllamav3's vision support is per-architecture -- turn it on once checked
-    "vlm": {"lanes": {"exl3": {"enabled": False}, "exlr8": {"enabled": False}},
-            "measure": {"taskeval": {"suite": "quick", "limit": 200}}},
+    # a vision-language / omni model: the GGUF lane ships the mmproj (pollard does that itself); MLX holds the tower
+    # high; the HF lanes quantize the language model and copy the towers through; EXL3 runs when exllamav3 has the
+    # architecture (or its language model as a plain causal LM -- text only) and is held with the reason otherwise
+    "vlm": {"measure": {"taskeval": {"suite": "quick", "limit": 200}}},
     # a decision model answers on /v1/systemone from first-position logits: llama.cpp only, judged on decisions
     "decision": {"lanes": {"mlx": {"enabled": False}, "gptq": {"enabled": False}, "mx": {"enabled": False},
                            "exl3": {"enabled": False}, "exlr8": {"enabled": False}},
                  "measure": {"taskeval": None, "decision": True, "toolcall": False}},
     # MoE: vLLM's fused-MoE kernels want one scheme for all experts (--moe-protect-attn-only); 2/3-bit GPTQ
-    # MoE kernels are poor, so the GPTQ ladder is 4 and 8. EXLR8 is off: pollard-exlr8 writes dense records only,
-    # not EXLR8's per-unit expert files yet
+    # MoE kernels are poor, so the GPTQ ladder is 4 and 8. EXLR8 encodes every expert matrix as its own dense record
+    # (checkpoint names), decoded by the reference loader -- not EXLR8's per-unit expert files
     "moe": {"lanes": {"gptq": {"rungs": [4, 8]}, "mlx": {"rungs": [3, 4, 6, 8]},
                       "mx": {"moe_protect_attn_only": True}, "exl3": {"rungs": [2.5, 3.0, 4.0]},
-                      "exlr8": {"enabled": False}}},
+                      "exlr8": {"rungs": [2.5, 3.0, 4.0, 5.0]}}},
 }
 LANES = ["gguf", "mlx", "gptq", "mx", "exl3", "exlr8", "draft"]
 MX_SCHEMES = {"nvfp4": "NVFP4", "mxfp4": "MXFP4", "fp8": "FP8", "fp8_dynamic": "FP8_DYNAMIC"}
@@ -222,6 +233,13 @@ class Step(dict):
 def _ctx(cfg, src):
     import pollard_workspace as ws
     hf_dir = src if os.path.isdir(src) else ws.source_dir(src)
+    hfw = cfg.get("hf_weights")
+    hf_repo = None
+    if hfw:                                        # the HF lanes read another checkpoint (one that has weights)
+        if os.path.isdir(str(hfw)):
+            hf_dir = os.path.abspath(str(hfw))
+        else:
+            hf_repo, hf_dir = str(hfw), ws.source_dir(str(hfw))
     mdir = ws.model_dir(src)
     cal = os.path.join(mdir, "calibration")
     name = ws.model_basename(src)
@@ -238,7 +256,10 @@ def _ctx(cfg, src):
         "state": os.path.join(mdir, "release-state.json"), "release_dir": os.path.join(mdir, "release"),
         "ngl": str(cfg.get("ngl", 0)), "gates": cfg.get("gates"),
         "imatrix": cfg.get("imatrix"), "free": bool(cfg.get("_free_after_upload")),
-        "org": cfg.get("org", "PollardWeights"),
+        "org": cfg.get("org", "PollardWeights"), "hf_repo": hf_repo,
+        "trc": "on" if cfg.get("trust_remote_code") is True or str(cfg.get("trust_remote_code")).lower() in
+               ("true", "on", "yes") else "auto",
+        "max_ram_gb": cfg.get("max_ram_gb"),
     }
     # inputs that already exist (a big model's f16 / imatrix / profile / corpus): used as they are, never rebuilt
     for key, plan_key in (("f16", "f16"), ("sens_raw", "sensitivity"), ("calib", "calib_file"),
@@ -333,9 +354,10 @@ def prep_steps(cfg, c, lanes):
     smoothed = any(l in lanes for l in ("gptq", "mx", "exl3", "exlr8"))
     raw_probe = any(l in lanes for l in ("gguf", "mlx"))
     steps = []
-    if not os.path.isdir(c["src"]):
+    if not os.path.isdir(c["src"]) or (c.get("hf_repo") and not os.path.isdir(c["hf_dir"])):
+        what = c["src"] if not os.path.isdir(c["src"]) else c["hf_repo"]
         steps.append(Step(id="prep/fetch", lane="prep", kind="prep", requires="any", fn="fetch",
-                          desc=f"pull {c['src']} -> {c['hf_dir']}"))
+                          desc=f"pull {what} -> {c['hf_dir']}"))
     steps.append(Step(id="prep/smoke", lane="prep", kind="prep", requires="any",
                       cmd=["pollard-smoke", "--model", c["hf_dir"]]))
     calib = ["pollard-calib", "--profile", str(cal.get("profile", "auto")), "--model", c["hf_dir"],
@@ -375,22 +397,76 @@ def prep_steps(cfg, c, lanes):
         if c["ngl"] == "0" and machine()["cuda"]:
             probe += ["--device", "cpu"]                 # a shared GPU is not ours (see pollard --ngl 0)
         steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", cmd=probe, out=c["sens_raw"]))
-    if smoothed and not loadable:
-        held = [l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]
+    held = [l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]
+    access, why_not = hf_lanes_access(c) if smoothed else (True, "")
+    if smoothed and not access:
         steps.append(Step(id="prep/smooth", lane="prep", kind="hold", requires="any", blocks=held,
-                          desc=f"{', '.join(held)} held: these lanes export from transformers weights and {why}"))
+                          desc=f"{', '.join(held)} held: {why_not}"))
     elif smoothed:
-        # the LOCKED gold recipe for the low-bit trellis / error-feedback lanes: SmoothQuant first
-        steps.append(Step(id="prep/smooth", lane="prep", kind="prep", requires="cuda",
-                          cmd=["pollard-hf-smooth", "--model", c["hf_dir"], "--out", c["smooth_dir"],
-                               "--calib", c["calib"]], out=c["smooth_dir"],
-                          disk_gb=_size_gb(c["hf_dir"]) * 1.02,
-                          blocks=[l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]))
-        steps.append(Step(id="prep/probe-smoothed", lane="prep", kind="prep", requires="cuda",
-                          cmd=["pollard-probe", "--model", c["smooth_dir"], "--eval", c["heldout"],
-                               "--out", c["sens_smooth"]], out=c["sens_smooth"],
-                          blocks=[l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]))
+        # the LOCKED gold recipe for the low-bit trellis / error-feedback lanes: SmoothQuant first, STREAMED (one
+        # block in memory). A small model gets a full smoothed copy (the transformers probe reads it); a big one an
+        # overlay of scales when a full copy would not fit the disk (the streamed lanes read it as the smoothed model)
+        full = route == "hf" and loadable
+        smooth = ["pollard-hf-smooth", "--model", c["hf_dir"], "--out", c["smooth_dir"], "--calib", c["calib"],
+                  "--overlay", "off" if full else "on"] + hf_flags(c)
+        steps.append(Step(id="prep/smooth", lane="prep", kind="prep", requires="cuda", cmd=smooth,
+                          out=c["smooth_dir"], disk_gb=_size_gb(c["hf_dir"]) * 1.02 if full else 0,
+                          blocks=held))
+        if full:
+            steps.append(Step(id="prep/probe-smoothed", lane="prep", kind="prep", requires="cuda",
+                              cmd=["pollard-probe", "--model", c["smooth_dir"], "--eval", c["heldout"],
+                                   "--out", c["sens_smooth"]], out=c["sens_smooth"], blocks=held))
+        else:
+            c["sens_smooth"] = c["sens_raw"]
+            steps.append(Step(id="prep/probe-smoothed", lane="prep", kind="note", requires="any",
+                              desc="the smoothed lanes allocate from the raw-weights profile "
+                                   f"({os.path.basename(c['sens_raw'])}): the transformers forward probe cannot run "
+                                   f"on this model whole ({why or 'not a plain causal LM'}) -- smoothing is an identity "
+                                   "fold, so the layer ranking carries over"))
     return steps
+
+
+def hf_flags(c, device=True):
+    """The flags every streamed HF-lane command shares: consent for custom code (the plan's trust_remote_code),
+    the device (CPU when the release runs llama.cpp at -ngl 0 on a shared GPU), the RAM cap."""
+    out = ["--trust-remote-code", c.get("trc", "auto")]
+    if device and c.get("ngl") == "0" and machine()["cuda"]:
+        out += ["--device", "cpu"]
+    if c.get("max_ram_gb"):
+        out += ["--max-ram-gb", str(c["max_ram_gb"])]
+    return out
+
+
+def hf_lanes_access(c):
+    """(True, "") when the streamed HF lanes can build this checkpoint, else (False, the exact reason). Decided from
+    config.json + the safetensors index (pollard_stream.static_backbone): nothing is built, no code runs."""
+    d = c["hf_dir"]
+    if not os.path.isdir(d):
+        return True, ""                                # fetched first; the build steps decide
+    try:
+        import pollard_stream as S
+    except Exception:                                  # noqa: BLE001
+        return True, ""
+    if not os.path.isfile(os.path.join(d, "config.json")):
+        return False, f"no config.json in {d}"
+    try:
+        files = S.weight_files(d)
+    except Exception:                                  # noqa: BLE001
+        files = []
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:                                        # an index whose shards are not here (only the small files)
+        return False, (f"{d} holds the index but not the weights ({len(missing)} of {len(files)} shards missing) -- "
+                       "name a checkpoint that has them with `hf_weights:` in the plan (an already-quantized one is "
+                       "dequantized on read)")
+    st = S.static_backbone(d)
+    if st["route"] in ("native", "puzzle", "unknown"):
+        return True, ""
+    if st["route"] == "remote":
+        if c.get("trc") == "on":
+            return True, ""
+        return False, (f"the checkpoint needs its own code ({', '.join(st.get('files') or [])}) and the plan does not "
+                       "consent: set `trust_remote_code: true` to run it")
+    return False, f"no way to build the text backbone: {st['why']}"
 
 
 def toolcall_wanted(cfg, c):
@@ -577,12 +653,25 @@ def lane_steps(cfg, c, lane):
         return steps
     steps, res = [], results_path(c, lane)
     tool = toolcall_wanted(cfg, c)
+    cfg_dir = next((d for d in (c["hf_dir"], c["src"]) if os.path.isfile(os.path.join(str(d), "config.json"))), None)
+    if lane == "exl3" and cfg_dir:
+        try:
+            import pollard_exl3 as E
+            ep = E.exl3_input_plan(cfg_dir)
+        except Exception as e:                                   # noqa: BLE001
+            ep = {"mode": "direct", "why": f"(not checked here: {e})"}
+        if ep["mode"] == "hold":
+            return [Step(id="exl3/hold", lane="exl3", kind="hold", requires="any", blocks=["exl3"],
+                         desc=f"exl3 held: {ep['why']}")]
+        if ep["mode"] == "text":
+            steps.append(Step(id="exl3/text-backbone", lane="exl3", kind="note", requires="any",
+                              desc=f"EXL3 of the language model only: {ep['why']}"))
     if lane == "exlr8":
         # the ONE encode every rung of this lane is a manifest over (resumable per layer inside pollard-exlr8)
         widths = ",".join(str(int(k)) for k in (lc.get("widths") or [2, 3, 4, 5, 6]))
         steps.append(Step(id="exlr8/encode", lane="exlr8", kind="build", requires=REQUIRES["exlr8"],
                           cmd=["pollard-exlr8", "--model", c["smooth_dir"], "--store", c["exlr8_store"], "--calib",
-                               c["calib"], "--widths", widths, "--encode-only"], out=c["exlr8_store"],
+                               c["calib"], "--widths", widths, "--encode-only"] + hf_flags(c), out=c["exlr8_store"],
                           desc="encode every matrix once at each width (LDLQ + tail-biting Viterbi, E4M3 codebook)"))
     for rung in lc.get("rungs") or []:
         tag = rung_tag(lane, rung)
@@ -594,17 +683,19 @@ def lane_steps(cfg, c, lane):
             src = c["hf_dir"]
         elif lane == "gptq":
             cmd = ["pollard-export", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"],
-                   "--calib", c["calib"], "--bits", str(int(rung)), "--out", out]
+                   "--calib", c["calib"], "--bits", str(int(rung)), "--out", out, "--engine", "auto"] + hf_flags(c)
             src = c["smooth_dir"]
         elif lane == "mx" and (mx_mix_bpw(rung) is not None or str(rung).lower() in MX6_FORMATS):
             # model-free, weight-only, CPU: no calibration set, no llm-compressor
-            cmd = ["pollard-mx", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"], "--out", out]
+            cmd = ["pollard-mx", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"], "--out", out,
+                   "--trust-remote-code", c.get("trc", "auto")]
             cmd += (["--mix", f"{mx_mix_bpw(rung):g}"] if mx_mix_bpw(rung) is not None
                     else ["--format", MX6_FORMATS[str(rung).lower()]])
             src = c["smooth_dir"]
         elif lane == "mx":
             scheme = MX_SCHEMES[str(rung).lower()]
-            cmd = ["pollard-mx", "--model", c["smooth_dir"], "--calib", c["calib"], "--scheme", scheme, "--out", out]
+            cmd = ["pollard-mx", "--model", c["smooth_dir"], "--calib", c["calib"], "--scheme", scheme, "--out", out,
+                   "--engine", "auto"] + hf_flags(c)
             if scheme not in ("FP8", "FP8_DYNAMIC"):
                 cmd += ["--sensitivity", c["sens_smooth"]]
                 if lc.get("moe_protect_attn_only"):
@@ -613,7 +704,7 @@ def lane_steps(cfg, c, lane):
         elif lane == "exlr8":                            # a manifest over the encode: seconds, no re-encode
             cmd = ["pollard-exlr8", "--model", c["smooth_dir"], "--store", c["exlr8_store"], "--calib", c["calib"],
                    "--sensitivity", c["sens_smooth"], "--widths", ",".join(str(int(k)) for k in (lc.get("widths") or [2, 3, 4, 5, 6])),
-                   "--bpw", str(float(rung)), "--out", out]
+                   "--bpw", str(float(rung)), "--out", out] + hf_flags(c)
             src = c["smooth_dir"]
         else:                                            # exl3
             cmd = ["pollard-exl3", "--model", c["smooth_dir"], "--bpw", str(float(rung)), "--calib-text", c["calib"],
@@ -621,13 +712,18 @@ def lane_steps(cfg, c, lane):
             src = c["smooth_dir"]
         rid = f"{lane}/{tag}"
         steps.append(Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
-                          out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0))
+                          out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
+                          held_codes=(EXIT_HELD,) if lane == "exl3" else ()))
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
                               cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1)))
         # gated against the ORIGINAL weights, not the smoothed copy: fidelity to the model people asked for
         ver = ["pollard-verify", "--lane", lane, "--model", out, "--source", c["hf_dir"], "--rung", name,
                "--results", res] + _verify_gate(c)
+        if lane in ("gptq", "mx", "exlr8"):
+            ver += ["--trust-remote-code", c.get("trc", "auto")]
+            if c.get("ngl") == "0" and machine()["cuda"]:
+                ver += ["--device", "cpu"]
         ver += ["--end-to-end"] if lane == "exl3" else ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
                           cmd=ver, out=out))
@@ -708,6 +804,9 @@ def plan_steps(cfg, src, only=None):
     lanes = [l for l in LANES if ((cfg.get("lanes") or {}).get(l) or {}).get("enabled")
              and (not only or l in only)]
     steps = prep_steps(cfg, c, lanes)
+    # the ONE card describes every lane the plan enables -- also the ones an earlier pass shipped (a pass-2 run with
+    # --lanes gptq,mx keeps the GGUF section it did not rebuild); a lane with no verified rung adds nothing to it
+    card_lanes = [l for l in LANES if ((cfg.get("lanes") or {}).get(l) or {}).get("enabled")]
     # the drafter is measured against the GGUF rungs and every lane's card quotes it: build + gate it right after the
     # GGUF ladder, before any card is written
     early_draft = "draft" in lanes and "gguf" in lanes
@@ -716,7 +815,7 @@ def plan_steps(cfg, src, only=None):
             steps += lane_steps(cfg, c, lane)
         if lane == "gguf" and early_draft:
             steps += lane_steps(cfg, c, "draft")
-        steps += publish_steps(cfg, c, lane, lanes)
+        steps += publish_steps(cfg, c, lane, card_lanes)
     if lanes:
         steps.append(public_step(cfg, c, lanes))
     return c, lanes, steps
@@ -782,7 +881,10 @@ def _fmt_cmd(cmd):
 
 def fetch(c):
     import pollard_workspace as ws
-    ws.fetch_source(c["src"])
+    if not os.path.isdir(c["src"]):
+        ws.fetch_source(c["src"])
+    if c.get("hf_repo") and not os.path.isdir(c["hf_dir"]):
+        ws.fetch_source(c["hf_repo"])
 
 
 def canonical_gguf(c):
@@ -1289,6 +1391,15 @@ def build_imatrix(c, cfg, out=print):
     raise RuntimeError(f"llama-imatrix produced no imatrix at {imx}")
 
 
+#: a lane tool that exits with this code HELD the step for an exact reason it printed (no exllamav3 architecture, no
+#: disk for the files exllamav3 reads) -- recorded as held, not failed
+EXIT_HELD = 3
+
+
+class Held(Exception):
+    pass
+
+
 def run_cmd(cmd, ok_codes=(0,)):
     from pollard_auto import _resolve_tool
     r = subprocess.run(_resolve_tool(list(cmd)))
@@ -1413,8 +1524,21 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             elif st.fn == "publish_rung":
                 res = publish_rung(st, c, cfg, run_upload, out)
             else:
-                run_cmd(st.cmd, st.ok_codes or (0,))
+                try:
+                    run_cmd(st.cmd, st.ok_codes or (0,))
+                except RuntimeError as e:
+                    if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
+                        raise Held(f"{e} (the reason is the HELD: line above)") from None
+                    raise
                 res = "done"
+        except Held as e:
+            out(f"      HELD: {e}")
+            statuses[st.id] = f"held: {e}"
+            if st.rung:
+                failed_rungs.add((st.lane, st.rung))
+            else:
+                failed_lanes.add(st.lane)
+            continue
         except Exception as e:                                   # noqa: BLE001
             res = "failed"
             out(f"      FAILED: {e}")

@@ -617,8 +617,11 @@ def test_release_toolcall_step_for_exlr8(model):
 
 
 def test_release_presets_keep_exlr8_off_where_it_cannot_serve():
-    for p in ("vlm", "decision", "moe"):
-        assert R.load_plan(None, p)["lanes"]["exlr8"]["enabled"] is False, p
+    # a decision model answers from first-position logits on llama.cpp only; every other kind gets EXLR8 now --
+    # MoE experts as one dense record per expert matrix, a VLM / omni through its language model (towers copied)
+    assert R.load_plan(None, "decision")["lanes"]["exlr8"]["enabled"] is False
+    for p in ("vlm", "moe", "text"):
+        assert R.load_plan(None, p)["lanes"]["exlr8"]["enabled"] is True, p
     assert R.load_plan(None)["lanes"]["exlr8"]["enabled"] is True
 
 

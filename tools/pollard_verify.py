@@ -311,6 +311,62 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     return kld_top1(ref, logits(model, loader))
 
 
+def stream_wanted(source, mode="auto", rung=None):
+    """(True, why) when the transformers lanes are measured STREAMED (pollard_stream: source and rung one block at a
+    time) -- for a source transformers' AutoModelForCausalLM cannot load whole here: a VLM / omni wrapper, custom
+    code, an already-quantized or overlay source, or weights bigger than free RAM can hold twice over."""
+    if mode in ("on", True):
+        return True, "asked for"
+    if mode in ("off", False):
+        return False, ""
+    for side in ("pollard_mx.json", "pollard-gptq.json", "pollard-exlr8.json"):
+        if rung and os.path.isfile(os.path.join(str(rung), side)):
+            # a Pollard rung stores EVERY tensor it was built with (a smoothed rung's folded norms too): read it
+            # whole, block by block -- swapping only its linears into the original source would pair smoothed
+            # weights with unsmoothed norms
+            return True, f"a Pollard rung ({side}): every tensor read from the rung"
+    if not os.path.isdir(str(source)):
+        return False, ""
+    try:
+        import pollard_stream as S
+        import pollard_workspace as ws
+    except Exception:                                                    # noqa: BLE001
+        return False, ""
+    if S.is_overlay(source):
+        return True, "the source is a smoothing overlay"
+    if S.needs_remote_code(source):
+        return True, "the source needs custom code"
+    cfg = ws.config_dict(source)
+    if cfg.get("quantization_config"):
+        return True, "the source is already quantized"
+    try:
+        from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES as LM
+        if cfg.get("model_type") not in LM:
+            return True, f"transformers has no causal-LM class for {cfg.get('model_type')!r}"
+    except Exception:                                                    # noqa: BLE001
+        return False, ""
+    try:
+        w = sum(os.path.getsize(p) for p in S.weight_files(source)) / 1e9
+    except Exception:                                                    # noqa: BLE001
+        return False, ""
+    free = S.free_ram_gb() or 0
+    if free and w * 2.2 > free:
+        return True, f"{w:.1f} GB of weights; {free:.1f} GB free RAM"
+    return False, ""
+
+
+def measure_stream(model, source, eval_path, device="cpu", length=512, chunks=8, trust_remote_code="auto"):
+    """The rung against its source, both streamed block by block (pollard_stream.stream_fidelity): any size, any
+    backbone the stream engine resolves, every Pollard rung format decoded from its bytes."""
+    import pollard_stream as S
+    dev = S.stream_device(device)
+    from transformers import AutoTokenizer
+    src = S.Source(source)
+    tok = AutoTokenizer.from_pretrained(src.base_dir, trust_remote_code=trust_remote_code in (True, "on"))
+    parts = _chunks(tok(_eval_text(eval_path))["input_ids"], length, chunks)
+    return S.stream_fidelity(source, model, parts, dev, trust_remote_code)
+
+
 def measure_exlr8(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False):
     """An EXLR8 rung: its weights decoded by the reference loader (bit-exact to the stored trellis codes) into the
     source architecture, then the same KLD / top-1 as the other transformers lanes."""
@@ -599,7 +655,12 @@ def main():
     ap.add_argument("--end-to-end", action="store_true", help="exl3: also check the assembled forward")
     ap.add_argument("--e2e-min-acc", type=float, default=0.30, help="exl3: min end-to-end next-tok agreement")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--trust-remote-code", nargs="?", const="on", default="auto", choices=["auto", "on", "off"],
+                    help="run the source's own code where no native transformers class covers it (never silent)")
+    ap.add_argument("--stream", default="auto", choices=["auto", "on", "off"],
+                    help="gptq / mx / exlr8: measure source and rung streamed block by block (any size, VLM / omni "
+                         "text backbones, custom code, already-quantized sources). auto = when transformers cannot "
+                         "load the source whole here")
     ap.add_argument("--sanitizer", action="store_true",
                     help="re-run this verify under NVIDIA compute-sanitizer (memcheck+racecheck)")
     a = ap.parse_args()
@@ -654,14 +715,19 @@ def main():
         if not a.source:
             ap.error(f"--lane {lane} measures against the source: pass --source (--ref for a GGUF)")
         print(f"-- fidelity vs {os.path.basename(str(a.source).rstrip('/'))} on {a.eval} --")
+        trc = a.trust_remote_code
+        streamed, why = stream_wanted(a.source, a.stream, a.model) if lane in ("gptq", "mx", "exlr8") else (False, "")
         if lane == "gguf":
             measured = measure_gguf(a.model, a.source, a.eval, a.ngl, a.chunks)
         elif lane == "mlx":
             measured = measure_mlx(a.model, a.source, a.eval, a.length, a.chunks)
+        elif streamed:
+            print(f"   streamed: source and rung block by block ({why})")
+            measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc)
         elif lane == "exlr8":
-            measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, a.trust_remote_code)
+            measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
         else:
-            measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, a.trust_remote_code)
+            measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
         print(f"   mean KLD {measured['kld']:.5f}   top-1 {measured.get('top1') or 0:.2f}%"
               + (f"   PPL {measured['ppl']:.4f}" if measured.get("ppl") else ""))
     if lane == "gguf" and a.gate is not None and str(a.model).endswith(".gguf"):

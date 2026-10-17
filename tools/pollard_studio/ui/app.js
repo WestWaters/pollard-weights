@@ -750,9 +750,11 @@ const ADV_SECTIONS = [
     tools: ["pollard_ngram"] },
   { title: "LANE EMITTERS", icon: "box",
     why: "One solved allocation, emitted into whichever runtime you need. Each lane has its own "
-       + "atoms and its own knobs.",
+       + "atoms and its own knobs. stream plans a build of a model bigger than RAM, a VLM / omni or a "
+       + "custom-code checkpoint: which text backbone the HF lanes will stream block by block, and the "
+       + "peak memory they will need, before anything is spent.",
     tools: ["pollard_mlx", "pollard_mx", "pollard_exl3", "pollard_exl3_band", "pollard_exlr8",
-            "pollard_export", "pollard_vllm", "pollard_draft", "pollard_draft_train"] },
+            "pollard_export", "pollard_vllm", "pollard_draft", "pollard_draft_train", "pollard_stream"] },
   { title: "FOUNDATION MODELS", icon: "layers",
     why: "Make your own model, the way the labs make their small open ones: a fresh architecture, or a smaller "
        + "model carved out of a bigger one (depth and width pruning measured on your text), then pretraining "
