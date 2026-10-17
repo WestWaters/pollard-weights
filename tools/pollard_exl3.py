@@ -59,15 +59,134 @@ def detect_vl(model_id):
 
 
 def detect_moe(model_id, layers_hint=0):
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id)
-        n = getattr(cfg, "num_hidden_layers", 0) or layers_hint
-        moe = any(getattr(cfg, k, 0) for k in
-                  ("num_experts", "num_local_experts", "n_routed_experts"))
-        return bool(moe), int(n)
-    except Exception:
+    import pollard_workspace as ws
+    cfg = ws.text_config_dict(ws.config_dict(model_id))      # plain JSON: no checkpoint code runs to read it
+    if not cfg:
         return False, layers_hint
+    n = cfg.get("num_hidden_layers", 0) or layers_hint
+    moe = any(isinstance(cfg.get(k), int) and cfg.get(k) > 1
+              for k in ("num_experts", "num_local_experts", "n_routed_experts"))
+    return bool(moe), int(n)
+
+
+#: exllamav3's architectures (arch_string of every exllamav3/architecture/*.py), read off the box's exllamav3 on
+#: 2026-10-16 -- used only where exllamav3 itself is not importable (a dry run on another machine)
+EXL3_ARCHS_STATIC = {
+    "AfmoeForCausalLM", "ApertusForCausalLM", "ArceeForCausalLM", "CohereForCausalLM", "Cohere2ForCausalLM",
+    "DeciLMForCausalLM", "DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM", "DFlashDraftModel",
+    "DFlashLagunaForCausalLM", "Dots1ForCausalLM", "Ernie4_5_ForCausalLM", "Ernie4_5_MoeForCausalLM",
+    "Exaone4ForCausalLM", "Gemma2ForCausalLM", "Gemma3ForConditionalGeneration", "Gemma3ForCausalLM",
+    "Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration", "Glm4ForCausalLM",
+    "Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration", "Glm4MoeForCausalLM",
+    "Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM", "GptOssForCausalLM", "HCXVisionV2ForCausalLM",
+    "HyperCLOVAXForCausalLM", "HYV3ForCausalLM", "IQuestCoderForCausalLM", "LagunaForCausalLM", "Lfm2MoeForCausalLM",
+    "LlamaForCausalLM", "MiMoForCausalLM", "MiniMaxM2ForCausalLM", "Ministral3ForCausalLM", "MistralForCausalLM",
+    "Mistral3ForConditionalGeneration", "MixtralForCausalLM", "MuseGlimmerForConditionalGeneration",
+    "NemotronHForCausalLM", "Olmo3ForCausalLM", "OlmoHybridForCausalLM", "Phi3ForCausalLM", "Qwen2ForCausalLM",
+    "Qwen2_5_VLForConditionalGeneration", "Qwen3ForCausalLM", "Qwen3_5ForConditionalGeneration",
+    "Qwen3MoeForCausalLM", "Qwen3NextForCausalLM", "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration", "SeedOssForCausalLM", "SmolLM3ForCausalLM", "SolarOpenMoeForCausalLM",
+    "Step3p5ForCausalLM", "Step3p7ForCausalLM",
+}
+
+
+def exl3_archs():
+    """(set of architecture strings exllamav3 converts, where the list came from)."""
+    try:
+        from exllamav3.architecture.architectures import ARCHITECTURES
+        return set(ARCHITECTURES), "exllamav3"
+    except Exception:                                               # noqa: BLE001
+        return set(EXL3_ARCHS_STATIC), "the list recorded from exllamav3 on 2026-10-16"
+
+
+def exl3_input_plan(model_dir):
+    """What exllamav3 converts for this checkpoint, decided from config.json alone:
+    {"mode": "direct" | "text" | "hold", "arch": ..., "why": ...}. `text` = the wrapper's language model lifted out
+    as the plain causal LM exllamav3 knows (pollard_stream.TEXT_EQUIV, verified token for token): a text-only EXL3.
+    `hold` carries the exact reason no EXL3 of this model would load in exllamav3."""
+    import json as _j
+    try:
+        cfg = _j.load(open(os.path.join(model_dir, "config.json"), encoding="utf-8"))
+    except Exception as e:                                          # noqa: BLE001
+        return {"mode": "hold", "arch": None, "why": f"no readable config.json in {model_dir} ({e})"}
+    archs, where = exl3_archs()
+    arch = (cfg.get("architectures") or [None])[0]
+    if arch is None:
+        return {"mode": "direct", "arch": None, "why": "config.json names no architecture: exllamav3 decides"}
+    if arch in archs:
+        return {"mode": "direct", "arch": arch, "why": ""}
+    import pollard_stream as S
+    eq = S.TEXT_EQUIV.get(cfg.get("model_type"))
+    if eq and eq["arch"] in archs:
+        return {"mode": "text", "arch": eq["arch"], "why": f"exllamav3 has no {arch}; its language model is "
+                                                           f"{eq['arch']} ({eq['why']}) -- a text-only EXL3"}
+    inner = None
+    for k in ("llm_config", "text_config", "language_config"):
+        v = cfg.get(k)
+        if isinstance(v, dict) and v.get("architectures"):
+            inner = v
+            break
+    detail = ""
+    if inner:
+        ia = (inner.get("architectures") or [None])[0]
+        detail = f"; its language model is {ia}"
+        if ia in archs:
+            detail += " -- exllamav3 has it, but no verified text-only mapping from this wrapper is recorded"
+        elif inner.get("model_type", "").endswith("_puzzle") or inner.get("moe_latent_size"):
+            base = ia.replace("Puzzle", "") if ia else "?"
+            detail += (f", which exllamav3's {base if base in archs else 'architectures'} cannot hold: "
+                       + ", ".join(x for x in (
+                           "per-layer block configs (expert count / width differ by layer)"
+                           if inner.get("block_configs") else "",
+                           "latent MoE (fc1/fc2_latent_proj)" if inner.get("moe_latent_size") else "") if x))
+    return {"mode": "hold", "arch": arch,
+            "why": f"exllamav3 has no architecture for {arch}{detail} ({where}) -- an EXL3 of it would not load in "
+                   "any runtime"}
+
+
+def exl3_input(model_dir, log=print):
+    """The folder exllamav3 converts: the model itself, a materialized copy of a smoothing overlay, or the text
+    backbone lifted out (TEXT_EQUIV). Cached next to the source (reused by every bpw rung)."""
+    import pollard_stream as S
+    plan = exl3_input_plan(S.read_overlay(model_dir)["base"] if S.is_overlay(model_dir) else model_dir)
+    if plan["mode"] == "hold":
+        return None, plan
+    if plan["mode"] == "text":                 # lifted straight out of the (overlay) source: one copy, text only
+        txt = model_dir.rstrip("/\\") + ".text"
+        if not os.path.exists(os.path.join(txt, ".pollard-text-backbone.json")):
+            _need_disk(model_dir, txt, text_only=True)
+            S.extract_text(model_dir, txt, log=log)
+        return txt, plan
+    if S.is_overlay(model_dir):
+        mat = model_dir.rstrip("/\\") + ".materialized"
+        if not os.path.exists(os.path.join(mat, ".pollard-materialized")):
+            _need_disk(model_dir, mat)
+            from pollard_hf_smooth import materialize
+            materialize(model_dir, mat, log=log)
+        return mat, plan
+    return model_dir, plan
+
+
+def _need_disk(src, out, text_only=False):
+    import shutil
+    import pollard_stream as S
+    s = S.Source(src)
+    if text_only:                              # only the language model's tensors are copied
+        spec = S.text_equivalent(src)
+        pre = tuple(a for a, _ in spec["renames"]) if spec else ()
+        need = sum(s.nbytes(k) for k in s.logical if k.startswith(pre)) * 1.02
+    else:
+        need = sum(os.path.getsize(p) for p in s.files) * 1.02
+    parent = os.path.dirname(os.path.abspath(out)) or "."
+    free = shutil.disk_usage(parent).free
+    margin = float(os.environ.get("POLLARD_DISK_MARGIN_GB", 5)) * 1e9
+    if need + margin > free:
+        print(f"HELD: exllamav3 reads files, so {out} needs ~{need / 1e9:.1f} GB (+{margin / 1e9:g} margin); "
+              f"{free / 1e9:.1f} GB free")
+        sys.exit(EXIT_HELD)
+
+
+EXIT_HELD = 3
 
 
 def pack_calib(model, text_path, out_path, rows=256, cols=2048):
@@ -373,6 +492,18 @@ def main():
             "*.safetensors", "*.json", "*.model", "*.txt"])
         print(f"   -> {a.model}", flush=True)
 
+    a.recorded_as = a.model                                 # the MANIFEST key: the folder the release asked for
+    if os.path.isdir(a.model):
+        src, plan = exl3_input(a.model) if not a.plan_only else (a.model, exl3_input_plan(a.model))
+        if src is None:
+            print(f"HELD: {plan['why']}")
+            sys.exit(EXIT_HELD)
+        if plan["mode"] == "text":
+            print(f"   {plan['why']}")
+        a.exl3_plan = plan
+        if src != a.model and not a.plan_only:
+            print(f"   exllamav3 reads {src}")
+            a.model = src
     if not a.out and not a.plan_only:                       # no --out -> organized workspace path
         import pollard_workspace as ws
         a.out = ws.resolve_out(a.model, "exl3", tag=f"{a.bpw}bpw")
@@ -492,9 +623,14 @@ def main():
     if r.returncode != 0 or not made:
         sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
                  f"-- see console above.")
+    if getattr(a, "exl3_plan", None):
+        import json as _j
+        with open(os.path.join(a.out, "pollard-exl3.json"), "w", encoding="utf-8") as f:
+            _j.dump({"input": a.exl3_plan["mode"], "arch": a.exl3_plan.get("arch"), "why": a.exl3_plan.get("why"),
+                     "converted_from": a.model}, f, indent=1)
     try:
         import pollard_workspace as ws
-        ws.record_build(a.model, "exl3", a.out, tag=f"{a.bpw}bpw", bpw=a.bpw)
+        ws.record_build(getattr(a, "recorded_as", a.model), "exl3", a.out, tag=f"{a.bpw}bpw", bpw=a.bpw)
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote EXL3 model -> {a.out}\n  run:  exllamav3 / TabbyAPI loads {a.out}"

@@ -347,28 +347,63 @@ def list_models() -> list:
     return sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
 
 
-def resolve_trust_remote_code(model_id, mode="auto") -> bool:
-    """Custom architectures (Spark2_5, etc.) ship their own modeling code that transformers must be
-    allowed to run to load them. 'auto' enables it ONLY when the model's config.json declares an
-    `auto_map` (i.e. it actually has custom code) and says so; 'on'/'off' force it. Reads config.json
-    as plain JSON -- no code is executed to make the decision. Shared by every export lane."""
-    if mode == "on":
-        return True
-    if mode == "off":
-        return False
+def _model_dir_of(model_id):
+    if os.path.isdir(model_id):
+        return model_id
     try:
-        pass  # json is imported at module scope
-        if os.path.isdir(model_id):
-            cfg = json.load(open(os.path.join(model_id, "config.json")))
-        else:
-            from huggingface_hub import hf_hub_download
-            cfg = json.load(open(hf_hub_download(model_id, "config.json")))
-        if cfg.get("auto_map"):
-            print("   [trust-remote-code] custom architecture (auto_map) detected -- enabling remote code")
-            return True
+        from huggingface_hub import hf_hub_download
+        return os.path.dirname(hf_hub_download(model_id, "config.json"))
+    except Exception:                                                     # noqa: BLE001
+        return None
+
+
+def resolve_trust_remote_code(model_id, mode="auto") -> bool:
+    """May this checkpoint's own Python code run? Custom architectures (Spark2_5, Nemotron-3.5-Bolt) ship their
+    modelling files and name them in config.json's auto_map. That code NEVER runs silently (owner, 2026-10-16):
+      'on'   consent given (--trust-remote-code on / release plan trust_remote_code: true) -- every file is named;
+      'off'  never;
+      'auto' no auto_map -> nothing to run (False); an auto_map -> ask y/N on a terminal, refuse anywhere else with
+             the files and the flag that consents (POLLARD_TRUST_REMOTE_CODE=1 also consents).
+    Decided from config.json read as plain JSON -- no code is executed to make the decision. Shared by every lane."""
+    if mode in (True, "on"):
+        d = _model_dir_of(model_id)
+        if d:
+            import pollard_stream as S
+            if S.needs_remote_code(d):
+                return S.consent(d, "on")
+        return True
+    if mode in (False, "off", None):
         return False
-    except Exception:
+    d = _model_dir_of(model_id)
+    if not d:
         return False
+    import pollard_stream as S
+    return S.consent(d, mode)
+
+
+def config_dict(model_id) -> dict:
+    """config.json as plain JSON (local dir, or the one file from the Hub) -- never runs checkpoint code. {} if
+    it cannot be read."""
+    d = _model_dir_of(model_id) if not os.path.isdir(str(model_id)) else model_id
+    try:
+        with open(os.path.join(d, "config.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:                                                     # noqa: BLE001
+        return {}
+
+
+def text_config_dict(cfg: dict) -> dict:
+    """The language model's config inside a wrapper (llm_config / text_config / thinker_config.text_config), merged
+    over the top level so plain keys (num_hidden_layers, num_experts ...) read the same for every model kind."""
+    out = dict(cfg or {})
+    for k in ("llm_config", "language_config", "text_config", "thinker_config"):
+        sub = (cfg or {}).get(k)
+        if isinstance(sub, dict):
+            if k == "thinker_config" and isinstance(sub.get("text_config"), dict):
+                sub = sub["text_config"]
+            out.update(sub)
+            break
+    return out
 
 
 def parse_layers(spec) -> set:

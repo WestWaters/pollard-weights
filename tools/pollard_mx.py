@@ -44,6 +44,14 @@ MXFP6 + MEASURED MIXES (pollard_mxfp6; model-free, weight-only, CPU, no llm-comp
   pollard-mx --model <hf> --mix 5.5 --sensitivity s.json --out ./M-MIX # FP8 / MXFP6 / FP4 per fused layer, <= 5.5 bpw
 The mix measures every linear at every atom and spends the bit budget where the sensitivity profile says it pays;
 see tools/pollard_mxfp6.py for the formats, layouts and which runtimes load each.
+
+STREAMED NVFP4 / MXFP4 / FP8 (--engine pollard, what `auto` picks wherever llm-compressor is missing or cannot load
+the model whole): one calibration pass streamed block by block (pollard_stream) measures every linear's input
+maximum -- NVFP4's input_global_scale, static FP8's input_scale -- and Pollard's own encoder writes the same
+compressed-tensors checkpoint llm-compressor's preset does (W4A4 NVFP4 / MXFP4, FP8 W8A8, FP8_DYNAMIC), hot layers at
+FP8, routers / lm_head / embeddings / towers at source precision. A source tensor that is ALREADY NVFP4 (NVIDIA's
+QAT checkpoints) is kept byte for byte (codes + E4M3 block scales; the tensor scale converted from modelopt's
+weight_scale_2), every other linear is quantized from the dequantized source, and pollard_mx.json records which.
 """
 import argparse, json, os, sys
 import pollard_workspace as ws
@@ -85,7 +93,7 @@ PROJECTOR_GLOBS = [r"re:.*(multi_modal_projector|mm_projector|mm_proj|merger|mod
 # (Qwen3-MoE / Qwen3-Next `re:.*mlp.gate$` + `re:.*shared_expert_gate$`, Mixtral `block_sparse_moe.gate`,
 # Llama 4 / gpt-oss `router`). Anchored with `$` so an expert's `gate_proj` / a dense `gate_up_proj`
 # never matches; on a dense model these match nothing.
-ROUTER_GLOBS = [r"re:.*(mlp|block_sparse_moe|feed_forward|moe)\.gate$", r"re:.*shared_expert_gate$",
+ROUTER_GLOBS = [r"re:.*(mlp|block_sparse_moe|feed_forward|moe|mixer)\.gate$", r"re:.*shared_expert_gate$",
                 r"re:.*(mlp|block_sparse_moe|feed_forward|moe)\.router$"]
 # Attention projections of a hot layer, for --moe-protect-attn-only: standard q/k/v/o, MLA (q_a/q_b,
 # kv_a_proj_with_mqa, kv_b), and linear-attention blocks (Qwen3-Next `linear_attn.in_proj_qkvz`).
@@ -410,6 +418,83 @@ def mx6_main(a):
     print(f"  VERIFY:  pollard-verify --lane mx --model {out} --source {a.model} --eval <heldout.txt> --gate")
 
 
+STREAM_SCHEMES = ("NVFP4", "MXFP4", "FP8", "FP8_DYNAMIC")
+
+
+def pick_engine(model, want="auto", scheme="NVFP4"):
+    """('pollard' | 'llmcompressor', why) -- auto keeps llm-compressor for what it always handled (a plain causal
+    LM that fits in RAM, no custom code, not already quantized) and streams everything else."""
+    if want != "auto":
+        return want, "asked for"
+    if scheme not in STREAM_SCHEMES:
+        return "llmcompressor", f"{scheme} is llm-compressor's"
+    try:
+        import llmcompressor  # noqa: F401
+    except Exception:                                                     # noqa: BLE001
+        return "pollard", "llm-compressor is not installed here"
+    if not os.path.isdir(model):
+        return "llmcompressor", ""
+    import pollard_stream as S
+    if S.is_overlay(model):
+        return "pollard", "a smoothing overlay -- only the stream reader applies it"
+    if S.needs_remote_code(model):
+        return "pollard", "custom code"
+    cfg = ws.config_dict(model)
+    if cfg.get("quantization_config"):
+        return "pollard", "the source is already quantized (NVFP4 tensors pass through)"
+    try:
+        from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES as LM
+        if cfg.get("model_type") not in LM:
+            return "pollard", f"transformers has no causal-LM class for {cfg.get('model_type')!r} (VLM / omni)"
+    except Exception:                                                     # noqa: BLE001
+        return "pollard", "transformers is not importable"
+    w = sum(os.path.getsize(p) for p in S.weight_files(model)) / 1e9
+    free = S.free_ram_gb() or 0
+    if w * 1.2 > free:
+        return "pollard", f"{w:.1f} GB of weights vs {free:.1f} GB free RAM: streamed"
+    return "llmcompressor", ""
+
+
+def stream_main(a, hot, protect_down):
+    """--engine pollard for NVFP4 / MXFP4 / FP8 / FP8_DYNAMIC: one streamed calibration pass for the activation
+    scales (when the scheme needs them), then the model-free encoder writes the compressed-tensors rung."""
+    import pollard_mxfp6 as M6
+    import pollard_stream as S
+    if a.scheme not in STREAM_SCHEMES:
+        sys.exit(f"ERROR: --engine pollard writes {', '.join(STREAM_SCHEMES)}; {a.scheme} needs llm-compressor")
+    if a.kv_fp8:
+        sys.exit("ERROR: --kv-fp8 (static FP8 k/v scales) needs llm-compressor; drop it for the stream engine")
+    if a.protect_scheme not in M6.SCHEME_WEIGHTS:
+        sys.exit(f"ERROR: --protect-scheme {a.protect_scheme} is llm-compressor's; the stream engine protects at "
+                 "FP8 / FP8_DYNAMIC")
+    if protect_down:
+        print("   note: --protect-down is llm-compressor's recipe; the stream engine protects whole hot layers")
+    need = {a.scheme, a.protect_scheme if hot else a.scheme} & set(M6.NEEDS_INPUT_SCALE)
+    amax, cal = None, None
+    if need:
+        if not a.calib:
+            sys.exit(f"ERROR: --calib required ({', '.join(sorted(need))} activation scales need calibration)")
+        dev = S.stream_device(a.device)
+        print(f"   calibration pass (streamed, {dev}) for the {', '.join(sorted(need))} activation scales ...")
+        amax, cal = S.collect_input_amax(a.model, a.calib, a.nsamples, a.seqlen, dev, a.trust_remote_code,
+                                         a.max_ram_gb)
+        print(f"   {cal['linears']} linears calibrated on {cal['rows']} rows; peak RSS {cal['peak_rss_gb']} GB")
+    meta = M6.build_scheme(a.model, a.out, a.scheme, hot={int(h) for h in hot}, protect=a.protect_scheme,
+                           input_amax=amax, moe_attn_only=a.moe_protect_attn_only,
+                           quantize_vision=a.quantize_vision)
+    if cal:
+        meta["calibration"] = cal
+        json.dump(meta, open(os.path.join(a.out, M6.SIDECAR), "w"), indent=1)
+    if meta.get("passthrough"):
+        print(f"   NVFP4 passthrough: {len(meta['passthrough'])} source NVFP4 linears kept byte for byte")
+    if meta.get("dequantized_source"):
+        print(f"   quantized from the dequantized source: {meta['dequantized_source']}")
+    ws.record_build(a.model, "mx", a.out, tag=f"{a.scheme}-{meta['bpw']}bpw", bpw=meta["bpw"])
+    print(f"wrote MX checkpoint -> {a.out}  (compressed-tensors, {meta['bpw']} bpw)")
+    print("\n".join(serve_hints(a.out, a.scheme, moe=bool(meta.get('modules') and any('.experts.' in m for m in meta['modules'])))))
+    print(f"  VERIFY:  pollard-verify --lane mx --model {a.out} --source {a.model} --eval <heldout.txt> --gate")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -452,6 +537,17 @@ def main():
                     help="run a model's own modeling code (custom archs like Spark2_5); 'auto' = only if "
                          "config.json has an auto_map")
     ap.add_argument("--plan-only", action="store_true", help="print the recipe + avg bits, build nothing")
+    ap.add_argument("--engine", default="auto", choices=["auto", "pollard", "llmcompressor"],
+                    help="NVFP4 / MXFP4 / FP8 rungs: 'pollard' = Pollard's own encoder streamed from disk (any size, "
+                         "VLM / omni text backbones, custom code with consent, already-quantized sources -- an NVFP4 "
+                         "source tensor passes through byte for byte; activation scales from one streamed "
+                         "calibration pass); 'llmcompressor' = llm-compressor's oneshot (loads through "
+                         "transformers); 'auto' = llm-compressor for a plain causal LM that fits in RAM when it is "
+                         "installed, Pollard's engine for everything else")
+    ap.add_argument("--device", default="auto", help="pollard engine: auto (CUDA when present) | cpu | cuda[:N]")
+    ap.add_argument("--nsamples", type=int, default=128, help="pollard engine: calibration rows")
+    ap.add_argument("--seqlen", type=int, default=2048, help="pollard engine: tokens per calibration row")
+    ap.add_argument("--max-ram-gb", type=float, help="pollard engine: cap the run's RAM (default 85%% of free)")
     ap.add_argument("--format", choices=["mxfp6-e3m2", "mxfp6-e2m3"],
                     help="a uniform OCP MXFP6 rung (every decoder linear at 6.25 bpw; routers / lm_head / embeddings / "
                          "towers kept at source precision). Model-free, CPU, no calibration")
@@ -473,14 +569,11 @@ def main():
         return mx6_main(a)
 
     n_layers, moe = a.layers, False
-    try:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(a.model, trust_remote_code=True)
-        n_layers = n_layers or getattr(cfg, "num_hidden_layers", 0) or getattr(
-            getattr(cfg, "text_config", None), "num_hidden_layers", 0)
-        moe = is_moe_config(cfg)
-    except Exception:
-        pass
+    cfg = ws.text_config_dict(ws.config_dict(a.model))        # plain JSON: no checkpoint code runs to read it
+    if cfg:
+        n_layers = n_layers or int(cfg.get("num_hidden_layers") or 0)
+        moe = is_moe_config(cfg) or any(isinstance(b, dict) and b.get("block_type") == "moe"
+                                        for b in (cfg.get("block_configs") or []))
     sens = {}
     if a.sensitivity and os.path.exists(a.sensitivity):
         sens = json.load(open(a.sensitivity))
@@ -537,6 +630,10 @@ def main():
     if not a.out:
         a.out = ws.resolve_out(a.model, "mx", tag=f"{a.scheme}-{ab}bpw")
         print(f"   (no --out) -> workspace: {a.out}")
+    engine, why = pick_engine(a.model, a.engine, a.scheme)
+    print(f"   engine: {engine}" + (f"  ({why})" if why else ""))
+    if engine == "pollard":
+        return stream_main(a, hot, protect_down)
     if not a.calib and not is_int and a.scheme != "FP8_DYNAMIC":
         sys.exit("ERROR: --calib required for real emit (FP4 activation scales need calibration).")
     if a.gptq and not a.calib:

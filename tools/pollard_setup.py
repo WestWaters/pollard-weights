@@ -11,11 +11,11 @@ What it checks, per lane (the REQUIREMENTS table below):
   gguf        the llama.cpp runtime, built for THIS machine (Metal on a Mac, CUDA for the detected GPU arch)
   ik          ik_llama.cpp -- only for the IQ*_KT flagship rungs (optional)
   mlx         Apple Silicon + mlx + mlx-lm
-  gptq        torch with a working CUDA device + transformers + gptqmodel
-  mx          torch (CUDA) + llm-compressor + compressed-tensors
+  gptq        torch with a working CUDA device + transformers + gguf-py (the streamed engine) + gptqmodel
+  mx          torch (CUDA) + gguf-py (the streamed engine) + llm-compressor + compressed-tensors
   exl3        torch (CUDA) + exllamav3 + its CUDA extension (prebuilt, or a toolchain to JIT it: an nvcc whose
               major matches torch's CUDA, and MSVC on Windows)
-  exlr8       torch (CUDA) + transformers + xxhash
+  exlr8       torch (CUDA) + transformers + gguf-py + xxhash
   draft       huggingface_hub + the llama.cpp runtime (find / convert / measure a drafter)
   draft-train speculators in its OWN venv (it pins transformers<5.17); recorded in Pollard's config so
               `pollard-draft train` uses it (optional)
@@ -61,14 +61,17 @@ LANES = {
     "gguf":        {"machine": "any",   "needs": ["py:numpy", "py:gguf", "runtime:llama.cpp"]},
     "ik":          {"machine": "any",   "needs": ["runtime:ik_llama.cpp"], "optional": True},
     "mlx":         {"machine": "apple", "needs": ["py:mlx", "py:mlx_lm"]},
+    # gptq / mx / exlr8 stream through pollard_stream (torch + transformers; gguf-py dequantizes a ggml-packed
+    # source on read); gptqmodel / llm-compressor are the engines `--engine auto` keeps for a plain model that fits
     "gptq":        {"machine": "cuda",  "needs": ["torch", "py:transformers", "py:safetensors", "py:datasets",
-                                                  "py:gptqmodel"]},
-    "mx":          {"machine": "cuda",  "needs": ["torch", "py:transformers", "py:datasets", "py:compressed_tensors",
+                                                  "py:gguf", "py:gptqmodel"]},
+    "mx":          {"machine": "cuda",  "needs": ["torch", "py:transformers", "py:datasets", "py:gguf",
+                                                  "py:compressed_tensors",
                                                   "py:llmcompressor"]},
     "exl3":        {"machine": "cuda",  "needs": ["torch", "py:transformers", "py:safetensors", "py:datasets",
                                                   "py:exllamav3", "exl3-ext"]},
     "exlr8":       {"machine": "cuda",  "needs": ["torch", "py:transformers", "py:safetensors", "py:datasets",
-                                                  "py:xxhash"]},
+                                                  "py:gguf", "py:xxhash"]},
     "draft":       {"machine": "any",   "needs": ["py:huggingface_hub", "runtime:llama.cpp"]},
     "draft-train": {"machine": "cuda",  "needs": ["env:speculators"], "optional": True},
     "toolcall":    {"machine": "any",   "needs": ["backend:any"]},

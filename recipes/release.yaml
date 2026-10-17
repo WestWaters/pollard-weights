@@ -5,6 +5,9 @@ preset: text                   # text | vlm | decision | moe -- fills anything n
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line
 gates: null                    # gates.yaml for pollard-verify --gate (null = the built-in defaults)
+trust_remote_code: false       # true = consent to run the checkpoint's own .py files (only used where no native class fits)
+hf_weights: null               # the checkpoint the HF lanes read (dir or repo id) when the --hf folder holds no weights
+max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300

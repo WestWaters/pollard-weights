@@ -45,7 +45,9 @@ def test_template_parses_and_presets_merge():
     dec = R.load_plan(None, "decision")
     assert [l for l in R.LANES if dec["lanes"][l]["enabled"]] == ["gguf"]
     assert dec["measure"]["decision"] is True and dec["measure"]["taskeval"] is None
-    assert R.load_plan(None, "vlm")["lanes"]["exl3"]["enabled"] is False
+    # every lane is on for a VLM / omni: the HF lanes quantize its language model (towers copied through); EXL3 is
+    # held at plan time only when exllamav3 has no architecture for it (pollard_exl3.exl3_input_plan)
+    assert R.load_plan(None, "vlm")["lanes"]["exl3"]["enabled"] is True
 
 
 def test_plan_file_overrides_preset_and_cli_preset_overrides_file(tmp_path):

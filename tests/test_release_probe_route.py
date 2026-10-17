@@ -64,9 +64,44 @@ def test_custom_code_checkpoint_takes_the_imatrix_probe_and_builds_the_imatrix_f
     assert "--model" not in probe, "never transformers for a model it cannot load"
     lad = s["gguf/ladder"].cmd
     assert lad[lad.index("--imatrix") + 1] == c["imatrix"], "the ladder uses the imatrix the probe used"
+    # custom code and no native class: the HF lanes need consent, and say exactly that (never silent)
     hold = s["prep/smooth"]
-    assert hold.kind == "hold" and set(hold.blocks) == {"gptq", "mx"} and "custom modelling code" in hold.desc
+    assert hold.kind == "hold" and set(hold.blocks) == {"gptq", "mx"} and "trust_remote_code: true" in hold.desc
     assert "prep/probe-smoothed" not in got
+
+
+def test_consent_in_the_plan_streams_the_hf_lanes_with_the_flag(home, monkeypatch):
+    src = hf_dir(home, "Bolt", {"model_type": "nemotron_h_omni", "auto_map": {"AutoModel": "x.Y"}})
+    pytest.importorskip("transformers")
+    c, lanes, steps = R.plan_steps(plan(home, trust_remote_code=True), src, {"gguf", "gptq", "mx", "exlr8"})
+    s = by_id(steps)
+    sm = s["prep/smooth"]
+    assert sm.kind == "prep" and sm.cmd[sm.cmd.index("--trust-remote-code") + 1] == "on"
+    assert sm.cmd[sm.cmd.index("--overlay") + 1] == "on", "a model transformers cannot load whole: scales only"
+    assert s["prep/probe-smoothed"].kind == "note" and c["sens_smooth"] == c["sens_raw"]
+    gp = s["gptq/int4/build"].cmd
+    assert gp[gp.index("--engine") + 1] == "auto" and gp[gp.index("--trust-remote-code") + 1] == "on"
+    ver = s["gptq/int4/verify"].cmd
+    assert ver[ver.index("--trust-remote-code") + 1] == "on"
+    assert s["exlr8/encode"].cmd[s["exlr8/encode"].cmd.index("--trust-remote-code") + 1] == "on"
+
+
+def test_an_index_without_its_shards_holds_the_hf_lanes_with_the_way_out(home):
+    src = hf_dir(home, "Bolt", {"model_type": "qwen3"}, weights=None)
+    Path(src, "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors"}}))
+    c, lanes, steps = R.plan_steps(plan(home), src, {"gguf", "gptq"})
+    hold = by_id(steps)["prep/smooth"]
+    assert hold.kind == "hold" and "hf_weights:" in hold.desc
+
+
+def test_hf_weights_names_the_checkpoint_the_hf_lanes_read(home):
+    src = hf_dir(home, "Bolt", {"model_type": "qwen3"}, weights=None)
+    w = hf_dir(home, "Bolt-24GB", {"model_type": "qwen3"})
+    c, lanes, steps = R.plan_steps(plan(home, hf_weights=w), src, {"gguf", "gptq"})
+    assert c["hf_dir"] == w and c["src"] == src
+    sm = by_id(steps)["prep/smooth"]
+    assert sm.cmd[sm.cmd.index("--model") + 1] == w
+    assert R.repo_name("PollardWeights", src).endswith("/Bolt-Pollard"), "the repo keeps the model's name"
 
 
 def test_unknown_architecture_is_routed_from_config_alone(home, monkeypatch):
