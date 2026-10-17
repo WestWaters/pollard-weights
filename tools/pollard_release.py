@@ -843,7 +843,8 @@ def lane_steps(cfg, c, lane):
                 ver += ["--device", "cpu"]
         ver += ["--end-to-end"] if lane == "exl3" else ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
-                          cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None))
+                          cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None,
+                          held_codes=(EXIT_HELD,) if lane == "mlx" else ()))   # disk / RAM short: held, rung kept
         if c.get("free"):
             st = _publish_rung_step(c, lane, tag, out)
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
@@ -965,15 +966,19 @@ def save_entry(path, sid, entry):
     with _STATE_LOCK:
         disk = load_state(path)
         disk[sid] = entry
-        save_state(path, disk)
+        try:
+            save_state(path, disk)
+        except OSError as e:                      # a full disk: the old state stays whole, this step re-runs next time
+            print(f"      WARNING: {e} -- {sid} is not recorded and runs again on the next release run",
+                  file=sys.stderr, flush=True)
+            return False
+    return True
 
 
 def save_state(path, state):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=1)
-    os.replace(tmp, path)
+    """tmp + fsync + rename (pollard_workspace.write_json_atomic): ENOSPC leaves the previous state intact."""
+    import pollard_workspace as ws
+    ws.write_json_atomic(path, state, indent=1)
 
 
 def _manifest_entry(path):
@@ -1945,8 +1950,12 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                                                  "(bigger than the free disk); the tool-call probe needs it on disk")
                 out("      tool calls: not measured (streamed rung)")
             else:
+                env = stream_env
+                if st.lane == "mlx" and cfg.get("disk_margin_gb") is not None:
+                    # the streamed MLX tools size their disk reserve from the plan's margin (never under their floor)
+                    env = dict(env or os.environ, POLLARD_DISK_MARGIN_GB=str(float(cfg["disk_margin_gb"])))
                 try:
-                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": stream_env} if stream_env else {}))
+                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": env} if env else {}))
                 except RuntimeError as e:
                     if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
                         raise Held(f"{e} (the reason is the HELD: line above)") from None

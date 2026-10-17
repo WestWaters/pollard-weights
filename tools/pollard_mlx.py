@@ -97,6 +97,34 @@ SPEECH_RE = re.compile(r"(^|\.)(talker|code2wav|token2wav|code_predictor|speech_
 
 EXIT_HELD = 3
 
+#: Free disk the streamed MLX steps (the build's writer, the verify, a remote mirror's cache) never fill: the plan's
+#: disk_margin_gb (POLLARD_DISK_MARGIN_GB; 3 GB by default) -- and on macOS, where swap, the system and every other
+#: app's writes share the data volume's APFS container, never under max(10 GB, 10% of the volume). A fixed 3 GB took a
+#: 16 GB Mac to 0 bytes free during a mirrored verify: swap grew into the last gigabytes and results-mlx.json /
+#: release-state.json could not be written.
+DISK_MARGIN_GB = 3.0
+MAC_DISK_FLOOR_GB, MAC_DISK_FLOOR_FRAC = 10.0, 0.10
+
+
+def disk_reserve_gb(path=None, total_bytes=None, platform=None):
+    """GB of free disk to leave at `path` (or on a volume of `total_bytes`): see DISK_MARGIN_GB."""
+    try:
+        margin = float(os.environ.get("POLLARD_DISK_MARGIN_GB", DISK_MARGIN_GB))
+    except ValueError:
+        margin = DISK_MARGIN_GB
+    if (platform or sys.platform) != "darwin":
+        return margin
+    if total_bytes is None and path is not None:
+        import shutil
+        p = os.path.abspath(str(path))
+        while not os.path.exists(p) and os.path.dirname(p) != p:
+            p = os.path.dirname(p)
+        try:
+            total_bytes = shutil.disk_usage(p).total
+        except OSError:
+            total_bytes = 0
+    return max(margin, MAC_DISK_FLOOR_GB, MAC_DISK_FLOOR_FRAC * (total_bytes or 0) / 1e9)
+
 
 # Converter versions that run a model WRONG -- the rung's bytes are fine, but every number measured through them (and
 # every answer a user gets from them) is off. mlx-lm < 0.32.0 routes LFM2-MoE (LFM2 / LFM2.5 8B-A1B, 24B-A2B) with a
@@ -749,8 +777,8 @@ class StreamWriter:
         self.mirror, self.out_bytes = mirror, out_bytes      # a remote source: fetch what each tensor reads
 
     def _reserve_gb(self):
-        """Disk the mirror must leave free: the rest of this rung + a margin."""
-        return max(0, self.out_bytes * 1.1 - self.bytes) / 1e9 + 3.0
+        """Disk the mirror must leave free: the rest of this rung + the floor (disk_reserve_gb)."""
+        return max(0, self.out_bytes * 1.1 - self.bytes) / 1e9 + self.mirror.floor_gb()
 
     def __enter__(self):
         import mlx.core as mx
@@ -906,7 +934,7 @@ def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
                                   f"{disk:.1f} GB is free" + (f" (+ {cache:.1f} GB the mirror's cache can give back)"
                                                              if same_disk else ""))
     # the room the build will want: the rung (+10%, as the writer reserves it) and one source unit fetched beside it
-    want = plan["out_gb"] * 1.1 + plan.get("largest_gb", 0.0) + 3.0
+    want = plan["out_gb"] * 1.1 + plan.get("largest_gb", 0.0) + (mirror.floor_gb() if same_disk else 3.0)
     if same_disk and disk < want and cache:
         freed = mirror.make_room(want)
         disk = shutil.disk_usage(parent).free / 1e9
@@ -1024,7 +1052,7 @@ class StreamedLM:
             blockdeps = set()
             for blk in self.layers:
                 blockdeps |= mir.deps(*[v for _, v in tree_flatten(blk.parameters())])
-            mir.ensure(mir.deps(*[v for _, v in tree_flatten(self.lm.parameters())]) - blockdeps, reserve_gb=3.0)
+            mir.ensure(mir.deps(*[v for _, v in tree_flatten(self.lm.parameters())]) - blockdeps)   # the floor
         orig = self._swap(True)
         try:
             self.mode = "record"
@@ -1035,7 +1063,7 @@ class StreamedLM:
             for i, blk in enumerate(orig):
                 deps = mir.deps(*[v for _, v in tree_flatten(blk.parameters())]) if mir is not None else set()
                 if deps:
-                    mir.ensure(deps, reserve_gb=3.0)
+                    mir.ensure(deps)                       # free disk re-checked (and LRU evicted) per tensor
                 for _, p in tree_flatten(blk.parameters()):  # one tensor at a time: an expert stack's reads + the
                     mx.eval(p)                             # stack never sit beside the rest of the block's stacks
                 for b in range(len(rows)):
@@ -1194,10 +1222,18 @@ class RemoteMirror:
                     self.present[k] = True
         except (OSError, ValueError):
             pass
-        self.pinned, self.by_load, self.reserve_gb = set(), {}, 3.0
+        self.pinned, self.by_load, self.reserve_gb = set(), {}, None   # None: the floor (floor_gb)
         self.fetched, self.evicted = 0, 0
         import shutil
         self.free_bytes = lambda: shutil.disk_usage(self.dir).free
+        self.total_bytes = lambda: shutil.disk_usage(self.dir).total
+
+    def floor_gb(self):
+        """The least free disk this cache ever leaves (disk_reserve_gb of the mirror's volume)."""
+        return disk_reserve_gb(total_bytes=self.total_bytes())
+
+    def _reserve(self):
+        return max(self.reserve_gb or 0.0, self.floor_gb()) * 1e9
 
     @classmethod
     def of(cls, local_dir, log=print):
@@ -1228,6 +1264,7 @@ class RemoteMirror:
         p = subprocess.Popen(self._cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         p.stdin.write(code.encode())
         p.stdin.close()
+        complete = False
         try:
             for f, off, n in ranges:
                 got, pos = 0, off
@@ -1238,9 +1275,12 @@ class RemoteMirror:
                     yield f, pos, b
                     got += len(b)
                     pos += len(b)
+            complete = True
         finally:
+            if not complete:                   # the reader stopped (disk short, an error): never wait on a full pipe
+                p.kill()
             rc = p.wait()
-            if rc:
+            if complete and rc:
                 raise RuntimeError(f"{self.ssh['host']}: remote read exited {rc}: {p.stderr.read()[-400:]!r}")
 
     # -- creation
@@ -1317,36 +1357,53 @@ class RemoteMirror:
 
     # -- cache
     def _save_state(self):
-        tmp = os.path.join(self.dir, MIRROR_STATE + ".tmp")
-        json.dump(list(self.present), open(tmp, "w", encoding="utf-8"))
-        os.replace(tmp, os.path.join(self.dir, MIRROR_STATE))
+        import pollard_workspace as ws
+        ws.write_json_atomic(os.path.join(self.dir, MIRROR_STATE), list(self.present), indent=None)
+
+    def _forget(self, drop):
+        """Evict `drop`: forget first, punch second -- a crash in between only means a refetch, never a zero read. On
+        a disk too full to write even the state file, the state file goes (the cache is then refetched as needed) and
+        the punch still frees the bytes."""
+        for k in drop:
+            del self.present[k]
+        try:
+            self._save_state()
+        except OSError:
+            try:                                   # cannot remove it either: no punch (the state would lie)
+                os.remove(os.path.join(self.dir, MIRROR_STATE))
+            except FileNotFoundError:
+                pass
+        for k in drop:
+            f, off, n = self.entries[k]
+            punch(os.path.join(self.dir, f), off, n)
+            self.evicted += n
 
     def _evict_for(self, need, keep):
-        free = self.free_bytes()
+        """Evict least-recently-used cache (never `keep` or a pinned key) until `need` more bytes fit over the
+        reserve, or raise OutOfMemoryBudget with the numbers -- before a single byte of `need` is written."""
+        free, reserve = self.free_bytes(), self._reserve()
         drop = []
         for k in list(self.present):
-            if free - need >= self.reserve_gb * 1e9:
+            if free - need >= reserve:
                 break
             if k in keep or k in self.pinned:
                 continue
             drop.append(k)
             free += self.entries[k][2]
-        if free - need < self.reserve_gb * 1e9:
+        if free - need < reserve:
+            if drop:
+                self._forget(drop)                                # what it can give back, it gives back
             import pollard_stream as S
             raise S.OutOfMemoryBudget(f"disk: the mirror needs {need / 1e9:.2f} GB more and only "
-                                      f"{(free - self.reserve_gb * 1e9) / 1e9:.2f} GB can be freed over the "
-                                      f"{self.reserve_gb:.1f} GB reserve at {self.dir}")
+                                      f"{(free - reserve) / 1e9:.2f} GB can be freed over the "
+                                      f"{reserve / 1e9:.1f} GB reserve at {self.dir}")
         if drop:
-            for k in drop:                                        # forget first, punch second: a crash in between
-                del self.present[k]                               # only means a refetch, never a zero read
-            self._save_state()
-            for k in drop:
-                f, off, n = self.entries[k]
-                punch(os.path.join(self.dir, f), off, n)
-                self.evicted += n
+            self._forget(drop)
 
     def ensure(self, keys, reserve_gb=None):
-        """Fetch what of `keys` is not on disk (after making room), pin all of them."""
+        """Fetch what of `keys` is not on disk, pin all of them. Room is made (least recently used evicted) for the
+        whole fetch first, and free disk is checked again before EACH tensor's bytes land -- swap, the rung, other
+        writers may have taken it meanwhile. The reserve is never under floor_gb()."""
         if reserve_gb is not None:
             self.reserve_gb = float(reserve_gb)
         keys = set(keys)
@@ -1366,18 +1423,55 @@ class RemoteMirror:
                 ranges[-1][2] += n
             else:
                 ranges.append([f, off, n])
-        fds = {}
+        fds, nxt, started, stream = {}, 0, [], iter(())          # todo is in stream order
         try:
-            for f, pos, b in self._stream([tuple(r) for r in ranges]):
+            stream = self._stream([tuple(r) for r in ranges])
+            for f, pos, b in stream:
                 if f not in fds:
                     fds[f] = os.open(os.path.join(self.dir, f), os.O_RDWR)
-                os.pwrite(fds[f], b, pos)
+                end, cur, mv = pos + len(b), pos, memoryview(b)
+                while cur < end:                                 # one tensor's bytes at a time
+                    while nxt < len(todo) and self.entries[todo[nxt]][0] == f and self.entries[todo[nxt]][1] <= cur:
+                        self._evict_for(self.entries[todo[nxt]][2], keys)    # this tensor still fits, now
+                        started.append(todo[nxt])
+                        nxt += 1
+                    stop = end
+                    if nxt < len(todo) and self.entries[todo[nxt]][0] == f:
+                        stop = min(end, self.entries[todo[nxt]][1])
+                    try:
+                        os.pwrite(fds[f], mv[cur - pos:stop - pos], cur)
+                    except OSError as e:
+                        import errno
+                        if e.errno not in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+                            raise
+                        import pollard_stream as S
+                        raise S.OutOfMemoryBudget(f"disk: full while fetching {f} at {self.dir} "
+                                                  f"({self.free_bytes() / 1e9:.2f} GB free)") from None
+                    cur = stop
+                    while started and sum(self.entries[started[0]][1:]) <= cur:   # off + n: this tensor is whole
+                        k = started.pop(0)
+                        self.present[k] = True
+                        self.fetched += self.entries[k][2]
+        except BaseException:
+            stream.close()                                       # stops the remote read (never blocks on its pipe)
+            for k in started:                                    # half-written tensors: give their bytes back
+                fn, off, n = self.entries[k]
+                try:
+                    punch(os.path.join(self.dir, fn), off, n)
+                except OSError:
+                    pass
+            try:
+                self._save_state()
+            except OSError:
+                pass
+            raise
         finally:
             for fd in fds.values():
                 os.close(fd)
-        for k in todo:
-            self.present[k] = True
-        self.fetched += need
+        for k in todo:                                           # the stream is whole (an empty tensor never yields)
+            if k not in self.present:
+                self.present[k] = True
+                self.fetched += self.entries[k][2]
         self._save_state()
         return need
 
@@ -1405,13 +1499,7 @@ class RemoteMirror:
                 drop.append(k)
                 free += self.entries[k][2]
         if drop:
-            for k in drop:                                 # forget first, punch second (as _evict_for)
-                del self.present[k]
-            self._save_state()
-            for k in drop:
-                f, off, n = self.entries[k]
-                punch(os.path.join(self.dir, f), off, n)
-                self.evicted += n
+            self._forget(drop)
         return self.evicted - before
 
 
