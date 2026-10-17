@@ -932,6 +932,19 @@ def load_state(path):
         return {}
 
 
+import threading as _threading
+_STATE_LOCK = _threading.RLock()
+
+
+def save_entry(path, sid, entry):
+    """Write ONE step's state under a lock, merged into what is on disk: several executes (the parallel scheduler's
+    build slots + measure queue) share one release-state.json, and none may overwrite another's steps."""
+    with _STATE_LOCK:
+        disk = load_state(path)
+        disk[sid] = entry
+        save_state(path, disk)
+
+
 def save_state(path, state):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -1558,6 +1571,10 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 builds = [b for b in builds if not b.get("uploaded") and not b.get("freed")
                           and os.path.exists(b.get("path", ""))
                           and f"gguf/{b.get('tag') or b.get('name')}/publish" not in done]
+                with _STATE_LOCK:                    # the parallel scheduler: each rung is measured by ONE chain
+                    claimed = c.setdefault("_claimed", set())
+                    builds = [b for b in builds if os.path.abspath(b["path"]) not in claimed]
+                    claimed.update(os.path.abspath(b["path"]) for b in builds)
             if builds:
                 queue[0:0] = gguf_rung_steps(cfg, c, builds)
                 out(f"{head}: {len(builds)} ladder rung(s) in the MANIFEST -> measure + verify each")
@@ -1578,7 +1595,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             failed_lanes.update(st.blocks or [])
             if run:
                 state[st.id] = {"status": statuses[st.id], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
             continue
         what = st.desc if st.fn else f"$ {_fmt_cmd(st.cmd)}"
         if not have.get(st.requires, False):
@@ -1678,12 +1695,12 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 failed_lanes.update(st.blocks)
                 statuses[st.id] = res
                 state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
                 continue
             if st.lane == "prep" or stop_on_fail:
                 statuses[st.id] = res
                 state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
                 raise SystemExit(f"   release stopped at {st.id}" + ("" if st.lane != "prep" else
                                  " -- a preparation step failed, nothing after it can be trusted"))
             if st.rung:
@@ -1695,11 +1712,191 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             kept.append((st.lane, st.rung, st.out))
         if res != "held":
             state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-            save_state(c["state"], state)
+            save_entry(c["state"], st.id, state[st.id])
     if run and kept:
         out("\n   KEPT on disk, NOT published (fix the measure / gate and re-run the plan to publish them):")
         for lane, rung, path in kept:
             out(f"     {lane}/{rung}: {path}")
+    return statuses
+
+
+# ------------------------------------------------------------------------------- parallel scheduler
+
+#: lanes whose rungs build in the GPU slot (streamed HF lanes, EXL3, the drafter); everything else (the llama-quantize
+#: GGUF rungs) builds in the CPU slot
+GPU_SLOT_LANES = ("gptq", "mx", "exlr8", "exl3", "draft", "mlx")
+#: RAM / VRAM a job may use at most, GB -- the box: 32 GB RAM, 16 GB VRAM (a little kept back for the OS / driver)
+RAM_TOTAL_GB, VRAM_TOTAL_GB = 30.0, 15.0
+
+
+def job_peak(st, c, cfg):
+    """(ram GB, vram GB, disk GB) one step may take at its peak -- what admission control reserves for it.
+    GGUF quantize: a small resident set (the tensors stream through) + its output on disk. A streamed HF-lane build:
+    the plan's max_ram_gb (the streamed planner keeps its peak under it). EXL3: exllamav3 on the GPU. A GGUF measure:
+    the rung's own size split over VRAM / RAM by the -ngl pollard_llamaserve picks (so its RAM is what does not fit)."""
+    lane = st.lane or ""
+    max_ram = float(cfg.get("max_ram_gb") or 24)
+    on_gpu = not (c.get("ngl") == "0")
+    if st.kind == "build" and lane == "gguf":
+        return 4.0, 0.0, float(st.disk_gb or 0)
+    if st.kind == "build" and lane == "exl3":
+        return 16.0, VRAM_TOTAL_GB - 1, float(st.disk_gb or 0)
+    if st.kind == "build":
+        return max_ram, (12.0 if on_gpu else 0.0), float(st.disk_gb or 0)
+    if lane == "gguf" and st.kind in ("measure", "verify", "gate"):
+        size = _size_gb(st.out) if st.out else 0.0
+        vram = min(size, VRAM_TOTAL_GB - 2) if on_gpu else 0.0
+        return max(2.0, size - vram + 2.0), vram, 0.0
+    if st.kind in ("measure", "verify", "gate"):
+        return max_ram, (12.0 if on_gpu else 0.0), 0.0
+    return 1.0, 0.0, 0.0
+
+
+class Admission:
+    """Admission control for the slots: a job starts only when its planned peak fits what is FREE now and what the
+    jobs already running have reserved (RAM <= 30 GB, VRAM <= 15 GB, disk with the plan's margin). A job that does not
+    fit WAITS -- never an OOM. Alone on the machine a job always starts (its own guards then decide)."""
+
+    def __init__(self, cfg, c, free_ram=None, free_vram=None, free_disk=None, sleep=time.sleep, out=print):
+        self.lock = _threading.Condition()
+        self.running = {}                                # step id -> (ram, vram, disk)
+        self.margin = float(cfg.get("disk_margin_gb", 3))
+        self.c = c
+        self._ram = free_ram or (lambda: __import__("pollard_stream").free_ram_gb())
+        self._vram = free_vram or (lambda: _free_vram_mib() / 1024.0)
+        self._disk = free_disk or (lambda: disk_free_gb(c["mdir"]))
+        self.sleep, self.out = sleep, out
+
+    def fits(self, peak):
+        ram, vram, disk = peak
+        if not self.running:
+            return True
+        used = [sum(x[i] for x in self.running.values()) for i in range(3)]
+        if used[0] + ram > RAM_TOTAL_GB or used[1] + vram > VRAM_TOTAL_GB:
+            return False
+        if ram and self._ram() < ram + 1.0:
+            return False
+        if vram and self._vram() < vram:
+            return False
+        if disk and self._disk() - used[2] < disk + self.margin:
+            return False
+        return True
+
+    def acquire(self, sid, peak, slot, poll_s=30):
+        waited = False
+        with self.lock:
+            while not self.fits(peak):
+                if not waited:
+                    self.out(f"   [{slot}] WAIT {sid}: needs ~{peak[0]:.0f} GB RAM / {peak[1]:.0f} GB VRAM / "
+                             f"{peak[2]:.0f} GB disk; running {sorted(self.running)}")
+                    waited = True
+                self.lock.wait(timeout=poll_s)
+            self.running[sid] = peak
+
+    def release(self, sid):
+        with self.lock:
+            self.running.pop(sid, None)
+            self.lock.notify_all()
+
+
+def rung_chains(steps):
+    """[(lane, rung, [steps])] in plan order: a GGUF rung = its build + its expand; a directory-lane rung = build,
+    complete gate, tool calls, verify, publish. Lane-level steps (card / upload / public) are not part of a chain."""
+    chains, idx = [], {}
+    for st in steps:
+        if st.kind in ("card", "upload", "finalize", "note", "hold") and not st.rung:
+            continue
+        # a lane-level build (the EXLR8 encode, the drafter's find / train / convert / expand) is its lane's own chain,
+        # in plan order -- so it runs before that lane's rungs in the same slot
+        key = (st.lane, st.rung or (st.id.split("rungs-", 1)[1] if "rungs-" in st.id else "_lane"))
+        if key not in idx:
+            idx[key] = len(chains)
+            chains.append((key[0], key[1], []))
+        chains[idx[key]][2].append(st)
+    return chains
+
+
+def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=print, timeline=None,
+                     admission=None, runner=None):
+    """`pollard release --parallel`: the shared prep ONCE (calib, imatrix, sensitivity, smoothing), then two build
+    slots side by side -- CPU (GGUF quantize) and GPU (streamed GPTQ / MX / EXLR8, EXL3, the drafter), each running
+    its lane's rungs back to back -- and ONE serialized measure queue (KLD / PPL, tool calls, the complete-model gate,
+    ggufcheck, then upload + confirmed free) fed as each build lands. Admission control holds any job whose peak does
+    not fit. The lane cards / uploads and the public flip run last, serially. Per-slot timeline -> timeline."""
+    import queue
+    have = have or machine()
+    runner = runner or (lambda ss: execute(ss, c, cfg, True, run_upload, redo, False, have, out))
+    admission = admission or Admission(cfg, c, out=out)
+    tl_path = timeline or os.path.join(c["mdir"], "release-timeline.log")
+    os.makedirs(os.path.dirname(tl_path), exist_ok=True)
+    tl_lock = _threading.Lock()
+    statuses = {}
+
+    def log(slot, what, sid):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {slot:7s} {what:6s} {sid}"
+        with tl_lock:
+            with open(tl_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            out(f"   [timeline] {line}")
+
+    prep = [s for s in steps if s.lane == "prep"]
+    final = [s for s in steps if s.kind in ("card", "upload", "finalize") and not s.rung]
+    statuses.update(runner(prep))                     # shared prep, once; a failure stops the release (SystemExit)
+    chains = rung_chains([s for s in steps if s not in prep and s not in final])
+    mq = queue.Queue()
+    slots = {"cpu": [], "gpu": []}
+    for lane, rung, ss in chains:
+        slots["gpu" if lane in GPU_SLOT_LANES else "cpu"].append((lane, rung, ss))
+
+    def run_job(slot, sid, ss, peak):
+        admission.acquire(sid, peak, slot)
+        log(slot, "start", sid)
+        try:
+            got = runner(ss)
+        except SystemExit as e:                        # one rung's hard stop is that rung's, not the release's
+            got = {s.id: f"failed: {e}" for s in ss}
+        finally:
+            admission.release(sid)
+        log(slot, "end", sid + "  " + ",".join(sorted({str(v).split(":")[0] for v in got.values()})))
+        with tl_lock:
+            statuses.update(got)
+        return got
+
+    def slot_worker(slot):
+        for lane, rung, ss in slots[slot]:
+            builds = [s for s in ss if s.kind == "build"]
+            rest = [s for s in ss if s.kind != "build"]
+            ok = True
+            for b in builds:
+                got = run_job(slot, b.id, [b], job_peak(b, c, cfg))
+                ok = ok and str(got.get(b.id, "")).split(":")[0] in ("done", "skipped")
+            if not ok:
+                with tl_lock:
+                    statuses.update({s.id: "skipped: upstream failed" for s in rest if s.kind != "publish"})
+                    statuses.update({s.id: "kept: upstream failed" for s in rest if s.kind == "publish"})
+                continue
+            if rest:
+                mq.put((lane, rung, rest))
+        mq.put(None)
+
+    def measure_worker(n_feeders):
+        done_feeders = 0
+        while done_feeders < n_feeders:
+            item = mq.get()
+            if item is None:
+                done_feeders += 1
+                continue
+            lane, rung, rest = item
+            peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
+            run_job("measure", f"{lane}/{rung}", rest, peak)
+
+    feeders = [_threading.Thread(target=slot_worker, args=(k,), name=f"slot-{k}", daemon=True) for k in slots]
+    meas = _threading.Thread(target=measure_worker, args=(len(feeders),), name="measure", daemon=True)
+    for t in feeders + [meas]:
+        t.start()
+    for t in feeders + [meas]:
+        t.join()
+    statuses.update(runner(final))
     return statuses
 
 
@@ -1725,6 +1922,9 @@ def main(argv=None):
     ap.add_argument("--free-after-upload", action="store_true",
                     help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
                          "needs --upload and `upload: true`")
+    ap.add_argument("--parallel", action="store_true",
+                    help="two build slots (CPU: GGUF quantize; GPU: streamed HF lanes / EXL3 / drafter) + one serialized "
+                         "measure queue, with admission control on RAM / VRAM / disk; shared prep once")
     ap.add_argument("--taskeval", action="store_true",
                     help="also run pollard-taskeval (lm-eval gsm8k/ifeval, ~1 h per rung) on every GGUF rung before "
                          "it is gated -- off by default: the release publishes on KLD + PPL + tool calls + coherence")
@@ -1784,7 +1984,10 @@ def main(argv=None):
     if run:
         from pollard_auto import MachineLock
         with MachineLock("pollard release " + src, force=a.force):
-            st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)
+            if a.parallel and not a.taskeval_only:
+                st = execute_parallel(steps, c, cfg, upload_ok, a.redo, have)
+            else:
+                st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)
     else:
         st = execute(steps, c, cfg, False, False, a.redo, a.stop_on_fail, have)
         print("\n   plan only -- add --run to execute (serially, resumable), --upload to publish.")
