@@ -119,6 +119,15 @@ def _out_tensors(out):
     """{key: file} over every safetensors under the output (a lane may nest: EXLR8's store/base, dense/)."""
     keys = {}
     for root, _, fs in os.walk(out):
+        if "pollard-streamed.json" in fs:            # shards uploaded + freed while the rung was written: their headers
+            try:
+                with open(os.path.join(root, "pollard-streamed.json"), encoding="utf-8") as f:
+                    for fn, e in (json.load(f).get("files") or {}).items():
+                        for k in (e.get("header") or {}):
+                            if k != "__metadata__":
+                                keys.setdefault(k, os.path.join(root, fn))
+            except (OSError, ValueError):
+                pass
         for f in fs:
             if f.endswith(".safetensors"):
                 p = os.path.join(root, f)

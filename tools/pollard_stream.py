@@ -203,7 +203,10 @@ def weight_files(model_dir):
     single = os.path.join(model_dir, "model.safetensors")
     if os.path.isfile(single):
         return [single]
-    return sorted(os.path.join(model_dir, f) for f in os.listdir(model_dir) if f.endswith(".safetensors"))
+    local = {os.path.join(model_dir, f) for f in os.listdir(model_dir) if f.endswith(".safetensors")}
+    # a rung whose shards were uploaded + freed as they were written: they are still its shards (read from the Hub)
+    local |= {os.path.join(model_dir, fn) for fn in read_streamed(model_dir)}
+    return sorted(local)
 
 
 class Source:
@@ -226,8 +229,15 @@ class Source:
         if not self.files:
             raise SystemExit(f"no safetensors weights in {self.base_dir}")
         self.entries, self._hdr = {}, {}
+        streamed = read_streamed(self.base_dir)
+        self._remote = {}                                 # path -> streamed entry: shards that live on the Hub now
         for p in self.files:
-            hdr, base = st_header(p)
+            ent = streamed.get(os.path.basename(p)) if not os.path.exists(p) else None
+            if ent is not None:
+                self._remote[p] = ent
+                hdr, base = ent["header"], ent["data_start"]
+            else:
+                hdr, base = st_header(p)
             self._hdr[p] = (hdr, base)
             for name, info in hdr.items():
                 if name == "__metadata__":
@@ -338,6 +348,10 @@ class Source:
         import numpy as np
         p, dt, shape, off, n = self.entries[name]
         npdt = np.dtype(ST_NP[dt])
+        if p in getattr(self, "_remote", {}):
+            ent = self._remote[p]
+            arr = np.frombuffer(hub_range(ent["repo"], ent["path_in_repo"], off, n), dtype=npdt)
+            return dt, arr.reshape(shape)
         arr = np.fromfile(p, dtype=npdt, count=n // npdt.itemsize if npdt.itemsize else 0, offset=off)
         return dt, arr.reshape(shape)
 
@@ -1599,16 +1613,115 @@ def collect_input_amax(model, calib=None, nsamples=128, seqlen=2048, device="cpu
 # ----------------------------------------------------------------------------------------------- writing
 
 
+#: pollard release sets this for ONE build of a rung bigger than the free disk: json {"out", "repo", "path_in_repo"}.
+#: Every safetensors shard written into exactly `out` is uploaded to <repo>/<path_in_repo>/, confirmed there (size +
+#: sha256), recorded in pollard-streamed.json (with its header, so the rung can still be READ -- verify streams it back
+#: with range requests) and deleted before the next shard is written. Any other directory (the smoothed source, a
+#: text copy) is written normally.
+SHARD_UPLOAD_ENV = "POLLARD_SHARD_UPLOAD"
+STREAMED = "pollard-streamed.json"
+
+
+def shard_upload_spec(out):
+    raw = os.environ.get(SHARD_UPLOAD_ENV)
+    if not raw:
+        return None
+    try:
+        spec = json.loads(raw)
+    except ValueError:
+        return None
+    norm = lambda p: os.path.normcase(os.path.abspath(str(p).rstrip("/\\")))
+    return spec if spec.get("out") and spec.get("repo") and norm(spec["out"]) == norm(out) else None
+
+
+def read_streamed(model_dir):
+    """{shard file name: entry} of the shards this rung uploaded + freed while it was written ({} for a normal one)."""
+    p = os.path.join(model_dir, STREAMED)
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f).get("files") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_streamed(out, fn, entry):
+    p = os.path.join(out, STREAMED)
+    d = {"files": {}}
+    if os.path.isfile(p):
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    d.setdefault("files", {})[fn] = entry
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, p)
+
+
+def _hf_api():
+    from huggingface_hub import HfApi
+    return HfApi()
+
+
+def stream_shard(out, path, spec, api=None, log=print):
+    """Upload ONE finished shard, confirm the Hub holds it byte for byte (size + sha256 read back), record it, delete
+    the local copy. Any failure raises with the shard still on disk -- the build stops there, nothing is lost."""
+    import pollard_hubcheck as H
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    fn = os.path.basename(path)
+    rp = f"{spec['path_in_repo'].strip('/')}/{fn}" if spec.get("path_in_repo") else fn
+    size, sha = os.path.getsize(path), H.sha256_file(path)
+    hdr, base = st_header(path)
+    api = api or _hf_api()
+    api.create_repo(spec["repo"], repo_type="model", exist_ok=True, private=True)   # public only once complete
+    api.upload_file(path_or_fileobj=path, path_in_repo=rp, repo_id=spec["repo"])
+    bad = H.mismatches(api, spec["repo"], [(rp, path)])
+    if bad:
+        raise RuntimeError(f"shard {fn} is not intact on {spec['repo']} ({bad[0]}) -- kept at {path}, build stopped")
+    _record_streamed(out, fn, {"repo": spec["repo"], "path_in_repo": rp, "size": size, "sha256": sha,
+                               "git_sha1": H.git_blob_sha1(path), "header": hdr, "data_start": base})
+    os.remove(path)
+    log(f"   shard {fn} ({size / 1e9:.2f} GB) -> {spec['repo']}/{rp}: confirmed on the Hub, freed locally")
+
+
+def hub_range(repo, path_in_repo, start, n, retries=3):
+    """`n` bytes of a file on the Hub from `start` (an HTTP range request; the token comes from the usual place)."""
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers, get_session
+    url = hf_hub_url(repo, path_in_repo)
+    last = None
+    for _ in range(retries):
+        try:
+            h = build_hf_headers()
+            h["Range"] = f"bytes={start}-{start + n - 1}"
+            r = get_session().get(url, headers=h, timeout=600, allow_redirects=True)
+            r.raise_for_status()
+            data = r.content if r.status_code == 206 else r.content[start:start + n]
+            if len(data) == n:
+                return data
+            last = f"{len(data)} of {n} bytes"
+        except Exception as e:                                    # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(2)
+    raise RuntimeError(f"could not read {n} bytes of {repo}/{path_in_repo} at {start}: {last}")
+
+
 class ShardWriter:
     """Writes a checkpoint shard by shard (bounded buffer) and the index at the end. Raw tensors keep their bytes."""
 
-    def __init__(self, out, max_shard_bytes=2 << 30, prefix="model"):
+    def __init__(self, out, max_shard_bytes=2 << 30, prefix="model", log=print):
         os.makedirs(out, exist_ok=True)
         self.out, self.max = out, max_shard_bytes
         self.buf, self.size, self.n = {}, 0, 0
         self.weight_map, self.files = {}, []
         self.prefix = prefix
         self.total = 0
+        self.log = log
+        # pollard release, for a rung bigger than the free disk: every shard of THIS directory is uploaded, confirmed
+        # on the Hub and freed before the next one is written (see stream_shard). Names are final from the start
+        # (model-00001.safetensors ...): the index maps them, so nothing is renamed after it left.
+        self.spec = shard_upload_spec(out)
 
     def add(self, name, dt, arr):
         import numpy as np
@@ -1647,9 +1760,16 @@ class ShardWriter:
             self.weight_map[k] = fn
         self.files.append(fn)
         self.buf, self.size = {}, 0
+        if self.spec:
+            stream_shard(self.out, os.path.join(self.out, fn), self.spec, log=self.log)
 
     def close(self):
         self.flush()
+        if self.spec:                                    # streamed: no renames, and always an index (uploaded LAST)
+            with open(os.path.join(self.out, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
+                json.dump({"metadata": {"total_size": self.total}, "weight_map": dict(sorted(self.weight_map.items()))},
+                          f, indent=2)
+            return self.weight_map
         n = len(self.files)
         final = {}
         for i, fn in enumerate(self.files, 1):

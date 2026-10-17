@@ -43,8 +43,9 @@ How it runs -- and why:
     uploaded. The cards are pollard-card per lane, --verified-only, from the numbers this run measured.
   * nothing is uploaded unless the plan says `upload: true` AND the command line says --upload.
   * --free-after-upload (with --upload): for a box whose free disk is smaller than a lane's whole ladder. Each rung
-    is built -> measured -> gated -> uploaded on its own, then its LOCAL file is deleted before the next rung (a
-    rung that fails the gate is deleted unpublished). The GGUF ladder is built one rung at a time (pollard --rung).
+    is built -> measured -> gated -> uploaded on its own, and its LOCAL file is deleted only once the Hub holds that
+    exact file (size + sha256 read back from the Hub). A rung that failed or skipped a measure / verify / gate, or
+    whose upload did not land intact, is KEPT on disk unpublished and listed at the end. The GGUF ladder is built one rung at a time (pollard --rung).
     Every build step first checks free disk against the rung's estimated size and holds the rung (not the release)
     when it does not fit. Only files this release built are ever deleted -- never the source, f16, imatrix or calib.
   * existing inputs can be named in the plan instead of rebuilt: `f16:` (an f16/bf16 GGUF), `imatrix:`,
@@ -89,7 +90,8 @@ calib:
   reasoning: auto              # auto | on | off | toggle -- thinking traces in the model's own delimiters
   reasoning_share: null        # null = 0.35 of the corpus when the model reasons
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
-  taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
+  taskeval: {suite: quick, limit: 200}   # OPT-IN (--taskeval, or later --taskeval-only): ~1 h per rung of lm-eval,
+                                         # so the release path does not run it; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
@@ -268,6 +270,8 @@ def _ctx(cfg, src):
         if cfg.get(plan_key):
             ctx[key] = os.path.abspath(str(cfg[plan_key]))
     ctx["given_f16"] = bool(cfg.get("f16"))
+    if cfg.get("measure_ref"):                           # the served measurements' reference (see measure_ref)
+        ctx["measure_ref"] = os.path.abspath(str(cfg["measure_ref"]))
     return ctx
 
 
@@ -516,28 +520,29 @@ def gguf_rung_steps(cfg, c, builds):
     """Measure + verify for every rung the GGUF ladder produced (read back from the MANIFEST)."""
     m, res, steps = dict(cfg.get("measure") or {}), results_path(c, "gguf"), []
     m["toolcall"] = toolcall_wanted(cfg, c)
+    ref = c.get("measure_ref") or c["f16"]                        # served measurements; verify stays on the f16
     for b in builds:
         tag, path = b.get("tag") or b.get("name"), b.get("path")
         common = ["--results", res, "--rung", tag]
         rid = f"gguf/{tag}"
-        if m.get("taskeval"):
+        if m.get("taskeval") and (cfg.get("_taskeval") or cfg.get("_taskeval_only")):
             t = m["taskeval"]
             steps.append(Step(id=f"{rid}/taskeval", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-taskeval", "--model", path, "--ref", c["f16"], "--suite",
+                              cmd=["pollard-taskeval", "--model", path, "--ref", ref, "--suite",
                                    str(t.get("suite", "quick")), "--limit", str(t.get("limit", 200)),
                                    "--ngl", c["ngl"], "--out", os.path.join(c["mdir"], "reports", "taskeval", tag)]
                               + common))
         if m.get("mt"):
             steps.append(Step(id=f"{rid}/mt", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-taskeval", "--model", path, "--ref", c["f16"], "--suite", "mt",
+                              cmd=["pollard-taskeval", "--model", path, "--ref", ref, "--suite", "mt",
                                    "--limit", str((m["mt"] or {}).get("limit", 100)), "--ngl", c["ngl"]] + common))
         if m.get("toolcall"):
             steps.append(Step(id=f"{rid}/toolcall", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-toolcall", "--gguf", path, "--ref", c["f16"], "--ngl", c["ngl"]] + common,
+                              cmd=["pollard-toolcall", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
                               ok_codes=(0, 1)))                        # a FAIL is a number for the gate, not a crash
         if m.get("decision"):
             steps.append(Step(id=f"{rid}/decision", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-decision", "--gguf", path, "--ref", c["f16"], "--ngl", c["ngl"]] + common,
+                              cmd=["pollard-decision", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
                               ok_codes=(0, 1)))
         steps.append(Step(id=f"{rid}/verify", lane="gguf", rung=tag, kind="verify", requires="any", out=path,
                           cmd=["pollard-verify", "--lane", "gguf", "--model", path, "--ref", c["f16"],
@@ -545,6 +550,66 @@ def gguf_rung_steps(cfg, c, builds):
         if c.get("free"):
             steps.append(_publish_rung_step(c, "gguf", tag, path))
     return steps
+
+
+def taskeval_only_steps(cfg, c):
+    """`pollard release --taskeval-only`: the task-retention numbers for rungs that are ALREADY published, after the
+    fact (overnight), then the card again. Each verified GGUF rung is measured from its local file, or -- freed after
+    its upload -- from a temporary download of its published copy, deleted again once measured. Not part of the
+    publish path: Pollard publishes on KLD + PPL + the tool-call gate + the complete-model gate."""
+    t = dict((cfg.get("measure") or {}).get("taskeval") or {"suite": "quick", "limit": 200})
+    ref = c.get("measure_ref") or c["f16"]
+    repo = repo_name(c["org"], c["src"])
+    steps = []
+    for b in gguf_builds(c):
+        if b.get("verified") is not True:
+            continue
+        tag = b.get("tag") or b.get("name")
+        cmd = ["pollard-taskeval", "--model", b["path"], "--ref", ref, "--suite", str(t.get("suite", "quick")),
+               "--limit", str(t.get("limit", 200)), "--ngl", c["ngl"],
+               "--out", os.path.join(c["mdir"], "reports", "taskeval", tag), "--results", results_path(c, "gguf"),
+               "--rung", tag]
+        steps.append(Step(id=f"gguf/{tag}/taskeval", lane="gguf", rung=tag, kind="measure", requires="any",
+                          fn="taskeval_rung", cmd=cmd, out=b["path"], repo=repo,
+                          remote=b.get("uploaded_as") if b.get("uploaded") == repo else None,
+                          desc=f"task retention of {tag} ({t.get('suite', 'quick')}, limit {t.get('limit', 200)})"))
+    steps.append(Step(id="gguf/card", lane="gguf", kind="card", requires="any", cmd=card_cmd(cfg, c, ["gguf"]),
+                      out=c["release_dir"], repo=repo))
+    steps.append(Step(id="gguf/card-upload", lane="gguf", kind="upload", requires="any", fn="card_upload", repo=repo,
+                      out=c["release_dir"], desc=f"the card with the retention numbers -> https://huggingface.co/{repo}"))
+    return steps
+
+
+def taskeval_rung(step, c, run_upload, out=print):
+    """Measure one published rung: its local file, else a temporary download of its published copy (deleted after)."""
+    cmd = list(step.cmd)
+    if os.path.exists(str(step.out)):
+        run_cmd(cmd)
+        return "done"
+    if not step.remote:
+        raise RuntimeError(f"{step.out} is neither on disk nor recorded as published")
+    from huggingface_hub import hf_hub_download
+    tmp = os.path.join(c["mdir"], "taskeval-download")
+    os.makedirs(tmp, exist_ok=True)
+    out(f"      fetching the published {step.remote} for the measurement (deleted afterwards)")
+    local = hf_hub_download(step.repo, step.remote, local_dir=tmp)
+    try:
+        cmd[cmd.index("--model") + 1] = local
+        run_cmd(cmd)
+    finally:
+        if os.path.exists(local):
+            os.remove(local)
+    return "done"
+
+
+def card_upload(step, c, run_upload, out=print):
+    card = os.path.join(step.out, "README.md")
+    if not run_upload:
+        out("      (not uploading the card: uploads are off)")
+        return "held"
+    from huggingface_hub import HfApi
+    HfApi().upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=step.repo)
+    return "done"
 
 
 def _publish_rung_step(c, lane, tag, path):
@@ -730,9 +795,15 @@ def lane_steps(cfg, c, lane):
                    "--out", out]
             src = c["smooth_dir"]
         rid = f"{lane}/{tag}"
-        steps.append(Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
-                          out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
-                          held_codes=(EXIT_HELD,) if lane in ("exl3", "mlx") else ()))
+        st_build = Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
+                        out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
+                        held_codes=(EXIT_HELD,) if lane in ("exl3", "mlx") else ())
+        if c.get("free") and lane in STREAMABLE:
+            # bigger than the free disk: written + uploaded + confirmed + freed one shard at a time, not held
+            from pollard_card import rung_subfolder
+            st_build["stream_to"] = (repo_name(c["org"], c["src"]),
+                                     f"{lane_folder(lane)}/{rung_subfolder({'name': name, 'tag': tag}, lane)}")
+        steps.append(st_build)
         if _has_weights(c["hf_dir"]):                    # never a text-only rung: the gate lists what is missing
             steps.append(Step(id=f"{rid}/complete", lane=lane, rung=tag, kind="gate", requires="any", out=out,
                               cmd=["pollard-complete", "--source", c["hf_dir"], "--out", out, "--lane", lane],
@@ -756,6 +827,13 @@ def lane_steps(cfg, c, lane):
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
             steps.append(st)
     return steps
+
+
+#: directory lanes whose writers can stream a rung to the Hub shard by shard (pollard_stream.ShardWriter: GPTQ;
+#: pollard_mxfp6.write_shards: every pollard-engine MX rung)
+STREAMABLE = ("gptq", "mx")
+#: free disk a streamed build still needs: the shard being written (a source shard can be ~5 GB) + the margin
+STREAM_SHARD_GB = 6.0
 
 
 def gguf_ladder_labels(c):
@@ -854,6 +932,19 @@ def load_state(path):
         return {}
 
 
+import threading as _threading
+_STATE_LOCK = _threading.RLock()
+
+
+def save_entry(path, sid, entry):
+    """Write ONE step's state under a lock, merged into what is on disk: several executes (the parallel scheduler's
+    build slots + measure queue) share one release-state.json, and none may overwrite another's steps."""
+    with _STATE_LOCK:
+        disk = load_state(path)
+        disk[sid] = entry
+        save_state(path, disk)
+
+
 def save_state(path, state):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -931,6 +1022,17 @@ def canonical_gguf(c):
         b["path"], b["name"] = os.path.abspath(target), want
         changed = True
     if changed:
+        # a re-run's rung lands on the published name an earlier, freed / kept / replaced build of the same tag had:
+        # the newest entry for a path is the build that is there now, so older entries for it go (publish_rung would
+        # otherwise find the stale one first -- unverified -- and keep the fresh, verified file off the Hub)
+        seen, keepl = set(), []
+        for b in reversed(man.get("builds", [])):
+            p = os.path.normcase(os.path.abspath(str(b.get("path", ""))))
+            if b.get("lane") == "gguf" and p in seen:
+                continue
+            seen.add(p)
+            keepl.append(b)
+        man["builds"] = list(reversed(keepl))
         ws._write_manifest(key, man)
 
 
@@ -1045,6 +1147,14 @@ def go_public(step, c, cfg, run_upload, statuses, out=print):
     if not shipped:
         out(f"      (nothing shipped this run -- {step.repo} stays as it is)")
         return "held"
+    import pollard_workspace as ws
+    stranded = [p for l in LANES for b in ws.read_manifest(lane_key(c, l)).get("builds", [])
+                if b.get("lane") == l and b.get("streamed_unverified") and b.get("verified") is not True
+                for p in b["streamed_unverified"][:1]]
+    if stranded:
+        raise RuntimeError(f"{step.repo} stays private: it holds streamed shards of a rung that did not pass its gate "
+                           f"({', '.join(sorted({os.path.dirname(p) for p in stranded}))}) -- verify it or remove that "
+                           "folder, then re-run")
     from huggingface_hub import HfApi
     api = HfApi()
     want = {"README.md"}
@@ -1120,8 +1230,12 @@ def _freeable(c, b):
              ws.model_dir(c["smooth_dir"]), c["mdir"]]
     if any(path.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots):
         return True
+    # the flagship mix lives next to the f16: as automap wrote it (<stem>-mix.gguf) or under its published name
+    # once canonical_gguf renamed it (<M>-Pollard-<TAG>.gguf)
+    name = os.path.basename(path)
     return bool(b.get("flagship")) and os.path.dirname(path) == os.path.normcase(
-        os.path.dirname(os.path.abspath(c["f16"]))) and path.endswith("-mix.gguf")
+        os.path.dirname(os.path.abspath(c["f16"]))) and (
+        path.endswith("-mix.gguf") or name.startswith(os.path.normcase(f"{c['name']}-Pollard-")))
 
 
 def _free_local(c, b, out=print):
@@ -1137,10 +1251,57 @@ def _free_local(c, b, out=print):
     return True
 
 
+def _sha256(path):
+    import pollard_hubcheck as H
+    return H.sha256_file(path)
+
+
+def _git_blob_sha1(path):
+    import pollard_hubcheck as H
+    return H.git_blob_sha1(path)
+
+
+def _local_pairs(path, path_in_repo):
+    """[(path in the repo, local file)] for one file or every file under a folder."""
+    if os.path.isfile(path):
+        return [(path_in_repo, path)]
+    pairs = []
+    for root, _, files in os.walk(path):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, path).replace(os.sep, "/")
+            pairs.append((f"{path_in_repo}/{rel}" if path_in_repo else rel, full))
+    return sorted(pairs)
+
+
+def remote_mismatches(api, repo, pairs):
+    """[why] for every (path in repo, local file | recorded {size, sha256}) the Hub does NOT hold intact (missing,
+    another size, another hash, no hash); [] = every file is there. See pollard_hubcheck."""
+    import pollard_hubcheck as H
+    return H.mismatches(api, repo, pairs)
+
+
+def _keep(c, lane, key, man, b, why, out):
+    """A rung that is NOT freed: recorded in the MANIFEST (kept = why) and said out loud."""
+    b["kept"] = why
+    b.pop("freed", None)
+    ws_write(key, man)
+    out(f"      KEPT {b.get('path')} -- {why}")
+
+
+def ws_write(key, man):
+    import pollard_workspace as ws
+    ws._write_manifest(key, man)
+
+
 def publish_rung(step, c, cfg, run_upload, out=print):
-    """--free-after-upload: upload ONE gated rung to its lane repo, check it landed, mark it uploaded in the MANIFEST,
-    then delete the local copy. A rung that did not pass the gate is not published; its file is freed too (its
-    numbers stay in the results file)."""
+    """--free-after-upload: upload ONE gated rung, confirm THAT file is on the Hub byte-for-byte (size + sha256
+    against the Hub's own listing), mark it uploaded in the MANIFEST, and only then delete the local copy.
+
+    Anything short of that keeps the file: a rung that failed or skipped its measure / verify / gate is NOT
+    published and NOT deleted (the LFM2.5 release, 2026-10-16, deleted three unverified, never-uploaded rungs --
+    five hours of builds -- because "did not pass the gate" was treated as "done with it"); an upload that raises,
+    or a file the Hub does not hold intact, keeps the local copy and fails the step."""
     import pollard_workspace as ws
     from pollard_card import rung_subfolder
     lane, repo = step.lane, step.repo
@@ -1154,13 +1315,17 @@ def publish_rung(step, c, cfg, run_upload, out=print):
             out("      (nothing to publish: the rung was not built)")
             return "skipped: not built"
         raise RuntimeError(f"{step.out} is not in the MANIFEST")
-    if b.get("uploaded"):
+    if b.get("uploaded") and not os.path.exists(b.get("path", "")):
         return "done"
+    import pollard_stream as PS
+    streamed = PS.read_streamed(b["path"]) if lane != "gguf" and os.path.isdir(b.get("path", "")) else {}
     if b.get("verified") is not True:
-        _free_local(c, b, out)
-        b["freed"] = "did not pass the gate -- not published"
-        ws._write_manifest(key, man)
-        return "done"
+        if streamed:
+            b["streamed_unverified"] = sorted(e["path_in_repo"] for e in streamed.values())
+        _keep(c, lane, key, man, b, "not verified (measure / verify / gate failed or did not run) -- not published"
+              + (f"; its {len(streamed)} streamed shard(s) stay in the PRIVATE repo, which will not go public "
+                 "until they are verified or removed" if streamed else ""), out)
+        return "kept: not verified"
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -1175,60 +1340,89 @@ def publish_rung(step, c, cfg, run_upload, out=print):
             out(f"      ggufcheck: {name} -> {b['runtime']}")
         except Exception as e:                                   # noqa: BLE001
             out(f"      ggufcheck: could not read {name} ({e}) -- the card will not state its runtime")
-        api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
-        landed = name in set(api.list_repo_files(repo))
-        b["uploaded_as"] = name
+        dest = name
+        if not b.get("uploaded"):
+            api.upload_file(path_or_fileobj=b["path"], path_in_repo=dest, repo_id=repo)
     else:
-        sub = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
-        api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
-        landed = f"{sub}/config.json" in set(api.list_repo_files(repo))
-        b["uploaded_as"] = sub
-    if not landed:
-        raise RuntimeError(f"{b['uploaded_as']} is not in {repo} after the upload -- keeping the local copy")
+        dest = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
+        if not b.get("uploaded") and streamed:
+            # the shards are already there (streamed + confirmed one by one); the rest, then the index LAST -- a
+            # loader sees the rung only once every shard it maps is in place
+            api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo,
+                              ignore_patterns=["model.safetensors.index.json", PS.STREAMED, "*.tmp"])
+            if os.path.isfile(os.path.join(b["path"], "model.safetensors.index.json")):
+                api.upload_file(path_or_fileobj=os.path.join(b["path"], "model.safetensors.index.json"),
+                                path_in_repo=f"{dest}/model.safetensors.index.json", repo_id=repo)
+        elif not b.get("uploaded"):
+            api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo)
+    b["uploaded_as"] = dest
+    pairs = [(rp, lp) for rp, lp in _local_pairs(b["path"], dest) if os.path.basename(lp) != PS.STREAMED]
+    pairs += [(e["path_in_repo"], {"size": e["size"], "sha256": e["sha256"], "git_sha1": e.get("git_sha1")})
+              for e in streamed.values()]
+    bad = remote_mismatches(api, repo, pairs)
+    if bad:
+        _keep(c, lane, key, man, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
+        raise RuntimeError(f"{dest} is not intact in {repo} after the upload ({bad[0]}) -- keeping the local copy")
     b["uploaded"] = repo
+    b.pop("kept", None)
+    if streamed:
+        b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
     ws._write_manifest(key, man)
-    out(f"      uploaded {b['uploaded_as']} -> https://huggingface.co/{repo}")
+    out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if _free_local(c, b, out):
-        b["freed"] = "uploaded"
+        b["freed"] = "uploaded + confirmed on the Hub"
         ws._write_manifest(key, man)
     return "done"
 
 
 def _free_vram_mib():
-    """Free VRAM on the first NVIDIA GPU in MiB, 0 when there is none (or nvidia-smi is missing)."""
-    if not shutil.which("nvidia-smi"):
-        return 0
-    try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=30)
-        return int(float(r.stdout.strip().splitlines()[0]))
-    except Exception:                                             # noqa: BLE001
-        return 0
+    """Free VRAM on the first NVIDIA GPU in MiB, 0 when there is none (pollard_llamaserve, shared with the tools)."""
+    import pollard_llamaserve as LS
+    return LS.free_vram_mib()
 
 
 def partial_ngl(gguf, free_mib, headroom_mib=1536, overhead_mib=1536):
-    """-ngl from FREE VRAM: llama.cpp offloads the LAST N blocks, so sum blk.* bytes from the end until the budget
-    is spent. Never the whole model unless the whole file fits -- a GPU somebody else is using stays usable."""
-    import re
-    from gguf import GGUFReader
-    blk, total = {}, 0
-    for t in GGUFReader(gguf).tensors:
-        total += int(t.n_bytes)
-        m = re.match(r"blk\.(\d+)\.", t.name)
-        if m:
-            blk[int(m.group(1))] = blk.get(int(m.group(1)), 0) + int(t.n_bytes)
-    budget = (free_mib - headroom_mib - overhead_mib) * 2 ** 20
-    if budget <= 0 or not blk:
-        return 0
-    if total <= budget:
-        return 99
-    n, ngl, used = max(blk) + 1, 0, 0
-    for i in range(n - 1, -1, -1):
-        if used + blk.get(i, 0) > budget or ngl >= n - 1:
-            break
-        used += blk.get(i, 0)
-        ngl += 1
-    return ngl
+    """-ngl from FREE VRAM: the last N blocks that fit, 99 only when the whole file does (pollard_llamaserve)."""
+    import pollard_llamaserve as LS
+    return LS.partial_ngl(gguf, free_mib, headroom_mib, overhead_mib)
+
+
+def _total_ram_gb():
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ae", ctypes.c_ulonglong)]
+            m = MS()
+            m.l = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return m.total / 1e9
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+    except Exception:                                             # noqa: BLE001
+        return 0.0
+
+
+def measure_ref(cfg, c):
+    """The GGUF the SERVED measurements (taskeval / toolcall / mt / decision) compare each rung against. The f16,
+    unless the plan names `measure_ref:` -- or the f16 cannot be served here: bigger than RAM + VRAM it pages off
+    disk at well under a token a second (the LFM2.5 f16, 48 GB on a 32 GB + 16 GB box: 0.75 tok/s, then the server
+    died). Then the release's own Q8_0 imatrix host stands in when it exists, and says so. The KLD verify always
+    runs against the f16 (prompt processing only, which paging survives)."""
+    if cfg.get("measure_ref"):
+        return os.path.abspath(str(cfg["measure_ref"]))
+    f16 = c["f16"]
+    room = _total_ram_gb() * 0.85 + _free_vram_mib() / 1024 * 1.073741824
+    if room and _size_gb(f16) > room:
+        for cand in (os.path.join(c["gguf_dir"], f"{c['name']}-Q8_0-host.gguf"),
+                     os.path.join(os.path.dirname(f16), f"{c['name']}-Q8_0.gguf")):
+            if os.path.isfile(cand):
+                print(f"   measure reference: {cand} (the f16 is {_size_gb(f16):.0f} GB, more than RAM + VRAM "
+                      f"~{room:.0f} GB, so it cannot be served at a usable speed; the KLD verify stays on the f16)")
+                return cand
+    return f16
 
 
 def imatrix_host(cfg, c):
@@ -1323,9 +1517,32 @@ class Held(Exception):
     pass
 
 
-def run_cmd(cmd, ok_codes=(0,)):
+def _toolcall_not_measured(st, why):
+    """Record a rung's tool calls as NOT MEASURED, with the reason, the way pollard-toolcall does (the gate's
+    toolcall_not_measured policy and the card read it from there)."""
+    cmd = list(st.cmd)
+    res, rung = cmd[cmd.index("--results") + 1], cmd[cmd.index("--rung") + 1]
+    from pollard_taskeval import save_results
+    save_results(res, rung, {"toolcall": {"status": "not-measured", "reason": why, "lane": st.lane}})
+    return "done"
+
+
+#: tools that take --device (the streamed HF lanes and their gate) and the ones with no CPU path at all
+DEVICE_TOOLS = ("pollard-export", "pollard-mx", "pollard-exlr8", "pollard-hf-smooth", "pollard-verify", "pollard-probe")
+GPU_ONLY_TOOLS = ("pollard-exl3",)
+
+
+def gpu_returned():
+    """True once POLLARD_GPU_UNTIL has passed (pollard_llamaserve.gpu_lent) on a CUDA machine."""
+    if not os.environ.get("POLLARD_GPU_UNTIL"):
+        return False
+    import pollard_llamaserve as LS
+    return not LS.gpu_lent()
+
+
+def run_cmd(cmd, ok_codes=(0,), env=None):
     from pollard_auto import _resolve_tool
-    r = subprocess.run(_resolve_tool(list(cmd)))
+    r = subprocess.run(_resolve_tool(list(cmd)), env=env) if env else subprocess.run(_resolve_tool(list(cmd)))
     if r.returncode not in ok_codes:
         raise RuntimeError(f"exit {r.returncode}")
 
@@ -1335,6 +1552,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
     have = have or machine()
     state = load_state(c["state"])
     statuses, failed_rungs, failed_lanes, unbuildable = {}, set(), set(), set()
+    kept = []                                        # (lane, rung, path) left on disk unpublished -- reported at the end
+    streamed = set()                                 # (lane, rung) built in streaming mode (shards already on the Hub)
     queue, n = list(steps), 0
     while queue:
         st = queue.pop(0)
@@ -1357,12 +1576,18 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
         if st.kind == "expand":
             if run and have.get("any"):
                 canonical_gguf(c)
+                if "measure_ref" not in c:
+                    c["measure_ref"] = measure_ref(cfg, c)
             builds = gguf_builds(c)
             if c.get("free"):                        # one rung at a time: only what is built and not yet published
                 done = {s.get("id") for s in queue} | set(statuses)
                 builds = [b for b in builds if not b.get("uploaded") and not b.get("freed")
                           and os.path.exists(b.get("path", ""))
                           and f"gguf/{b.get('tag') or b.get('name')}/publish" not in done]
+                with _STATE_LOCK:                    # the parallel scheduler: each rung is measured by ONE chain
+                    claimed = c.setdefault("_claimed", set())
+                    builds = [b for b in builds if os.path.abspath(b["path"]) not in claimed]
+                    claimed.update(os.path.abspath(b["path"]) for b in builds)
             if builds:
                 queue[0:0] = gguf_rung_steps(cfg, c, builds)
                 out(f"{head}: {len(builds)} ladder rung(s) in the MANIFEST -> measure + verify each")
@@ -1383,7 +1608,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             failed_lanes.update(st.blocks or [])
             if run:
                 state[st.id] = {"status": statuses[st.id], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
             continue
         what = st.desc if st.fn else f"$ {_fmt_cmd(st.cmd)}"
         if not have.get(st.requires, False):
@@ -1396,17 +1621,30 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 f"with --lanes {st.lane}) -- {what}")
             statuses[st.id] = f"skipped: needs {REQUIRES[st.lane]}"
             continue
-        if st.kind == "publish" and (st.lane, st.rung) in failed_rungs and st.lane not in failed_lanes:
-            pass                                     # free mode: a rung that failed is still freed (not published)
-        elif st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
+        if st.kind == "publish" and (st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs):
+            # free mode: a rung whose build / measure / verify failed or was skipped is neither published NOR deleted
+            out(f"{head}: KEPT locally, not published (an earlier step of this rung failed) -- {st.out}")
+            statuses[st.id] = "kept: upstream failed"
+            kept.append((st.lane, st.rung, st.out))
+            continue
+        if st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
             out(f"{head}: SKIP (an earlier step of this {'rung' if st.rung else 'lane'} failed) -- {what}")
             statuses[st.id] = "skipped: upstream failed"
             continue
         need = st.disk_gb or 0
+        stream_env = None
         if run and need and st.kind in ("build", "prep") and resume_reason(st, state, redo) is None:
             free = disk_free_gb(st.out or c["mdir"])
             margin = float(cfg.get("disk_margin_gb", 3))
-            if free < need + margin:
+            if free < need + margin and st.stream_to and run_upload and free >= STREAM_SHARD_GB + margin:
+                import pollard_stream as PS
+                repo, sub = st.stream_to
+                stream_env = dict(os.environ, **{PS.SHARD_UPLOAD_ENV: json.dumps(
+                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub})})
+                streamed.add((st.lane, st.rung))
+                out(f"{head}: ~{need:.1f} GB > {free:.1f} GB free -- STREAMING: each shard written -> uploaded to "
+                    f"{repo}/{sub}/ -> confirmed -> freed before the next (the repo stays private)")
+            elif free < need + margin:
                 msg = f"held: disk (needs ~{need:.1f} GB + {margin:g} margin, {free:.1f} GB free)"
                 out(f"{head}: {msg} -- {what}")
                 statuses[st.id] = msg
@@ -1422,6 +1660,20 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             out(f"{head}: [{why}] {what}")
             statuses[st.id] = f"skipped: {why}"
             continue
+        if run and st.cmd and gpu_returned():
+            # POLLARD_GPU_UNTIL passed: the GPU goes back to its owner. The streamed tools move to the CPU; work that
+            # only runs on a GPU (EXL3, training a drafter) is HELD -- resumable on the next run -- never squeezed in
+            if str(st.cmd[0]) in GPU_ONLY_TOOLS or st.id == "draft/train":
+                msg = "held: GPU-only step and the GPU is not ours after POLLARD_GPU_UNTIL -- re-run the plan to resume"
+                out(f"{head}: {msg} -- {what}")
+                statuses[st.id] = msg
+                if st.rung:
+                    failed_rungs.add((st.lane, st.rung))
+                else:
+                    failed_lanes.add(st.lane)
+                continue
+            if str(st.cmd[0]) in DEVICE_TOOLS and "--device" not in st.cmd:
+                st = Step(st, cmd=list(st.cmd) + ["--device", "cpu"])
         out(f"{head}: {what}")
         if not run:
             statuses[st.id] = "planned"
@@ -1439,9 +1691,17 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 res = "done"
             elif st.fn == "publish_rung":
                 res = publish_rung(st, c, cfg, run_upload, out)
+            elif st.fn == "taskeval_rung":
+                res = taskeval_rung(st, c, run_upload, out)
+            elif st.fn == "card_upload":
+                res = card_upload(st, c, run_upload, out)
+            elif st.kind == "measure" and (st.lane, st.rung) in streamed and "pollard-toolcall" in str(st.cmd[0]):
+                res = _toolcall_not_measured(st, "the rung was streamed to the Hub shard by shard while it was built "
+                                                 "(bigger than the free disk); the tool-call probe needs it on disk")
+                out("      tool calls: not measured (streamed rung)")
             else:
                 try:
-                    run_cmd(st.cmd, st.ok_codes or (0,))
+                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": stream_env} if stream_env else {}))
                 except RuntimeError as e:
                     if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
                         raise Held(f"{e} (the reason is the HELD: line above)") from None
@@ -1462,12 +1722,12 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 failed_lanes.update(st.blocks)
                 statuses[st.id] = res
                 state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
                 continue
             if st.lane == "prep" or stop_on_fail:
                 statuses[st.id] = res
                 state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
                 raise SystemExit(f"   release stopped at {st.id}" + ("" if st.lane != "prep" else
                                  " -- a preparation step failed, nothing after it can be trusted"))
             if st.rung:
@@ -1475,9 +1735,195 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             elif st.kind in ("build", "card"):
                 failed_lanes.add(st.lane)                    # no card -> nothing to publish
         statuses[st.id] = res
+        if str(res).startswith("kept"):
+            kept.append((st.lane, st.rung, st.out))
         if res != "held":
             state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-            save_state(c["state"], state)
+            save_entry(c["state"], st.id, state[st.id])
+    if run and kept:
+        out("\n   KEPT on disk, NOT published (fix the measure / gate and re-run the plan to publish them):")
+        for lane, rung, path in kept:
+            out(f"     {lane}/{rung}: {path}")
+    return statuses
+
+
+# ------------------------------------------------------------------------------- parallel scheduler
+
+#: lanes whose rungs build in the GPU slot (streamed HF lanes, EXL3, the drafter); everything else (the llama-quantize
+#: GGUF rungs) builds in the CPU slot
+GPU_SLOT_LANES = ("gptq", "mx", "exlr8", "exl3", "draft", "mlx")
+#: RAM / VRAM a job may use at most, GB -- the box: 32 GB RAM, 16 GB VRAM (a little kept back for the OS / driver)
+RAM_TOTAL_GB, VRAM_TOTAL_GB = 30.0, 15.0
+
+
+def job_peak(st, c, cfg):
+    """(ram GB, vram GB, disk GB) one step may take at its peak -- what admission control reserves for it.
+    GGUF quantize: a small resident set (the tensors stream through) + its output on disk. A streamed HF-lane build:
+    the plan's max_ram_gb (the streamed planner keeps its peak under it). EXL3: exllamav3 on the GPU. A GGUF measure:
+    the rung's own size split over VRAM / RAM by the -ngl pollard_llamaserve picks (so its RAM is what does not fit)."""
+    lane = st.lane or ""
+    max_ram = float(cfg.get("max_ram_gb") or 24)
+    on_gpu = not (c.get("ngl") == "0")
+    if st.kind == "build" and lane == "gguf":
+        return 4.0, 0.0, float(st.disk_gb or 0)
+    if st.kind == "build" and lane == "exl3":
+        return 16.0, VRAM_TOTAL_GB - 1, float(st.disk_gb or 0)
+    if st.kind == "build":
+        return max_ram, (12.0 if on_gpu else 0.0), float(st.disk_gb or 0)
+    if lane == "gguf" and st.kind in ("measure", "verify", "gate"):
+        size = _size_gb(st.out) if st.out else 0.0
+        vram = min(size, VRAM_TOTAL_GB - 2) if on_gpu else 0.0
+        return max(2.0, size - vram + 2.0), vram, 0.0
+    if st.kind in ("measure", "verify", "gate"):
+        return max_ram, (12.0 if on_gpu else 0.0), 0.0
+    return 1.0, 0.0, 0.0
+
+
+class Admission:
+    """Admission control for the slots: a job starts only when its planned peak fits what is FREE now and what the
+    jobs already running have reserved (RAM <= 30 GB, VRAM <= 15 GB, disk with the plan's margin). A job that does not
+    fit WAITS -- never an OOM. Alone on the machine a job always starts (its own guards then decide)."""
+
+    def __init__(self, cfg, c, free_ram=None, free_vram=None, free_disk=None, sleep=time.sleep, out=print):
+        self.lock = _threading.Condition()
+        self.running = {}                                # step id -> (ram, vram, disk)
+        self.margin = float(cfg.get("disk_margin_gb", 3))
+        self.c = c
+        self._ram = free_ram or (lambda: __import__("pollard_stream").free_ram_gb())
+        self._vram = free_vram or (lambda: _free_vram_mib() / 1024.0)
+        self._disk = free_disk or (lambda: disk_free_gb(c["mdir"]))
+        self.sleep, self.out = sleep, out
+
+    def fits(self, peak):
+        ram, vram, disk = peak
+        if not self.running:
+            return True
+        used = [sum(x[i] for x in self.running.values()) for i in range(3)]
+        if used[0] + ram > RAM_TOTAL_GB or used[1] + vram > VRAM_TOTAL_GB:
+            return False
+        if ram and self._ram() < ram + 1.0:
+            return False
+        if vram and self._vram() < vram:
+            return False
+        if disk and self._disk() - used[2] < disk + self.margin:
+            return False
+        return True
+
+    def acquire(self, sid, peak, slot, poll_s=30):
+        waited = False
+        with self.lock:
+            while not self.fits(peak):
+                if not waited:
+                    self.out(f"   [{slot}] WAIT {sid}: needs ~{peak[0]:.0f} GB RAM / {peak[1]:.0f} GB VRAM / "
+                             f"{peak[2]:.0f} GB disk; running {sorted(self.running)}")
+                    waited = True
+                self.lock.wait(timeout=poll_s)
+            self.running[sid] = peak
+
+    def release(self, sid):
+        with self.lock:
+            self.running.pop(sid, None)
+            self.lock.notify_all()
+
+
+def rung_chains(steps):
+    """[(lane, rung, [steps])] in plan order: a GGUF rung = its build + its expand; a directory-lane rung = build,
+    complete gate, tool calls, verify, publish. Lane-level steps (card / upload / public) are not part of a chain."""
+    chains, idx = [], {}
+    for st in steps:
+        if st.kind in ("card", "upload", "finalize", "note", "hold") and not st.rung:
+            continue
+        # a lane-level build (the EXLR8 encode, the drafter's find / train / convert / expand) is its lane's own chain,
+        # in plan order -- so it runs before that lane's rungs in the same slot
+        key = (st.lane, st.rung or (st.id.split("rungs-", 1)[1] if "rungs-" in st.id else "_lane"))
+        if key not in idx:
+            idx[key] = len(chains)
+            chains.append((key[0], key[1], []))
+        chains[idx[key]][2].append(st)
+    return chains
+
+
+def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=print, timeline=None,
+                     admission=None, runner=None):
+    """`pollard release --parallel`: the shared prep ONCE (calib, imatrix, sensitivity, smoothing), then two build
+    slots side by side -- CPU (GGUF quantize) and GPU (streamed GPTQ / MX / EXLR8, EXL3, the drafter), each running
+    its lane's rungs back to back -- and ONE serialized measure queue (KLD / PPL, tool calls, the complete-model gate,
+    ggufcheck, then upload + confirmed free) fed as each build lands. Admission control holds any job whose peak does
+    not fit. The lane cards / uploads and the public flip run last, serially. Per-slot timeline -> timeline."""
+    import queue
+    have = have or machine()
+    runner = runner or (lambda ss: execute(ss, c, cfg, True, run_upload, redo, False, have, out))
+    admission = admission or Admission(cfg, c, out=out)
+    tl_path = timeline or os.path.join(c["mdir"], "release-timeline.log")
+    os.makedirs(os.path.dirname(tl_path), exist_ok=True)
+    tl_lock = _threading.Lock()
+    statuses = {}
+
+    def log(slot, what, sid):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {slot:7s} {what:6s} {sid}"
+        with tl_lock:
+            with open(tl_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            out(f"   [timeline] {line}")
+
+    prep = [s for s in steps if s.lane == "prep"]
+    final = [s for s in steps if s.kind in ("card", "upload", "finalize") and not s.rung]
+    statuses.update(runner(prep))                     # shared prep, once; a failure stops the release (SystemExit)
+    chains = rung_chains([s for s in steps if s not in prep and s not in final])
+    mq = queue.Queue()
+    slots = {"cpu": [], "gpu": []}
+    for lane, rung, ss in chains:
+        slots["gpu" if lane in GPU_SLOT_LANES else "cpu"].append((lane, rung, ss))
+
+    def run_job(slot, sid, ss, peak):
+        admission.acquire(sid, peak, slot)
+        log(slot, "start", sid)
+        try:
+            got = runner(ss)
+        except SystemExit as e:                        # one rung's hard stop is that rung's, not the release's
+            got = {s.id: f"failed: {e}" for s in ss}
+        finally:
+            admission.release(sid)
+        log(slot, "end", sid + "  " + ",".join(sorted({str(v).split(":")[0] for v in got.values()})))
+        with tl_lock:
+            statuses.update(got)
+        return got
+
+    def slot_worker(slot):
+        for lane, rung, ss in slots[slot]:
+            builds = [s for s in ss if s.kind == "build"]
+            rest = [s for s in ss if s.kind != "build"]
+            ok = True
+            for b in builds:
+                got = run_job(slot, b.id, [b], job_peak(b, c, cfg))
+                ok = ok and str(got.get(b.id, "")).split(":")[0] in ("done", "skipped")
+            if not ok:
+                with tl_lock:
+                    statuses.update({s.id: "skipped: upstream failed" for s in rest if s.kind != "publish"})
+                    statuses.update({s.id: "kept: upstream failed" for s in rest if s.kind == "publish"})
+                continue
+            if rest:
+                mq.put((lane, rung, rest))
+        mq.put(None)
+
+    def measure_worker(n_feeders):
+        done_feeders = 0
+        while done_feeders < n_feeders:
+            item = mq.get()
+            if item is None:
+                done_feeders += 1
+                continue
+            lane, rung, rest = item
+            peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
+            run_job("measure", f"{lane}/{rung}", rest, peak)
+
+    feeders = [_threading.Thread(target=slot_worker, args=(k,), name=f"slot-{k}", daemon=True) for k in slots]
+    meas = _threading.Thread(target=measure_worker, args=(len(feeders),), name="measure", daemon=True)
+    for t in feeders + [meas]:
+        t.start()
+    for t in feeders + [meas]:
+        t.join()
+    statuses.update(runner(final))
     return statuses
 
 
@@ -1503,6 +1949,15 @@ def main(argv=None):
     ap.add_argument("--free-after-upload", action="store_true",
                     help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
                          "needs --upload and `upload: true`")
+    ap.add_argument("--parallel", action="store_true",
+                    help="two build slots (CPU: GGUF quantize; GPU: streamed HF lanes / EXL3 / drafter) + one serialized "
+                         "measure queue, with admission control on RAM / VRAM / disk; shared prep once")
+    ap.add_argument("--taskeval", action="store_true",
+                    help="also run pollard-taskeval (lm-eval gsm8k/ifeval, ~1 h per rung) on every GGUF rung before "
+                         "it is gated -- off by default: the release publishes on KLD + PPL + tool calls + coherence")
+    ap.add_argument("--taskeval-only", action="store_true",
+                    help="after publishing: task retention for every verified GGUF rung (its local file or a temporary "
+                         "download of the published one), then regenerate + upload the card")
     a = ap.parse_args(argv)
 
     if a.init:
@@ -1525,7 +1980,11 @@ def main(argv=None):
     if only and only - set(LANES):
         ap.error(f"unknown lane(s) {sorted(only - set(LANES))}; choose from {LANES}")
     run = a.run and not a.dry_run
+    cfg["_taskeval"] = bool(a.taskeval)
+    cfg["_taskeval_only"] = bool(a.taskeval_only)
     c, lanes, steps = plan_steps(cfg, src, only)
+    if a.taskeval_only:
+        steps = taskeval_only_steps(cfg, c)
     have = machine()
     print(f"== pollard release :: {src}  (preset {cfg['preset']}, {'RUN' if run else 'plan only'})")
     print(f"   lanes: {', '.join(lanes) or 'none'}   |   this machine: "
@@ -1552,7 +2011,10 @@ def main(argv=None):
     if run:
         from pollard_auto import MachineLock
         with MachineLock("pollard release " + src, force=a.force):
-            st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)
+            if a.parallel and not a.taskeval_only:
+                st = execute_parallel(steps, c, cfg, upload_ok, a.redo, have)
+            else:
+                st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)
     else:
         st = execute(steps, c, cfg, False, False, a.redo, a.stop_on_fail, have)
         print("\n   plan only -- add --run to execute (serially, resumable), --upload to publish.")

@@ -199,25 +199,47 @@ def measure_gguf(model, ref, eval_path, ngl="0", chunks=16, ppl_bin=None):
     import shutil
     from pollard_calc import find_llama_bin
     from pollard_bench import _ppl_kl
-    ppl_bin = ppl_bin or find_llama_bin("llama-perplexity") or "llama-perplexity"
+    import pollard_llamaserve as LS
+    # the rung's own runtime: an ik_llama-only file (the IQ*_KT flagship) is measured by ik_llama's perplexity, which
+    # reads the stock-written KL base (same format) -- stock llama.cpp cannot load it at all
+    given = ppl_bin
+    ppl_bin = ppl_bin or LS.bin_for(model, "llama-perplexity") or find_llama_bin("llama-perplexity") or "llama-perplexity"
+    ref_bin = given or find_llama_bin("llama-perplexity") or ppl_bin
     try:
         import pollard_workspace as ws
         base = os.path.join(ws.cache_dir(create=True), os.path.splitext(os.path.basename(ref))[0]
                             + f".c{chunks}.klbase.dat")
     except Exception:
         base = os.path.splitext(ref)[0] + f".c{chunks}.klbase.dat"
+    # -ngl per file from free VRAM (pollard_llamaserve): `auto` is never handed to llama.cpp, and a GPU run that
+    # fails is retried once on the CPU
+    import pollard_llamaserve as LS
+
+    def tries(path):
+        n = LS.resolve_ngl(path, ngl)
+        return [n] + (["0"] if n != "0" else [])
+
     if not (os.path.exists(base) and os.path.getsize(base) > 0):
-        cmd = [ppl_bin, "-m", ref, "-f", eval_path, "-c", "2048", "-ngl", str(ngl),
-               "--kl-divergence-base", base] + (["--chunks", str(chunks)] if chunks else [])
-        print("   KL base: $ " + " ".join(cmd), flush=True)
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
-        if (r.returncode or free < 1e9) and os.path.exists(base):
-            os.remove(base)                              # a short base poisons every later rung
+        for n in tries(ref):
+            cmd = [ref_bin, "-m", ref, "-f", eval_path, "-c", "2048", "-ngl", str(n),
+                   "--kl-divergence-base", base] + (["--chunks", str(chunks)] if chunks else [])
+            print("   KL base: $ " + " ".join(cmd), flush=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
+            if (r.returncode or free < 1e9) and os.path.exists(base):
+                os.remove(base)                          # a short base poisons every later rung
+            if os.path.exists(base):
+                break
+            tail = "\n".join(((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-8:])
+            print(f"   KL base -ngl {n} failed (exit {r.returncode}):\n{tail}", flush=True)
         if not os.path.exists(base):
             raise SystemExit(f"could not build the KL base from {ref} (exit {r.returncode}, "
                              f"{free/1e9:.1f} GB free)")
-    res = _ppl_kl(ppl_bin, model, eval_path, base, ngl, chunks)
+    for n in tries(model):
+        res = _ppl_kl(ppl_bin, model, eval_path, base, n, chunks)
+        if res.get("mean_kld") is not None:
+            break
+        print(f"   llama-perplexity -ngl {n} produced no KLD for {model}", flush=True)
     if res.get("mean_kld") is None:
         raise SystemExit(f"llama-perplexity produced no KLD for {model}")
     return {"kld": res["mean_kld"], "top1": res.get("top1"), "ppl": res.get("ppl"), "ref_ppl": res.get("ref_ppl"),
@@ -371,8 +393,9 @@ DEFAULT_GATES = """\
 #   mt_retention_min mean chrF++ retention over the language pairs       pollard-taskeval --suite mt
 #   toolcall_pass    true = still emits valid tool calls                 pollard-toolcall --results
 #   toolcall_retention_min  tool-call success vs the reference's, percent pollard-toolcall --ref --results
-#   toolcall_not_measured   fail | skip: a rung pollard-toolcall recorded as NOT MEASURED (no server for its lane on
-#                    this machine, GPU not free, too big) -- default: the `missing` policy
+#   toolcall_not_measured   skip | fail: a rung pollard-toolcall recorded as NOT MEASURED (no server for its lane on
+#                    this machine, GPU not free, too big). skip (the default) PUBLISHES it and the card says
+#                    "tool calls: not measured (<reason>)"; fail holds it back
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
@@ -383,6 +406,7 @@ missing: fail
 default:
   kld_max: 0.5
   top1_min: 75
+  toolcall_not_measured: skip
 lanes:
   gguf:
     runtime: stock
@@ -507,9 +531,10 @@ def evaluate_gate(metrics, th, missing="fail"):
     def row(name, value, want, ok, why=""):
         checks.append({"check": name, "value": value, "want": want, "ok": bool(ok), "why": why})
     # a rung pollard-toolcall explicitly recorded as NOT MEASURED (no server for its lane here, GPU not free, too
-    # big) is held to `toolcall_not_measured` (default: the `missing` policy), with the reason on the row
+    # big) is held to `toolcall_not_measured`: skip by default (owner, 2026-10-16) -- the rung publishes and the card
+    # says "tool calls: not measured (<reason>)"; `fail` holds it back. The reason is on the row either way.
     tc_nm = metrics.get("toolcall_status") == "not-measured"
-    tc_policy = th.get("toolcall_not_measured", missing)
+    tc_policy = th.get("toolcall_not_measured", "skip")
     tc_why = f"not measured: {metrics.get('toolcall_reason') or 'no reason recorded'}"
     for key, want in th.items():
         if key in _CHECKS:
@@ -742,7 +767,10 @@ def main():
     if a.coherence and lane == "gguf":
         from pollard_bench import coherence_gate
         from pollard_calc import find_llama_bin
-        res = coherence_gate(find_llama_bin("llama-cli") or "llama-cli", a.model, a.ngl, quick=True)
+        import pollard_llamaserve as LS
+        res = coherence_gate(LS.bin_for(a.model, "llama-cli") or find_llama_bin("llama-cli") or "llama-cli", a.model,
+                             LS.resolve_ngl(a.model, a.ngl),
+                             quick=True)
         measured["coherence"] = res.get("verdict")
 
     if a.results and measured:

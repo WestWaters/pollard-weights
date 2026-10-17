@@ -15,7 +15,8 @@ calib:
   reasoning: auto              # auto | on | off | toggle -- thinking traces in the model's own delimiters
   reasoning_share: null        # null = 0.35 of the corpus when the model reasons
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
-  taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
+  taskeval: {suite: quick, limit: 200}   # OPT-IN (--taskeval, or later --taskeval-only): ~1 h per rung of lm-eval,
+                                         # so the release path does not run it; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)

@@ -165,6 +165,7 @@ def test_a_failed_prep_step_stops_the_release(model, monkeypatch):
 def test_gguf_rungs_are_expanded_from_the_manifest_and_get_their_published_names(model, monkeypatch, tmp_path):
     cfg = R.load_plan(None)
     cfg["measure"] = {"taskeval": {"suite": "quick", "limit": 50}, "toolcall": True}
+    cfg["_taskeval"] = True                                   # opt-in (pollard release --taskeval)
     c, _, steps = R.plan_steps(cfg, model, {"gguf"})
     os.makedirs(c["gguf_dir"], exist_ok=True)
     ran = []
