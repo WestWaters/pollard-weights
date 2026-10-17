@@ -799,11 +799,8 @@ def main():
 
     from transformers import AutoTokenizer
     dev = a.device
-    if dev == "auto":
-        dev = ("cuda" if torch.cuda.is_available()
-               else "mps" if torch.backends.mps.is_available() else "cpu")
-    elif dev == "mps" and not torch.backends.mps.is_available():
-        dev = "cpu"
+    import pollard_device                       # auto -> CUDA > MPS > CPU; an unusable explicit device falls back
+    dev = pollard_device.pick(dev, torch)
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
     offdir = a.offload_dir or os.path.join(os.path.dirname(a.out or ".") or ".", "pollard-offload")
     dev, loadkw, note = plan_placement(a.model, dev, offdir)

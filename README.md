@@ -61,15 +61,38 @@ flowchart LR
 
 ## Quick start
 
-Nix/NixOS users can build and install the core CLI with the
-[Nix flake](notes/nix.md). GPU quantization dependencies and llama.cpp are separate.
-
 ```bash
-./install.sh                                     # tools + the llama.cpp runtime, one shot
+pip install pollard-weights                      # into a venv (or uv pip install / -e <checkout>)
+pollard setup                                    # checks every lane on THIS machine, offers to install what's missing
+./install.sh                                     # (alternative) tools + the llama.cpp runtime, one shot
 pollard-calc --model Qwen/Qwen3-30B-A3B --ram 16 # what CAN this machine do
 pollard-fit  --gguf model-f16.gguf --ram 16      # build a memory-fit GGUF for it
 llama-cli    -m model-f16-pollard.gguf           # run it
 ```
+
+**`pollard setup`** is the installer for everything past the core CLI. It runs a table per lane
+(gguf, ik, mlx, gptq, mx, exl3, exlr8, draft, draft-train, toolcall, convert) and reports each one
+as *ready*, *missing X*, or *not possible here* with the reason (MLX needs Apple Silicon; GPTQ/MX/EXL3
+need an NVIDIA GPU). "Installed" doesn't count until it works: each package is imported in a fresh
+interpreter, and torch runs a small op on the device it would use. A torch wheel without kernels for
+your card (a cu124 wheel on a Blackwell sm_120, say) is reported as the wrong torch, and a vLLM with
+no compiled kernels is reported as unusable. After the report it asks
+`Install missing pieces for lanes gptq,exl3? [Y/n]`. `--dry-run` prints the exact commands without
+running them, `--yes` installs without asking, and `--lanes gptq,mx` limits the check to those lanes.
+Installs go into the **active venv**, with torch from the PyTorch index that matches your GPU and driver
+(cu126/cu128/cu130; MPS wheels on a Mac). `speculators` gets its own venv because it pins
+`transformers<5.17`. The llama.cpp runtime is built for this machine: Metal on a Mac, CUDA for the
+detected GPU arch on NVIDIA. System pieces are never installed for you, and nothing runs under sudo.
+For the CUDA toolkit, MSVC Build Tools, Xcode command-line tools and git, setup prints a one-line
+command or link and waits for your OK. `pollard-doctor --env` prints the same report.
+Every tool picks its device the same native way: CUDA on NVIDIA (Linux or Windows), MPS/Metal on
+Apple Silicon (MLX for the MLX lane), CPU otherwise. `pollard` and `pollard release` run a fast
+cached check first. If a lane you asked for is missing something, you get a one-line hint, and a
+`--run` stops with the fix command before the build starts.
+
+**Nix is optional.** It's one packaging route for the core CLI ([Nix flake](notes/nix.md)), and you
+don't need it. The GPU lanes' dependencies and the llama.cpp runtime are outside the flake. With
+pip/uv, `pollard setup` handles all of that for you.
 
 ⚠️ **`pollard-fit` alone gives you a *uniform* build sized to your RAM — no quality
 win.** The win over uniform quants comes from the calibration step: measure the
@@ -472,6 +495,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 | Command | What it does |
 |---|---|
 | `pollard-verify` · `pollard-doctor` | Correctness gate (real reconstruction); diagnose/predict/repair any model any lane |
+| `pollard setup` · `pollard-doctor --env` | What every lane needs on this machine, checked working (import + device op); installs what is missing into the venv, builds the runtime for this GPU |
 | `pollard-eval` · `pollard-bench` · `pollard-kl` · `pollard-scorecard` | Top-1+KL eval (`--chart`); gold-card benchmark; KL-to-f16; standardized scorecard |
 | `pollard-serve-eval` | A/B a quantized model vs its baseline on the **served** stack (vLLM/SGLang) — teacher-forced PPL, top-1 agreement, KL; stdlib only |
 | `pollard-probes` · `pollard-health` | Task-accuracy MCQ probes; is your accelerator at full speed or silently degraded? |

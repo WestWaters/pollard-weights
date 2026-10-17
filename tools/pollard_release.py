@@ -130,8 +130,9 @@ def mx_mix_bpw(rung):
     return float(r[3:].lstrip("-_").removesuffix("bpw"))
 
 
-REQUIRES = {"gguf": "any", "mlx": "apple", "gptq": "cuda", "mx": "cuda", "exl3": "cuda", "exlr8": "cuda",
-            "draft": "any"}
+# the machine each lane builds on -- one table, pollard_setup.LANES, which also lists what each lane needs installed
+from pollard_setup import MACHINE as _MACHINE
+REQUIRES = {lane: _MACHINE[lane] for lane in LANES}
 
 
 # ------------------------------------------------------------------------------- plan file
@@ -1347,6 +1348,8 @@ def main(argv=None):
     ap.add_argument("--stop-on-fail", action="store_true", help="stop at the first failed rung (default: carry on)")
     ap.add_argument("--init", metavar="PATH", help="write the plan template (with --preset applied) and exit")
     ap.add_argument("--force", action="store_true", help="ignore the machine lock")
+    ap.add_argument("--skip-setup-check", action="store_true",
+                    help="run even when `pollard setup` finds a lane's dependencies missing on this machine")
     ap.add_argument("--free-after-upload", action="store_true",
                     help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
                          "needs --upload and `upload: true`")
@@ -1387,6 +1390,15 @@ def main(argv=None):
     print(f"   upload: {'ON' if upload_ok else 'off'}"
           + ("" if upload_ok else " (needs `upload: true` in the plan AND --upload)"))
     print(f"   state: {c['state']}\n")
+    # what each lane needs installed, checked BEFORE the first step: a lane missing gptqmodel stops here with the
+    # fix command, not hours in. Lanes this machine cannot build at all are left to execute() (it skips them).
+    import pollard_setup as S
+    here = [lane for lane in lanes if have.get(REQUIRES.get(lane, "any"), False)]
+    if run and not a.skip_setup_check:
+        if S.require(here):
+            return 2
+    elif not run:
+        S.hint(here, out=print)
     if run:
         from pollard_auto import MachineLock
         with MachineLock("pollard release " + src, force=a.force):

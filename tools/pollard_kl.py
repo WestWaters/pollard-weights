@@ -87,11 +87,12 @@ def main():
     ap.add_argument("--calib-file", required=True)
     ap.add_argument("--eval-file", required=True)
     ap.add_argument("--out", default="")
-    ap.add_argument("--device", default="mps")
+    ap.add_argument("--device", default="auto", help="auto (CUDA > MPS > CPU) | cuda[:N] | mps | cpu")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
+    import pollard_device
+    dev = pollard_device.pick(a.device, torch)          # auto / cuda / mps / cpu -> what runs here
     print(f"== pollard-kl :: {a.model}  recipe={a.recipe} qmode={a.qmode}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     ref = load_backbone(a.model, torch.float16, dev)
