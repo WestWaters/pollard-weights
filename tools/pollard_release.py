@@ -267,6 +267,8 @@ def _ctx(cfg, src):
         if cfg.get(plan_key):
             ctx[key] = os.path.abspath(str(cfg[plan_key]))
     ctx["given_f16"] = bool(cfg.get("f16"))
+    if cfg.get("measure_ref"):                           # the served measurements' reference (see measure_ref)
+        ctx["measure_ref"] = os.path.abspath(str(cfg["measure_ref"]))
     return ctx
 
 

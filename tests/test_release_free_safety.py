@@ -209,3 +209,15 @@ def test_a_rerun_rung_replaces_the_stale_entry_at_its_published_name(model, inpu
     ws.record_gate(canon, {"pass": True})
     assert R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", canon), c, cfg, True, out=lambda *_: None) == "done"
     assert "Tiny-1B-Pollard-Q6_K.gguf" in hub[REPO] and not os.path.exists(canon)
+
+
+def test_measure_ref_from_the_plan_is_the_served_reference_and_verify_stays_on_the_f16(model, inputs, tmp_path):
+    q8 = tmp_path / "Tiny-1B-Q8_0.gguf"
+    q8.write_bytes(b"GGUF")
+    cfg = plan(inputs, measure={"taskeval": {"suite": "quick", "limit": 5}, "toolcall": True},
+               measure_ref=str(q8))
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    steps = {s.id.split("/")[-1]: s for s in R.gguf_rung_steps(cfg, c, [{"tag": "Q6_K", "path": "r.gguf"}])}
+    ref = lambda s: s.cmd[s.cmd.index("--ref") + 1]
+    assert ref(steps["taskeval"]) == str(q8) and ref(steps["toolcall"]) == str(q8)
+    assert ref(steps["verify"]) == c["f16"], "the KLD gate is always against the f16"
