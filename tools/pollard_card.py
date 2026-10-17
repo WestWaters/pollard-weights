@@ -209,6 +209,9 @@ def build_runtimes(builds, repo=None):
         if b.get("lane", "gguf") != "gguf" or not path:
             continue
         src, where = path, "local file"
+        if not os.path.isfile(path) and b.get("runtime"):
+            out[path] = b["runtime"]                      # read before the rung was freed (pollard release)
+            continue
         if not os.path.isfile(path):
             if not repo:
                 continue
@@ -576,6 +579,71 @@ def rungs_section(builds, lane, repo):
             "```bash", f'hf download {repo} --include "{pick}/*" --local-dir .', run.format(d=pick), "```", ""]
 
 
+#: ONE repo per model (owner, 2026-10-16): GGUF rungs + mmproj at the root, every other lane in its own folder
+LANE_FOLDER = {"mlx": "MLX", "gptq": "GPTQ", "mx": "MX", "exl3": "EXL3", "exlr8": "EXLR8", "draft": "DRAFT"}
+LANE_TITLE = {"mlx": "MLX (Apple Silicon)", "gptq": "GPTQ (vLLM / SGLang)",
+              "mx": "MX -- NVFP4 / MXFP4 / MXFP6 / FP8 (vLLM, Blackwell)", "exl3": "EXL3 (ExLlamaV3 / TabbyAPI)",
+              "exlr8": "EXLR8 (one trellis encode, every rung a manifest)"}
+
+
+def lane_dir(repo):
+    """The local folder `hf download <repo> --local-dir` writes to in the commands on the card."""
+    return "./" + str(repo).split("/")[-1]
+
+
+def lane_serve(lane, path, tools=None):
+    """The serve command for one directory-lane rung at a local `path`, with the tool-call flags that server needs."""
+    tools = tools if isinstance(tools, dict) else {}
+    vflags = f" {tools['vllm_flags']}" if tools.get("vllm_parser") and tools.get("vllm_flags") else ""
+    if lane == "mlx":
+        return [f"mlx_lm.server --model {path}"]
+    if lane in ("gptq", "mx"):
+        return [f"vllm serve {path}{vflags}"]
+    if lane == "exl3":
+        return [f"# TabbyAPI: python main.py --model-dir {os.path.dirname(path) or '.'} "
+                f"--model-name {os.path.basename(path)}"]
+    if lane == "exlr8":
+        return [f"pollard-exlr8 --decode {path} --out {path}-bf16", f"vllm serve {path}-bf16{vflags}"]
+    return []
+
+
+def lane_folder_section(lane, builds, results, repo, tools=None):
+    """One lane of the ONE-repo card: its rungs in <LANE>/<rung>/ with the measured numbers (PPL / KLD / top-1 /
+    Tool-ready / gate, whichever were recorded), and the exact download + serve command."""
+    if not builds or lane not in LANE_FOLDER or lane == "draft":
+        return []
+    F = LANE_FOLDER[lane]
+    rows = []
+    for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
+        r = _rung_result(results, b)
+        top1 = r.get("top1")
+        rows.append(f"| `{F}/{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} | "
+                    f"{_fmt_num(r.get('ppl'))} | {_fmt_num(r.get('kld'))} | "
+                    f"{(f'{float(top1):.2f}%' if top1 else '--')} | {tool_ready_cell(r.get('toolcall'))} |"
+                    f"{verified_cell(b, results)}")
+    pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+    here = lane_dir(repo)
+    path = f"{here}/{F}/{pick}"
+    out = [f"## {LANE_TITLE.get(lane, lane.upper())} -- `{F}/`", "",
+           f"Each rung is a complete checkpoint in its own folder under `{F}/`. Download only the one you want:", "",
+           "| folder | size | avg bits | PPL | Mean KLD | Top-1 agree | Tool-ready | verified |",
+           "|---|---:|---:|---:|---:|---:|---|---|", *rows, "",
+           "```bash", f'hf download {repo} --include "{F}/{pick}/*" --local-dir {here}', *lane_serve(lane, path, tools),
+           "```", ""]
+    if lane == "mx":
+        import pollard_mxfp6 as M6
+        extra = []
+        for b in builds:
+            meta = M6.read_meta(b.get("path", "")) or {}
+            d = f"{here}/{F}/{rung_subfolder(b, 'mx')}"
+            for line in M6.serve_lines(meta, d) if meta else []:
+                if line not in extra:
+                    extra.append(line)
+        if extra:
+            out += ["Weight-only MXFP6 / mix rungs load in these runtimes:", "", "```bash", *extra, "```", ""]
+    return out
+
+
 def mx_rungs_section(builds, repo, pick):
     """The MX lane's rung table with a format column and, per rung, the runtimes that load it (pollard_mx.json, written
     by pollard-mx --format / --mix; an llm-compressor rung has none and is a compressed-tensors checkpoint for vLLM)."""
@@ -930,6 +998,10 @@ def main():
     ap.add_argument("--draft-results", help="results-draft.json from pollard-draft measure: adds a Speculative "
                     "decoding section (matched drafter, measured tokens per target pass, this lane's serve line)")
     ap.add_argument("--draft-repo", help="the drafter repo (<M>-Pollard-DRAFT) the section points at")
+    ap.add_argument("--also", nargs=3, action="append", default=[], metavar=("LANE", "BUILDS_FROM", "RESULTS"),
+                    help="ONE repo per model: add this lane's rungs (in its <LANE>/ folder) to the card, read from "
+                         "the MANIFEST key BUILDS_FROM and its results file (repeatable). The drafter (draft lane) "
+                         "is then described in DRAFT/ of the same repo.")
     ap.add_argument("--extra-md", help="markdown file of EXTRA `## ` sections for this model -- the "
                     "per-model prose the template cannot know (a measured comparison, an arch note, a "
                     "quirk). Inserted after Available files, in file order, so regenerating a card "
@@ -964,6 +1036,17 @@ def main():
         lanes = sorted({b.get("lane") for b in builds if b.get("lane")}) or lanes
     eval_str = results.get("_eval", "")
     f16_ppl = results.get("_f16_ppl")
+    also = []                                        # [(lane, builds, results)] -- the ONE-repo card's other lanes
+    for lane_, key_, res_ in a.also:
+        if lane_ == "draft":
+            continue
+        rr = json.load(open(res_, encoding="utf-8")) if res_ and os.path.exists(res_) else {}
+        bb = load_builds(key_, lane_)
+        if a.verified_only:
+            bb = [b for b in bb if gate_verdict(b, rr) is True]
+        if bb:
+            also.append((lane_, bb, rr))
+    one_repo = bool(a.also)
 
     runtimes = build_runtimes(builds, repo if a.runtime_from_repo else None)
     # A rung can fail stock llama.cpp two ways -- a fork-only atom, or a fork-only architecture -- and
@@ -1027,7 +1110,8 @@ def main():
     ptag = ("text-classification" if decision and not a.pipeline_tag else
             detect_pipeline_tag(base_model, cfg, a.pipeline_tag, a.mmproj, a.input_support))
     uses_ik = any(runtimes.get(b.get("path")) == "ik_llama" for b in builds)
-    out = [frontmatter(base_model, lic, lanes, mtype, account, ptag, decision, uses_ik), "",
+    out = [frontmatter(base_model, lic, lanes + [l for l, _, _ in also if l not in lanes], mtype, account, ptag,
+                       decision, uses_ik), "",
            f"# {name} -- Pollard", ""]
     if f16_gb and small_gb:
         out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) -> {small_gb:.2f} GB** -- "
@@ -1247,7 +1331,16 @@ def main():
     if decision and dec_rows:
         out += decision_section(builds, results)
     out += retention_section(builds, results)
-    out += rungs_section(builds, primary, repo)
+    if one_repo and primary != "gguf":
+        out += lane_folder_section(primary, builds, results, repo, facts.get("tools"))
+    else:
+        out += rungs_section(builds, primary, repo)
+    if also:
+        out += ["## Every format in this repo", "",
+                "One repo holds every Pollard build of this model: the GGUF files above sit at the root, each other "
+                "format in its own folder: " + ", ".join(f"`{LANE_FOLDER[l]}/`" for l, _, _ in also), ""]
+    for lane_, bb, rr in also:
+        out += lane_folder_section(lane_, bb, rr, repo, facts.get("tools"))
 
     # ---- usage
     def _recommended(b):
@@ -1360,7 +1453,14 @@ def main():
         import pollard_draft as PD
         org = repo.split("/")[0] if "/" in repo else (account or PLACEHOLDER_OWNER)
         trepos = {**PD.target_repos_for(org, base_model, lanes), primary: repo}
-        out += PD.card_section(json.load(open(a.draft_results, encoding="utf-8")), a.draft_repo, trepos, primary)
+        if one_repo:                                 # the drafter lives in DRAFT/ of this repo
+            here = lane_dir(repo)
+            trepos = {"gguf": repo, **{l: f"{here}/{LANE_FOLDER[l]}/<rung>" for l, _, _ in also
+                                       if l in ("mlx", "gptq", "mx")}}
+            out += PD.card_section(json.load(open(a.draft_results, encoding="utf-8")), f"{here}/DRAFT", trepos,
+                                   primary, folder_of=repo)
+        else:
+            out += PD.card_section(json.load(open(a.draft_results, encoding="utf-8")), a.draft_repo, trepos, primary)
 
     # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
     # prints from, so the card and the CLI cannot drift apart

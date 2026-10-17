@@ -1014,9 +1014,10 @@ def trained_phrase(meta, md=True):
             f"rung{taps}")
 
 
-def card_section(results, draft_repo, target_repos, lane=None, kind=None):
+def card_section(results, draft_repo, target_repos, lane=None, kind=None, folder_of=None):
     """`## Speculative decoding` for a TARGET lane's card: the matched drafter, its measured acceptance against this
-    model's quantized rungs, and the serve line for this lane's runtime."""
+    model's quantized rungs, and the serve line for this lane's runtime. `folder_of` = the ONE repo that holds the
+    drafter in its DRAFT/ folder; `draft_repo` is then the local path that folder downloads to."""
     if not results:
         return []
     rungs = {k: v for k, v in results.items() if not k.startswith("_") and isinstance(v, dict)
@@ -1027,8 +1028,11 @@ def card_section(results, draft_repo, target_repos, lane=None, kind=None):
     src = next((v["draft"].get("source") for v in rungs.values() if v["draft"].get("source")), None)
     own = next((trained_phrase(v["draft"]) for v in rungs.values() if trained_phrase(v["draft"])), None)
     table, hw = measured_table(rungs)
+    where = (f"this repo's `DRAFT/` folder (`hf download {folder_of} --include \"DRAFT/*\" --local-dir "
+             f"{os.path.dirname(draft_repo) or '.'}`)" if folder_of else
+             f"[{draft_repo}](https://huggingface.co/{draft_repo})")
     out = ["## Speculative decoding", "",
-           f"A drafter matched to these quantized rungs ships in [{draft_repo}](https://huggingface.co/{draft_repo})"
+           f"A drafter matched to these quantized rungs ships in {where}"
            + (f" ({METHODS[kind]['label']}; {own})" if own else
               f" ({METHODS[kind]['label']}, from [{src}](https://huggingface.co/{src}))" if src else "") + ". "
            "The target verifies every drafted token, so the output is the target's own; each accepted token is a "

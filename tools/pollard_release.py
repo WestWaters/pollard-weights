@@ -23,14 +23,14 @@ The lanes and their ladders (what each lane's runtime supports):
         EAGLE-3 head (or a same-family small model), GGUF ladder Q8_0 / Q4_K_M + its HF folder, MEASURED as tokens
         per target pass against every GGUF rung of this release, gated on that                -> <M>-Pollard-DRAFT
 
-One repo per lane (the PollardWeights naming: <M>-Pollard for GGUF, <M>-Pollard-<LANE> otherwise). The drafter repo
-holds the drafter's HF folder at its root (what vLLM / SGLang / dflash-mlx load by repo id) and its GGUF rungs beside
-it (<M>-Pollard-DRAFT-<Kind>-<QUANT>.gguf, for llama.cpp -md); every target lane's card gets a Speculative decoding
-section with the measured numbers and that lane's serve line. GGUF rungs
-are files at the repo root, named <M>-Pollard-<TAG>.gguf like every published Pollard GGUF; a directory lane puts
-each rung in its own subfolder (`4bit/`, `int4/`, `nvfp4/`, `4.0bpw/`) with the lane's default rung ALSO at the
-root, so `mlx_lm.generate --model <repo>` / `vllm serve <repo>` work as-is -- the layout MiniCPM5-2B-Pollard-MLX
-already ships.
+ONE repo per model, <org>/<M>-Pollard, holds every lane: the GGUF rungs (<M>-Pollard-<TAG>.gguf) and the mmproj
+at the root -- so `llama-server -hf <repo>:<TAG>` works as it always has -- and each other lane in its own folder with
+a subfolder per rung: MLX/<rung>/, GPTQ/<rung>/, MX/<rung>/, EXL3/<bpw>/, EXLR8/<bpw>/, and the drafter in DRAFT/ (its
+GGUF rungs + its HF folder). ONE card covers every lane: the rung table per lane with the measured numbers and
+Tool-ready, and per lane the exact `hf download --include "<LANE>/<rung>/*"` + serve command. Every lane's card step
+regenerates it as that lane lands. The repo is created PRIVATE and the last step makes it public only once every
+lane that ships this run is uploaded and the file list (README, every rung in its folder, the mmproj) checks out.
+Repos published before this (<M>-Pollard-MLX and friends) are left as they are.
 
 How it runs -- and why:
   * pollard-smoke preflight FIRST, before anything is spent.
@@ -49,6 +49,15 @@ How it runs -- and why:
     when it does not fit. Only files this release built are ever deleted -- never the source, f16, imatrix or calib.
   * existing inputs can be named in the plan instead of rebuilt: `f16:` (an f16/bf16 GGUF), `imatrix:`,
     `sensitivity:` (the raw-weights profile), `calib_file:` + `heldout_file:` (skip pollard-calib).
+  * the raw-weights sensitivity profile comes from one of two probes (`probe:` in the plan, default auto):
+    the transformers forward probe on the HF weights, or the imatrix probe (pollard-probe --from-imatrix) on the
+    GGUF input, which needs no model load. auto takes the imatrix probe whenever a GGUF input exists and the HF
+    weights cannot be used -- transformers has no class for the architecture, the checkpoint needs custom code,
+    the folder holds no weights, or the weights are bigger than free RAM + accelerator -- and builds the imatrix
+    first when the plan names none (on the GGUF itself, or on a Q8_0 host when an f16 is bigger than RAM, at a
+    partial -ngl; `imatrix_host:`, `imatrix_ngl:`, `imatrix_chunks:` override). When transformers cannot load the
+    model, the lanes that export from HF weights (gptq / mx / exl3 / exlr8) are HELD with that reason and the
+    release carries on with the rest.
 """
 from __future__ import annotations
 
@@ -158,12 +167,18 @@ def load_plan(path=None, preset=None):
     return cfg
 
 
-def repo_name(org, model, lane):
-    """PollardWeights naming, consistent with the repos already published: <M>-Pollard (GGUF),
-    <M>-Pollard-MLX / -GPTQ / -MX / -EXL3 / -EXLR8 for the others."""
+def repo_name(org, model, lane=None):
+    """ONE repo per model (owner, 2026-10-16): <org>/<M>-Pollard holds every lane -- the GGUF rungs + mmproj at the
+    root (so `llama-server -hf <repo>:<TAG>` keeps working), each other lane in its own folder (lane_folder). The
+    older per-lane repos (<M>-Pollard-MLX / -GPTQ / ...) stay where they are; nothing new goes to one."""
     import pollard_workspace as ws
-    base = ws.model_basename(model)
-    return f"{org}/{base}-Pollard" + ("" if lane == "gguf" else f"-{lane.upper()}")
+    return f"{org}/{ws.model_basename(model)}-Pollard"
+
+
+def lane_folder(lane):
+    """Where a lane lives in the one repo: '' (the root) for GGUF, MLX/ GPTQ/ MX/ EXL3/ EXLR8/ DRAFT/ otherwise."""
+    from pollard_card import LANE_FOLDER
+    return LANE_FOLDER.get(lane, "")
 
 
 def rung_tag(lane, rung):
@@ -246,6 +261,72 @@ def _verify_gate(c):
     return ["--gate"] + ([c["gates"]] if c["gates"] else [])
 
 
+PROBE_ROUTES = ("auto", "hf", "imatrix")
+#: imatrix chunks when the plan does not say: the full Calib 3.0 corpus is ~9k chunks of 512, hours on a big model
+IMATRIX_CHUNKS = 1000
+
+
+def transformers_loadable(hf_dir):
+    """(True, "") when transformers can load this checkpoint as a causal LM or a vision-language model without
+    running custom code, else (False, why); (None, why) when this machine cannot tell (no transformers).
+    Decided from config.json, without importing the model."""
+    cfgp = os.path.join(hf_dir, "config.json")
+    if not os.path.isfile(cfgp):
+        return False, "no config.json in the HF folder"
+    try:
+        conf = json.load(open(cfgp, encoding="utf-8"))
+    except Exception as e:                                        # noqa: BLE001
+        return False, f"config.json is unreadable ({e})"
+    if conf.get("auto_map"):
+        return False, "the checkpoint needs custom modelling code (config.json auto_map), which the probe never runs"
+    mt = conf.get("model_type")
+    try:
+        from transformers.models.auto.modeling_auto import (MODEL_FOR_CAUSAL_LM_MAPPING_NAMES as LM,
+                                                            MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES as VL)
+    except Exception:                                             # noqa: BLE001
+        return None, "transformers is not installed here"            # unknown: not a verdict on the model
+    if mt not in LM and mt not in VL:
+        return False, f"transformers has no causal-LM or image-text-to-text class for model_type {mt!r}"
+    return True, ""
+
+
+def probe_fits(hf_dir):
+    """(True, "") when the HF weights fit free RAM + the accelerator, else (False, why). The forward probe can
+    shard a bigger model to disk, but paging tens of GB through it is the wall the imatrix probe exists for."""
+    from pollard_auto import _accel_gb, _weights_gb
+    from pollard_calc import detect_available_ram_gb
+    w = _weights_gb(hf_dir) * (1 << 30) / 1e9
+    if not w:
+        return False, "the HF folder holds no weights"
+    ram, acc = detect_available_ram_gb() or 0.0, _accel_gb() or 0.0
+    if w > ram + acc:
+        return False, f"{w:.1f} GB of HF weights > {ram:.1f} GB free RAM + {acc:.1f} GB accelerator"
+    return True, ""
+
+
+def probe_route(cfg, c):
+    """("hf" | "imatrix", why, transformers can load it). See `probe:` in the module doc."""
+    want = str(cfg.get("probe") or "auto").lower()
+    if want not in PROBE_ROUTES:
+        raise SystemExit(f"probe: {want!r} -- choose from {PROBE_ROUTES}")
+    gguf = c["f16"] if (c.get("given_f16") or os.path.isfile(c["f16"])) else None
+    local = os.path.isdir(c["hf_dir"])
+    if want == "hf":
+        return "hf", "probe: hf in the plan", True
+    if want == "imatrix":
+        if not gguf:
+            raise SystemExit("probe: imatrix needs a GGUF input (`f16:` in the plan)")
+        ok, why = transformers_loadable(c["hf_dir"]) if local else (True, "")
+        return "imatrix", "probe: imatrix in the plan" + (f" ({why})" if ok is False else ""), ok is not False
+    if not gguf or not local:
+        return "hf", "", True
+    ok, why = transformers_loadable(c["hf_dir"])
+    if ok is False:
+        return "imatrix", why, False
+    fits, why = probe_fits(c["hf_dir"])
+    return ("hf", "", True) if fits else ("imatrix", why, True)
+
+
 def prep_steps(cfg, c, lanes):
     cal = cfg.get("calib") or {}
     smoothed = any(l in lanes for l in ("gptq", "mx", "exl3", "exlr8"))
@@ -272,15 +353,32 @@ def prep_steps(cfg, c, lanes):
                           desc=f"calibration given in the plan: {c['calib']} (held-out {c['heldout']})"))
     else:
         steps.append(Step(id="prep/calib", lane="prep", kind="prep", requires="any", cmd=calib, out=c["calib"]))
+    route, why, loadable = probe_route(cfg, c)
+    c["probe_route"] = route
+    if route == "imatrix" and not c.get("imatrix"):
+        c["imatrix"] = os.path.join(c["mdir"], "calibration", f"{c['name']}.imatrix")
+    if route == "imatrix" and c.get("imatrix") and not os.path.exists(str(c["imatrix"])):
+        steps.append(Step(id="prep/imatrix", lane="prep", kind="prep", requires="any", fn="imatrix",
+                          out=c["imatrix"], desc=f"llama-imatrix on the GGUF input (calibration: {c['calib']}) -> "
+                                                 f"{c['imatrix']}"))
     if raw_probe and cfg.get("sensitivity"):
         steps.append(Step(id="prep/probe", lane="prep", kind="note", requires="any",
                           desc=f"sensitivity profile given in the plan: {c['sens_raw']}"))
+    elif raw_probe and route == "imatrix":
+        print(f"   probe: from the imatrix on {c['f16']} -- {why}")
+        steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", out=c["sens_raw"],
+                          cmd=["pollard-probe", "--from-imatrix", str(c["imatrix"]), "--gguf", c["f16"],
+                               "--out", c["sens_raw"]]))
     elif raw_probe:
         probe = ["pollard-probe", "--model", c["hf_dir"], "--eval", c["heldout"], "--out", c["sens_raw"]]
         if c["ngl"] == "0" and machine()["cuda"]:
             probe += ["--device", "cpu"]                 # a shared GPU is not ours (see pollard --ngl 0)
         steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", cmd=probe, out=c["sens_raw"]))
-    if smoothed:
+    if smoothed and not loadable:
+        held = [l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]
+        steps.append(Step(id="prep/smooth", lane="prep", kind="hold", requires="any", blocks=held,
+                          desc=f"{', '.join(held)} held: these lanes export from transformers weights and {why}"))
+    elif smoothed:
         # the LOCKED gold recipe for the low-bit trellis / error-feedback lanes: SmoothQuant first
         steps.append(Step(id="prep/smooth", lane="prep", kind="prep", requires="cuda",
                           cmd=["pollard-hf-smooth", "--model", c["hf_dir"], "--out", c["smooth_dir"],
@@ -372,7 +470,7 @@ def gguf_rung_steps(cfg, c, builds):
 
 
 def _publish_rung_step(c, lane, tag, path):
-    repo = repo_name(c["org"], c["src"], lane)
+    repo = repo_name(c["org"], c["src"])
     return Step(id=f"{lane}/{tag}/publish", lane=lane, rung=tag, kind="publish", requires="any", fn="publish_rung",
                 out=path, repo=repo, desc=f"upload this rung -> https://huggingface.co/{repo}, then free its local copy")
 
@@ -558,32 +656,49 @@ def _draft_on(cfg):
     return bool(((cfg.get("lanes") or {}).get("draft") or {}).get("enabled"))
 
 
-def publish_steps(cfg, c, lane):
-    import pollard_workspace as ws
-    repo = repo_name(cfg.get("org", "PollardWeights"), c["src"], lane)
-    outdir = os.path.join(c["release_dir"], lane)
+def card_cmd(cfg, c, lanes):
+    """The ONE card for the one repo: the primary lane (GGUF when it is in the run) in full, every other lane as its
+    own folder section with its measured numbers and download + serve commands, the drafter in DRAFT/. Every lane's
+    card step regenerates it, so the README always describes what has landed so far."""
+    repo = repo_name(cfg.get("org", "PollardWeights"), c["src"])
+    body = [l for l in lanes if l != "draft"]
+    primary = "gguf" if "gguf" in body else (body[0] if body else "gguf")
     card = ["pollard-card", "--model", c["src"] if not os.path.isdir(c["src"]) else c["hf_dir"],
-            "--base-model", c["src"], "--lane", lane, "--builds-from", lane_key(c, lane),
-            "--results", results_path(c, lane), "--repo", repo, "--out", os.path.join(outdir, "README.md"),
+            "--base-model", c["src"], "--lane", primary, "--builds-from", lane_key(c, primary),
+            "--results", results_path(c, primary), "--repo", repo, "--out", os.path.join(c["release_dir"], "README.md"),
             "--verified-only"]
-    if lane == "draft":
-        card = ["pollard-draft", "card", "--target", c["src"], "--key", c["src"], "--results", results_path(c, lane),
-                "--repo", repo, "--org", cfg.get("org", "PollardWeights"), "--out", os.path.join(outdir, "README.md"),
-                "--verified-only", "--lanes", ",".join(l for l in LANES if l not in ("draft", "exl3", "exlr8") and
-                                                      ((cfg.get("lanes") or {}).get(l) or {}).get("enabled"))]
-    elif _draft_on(cfg):
-        card += ["--draft-results", results_path(c, "draft"),
-                 "--draft-repo", repo_name(cfg.get("org", "PollardWeights"), c["src"], "draft")]
-    if lane == "gguf":
+    for other in body:
+        if other != primary:
+            card += ["--also", other, lane_key(c, other), results_path(c, other)]
+    if "draft" in lanes or _draft_on(cfg):
+        card += ["--also", "draft", c["src"], results_path(c, "draft"),
+                 "--draft-results", results_path(c, "draft"), "--draft-repo", repo]
+    if primary == "gguf":
         card += ["--calib-file", os.path.basename(c["calib"]),
                  "--calib-note", f"the pollard-calib '{(cfg.get('calib') or {}).get('profile', 'auto')}' profile "
                                  "(sources, revisions and licences in the shipped .sources.json)"]
-    if c.get("free") and lane != "draft":
+    if c.get("free"):
         card += ["--runtime-from-repo"]                  # freed rungs are read from their published copy
-    steps = [Step(id=f"{lane}/card", lane=lane, kind="card", requires="any", cmd=card, out=outdir, repo=repo)]
+    return card
+
+
+def publish_steps(cfg, c, lane, lanes=None):
+    repo = repo_name(cfg.get("org", "PollardWeights"), c["src"])
+    outdir = c["release_dir"]
+    steps = [Step(id=f"{lane}/card", lane=lane, kind="card", requires="any", cmd=card_cmd(cfg, c, lanes or [lane]),
+                  out=outdir, repo=repo)]
+    where = f"{lane_folder(lane)}/ in " if lane_folder(lane) else ""
     steps.append(Step(id=f"{lane}/upload", lane=lane, kind="upload", requires="any", fn="upload", repo=repo,
-                      out=outdir, desc=f"publish the verified {lane} rungs + card -> https://huggingface.co/{repo}"))
+                      out=outdir, desc=f"publish the verified {lane} rungs + card -> {where}"
+                                       f"https://huggingface.co/{repo}"))
     return steps
+
+
+def public_step(cfg, c, lanes):
+    repo = repo_name(cfg.get("org", "PollardWeights"), c["src"])
+    return Step(id="release/public", lane="release", kind="finalize", requires="any", fn="go_public", repo=repo,
+                lanes=list(lanes), desc=f"every lane that ships this run is on {repo} and its file list checks out "
+                                        "-> make the repo public (it is created private)")
 
 
 def plan_steps(cfg, src, only=None):
@@ -599,7 +714,9 @@ def plan_steps(cfg, src, only=None):
             steps += lane_steps(cfg, c, lane)
         if lane == "gguf" and early_draft:
             steps += lane_steps(cfg, c, "draft")
-        steps += publish_steps(cfg, c, lane)
+        steps += publish_steps(cfg, c, lane, lanes)
+    if lanes:
+        steps.append(public_step(cfg, c, lanes))
     return c, lanes, steps
 
 
@@ -700,16 +817,42 @@ def default_build(builds, lane, want):
     return max(builds, key=lambda b: b.get("bytes") or 0) if builds else None
 
 
-def upload(step, c, cfg, run_upload):
-    """Publish the verified rungs of one lane + its card. GGUF: files at the root. Directory lanes: one subfolder
-    per rung plus the default rung at the root. Refuses a lane with no verified rung, and checks the repo
-    afterwards: a repo without its README is not live."""
+def lane_expect(c, lane, builds, repo):
+    """The repo paths a lane's verified rungs must have once published (the file-list check)."""
+    from pollard_card import rung_subfolder
+    F = lane_folder(lane)
+    out = set()
+    for b in builds:
+        if lane == "gguf":
+            out.add(b.get("uploaded_as") or b.get("name") or os.path.basename(b["path"]))
+        elif lane == "draft":
+            if b.get("publish") is False:
+                continue
+            if b.get("format") == "gguf":
+                out.add(f"{F}/{b.get('name') or os.path.basename(b['path'])}")
+            elif b.get("format") == "hf":
+                out.add(f"{F}/config.json")
+        else:
+            out.add(f"{F}/{rung_subfolder(b, lane)}/config.json")
+    if lane == "gguf" and os.path.isdir(c["gguf_dir"]):
+        out |= {f for f in os.listdir(c["gguf_dir"]) if f.startswith("mmproj-")}
+    return out
+
+
+def _lane_builds(c, lane, repo):
     import pollard_workspace as ws
+    return [b for b in ws.read_manifest(lane_key(c, lane)).get("builds", [])
+            if b.get("lane") == lane and b.get("verified") is True
+            and (os.path.exists(b.get("path", "")) or b.get("uploaded") == repo)]
+
+
+def upload(step, c, cfg, run_upload):
+    """Publish the verified rungs of one lane + the (combined) card into the ONE repo: GGUF files at the root, a
+    directory lane as <LANE>/<rung>/, the drafter in DRAFT/. Refuses a lane with no verified rung, and checks the repo
+    afterwards: a lane whose files are not all there -- or a repo without its README -- is not published."""
     from pollard_card import rung_subfolder
     lane, repo = step.lane, step.repo
-    builds = [b for b in ws.read_manifest(lane_key(c, lane)).get("builds", [])
-              if b.get("lane") == lane and b.get("verified") is True
-              and (os.path.exists(b.get("path", "")) or b.get("uploaded") == repo)]
+    builds = _lane_builds(c, lane, repo)
     card = os.path.join(step.out, "README.md")
     if not builds:
         raise RuntimeError(f"no verified {lane} rung to publish")
@@ -722,25 +865,22 @@ def upload(step, c, cfg, run_upload):
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")          # Xet write tokens expire mid-transfer
     from huggingface_hub import HfApi
     api = HfApi()
-    api.create_repo(repo, repo_type="model", exist_ok=True)
-    expect = {"README.md"}
+    api.create_repo(repo, repo_type="model", exist_ok=True, private=True)   # public only once complete
+    F = lane_folder(lane)
     if lane == "draft":
         for b in builds:
             if b.get("publish") is False:
                 continue
             if b.get("format") == "gguf":
                 name = b.get("name") or os.path.basename(b["path"])
-                api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
-                expect.add(name)
-            elif b.get("format") == "hf":                      # the HF drafter at the root: vLLM / SGLang / MLX
-                api.upload_folder(folder_path=b["path"], repo_id=repo)
-                expect.add("config.json")
+                api.upload_file(path_or_fileobj=b["path"], path_in_repo=f"{F}/{name}", repo_id=repo)
+            elif b.get("format") == "hf":                      # the HF drafter: vLLM / SGLang / MLX load DRAFT/
+                api.upload_folder(folder_path=b["path"], path_in_repo=F, repo_id=repo)
     elif lane == "gguf":
         for b in builds:
             name = b.get("uploaded_as") or b.get("name") or os.path.basename(b["path"])
             if b.get("uploaded") != repo:                      # --free-after-upload already put it there
                 api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
-            expect.add(name)
         if c.get("imatrix") and os.path.exists(str(c["imatrix"])):
             api.upload_file(path_or_fileobj=str(c["imatrix"]), path_in_repo=f"{c['name']}.imatrix", repo_id=repo)
         for side in (c["calib"], c["calib"] + ".sources.json"):
@@ -751,21 +891,47 @@ def upload(step, c, cfg, run_upload):
                 api.upload_file(path_or_fileobj=os.path.join(c["gguf_dir"], f), path_in_repo=f, repo_id=repo)
     else:
         for b in builds:
-            sub = rung_subfolder(b, lane)
             if b.get("uploaded") != repo:
-                api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
-            expect.add(f"{sub}/config.json")
-        if not any(b.get("root") for b in builds):
-            local = [b for b in builds if os.path.exists(b.get("path", ""))]
-            root = default_build(local, lane, ((cfg.get("lanes") or {}).get(lane) or {}).get("default"))
-            if root:
-                api.upload_folder(folder_path=root["path"], repo_id=repo)
+                api.upload_folder(folder_path=b["path"], path_in_repo=f"{F}/{rung_subfolder(b, lane)}", repo_id=repo)
     api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo)
-    missing = expect - set(api.list_repo_files(repo))
+    missing = (lane_expect(c, lane, builds, repo) | {"README.md"}) - set(api.list_repo_files(repo))
     if missing:
         raise RuntimeError(f"{repo} is missing {sorted(missing)} after upload -- not live")
-    print(f"      live: https://huggingface.co/{repo}  ({len(builds)} rung(s))")
+    print(f"      landed: {len(builds)} {lane} rung(s) in https://huggingface.co/{repo}" + (f" ({F}/)" if F else ""))
     return "uploaded"
+
+
+def go_public(step, c, cfg, run_upload, statuses, out=print):
+    """The last step: the repo was created private and stays private until EVERY lane that ships this run is
+    uploaded and the whole file list (README, each lane's rungs in its folder, the mmproj) is on the Hub. A lane
+    whose upload failed keeps it private; a lane that built nothing (held / failed / not this machine) ships
+    nothing and does not block."""
+    if not run_upload:
+        out("      (not publishing: uploads are off)")
+        return "held"
+    ups = {l: statuses.get(f"{l}/upload") for l in (step.lanes or [])}
+    bad = sorted(l for l, v in ups.items() if v == "failed")
+    if bad:
+        raise RuntimeError(f"{step.repo} stays private: the {', '.join(bad)} upload failed")
+    shipped = [l for l, v in ups.items() if v == "done"]
+    if not shipped:
+        out(f"      (nothing shipped this run -- {step.repo} stays as it is)")
+        return "held"
+    from huggingface_hub import HfApi
+    api = HfApi()
+    want = {"README.md"}
+    for l in shipped:
+        want |= lane_expect(c, l, _lane_builds(c, l, step.repo), step.repo)
+    files = set(api.list_repo_files(step.repo))
+    missing = want - files
+    if missing:
+        raise RuntimeError(f"{step.repo} stays private: missing {sorted(missing)}")
+    try:
+        api.update_repo_settings(repo_id=step.repo, private=False)
+    except AttributeError:                                       # older huggingface_hub
+        api.update_repo_visibility(step.repo, private=False)
+    out(f"      PUBLIC: https://huggingface.co/{step.repo}  ({', '.join(shipped)}; {len(files)} files checked)")
+    return "done"
 
 
 def _size_gb(path):
@@ -872,18 +1038,21 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from huggingface_hub import HfApi
     api = HfApi()
-    api.create_repo(repo, repo_type="model", exist_ok=True)
+    api.create_repo(repo, repo_type="model", exist_ok=True, private=True)   # public only once complete
     if lane == "gguf":
         name = b.get("name") or os.path.basename(b["path"])
+        try:                                     # pollard-ggufcheck before it leaves: the card states the runtime
+            import pollard_ggufcompat as gc
+            b["runtime"] = gc.runtime_of(b["path"])[0]
+            out(f"      ggufcheck: {name} -> {b['runtime']}")
+        except Exception as e:                                   # noqa: BLE001
+            out(f"      ggufcheck: could not read {name} ({e}) -- the card will not state its runtime")
         api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
         landed = name in set(api.list_repo_files(repo))
         b["uploaded_as"] = name
     else:
-        sub = rung_subfolder(b, lane)
+        sub = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
         api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
-        if step.default:
-            api.upload_folder(folder_path=b["path"], repo_id=repo)
-            b["root"] = True
         landed = f"{sub}/config.json" in set(api.list_repo_files(repo))
         b["uploaded_as"] = sub
     if not landed:
@@ -895,6 +1064,126 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         b["freed"] = "uploaded"
         ws._write_manifest(key, man)
     return "done"
+
+
+def _free_vram_mib():
+    """Free VRAM on the first NVIDIA GPU in MiB, 0 when there is none (or nvidia-smi is missing)."""
+    if not shutil.which("nvidia-smi"):
+        return 0
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=30)
+        return int(float(r.stdout.strip().splitlines()[0]))
+    except Exception:                                             # noqa: BLE001
+        return 0
+
+
+def partial_ngl(gguf, free_mib, headroom_mib=1536, overhead_mib=1536):
+    """-ngl from FREE VRAM: llama.cpp offloads the LAST N blocks, so sum blk.* bytes from the end until the budget
+    is spent. Never the whole model unless the whole file fits -- a GPU somebody else is using stays usable."""
+    import re
+    from gguf import GGUFReader
+    blk, total = {}, 0
+    for t in GGUFReader(gguf).tensors:
+        total += int(t.n_bytes)
+        m = re.match(r"blk\.(\d+)\.", t.name)
+        if m:
+            blk[int(m.group(1))] = blk.get(int(m.group(1)), 0) + int(t.n_bytes)
+    budget = (free_mib - headroom_mib - overhead_mib) * 2 ** 20
+    if budget <= 0 or not blk:
+        return 0
+    if total <= budget:
+        return 99
+    n, ngl, used = max(blk) + 1, 0, 0
+    for i in range(n - 1, -1, -1):
+        if used + blk.get(i, 0) > budget or ngl >= n - 1:
+            break
+        used += blk.get(i, 0)
+        ngl += 1
+    return ngl
+
+
+def imatrix_host(cfg, c):
+    """(GGUF the imatrix runs on, quant type to build it as or None). The GGUF input itself when it is already
+    quantized (a vendor QAT file) or fits in RAM; else a Q8_0 host next to it -- an f16 bigger than RAM pages
+    off disk for every chunk (the 30B lesson: compute on a smaller host at a partial -ngl)."""
+    if cfg.get("imatrix_host"):
+        return os.path.abspath(str(cfg["imatrix_host"])), None
+    src = c["f16"]
+    try:
+        import pollard_passthrough as pt
+        if pt.is_quantized_source(pt.read_tensors(src)):
+            return src, None
+    except Exception:                                             # noqa: BLE001
+        pass
+    from pollard_calc import detect_available_ram_gb
+    if _size_gb(src) <= (detect_available_ram_gb() or 0.0) * 0.8:
+        return src, None
+    return os.path.join(c["gguf_dir"], f"{c['name']}-Q8_0-host.gguf"), "Q8_0"
+
+
+def imatrix_ngl(cfg, c, host):
+    if cfg.get("imatrix_ngl") is not None:
+        return str(int(cfg["imatrix_ngl"]))
+    if c["ngl"] != "auto":
+        return c["ngl"]
+    free = _free_vram_mib()
+    if free:
+        return str(partial_ngl(host, free))
+    from pollard_auto import _fit_ngl                             # Apple / no nvidia-smi: the unified-memory fit
+    return _fit_ngl(host, "auto")
+
+
+def build_imatrix(c, cfg, out=print):
+    """The prep/imatrix step: (Q8_0 host if needed ->) llama-imatrix over the release calibration -> c['imatrix']
+    (legacy .dat, which ik_llama's trellis flagship also reads). A failure at a partial -ngl retries once on the
+    CPU; nothing is renamed into place unless llama-imatrix exited 0."""
+    from pollard_auto import _imatrix_shape
+    from pollard_calc import find_llama_bin
+    imx = str(c["imatrix"])
+    host, qtype = imatrix_host(cfg, c)
+    if qtype and not os.path.exists(host):
+        need = _size_gb(c["f16"]) * 0.55
+        free = disk_free_gb(host)
+        if free < need + float(cfg.get("disk_margin_gb", 3)):
+            raise RuntimeError(f"a {qtype} imatrix host needs ~{need:.1f} GB, {free:.1f} GB free")
+        q = find_llama_bin("llama-quantize")
+        if not q:
+            raise RuntimeError("llama-quantize not found (pollard-runtime)")
+        os.makedirs(os.path.dirname(host), exist_ok=True)
+        out(f"      {qtype} imatrix host: {q} {c['f16']} {host} {qtype}")
+        run_cmd([q, c["f16"], host + ".partial", qtype])
+        os.replace(host + ".partial", host)
+    binim = find_llama_bin("llama-imatrix")
+    if not binim:
+        raise RuntimeError("llama-imatrix not found (pollard-runtime)")
+    os.makedirs(os.path.dirname(os.path.abspath(imx)), exist_ok=True)
+    ngl = imatrix_ngl(cfg, c, host)
+    base = [binim, "-m", host, "-f", c["calib"], "-o", imx + ".partial", "--output-format", "dat"]
+    base += _imatrix_shape(host) or ["-c", "512", "-b", "512", "-ub", "512"]
+    chunks = cfg.get("imatrix_chunks", IMATRIX_CHUNKS)
+    if chunks:
+        base += ["--chunks", str(int(chunks))]
+    if os.environ.get("POLLARD_THREADS"):
+        base += ["-t", os.environ["POLLARD_THREADS"], "-tb", os.environ["POLLARD_THREADS"]]
+    try:                                                          # chat-template tokens in the corpus stay tokens
+        if "parse-special" in subprocess.run([binim, "--help"], capture_output=True, text=True, timeout=60).stdout:
+            base += ["--parse-special"]
+    except Exception:                                             # noqa: BLE001
+        pass
+    for attempt in ([ngl, "0"] if ngl != "0" else ["0"]):
+        if os.path.exists(imx + ".partial"):
+            os.remove(imx + ".partial")
+        out(f"      $ {_fmt_cmd(base + ['-ngl', attempt])}")
+        try:
+            run_cmd(base + ["-ngl", attempt])
+        except RuntimeError as e:
+            out(f"      llama-imatrix -ngl {attempt}: {e}" + (" -- retrying on the CPU" if attempt != "0" else ""))
+            continue
+        if os.path.exists(imx + ".partial"):
+            os.replace(imx + ".partial", imx)
+            return imx
+    raise RuntimeError(f"llama-imatrix produced no imatrix at {imx}")
 
 
 def run_cmd(cmd, ok_codes=(0,)):
@@ -951,6 +1240,14 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             out(f"{head}: {st.desc}")
             statuses[st.id] = "note"
             continue
+        if st.kind == "hold":                         # a lane this model cannot take: recorded, the rest carry on
+            out(f"{head}: HELD -- {st.desc}")
+            statuses[st.id] = f"held: {st.desc}"
+            failed_lanes.update(st.blocks or [])
+            if run:
+                state[st.id] = {"status": statuses[st.id], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                save_state(c["state"], state)
+            continue
         what = st.desc if st.fn else f"$ {_fmt_cmd(st.cmd)}"
         if not have.get(st.requires, False):
             out(f"{head}: SKIP on this machine (needs {st.requires}) -- {what}")
@@ -998,6 +1295,11 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 res = "done"
             elif st.fn == "upload":
                 res = "done" if upload(st, c, cfg, run_upload) == "uploaded" else "held"
+            elif st.fn == "go_public":
+                res = go_public(st, c, cfg, run_upload, statuses, out)
+            elif st.fn == "imatrix":
+                build_imatrix(c, cfg, out)
+                res = "done"
             elif st.fn == "publish_rung":
                 res = publish_rung(st, c, cfg, run_upload, out)
             else:

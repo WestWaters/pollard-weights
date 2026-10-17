@@ -438,12 +438,11 @@ def test_release_draft_lane_order_and_cards(model):
         < got.index("gguf/card"), "the drafter is built + gated before any card quotes it"
     by = {s.id: s for s in steps}
     assert R.REQUIRES["draft"] == "any"
-    for lane in ("gguf", "mlx", "gptq"):
+    for lane in ("gguf", "mlx", "gptq", "draft"):          # ONE repo: every lane's card step writes the same card
         card = by[f"{lane}/card"].cmd
-        assert card[card.index("--draft-repo") + 1].endswith("Tiny-1B-Pollard-DRAFT")
-    dc = by["draft/card"].cmd
-    assert dc[:2] == ["pollard-draft", "card"] and "--verified-only" in dc
-    assert "exl3" not in dc[dc.index("--lanes") + 1]
+        assert card[card.index("--draft-repo") + 1] == "PollardWeights/Tiny-1B-Pollard", "the drafter is in DRAFT/"
+        assert ["--also", "draft"] == card[card.index("draft") - 1:card.index("draft") + 1]
+    assert by["draft/card"].cmd == by["gguf/card"].cmd
     conv = by["draft/convert"].cmd
     assert conv[conv.index("--rungs") + 1] == "Q8_0,Q4_K_M"
     # off by default: no draft step, no draft flag on cards
@@ -507,7 +506,7 @@ def test_release_execute_expands_draft_rungs(model, monkeypatch):
     assert [x[:2] for x in ran if "draft" in " ".join(x)] == [["pollard-draft", "find"], ["pollard-draft", "train"],
                                     ["pollard-draft", "convert"],
                                     ["pollard-draft", "measure"], ["pollard-verify", "--lane"],
-                                    ["pollard-draft", "card"]]
+                                    ["pollard-card", "--model"]]
 
 
 def test_release_upload_draft_layout(model, monkeypatch):
@@ -542,13 +541,13 @@ def test_release_upload_draft_layout(model, monkeypatch):
             calls.append(("folder", folder_path, path_in_repo))
 
         def list_repo_files(self, repo):
-            return ["README.md", "config.json", "Tiny-1B-Pollard-DRAFT-DFlash-Q4_K_M.gguf"]
+            return ["README.md", "DRAFT/config.json", "DRAFT/Tiny-1B-Pollard-DRAFT-DFlash-Q4_K_M.gguf"]
     import types
     monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=Api))
-    st = R.Step(id="draft/upload", lane="draft", kind="upload", repo="P/Tiny-1B-Pollard-DRAFT", out=out)
+    st = R.Step(id="draft/upload", lane="draft", kind="upload", repo="P/Tiny-1B-Pollard", out=out)
     assert R.upload(st, c, cfg, True) == "uploaded"
-    assert ("file", "Tiny-1B-Pollard-DRAFT-DFlash-Q4_K_M.gguf") in calls
-    assert ("folder", os.path.abspath(hf), None) in calls, "the HF drafter at the root: vLLM loads it by repo id"
+    assert ("file", "DRAFT/Tiny-1B-Pollard-DRAFT-DFlash-Q4_K_M.gguf") in calls
+    assert ("folder", os.path.abspath(hf), "DRAFT") in calls, "the HF drafter in DRAFT/ of the one repo"
     assert not any("bf16" in str(x) for x in calls)
 
 
