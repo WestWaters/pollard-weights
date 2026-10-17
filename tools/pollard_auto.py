@@ -362,6 +362,14 @@ def _build_ladder(a, ik_flagship):
     for label, (ram, preset, gb) in picks.items():
         print(f"      {label:<7} --ram {ram:<5} -> {preset} ~{gb:.1f} GB")
     want = _wanted_rungs(a)
+    if want is not None and "IQ2" in want and "IQ2" not in picks and ik_flagship:
+        # asked for BY NAME: the stock 2-bit rung (mainline llama.cpp runs it) beside the ik-only flagship. The
+        # ladder leaves IQ2 to the flagship by default, so `--rung IQ2` used to build nothing at all.
+        extra = pick_ladder(pts, f16_gb, ik_flagship=False).get("IQ2")
+        if extra:
+            picks["IQ2"] = extra
+            print(f"      IQ2     --ram {extra[0]:<5} -> {extra[1]} ~{extra[2]:.1f} GB  (asked for by --rung: the "
+                  "stock 2-bit rung beside the trellis flagship)")
     if want is not None:
         picks = {k: v for k, v in picks.items() if k.upper() in want}
         print(f"      --rung: building {', '.join(picks) or 'no ladder rung'} this run")
@@ -477,13 +485,24 @@ def _automap_mix(a, is_moe, ik_dir=None):
     return out
 
 
+def flagship_mix_path(gguf, here=None):
+    """Where pollard-automap writes the mix: <stem>-mix.gguf next to the f16, where <stem> is the file name with
+    `-f16.gguf` / `.f16.gguf` / `.gguf` cut off (pollard_automap's own rule). The recorder used the plain stem, so
+    LFM2.5-24B-A2B-f16.gguf looked for LFM2.5-24B-A2B-f16-mix.gguf while automap wrote LFM2.5-24B-A2B-mix.gguf --
+    the flagship built and was never recorded, measured or published."""
+    import re as _re
+    base = os.path.basename(gguf)
+    stem = _re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base, flags=_re.I)
+    return os.path.join(here or os.path.dirname(os.path.abspath(gguf)) or ".", f"{stem}-mix.gguf")
+
+
 def _record_flagship(a, here, body=None):
     """Put the automap mix in the MANIFEST beside the ladder rungs, so pollard-release measures, gates, cards and
     publishes it like any other rung. automap writes `<stem>-mix.gguf` next to the f16; the tag is its body atom
     (iq1_kt by default with an imatrix -> IQ1_KT, the name the published flagships use)."""
-    stem = os.path.splitext(os.path.basename(a.gguf))[0]
-    mix = os.path.join(here, f"{stem}-mix.gguf")
+    mix = flagship_mix_path(a.gguf, here)
     if not os.path.isfile(mix):
+        print(f"   (warning: the flagship mix is not at {mix} -- not recorded, so it will not be measured or published)")
         return None
     try:
         import pollard_workspace as ws
@@ -1280,6 +1299,10 @@ def _dispatch(a):
     want = _wanted_rungs(a)
     if a.ladder and (want is None or want - {"flagship"}):
         _build_ladder(a, ik_flagship=bool(a.imatrix) and ik_known is True)
+    elif a.ladder and want == {"flagship"}:
+        # --rung flagship: ONLY the automap mix below. This used to fall through to the bare fit-your-RAM build
+        # (pollard-fit --ram 16): the LFM2.5 release got an unasked 10.7 GB IQ3_S under the IQ3_S rung's name.
+        print("   1) (the publish ladder is not in --rung this run -- flagship only)")
     else:
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(a.ram)]
         if a.imatrix: cmd += ["--imatrix", a.imatrix]

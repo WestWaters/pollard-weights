@@ -1092,13 +1092,21 @@ def served(model, ngl, ctx=4096, threads=None, server=None, log_path=None):
     """llama-server --jinja for the duration; yields its base url."""
     from pollard_calc import find_llama_bin
     import shutil
-    binary = server or find_llama_bin("llama-server") or shutil.which("llama-server")
+    import pollard_llamaserve as LS
+    binary = server or LS.bin_for(model, "llama-server") or shutil.which("llama-server")
     if not binary:
         raise NotMeasured("llama-server not found (install llama.cpp or pass --llama-server)")
-    port = _free_port()
-    with _launch(gguf_cmd(binary, model, port, ngl, ctx, threads), f"llama-server on {model}", log_path,
-                 port=port) as base:
-        yield base
+    # pollard_llamaserve: -ngl from free VRAM (a bare `auto` is never handed to the server), one slot, a wait scaled
+    # to the file, the server's own log tail on failure, one retry on the CPU
+    import pollard_llamaserve as LS
+    extra = gguf_cmd(binary, model, 0, ngl, ctx, threads)
+    extra = extra[extra.index("--jinja"):]                       # the template + reasoning flags (+ -t)
+    try:
+        with LS.serve(model, ngl, ctx, binary=binary, extra=extra,
+                      log_path=log_path or os.path.abspath(_SERVER_LOG)) as srv:
+            yield srv.base
+    except LS.ServerFailed as e:
+        raise SystemExit(str(e)) from None
 
 
 def preflight(backend, model, ngl="0", kind=None, server=None):
