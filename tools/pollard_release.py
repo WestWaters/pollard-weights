@@ -82,6 +82,8 @@ gates: null                    # gates.yaml for pollard-verify --gate (null = th
 trust_remote_code: false       # true = consent to run the checkpoint's own .py files (only used where no native class fits)
 hf_weights: null               # the checkpoint the HF lanes read (dir or repo id) when the --hf folder holds no weights
 max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
+remote_source: null            # ssh://user@host/<dir>?python=..&key=..: the MLX lane reads the source through a sparse
+                               # local mirror at --hf (tensors fetched as read, cached within the free disk)
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300
@@ -261,6 +263,7 @@ def _ctx(cfg, src):
         "trc": "on" if cfg.get("trust_remote_code") is True or str(cfg.get("trust_remote_code")).lower() in
                ("true", "on", "yes") else "auto",
         "max_ram_gb": cfg.get("max_ram_gb"),
+        "toolcall_ref_rows": os.path.abspath(str(cfg["toolcall_ref_rows"])) if cfg.get("toolcall_ref_rows") else None,
     }
     # inputs that already exist (a big model's f16 / imatrix / profile / corpus): used as they are, never rebuilt
     for key, plan_key in (("f16", "f16"), ("sens_raw", "sensitivity"), ("calib", "calib_file"),
@@ -355,7 +358,13 @@ def prep_steps(cfg, c, lanes):
     smoothed = any(l in lanes for l in ("gptq", "mx", "exl3", "exlr8"))
     raw_probe = any(l in lanes for l in ("gguf", "mlx"))
     steps = []
-    if not os.path.isdir(c["src"]) or (c.get("hf_repo") and not os.path.isdir(c["hf_dir"])):
+    if cfg.get("remote_source"):                    # the source stays on another machine: a sparse local mirror
+        if not os.path.isfile(os.path.join(c["hf_dir"], ".pollard-remote")):
+            steps.append(Step(id="prep/mirror", lane="prep", kind="prep", requires="any", out=c["hf_dir"],
+                              cmd=["pollard-mlx", "--model", c["hf_dir"], "--remote-source",
+                                   str(cfg["remote_source"]), "--mirror-only"],
+                              desc=f"mirror {cfg['remote_source']} -> {c['hf_dir']} (headers + small files)"))
+    elif not os.path.isdir(c["src"]) or (c.get("hf_repo") and not os.path.isdir(c["hf_dir"])):
         what = c["src"] if not os.path.isdir(c["src"]) else c["hf_repo"]
         steps.append(Step(id="prep/fetch", lane="prep", kind="prep", requires="any", fn="fetch",
                           desc=f"pull {what} -> {c['hf_dir']}"))
@@ -509,6 +518,8 @@ def toolcall_cmd(c, lane, out, name, res):
         cmd += ["--ref-backend", "hf"]
     if lane != "mlx":
         cmd += ["--ref-fallback", c["f16"]]
+    if c.get("toolcall_ref_rows"):                  # the reference measured on another machine (labelled cross-backend)
+        cmd += ["--ref-rows", c["toolcall_ref_rows"]]
     return cmd
 
 
@@ -732,7 +743,8 @@ def lane_steps(cfg, c, lane):
         rid = f"{lane}/{tag}"
         steps.append(Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
                           out=out, src=src, disk_gb=_rung_gb(lane, rung, c["hf_dir"]) if c.get("free") else 0,
-                          held_codes=(EXIT_HELD,) if lane in ("exl3", "mlx") else ()))
+                          held_codes=(EXIT_HELD,) if lane in ("exl3", "mlx") else (),
+                          mem="mlx-build" if lane == "mlx" else None, bits=int(rung) if lane == "mlx" else None))
         if _has_weights(c["hf_dir"]):                    # never a text-only rung: the gate lists what is missing
             steps.append(Step(id=f"{rid}/complete", lane=lane, rung=tag, kind="gate", requires="any", out=out,
                               cmd=["pollard-complete", "--source", c["hf_dir"], "--out", out, "--lane", lane],
@@ -740,7 +752,8 @@ def lane_steps(cfg, c, lane):
                                    "file of the source"))
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
-                              cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1)))
+                              cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1), rung_dir=out, results=res,
+                              rung_name=name, mem="mlx-serve" if lane == "mlx" else None))
         # gated against the ORIGINAL weights, not the smoothed copy: fidelity to the model people asked for
         ver = ["pollard-verify", "--lane", lane, "--model", out, "--source", c["hf_dir"], "--rung", name,
                "--results", res] + _verify_gate(c)
@@ -750,7 +763,7 @@ def lane_steps(cfg, c, lane):
                 ver += ["--device", "cpu"]
         ver += ["--end-to-end"] if lane == "exl3" else ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
-                          cmd=ver, out=out))
+                          cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None))
         if c.get("free"):
             st = _publish_rung_step(c, lane, tag, out)
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
@@ -839,8 +852,9 @@ def plan_steps(cfg, src, only=None):
             steps += lane_steps(cfg, c, lane)
         if lane == "gguf" and early_draft:
             steps += lane_steps(cfg, c, "draft")
-        steps += publish_steps(cfg, c, lane, card_lanes)
-    if lanes:
+        if not cfg.get("_rungs_only"):
+            steps += publish_steps(cfg, c, lane, card_lanes)
+    if lanes and not cfg.get("_rungs_only"):
         steps.append(public_step(cfg, c, lanes))
     return c, lanes, steps
 
@@ -991,8 +1005,7 @@ def upload(step, c, cfg, run_upload):
               "AND --upload)")
         return "held"
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")          # Xet write tokens expire mid-transfer
-    from huggingface_hub import HfApi
-    api = HfApi()
+    api = hf_api(cfg)
     api.create_repo(repo, repo_type="model", exist_ok=True, private=True)   # public only once complete
     F = lane_folder(lane)
     if lane == "draft":
@@ -1045,8 +1058,7 @@ def go_public(step, c, cfg, run_upload, statuses, out=print):
     if not shipped:
         out(f"      (nothing shipped this run -- {step.repo} stays as it is)")
         return "held"
-    from huggingface_hub import HfApi
-    api = HfApi()
+    api = hf_api(cfg)
     want = {"README.md"}
     for l in shipped:
         want |= lane_expect(c, l, _lane_builds(c, l, step.repo), step.repo)
@@ -1164,8 +1176,7 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    from huggingface_hub import HfApi
-    api = HfApi()
+    api = hf_api(cfg)
     api.create_repo(repo, repo_type="model", exist_ok=True, private=True)   # public only once complete
     if lane == "gguf":
         name = b.get("name") or os.path.basename(b["path"])
@@ -1314,6 +1325,194 @@ def build_imatrix(c, cfg, out=print):
     raise RuntimeError(f"llama-imatrix produced no imatrix at {imx}")
 
 
+# ------------------------------------------------------------------------------- memory preflight (MLX on a Mac)
+#
+# The MLX lane builds and verifies streamed (one tensor / one block at a time), but a 16 GB Mac has rebooted under
+# memory pressure before: every MLX step is checked against the RAM that is free NOW, minus a floor
+# (POLLARD_MIN_FREE_GB, 2 GB) -- and the plan's max_ram_gb -- before it starts. A build or verify that does not fit is
+# HELD with the numbers (the rest of the ladder carries on); a tool-call gate whose rung cannot be served whole in
+# mlx_lm.server is recorded as not measured, with the reason, and the card says so.
+
+def memory_need(st, c):
+    """GB of RAM an MLX step needs on this machine, or None when it cannot be told yet (source not there)."""
+    try:
+        import pollard_mlx as M
+        if st.mem == "mlx-build":
+            low, high = M.rung_bits(int(st.bits))
+            return M.plan_build(c["hf_dir"], low, high)["peak_gb"]
+        if st.mem == "mlx-verify":
+            return M.plan_verify(c["hf_dir"])["peak_gb"]
+        if st.mem == "mlx-serve":                     # mlx_lm.server holds the whole rung + its cache
+            gb = _size_gb(st.rung_dir) if st.rung_dir and os.path.exists(st.rung_dir) else 0.0
+            return gb * 1.15 + 1.0 if gb else None
+    except (Exception, SystemExit):                   # noqa: BLE001 -- unreadable here: the step's own checks decide
+        return None
+    return None
+
+
+def memory_short(st, c, cfg):
+    """The reason this step does not fit the RAM free now, or "" when it does (or cannot be told)."""
+    need = memory_need(st, c)
+    if not need:
+        return ""
+    try:
+        import pollard_stream as S
+        free = S.free_ram_gb()
+    except Exception:                                 # noqa: BLE001
+        free = None
+    if free is None:
+        return ""
+    floor = float(os.environ.get("POLLARD_MIN_FREE_GB", 2.0))
+    cap = cfg.get("max_ram_gb")
+    usable = min(free - floor, float(cap)) if cap else free - floor
+    if need <= usable:
+        return ""
+    what = {"mlx-build": "the streamed MLX build", "mlx-verify": "the streamed MLX verify",
+            "mlx-serve": "mlx_lm.server with the whole rung"}[st.mem]
+    return (f"{what} needs ~{need:.1f} GB of RAM and {max(usable, 0):.1f} GB is usable here ({free:.1f} GB free, "
+            f"{floor:g} GB floor" + (f", max_ram_gb {cap}" if cap else "") + ")")
+
+
+def record_toolcall_not_measured(st, why):
+    import pollard_workspace as ws
+    if st.results:
+        ws.merge_results(st.results, st.rung_name or st.rung, {"toolcall": {
+            "status": "not-measured", "reason": why, "backend": "mlx", "mode": "full", "lane": st.lane}})
+
+
+# ------------------------------------------------------------------------------- upload relay (--upload-via)
+
+class RelayApi:
+    """The huggingface_hub calls a release makes, run on ANOTHER machine over ssh -- for a builder with no HF login
+    (the Mac builds MLX, the box holds the token). `ssh://user@host[:port]/<staging dir>?python=<python>&key=<identity>
+    &min_free_gb=40`. A folder or file is copied with scp into <staging>/<job>/ (after checking that machine keeps
+    min_free_gb free), uploaded from there with that machine's own login, checked on the Hub file by file (size, and
+    sha256 for LFS files) against the local copy, and the staging copy is deleted. Nothing local is touched."""
+
+    def __init__(self, url, runner=None, out=print):
+        from urllib.parse import urlparse, parse_qs, unquote
+        u = urlparse(url)
+        if u.scheme != "ssh" or not u.hostname:
+            raise SystemExit(f"--upload-via {url}: expected ssh://user@host[:port]/<staging dir>?python=<python>")
+        q = {k: v[-1] for k, v in parse_qs(u.query).items()}
+        self.host = f"{u.username}@{u.hostname}" if u.username else u.hostname
+        self.port = str(u.port or 22)
+        path = unquote(u.path)
+        self.staging = path[1:] if len(path) > 2 and path[2] == ":" else path      # /C:/x -> C:/x (Windows)
+        self.python = q.get("python", "python3")
+        self.key = os.path.expanduser(q["key"]) if q.get("key") else None
+        self.min_free = float(q.get("min_free_gb", 40))
+        self.run_, self.out = runner or subprocess.run, out
+
+    def _base(self, tool="ssh"):
+        return [tool] + (["-i", self.key] if self.key else []) + ["-o", "BatchMode=yes",
+                                                                   "-P" if tool == "scp" else "-p", self.port]
+
+    def _py(self, code):
+        """Run python on the relay (code on stdin); the last stdout line is JSON."""
+        pre = "import json, os\nos.environ.setdefault('HF_HUB_DISABLE_XET', '1')\n"
+        r = self.run_(self._base() + [self.host, f'"{self.python}" -'], input=pre + code, capture_output=True,
+                      text=True)
+        if r.returncode:
+            raise RuntimeError(f"relay {self.host}: python exited {r.returncode}: {(r.stderr or '')[-800:]}")
+        lines = [x for x in (r.stdout or "").splitlines() if x.strip()]
+        return json.loads(lines[-1]) if lines else None
+
+    def _api(self, call):
+        return self._py(f"from huggingface_hub import HfApi\napi = HfApi()\nprint(json.dumps({call}))\n")
+
+    def create_repo(self, repo_id, repo_type="model", exist_ok=True, private=True):
+        self._api(f"str(api.create_repo({repo_id!r}, repo_type={repo_type!r}, exist_ok={exist_ok!r}, "
+                  f"private={private!r}))")
+
+    def list_repo_files(self, repo_id):
+        return self._api(f"api.list_repo_files({repo_id!r})")
+
+    def update_repo_settings(self, repo_id, private):
+        self._api(f"str(api.update_repo_settings(repo_id={repo_id!r}, private={private!r}))")
+
+    def _drop(self, job):
+        self._py(f"import shutil\nshutil.rmtree({job!r}, ignore_errors=True)\nprint('null')\n")
+
+    def _stage(self, local):
+        import uuid
+        job = f"{self.staging.rstrip('/')}/{uuid.uuid4().hex[:12]}"
+        size = _size_gb(local)
+        free = self._py(f"import shutil\nos.makedirs({job!r}, exist_ok=True)\n"
+                        f"print(json.dumps(shutil.disk_usage({job!r}).free / 1e9))\n")
+        if free - size < self.min_free:
+            self._drop(job)
+            raise RuntimeError(f"relay {self.host}: {size:.1f} GB to stage and {free:.1f} GB free there -- it must keep "
+                               f"{self.min_free:g} GB free")
+        self.out(f"      relay: scp {local} -> {self.host}:{job}/ ({size:.2f} GB; {free:.0f} GB free there)")
+        r = self.run_(self._base("scp") + ["-q", "-r", local, f"{self.host}:{job}/"])
+        if r.returncode:
+            self._drop(job)
+            raise RuntimeError(f"relay {self.host}: scp exited {r.returncode}")
+        return job
+
+    @staticmethod
+    def local_files(local, prefix):
+        """{path in repo: (size, sha256)} of a local file or folder as upload_file / upload_folder lay it out."""
+        import hashlib
+        if os.path.isfile(local):
+            items = [(local, prefix)]
+        else:
+            items = [(os.path.join(r, f), "/".join(x for x in (prefix.strip("/"), os.path.relpath(
+                os.path.join(r, f), local).replace(os.sep, "/")) if x)) for r, _, fs in os.walk(local) for f in fs]
+        out = {}
+        for p, rp in items:
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for blk in iter(lambda: f.read(1 << 24), b""):
+                    h.update(blk)
+            out[rp] = (os.path.getsize(p), h.hexdigest())
+        return out
+
+    def check(self, repo_id, want):
+        got = self._py("from huggingface_hub import HfApi\napi = HfApi()\nd = {}\n"
+                       f"for f in api.list_repo_tree({repo_id!r}, recursive=True):\n"
+                       "    if hasattr(f, 'size') and not hasattr(f, 'tree_id'):\n"
+                       "        d[f.path] = [f.size, (f.lfs.sha256 if getattr(f, 'lfs', None) else None)]\n"
+                       "print(json.dumps(d))\n")
+        bad = sorted(rp for rp, (size, sha) in want.items()
+                     if rp not in got or got[rp][0] != size or (got[rp][1] and got[rp][1] != sha))
+        if bad:
+            raise RuntimeError(f"{repo_id}: after the relay upload {len(bad)} file(s) differ from the local copy "
+                               f"(size / sha256): {bad[:5]}")
+        self.out(f"      relay: {len(want)} file(s) on the Hub match the local copy (size + sha256)")
+
+    def upload_folder(self, folder_path, path_in_repo, repo_id, **kw):
+        want = self.local_files(folder_path, path_in_repo)
+        job = self._stage(folder_path)
+        try:
+            src = f"{job}/{os.path.basename(os.path.normpath(folder_path))}"
+            self._api(f"str(api.upload_folder(folder_path={src!r}, path_in_repo={path_in_repo!r}, "
+                      f"repo_id={repo_id!r}))")
+            self.check(repo_id, want)
+        finally:
+            self._drop(job)
+
+    def upload_file(self, path_or_fileobj, path_in_repo, repo_id, **kw):
+        want = self.local_files(path_or_fileobj, path_in_repo)
+        job = self._stage(path_or_fileobj)
+        try:
+            src = f"{job}/{os.path.basename(path_or_fileobj)}"
+            self._api(f"str(api.upload_file(path_or_fileobj={src!r}, path_in_repo={path_in_repo!r}, "
+                      f"repo_id={repo_id!r}))")
+            self.check(repo_id, want)
+        finally:
+            self._drop(job)
+
+
+def hf_api(cfg):
+    """HfApi() here, or the --upload-via relay (another machine's login) when the plan names one."""
+    if cfg.get("upload_via"):
+        return RelayApi(str(cfg["upload_via"]))
+    from huggingface_hub import HfApi
+    return HfApi()
+
+
 #: a lane tool that exits with this code HELD the step for an exact reason it printed (no exllamav3 architecture, no
 #: disk for the files exllamav3 reads) -- recorded as held, not failed
 EXIT_HELD = 3
@@ -1424,8 +1623,29 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             continue
         out(f"{head}: {what}")
         if not run:
+            if st.mem:
+                need = memory_need(st, c)
+                if need:
+                    out(f"      memory: needs ~{need:.1f} GB of RAM here (checked against free RAM before it runs)")
             statuses[st.id] = "planned"
             continue
+        if st.mem:
+            short = memory_short(st, c, cfg)
+            if short and st.mem == "mlx-serve":           # a number nobody can measure here is said so, not faked
+                record_toolcall_not_measured(st, short)
+                out(f"      NOT MEASURED: {short}")
+                statuses[st.id] = "done"
+                state[st.id] = {"status": "done", "not_measured": short, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                save_state(c["state"], state)
+                continue
+            if short:
+                out(f"      HELD: memory -- {short}")
+                statuses[st.id] = f"held: memory ({short})"
+                if st.rung:
+                    failed_rungs.add((st.lane, st.rung))
+                else:
+                    failed_lanes.add(st.lane)
+                continue
         try:
             if st.fn == "fetch":
                 fetch(c)
@@ -1503,6 +1723,14 @@ def main(argv=None):
     ap.add_argument("--free-after-upload", action="store_true",
                     help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
                          "needs --upload and `upload: true`")
+    ap.add_argument("--upload-via", metavar="SSH_URL",
+                    help="upload through another machine's HF login: ssh://user@host[:port]/<staging dir>?python="
+                         "<python>&key=<identity>&min_free_gb=40 (scp -> upload there -> size/sha256 checked on the "
+                         "Hub -> staging deleted). Also `upload_via:` in the plan")
+    ap.add_argument("--rungs-only", action="store_true",
+                    help="with --free-after-upload: publish each verified rung into its lane folder and stop there -- "
+                         "no card, no README upload, no visibility change (for a machine that builds one lane of a "
+                         "release another machine cards)")
     a = ap.parse_args(argv)
 
     if a.init:
@@ -1518,6 +1746,12 @@ def main(argv=None):
             ap.error("--free-after-upload deletes each rung once it is published: it needs --upload AND "
                      "`upload: true` in the plan")
         cfg["_free_after_upload"] = True
+    if a.upload_via:
+        cfg["upload_via"] = a.upload_via
+    if a.rungs_only:
+        if not a.free_after_upload:
+            ap.error("--rungs-only publishes rung by rung: it needs --free-after-upload")
+        cfg["_rungs_only"] = True
     src = a.hf or cfg.get("model")
     if not src:
         ap.error("pass --hf <repo-or-dir> (or set `model:` in the plan)")
@@ -1544,6 +1778,13 @@ def main(argv=None):
     # fix command, not hours in. Lanes this machine cannot build at all are left to execute() (it skips them).
     import pollard_setup as S
     here = [lane for lane in lanes if have.get(REQUIRES.get(lane, "any"), False)]
+    if "mlx" in here and _has_weights(c["hf_dir"]):
+        try:
+            import pollard_mlx as M
+            if M.needs_mlx_vlm(c["hf_dir"]):              # towers / projector / talker: mlx-vlm ships it whole
+                here = ["mlx-vlm" if lane == "mlx" else lane for lane in here]
+        except Exception:                                  # noqa: BLE001
+            pass
     if run and not a.skip_setup_check:
         if S.require(here):
             return 2

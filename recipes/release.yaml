@@ -8,6 +8,8 @@ gates: null                    # gates.yaml for pollard-verify --gate (null = th
 trust_remote_code: false       # true = consent to run the checkpoint's own .py files (only used where no native class fits)
 hf_weights: null               # the checkpoint the HF lanes read (dir or repo id) when the --hf folder holds no weights
 max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
+remote_source: null            # ssh://user@host/<dir>?python=..&key=..: the MLX lane reads the source through a sparse
+                               # local mirror at --hf (tensors fetched as read, cached within the free disk)
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300
