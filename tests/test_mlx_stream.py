@@ -385,7 +385,7 @@ def test_streamed_build_writes_the_same_bytes_as_the_converters_own_save(tiny, k
     on, off = root / f"{tag}-on", root / f"{tag}-off"
     r1 = _build(tiny[kind], on, "--stream", "on", *extra)
     assert r1.returncode == 0, r1.stdout[-1500:] + r1.stderr[-1500:]
-    assert "streamed build: peak MLX" in r1.stdout
+    assert "streamed build: peak footprint" in r1.stdout
     r2 = _build(tiny[kind], off, "--stream", "off", *extra)
     assert r2.returncode == 0, r2.stderr[-1500:]
     a, b = _tree(on), _tree(off)

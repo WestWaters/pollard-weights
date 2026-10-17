@@ -336,7 +336,7 @@ def measure_mlx(model, source, eval_path, length=512, chunks=8, stream="auto", l
             kl, t1, nq_, nr_ = _kl_chunk(ref[offs[b]:offs[b + 1]], q.logits(b), ids)
             kls.append(kl), top.append(t1), nll_q.append(nq_), nll_r.append(nr_)
         nb = guard.numbers()
-        log(f"   streamed verify: peak MLX {nb['peak_mlx_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, lowest free RAM "
+        log(f"   streamed verify: peak footprint {nb['peak_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, lowest free RAM "
             f"{nb['min_free_ram_gb']} GB")
     else:
         smodel = None

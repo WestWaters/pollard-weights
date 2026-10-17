@@ -634,9 +634,24 @@ def _np_bytes(a):
     return np.ascontiguousarray(np.array(a, copy=False))
 
 
+def peak_footprint_bytes():
+    """macOS: this process's lifetime maximum physical footprint (proc_pid_rusage, rusage_info_v4); None elsewhere."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+        buf = (ctypes.c_uint64 * 64)()
+        if lib.proc_pid_rusage(os.getpid(), 4, buf):
+            return None
+        return int(buf[2 + 28])                          # after the 16-byte uuid: ri_lifetime_max_phys_footprint
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
 class MemoryGuard:
     """Stops a streamed step cleanly when free RAM drops under `min_free_gb` (checked at most every `every_s`), and
-    keeps the numbers: peak MLX memory, peak RSS, lowest free RAM seen."""
+    keeps the numbers: peak physical footprint, peak RSS, lowest free RAM seen."""
 
     def __init__(self, min_free_gb=None, every_s=2.0, log=print):
         self.min_free = float(os.environ.get("POLLARD_MIN_FREE_GB", 2.0)) if min_free_gb is None else min_free_gb
@@ -659,14 +674,12 @@ class MemoryGuard:
                                       "floor -- nothing more is written; free memory and run it again")
 
     def numbers(self):
+        """peak_gb = the process's lifetime peak PHYSICAL FOOTPRINT on macOS (what the memory-pressure system charges it:
+        RSS misses Metal buffers, mx.get_peak_memory counts file-backed loads it never made resident), else peak RSS."""
         import pollard_stream as S
-        try:
-            import mlx.core as mx
-            mlx_peak = mx.get_peak_memory() / 1e9
-        except Exception:                                  # noqa: BLE001
-            mlx_peak = None
-        return {"peak_rss_gb": round(S.peak_rss_bytes() / 1e9, 2),
-                "peak_mlx_gb": None if mlx_peak is None else round(mlx_peak, 2),
+        foot = peak_footprint_bytes()
+        rss = S.peak_rss_bytes()
+        return {"peak_gb": round(max(foot or 0, rss) / 1e9, 2), "peak_rss_gb": round(rss / 1e9, 2),
                 "min_free_ram_gb": None if self.low is None else round(self.low, 2)}
 
 
@@ -770,7 +783,7 @@ class StreamWriter:
                     mir = (f"; mirror fetched {self.mirror.fetched / 1e9:.1f} GB, cached "
                            f"{self.mirror.resident_gb():.1f} GB") if self.mirror is not None else ""
                     self.log(f"   wrote {j + 1}/{total} tensors of {os.path.basename(file)}  "
-                             f"({self.bytes / 1e9:.2f} GB, {time.time() - t0:.0f}s; peak MLX {nb['peak_mlx_gb']} GB, "
+                             f"({self.bytes / 1e9:.2f} GB, {time.time() - t0:.0f}s; peak footprint {nb['peak_gb']} GB, "
                              f"peak RSS {nb['peak_rss_gb']} GB, free RAM low {nb['min_free_ram_gb']} GB{mir})",
                              flush=True)
         os.replace(tmp, file)
@@ -969,7 +982,7 @@ class StreamedLM:
                 if i % 8 == 0 or i == len(orig) - 1:
                     nb = self.guard.numbers()
                     self.log(f"   {os.path.basename(str(self.path).rstrip('/'))}: block {i + 1}/{len(orig)}  "
-                             f"(peak MLX {nb['peak_mlx_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, free RAM low "
+                             f"(peak footprint {nb['peak_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, free RAM low "
                              f"{nb['min_free_ram_gb']} GB)", flush=True)
             self.final = dict(self.h)
             self.h = {}
@@ -1496,7 +1509,7 @@ def main():
             shutil.rmtree(staging, ignore_errors=True)
     if stream:
         nb = guard.numbers()
-        print(f"   streamed build: peak MLX {nb['peak_mlx_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, "
+        print(f"   streamed build: peak footprint {nb['peak_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, "
               f"lowest free RAM {nb['min_free_ram_gb']} GB"
               + (f"; mirror fetched {mirror.fetched / 1e9:.1f} GB, evicted {mirror.evicted / 1e9:.1f} GB"
                  if mirror is not None else ""))
