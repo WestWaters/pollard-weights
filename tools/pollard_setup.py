@@ -11,6 +11,8 @@ What it checks, per lane (the REQUIREMENTS table below):
   gguf        the llama.cpp runtime, built for THIS machine (Metal on a Mac, CUDA for the detected GPU arch)
   ik          ik_llama.cpp -- only for the IQ*_KT flagship rungs (optional)
   mlx         Apple Silicon + mlx + mlx-lm
+  mlx-vlm     + mlx-vlm (git master: Qwen3-Omni, Nemotron omni) + torchvision -- the MLX lane of a model with
+              vision / audio towers, a projector or a talker (`pollard release` asks for it on such a model)
   gptq        torch with a working CUDA device + transformers + gguf-py (the streamed engine) + gptqmodel
   mx          torch (CUDA) + gguf-py (the streamed engine) + llm-compressor + compressed-tensors
   exl3        torch (CUDA) + exllamav3 + its CUDA extension (prebuilt, or a toolchain to JIT it: an nvcc whose
@@ -61,6 +63,9 @@ LANES = {
     "gguf":        {"machine": "any",   "needs": ["py:numpy", "py:gguf", "runtime:llama.cpp"]},
     "ik":          {"machine": "any",   "needs": ["runtime:ik_llama.cpp"], "optional": True},
     "mlx":         {"machine": "apple", "needs": ["py:mlx", "py:mlx_lm"]},
+    # a VLM / omni ships whole through mlx-vlm; its processors (Qwen2-VL video) import torchvision
+    "mlx-vlm":     {"machine": "apple", "needs": ["py:mlx", "py:mlx_lm", "py:mlx_vlm", "py:torchvision"],
+                    "optional": True},
     # gptq / mx / exlr8 stream through pollard_stream (torch + transformers; gguf-py dequantizes a ggml-packed
     # source on read); gptqmodel / llm-compressor are the engines `--engine auto` keeps for a plain model that fits
     "gptq":        {"machine": "cuda",  "needs": ["torch", "py:transformers", "py:safetensors", "py:datasets",
@@ -91,7 +96,10 @@ PY = {
     "xxhash": ("xxhash", "xxhash", []),
     "huggingface_hub": ("huggingface-hub", "huggingface-hub", []),
     "mlx": ("mlx", "mlx", []),
-    "mlx_lm": ("mlx-lm", "mlx-lm", []),
+    "mlx_lm": ("mlx-lm>=0.32.0", "mlx-lm", []),      # 0.32.0: LFM2-MoE routes like the model
+    # Qwen3-Omni (qwen3_omni_moe) and Nemotron-3.5-Bolt (nemotron_h_omni) are on master, not on PyPI's 0.7.8
+    "mlx_vlm": ("mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm", "mlx-vlm", []),
+    "torchvision": ("torchvision", "torchvision", []),
     "compressed_tensors": ("compressed-tensors", "compressed-tensors", []),
     "llmcompressor": ("llmcompressor", "llmcompressor", []),
     # these two compile against the torch already in the env: build isolation would fetch a CPU torch instead
@@ -396,6 +404,9 @@ _BODIES = {
                  "    res['ext'] = 'prebuilt' if u.find_spec('exllamav3_ext') else 'jit'\n"
                  "    if res['ext'] == 'prebuilt':\n        import exllamav3_ext\n",
     "speculators": "    import speculators, transformers\n    res['transformers'] = transformers.__version__\n",
+    # PyPI's mlx-vlm predates the omni models the MLX lane ships whole: master has them
+    "mlx_vlm": "    import mlx_vlm\n    from mlx_vlm.models import qwen3_omni_moe, nemotron_h_nano_omni\n"
+               "    res['op'] = 'qwen3_omni_moe + nemotron_h_nano_omni'\n",
 }
 
 

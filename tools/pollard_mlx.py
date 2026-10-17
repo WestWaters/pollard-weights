@@ -21,7 +21,7 @@ Apple Silicon (this box has `mlx`).
 
 --range search (default) picks each group's scale/bias by an imatrix-weighted range search instead of min/max;
 the files are standard MLX affine (mlx-lm loads them unchanged). --range minmax = MLX's own choice."""
-import argparse, json, os, re, sys
+import argparse, json, os, re, struct, sys
 
 HIGH, LOW = 8, 4
 MLX_BITS = (2, 3, 4, 5, 6, 8)
@@ -98,6 +98,41 @@ SPEECH_RE = re.compile(r"(^|\.)(talker|code2wav|token2wav|code_predictor|speech_
 EXIT_HELD = 3
 
 
+# Converter versions that run a model WRONG -- the rung's bytes are fine, but every number measured through them (and
+# every answer a user gets from them) is off. mlx-lm < 0.32.0 routes LFM2-MoE (LFM2 / LFM2.5 8B-A1B, 24B-A2B) with a
+# SOFTMAX over the experts and adds the selection bias into the mixing weights; the model (HF Transformers, llama.cpp)
+# routes with a sigmoid and uses the bias for selection only. Measured on LFM2.5-8B-A1B, mlx-lm 4-bit: KLD 0.47 through
+# the old routing, 0.39 through the right one (the source's own PPL 37.9 vs 32.2).
+RUNTIME_FIXES = {"lfm2_moe": ("mlx_lm", (0, 32, 0), "LFM2-MoE expert routing (sigmoid, bias for selection only)")}
+
+
+def _version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+
+
+def mlx_runtime_problem(model_dir):
+    """A sentence when the installed converter is known to run this checkpoint's architecture wrong, else None."""
+    try:
+        import pollard_workspace as _ws
+        mt = (_ws.text_config_dict(_ws.config_dict(model_dir)) or {}).get("model_type")
+    except Exception:                                       # noqa: BLE001
+        return None
+    fix = RUNTIME_FIXES.get(mt)
+    if not fix:
+        return None
+    pkg, need, what = fix
+    try:
+        import importlib
+        have = getattr(importlib.import_module(pkg), "__version__", None)
+    except Exception:                                       # noqa: BLE001
+        return None
+    if have is None or _version_tuple(have) >= need:
+        return None
+    want = ".".join(map(str, need))
+    return (f"{pkg.replace('_', '-')} {have} runs {mt} wrong ({what}; fixed in {want}) -- "
+            f'pip install -U "{pkg.replace("_", "-")}>={want}"')
+
+
 def mlx_engine(model_dir):
     """Which converter ships this checkpoint WHOLE: ("mlx_lm", None) for a text model; ("mlx_vlm", model_type) for a
     model with a vision / audio tower, projector or speech output (mlx-lm drops every one of them); or
@@ -128,6 +163,13 @@ def mlx_engine(model_dir):
                             f"width per layer) and this mlx-vlm's {mt!r} builds every layer from one -- "
                             f"{MLX_VLM_NEWER}")
     return "mlx_vlm", mt
+
+
+def needs_mlx_vlm(model_dir):
+    """True when this checkpoint carries a vision / audio tower, projector or talker: its MLX lane is mlx-vlm (decided
+    from the safetensors index and config, nothing imported)."""
+    import pollard_complete as PC
+    return bool(os.path.isdir(model_dir) and PC.inventory(model_dir)["components"])
 
 
 #: Nemotron-3.5-Bolt (nemotron_h_omni over a nemotron_h_puzzle decoder) landed in mlx-vlm after 0.7.8 (#2528)
@@ -196,7 +238,7 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
         return {"bits": vision_bits or globals()["HIGH"], "group_size": gsize}
     if "embed" in path or path.endswith("lm_head"):    # embed_tokens (llama) OR embedding (Spark2_5, tied)
         return {"bits": HIGH, "group_size": gsize}      # vocab carriers: keep high
-    if is_moe and (re.search(r"\.(mlp|block_sparse_moe)\.gate$", path)
+    if is_moe and (re.search(r"\.(mlp|block_sparse_moe|feed_forward)\.gate$", path)
                    or "shared_expert" in path):
         return {"bits": HIGH, "group_size": gsize}      # router + shared: selection integrity
     if "self_attn" in path and path.endswith("g_proj"):  # head-wise attn output gate (Spark2_5): selection-critical
@@ -204,9 +246,10 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
     li = layer_of(path)
     if li is None or li not in alloc:
         return {"bits": LOW, "group_size": gsize}
-    if "self_attn" in path or re.search(r"\.mixer\.(q_proj|k_proj|v_proj|o_proj|in_proj|out_proj)$", path):
-        return {"bits": alloc[li]["attn"], "group_size": gsize}   # NemotronH: attention / Mamba2 token mixers
-    if "mlp" in path or "block_sparse_moe" in path or "experts" in path or "latent_proj" in path:
+    if "self_attn" in path or re.search(r"\.(mixer|conv)\.(q_proj|k_proj|v_proj|o_proj|in_proj|out_proj)$", path):
+        return {"bits": alloc[li]["attn"], "group_size": gsize}   # NemotronH Mamba2 / LFM2 short-conv token mixers
+    if ("mlp" in path or "block_sparse_moe" in path or "experts" in path or "latent_proj" in path
+            or "feed_forward" in path):
         return {"bits": alloc[li]["ffn"], "group_size": gsize}
     return {"bits": LOW, "group_size": gsize}
 
@@ -344,7 +387,9 @@ def encode_affine(w, bits, group_size=64, imp=None, method="search", store=None,
 
     method "minmax" = the classic min/max grid; "search" = the imatrix-weighted range search. `imp` = per input
     channel importance [K] (activation E[x^2], an imatrix row), or [..., K] per row block. Works on numpy or,
-    with xp=mlx.core, on the GPU; rows are processed in chunks of ~max_elems weights."""
+    with xp=mlx.core, on the GPU. Rows are processed in chunks of ~max_elems weights -- cast to float32, searched and
+    packed one chunk at a time, so the working set is one chunk, never a float32 copy of the whole tensor. `init` =
+    MLX's own (scales, biases) for the whole tensor, or a callable (row0, row1) -> the same for those rows."""
     import numpy as np
     xp = xp or np
     if bits not in MLX_BITS:
@@ -357,7 +402,7 @@ def encode_affine(w, bits, group_size=64, imp=None, method="search", store=None,
     rows = 1
     for d in shape[:-1]:
         rows *= d
-    W = w.reshape(rows, K // group_size, group_size).astype(xp.float32)
+    W = w.reshape(rows, K // group_size, group_size)
     I = None
     if imp is not None:
         I = xp.array(imp) if xp is not np else np.asarray(imp, dtype=np.float32)
@@ -373,28 +418,34 @@ def encode_affine(w, bits, group_size=64, imp=None, method="search", store=None,
         else:
             raise ValueError(f"importance has {I.size} values; weight needs {K} (per channel)")
         I = xp.maximum(I, 0.0) + 1e-8 * (I.mean() if I.size else 1.0)
-    if init is not None:
+    get_init = None
+    if callable(init):
+        get_init = init
+    elif init is not None:
         s0, b0 = init
-        init = (s0.reshape(rows, K // group_size), b0.reshape(rows, K // group_size))
+        s0, b0 = s0.reshape(rows, K // group_size), b0.reshape(rows, K // group_size)
+        get_init = lambda r0, r1: (s0[r0:r1], b0[r0:r1])               # noqa: E731
     step = max(1, max_elems // max(1, K))
-    qs, ss, bs = [], [], []
+    ps, ss, bs = [], [], []
     for r in range(0, rows, step):
-        g = W[r:r + step]
+        g = W[r:r + step].astype(xp.float32)
         ii = None if I is None else (I if I.shape[0] == 1 else I[r:r + step])
         if method == "minmax":
             q, s_, b_, _ = search_groups(g, bits, ii, store, xp, grid=(0.0,), refits=0)
         else:
             q, s_, b_, _ = search_groups(g, bits, ii, store, xp,
-                                         init=None if init is None else (init[0][r:r + step],
-                                                                         init[1][r:r + step]))
-        qs.append(np.asarray(q.astype(xp.uint8)) if xp is not np else q.astype(np.uint8))
+                                         init=None if get_init is None else get_init(r, min(rows, r + step)))
+        q8 = np.asarray(q.astype(xp.uint8)) if xp is not np else q.astype(np.uint8)
+        ps.append(pack_mlx(q8.reshape(-1, K), bits))
+        if hasattr(xp, "eval"):                                   # MLX is lazy: drop the chunk's graph now
+            xp.eval(s_, b_)
         ss.append(s_)
         bs.append(b_)
-    q = np.concatenate(qs, 0).reshape(*shape[:-1], K)
+        del g, q, q8
     cat = (lambda a: xp.concatenate(a, 0)) if xp is not np else (lambda a: np.concatenate(a, 0))
     s = cat(ss).reshape(*shape[:-1], K // group_size)
     b = cat(bs).reshape(*shape[:-1], K // group_size)
-    return pack_mlx(q, bits), s, b
+    return np.concatenate(ps, 0).reshape(*shape[:-1], K * bits // 32), s, b
 
 
 def weighted_error(w, packed, scales, biases, bits, group_size=64, imp=None):
@@ -417,15 +468,37 @@ _GGUF_TO_HF = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn
                "ffn_up_exps": "mlp.switch_mlp.up_proj", "ffn_down_exps": "mlp.switch_mlp.down_proj"}
 
 
-def gguf_name_to_path(name):
-    """blk.3.attn_q.weight -> model.layers.3.self_attn.q_proj ; output.weight -> lm_head ; else None."""
+# ... and the other layouts' names for the same GGUF tensors. LFM2 / LFM2-MoE: the short-conv mixer, `out_proj` for
+# attention output, `feed_forward` for the MLP (mlx-lm renames w1/w3/w2 to gate/up/down_proj and stacks the experts
+# into switch_mlp) and `feed_forward.gate` for the router. Without these an LFM2 imatrix matched nothing and the
+# "imatrix-weighted" search ran on plain weight error.
+_GGUF_TO_HF_ALT = {"attn_output": ("self_attn.out_proj",),
+                   "shortconv.in_proj": ("conv.in_proj",), "shortconv.out_proj": ("conv.out_proj",),
+                   "ffn_gate_inp": ("mlp.gate", "feed_forward.gate"),
+                   "ffn_gate": ("feed_forward.gate_proj",), "ffn_up": ("feed_forward.up_proj",),
+                   "ffn_down": ("feed_forward.down_proj",),
+                   "ffn_gate_exps": ("feed_forward.switch_mlp.gate_proj",),
+                   "ffn_up_exps": ("feed_forward.switch_mlp.up_proj",),
+                   "ffn_down_exps": ("feed_forward.switch_mlp.down_proj",)}
+
+
+def gguf_name_to_paths(name):
+    """Every module path a GGUF tensor name can stand for (a lookup only ever matches the model's own):
+    blk.3.attn_output.weight -> [model.layers.3.self_attn.o_proj, model.layers.3.self_attn.out_proj]."""
     n = name[:-len(".weight")] if name.endswith(".weight") else name
     if n == "output":
-        return "lm_head"
-    m = re.match(r"blk\.(\d+)\.(\w+)$", n)
-    if m and m.group(2) in _GGUF_TO_HF:
-        return f"model.layers.{m.group(1)}.{_GGUF_TO_HF[m.group(2)]}"
-    return None
+        return ["lm_head"]
+    m = re.match(r"blk\.(\d+)\.([\w.]+)$", n)
+    if not m:
+        return []
+    tails = ([_GGUF_TO_HF[m.group(2)]] if m.group(2) in _GGUF_TO_HF else []) + list(_GGUF_TO_HF_ALT.get(m.group(2), ()))
+    return [f"model.layers.{m.group(1)}.{t}" for t in tails]
+
+
+def gguf_name_to_path(name):
+    """blk.3.attn_q.weight -> model.layers.3.self_attn.q_proj ; output.weight -> lm_head ; else None."""
+    p = gguf_name_to_paths(name)
+    return p[0] if p else None
 
 
 def _read_imatrix(path):
@@ -460,8 +533,7 @@ def load_importance(path):
         return {k: np.asarray(v, np.float32) for k, v in load_file(path).items()}
     out = {}
     for name, vals in _read_imatrix(path).items():
-        p = gguf_name_to_path(name)
-        if p:
+        for p in gguf_name_to_paths(name):
             out[p] = np.asarray(vals, np.float32)
     return out
 
@@ -516,6 +588,833 @@ class RangeSearchQuantize:
         return False
 
 
+
+# ----------------------------------------------------------------- streamed build: one tensor in memory at a time
+#
+# mlx-lm and mlx-vlm already build the model LAZILY: mx.load reads nothing until an array is evaluated, sanitize
+# (expert stacking, renames, transposes) and nn.quantize only add graph nodes. Two things made a big model sit in
+# memory whole anyway:
+#   * the range search ran eagerly inside mx.quantize (numpy in the loop), so every quantized tensor was computed and
+#     held before the first byte was written -- the whole quantized model in RAM (LFM2.5-24B: ~13.6 GB at 3 bits);
+#   * mx.save_safetensors evaluates a whole shard (up to 5 GB of output, and every source tensor feeding it) at once.
+# The streamed build keeps both converters' own code -- load, sanitize, quant predicate, config, tokenizer, processor
+# files -- and replaces exactly those two calls: mx.quantize returns MLX's own LAZY answer as a placeholder (and notes
+# which module's weight it stands for), and mx.save_safetensors writes the header from the shapes, then evaluates and
+# writes ONE tensor at a time (running the range search for a placeholder right there), freeing it before the next.
+# Peak memory = one source tensor (an expert stack: one projection of one layer) + its encoding, preflighted
+# (plan_build) and guarded (free RAM checked while writing). The bytes are the non-streamed build's: same header
+# (MLX's own key order, read from a one-element probe file), same encoding (encode_affine, chunk for chunk).
+
+STREAM_MODES = ("auto", "on", "off")
+#: python + mlx + the converter's imports + tokenizer / processor, measured ~0.6-0.9 GB on an M-series Mac
+BASE_GB = 0.9
+#: the range search's per-chunk working set (a 4M-weight chunk, its candidates and their errors), GB
+SEARCH_GB = 0.35
+_WRITTEN = None
+
+
+class StreamedQuantize(RangeSearchQuantize):
+    """While active, mx.quantize is MLX's own -- lazy -- and, for --range search, its outputs are placeholders: the
+    writer (StreamWriter) replaces each with encode_affine's answer when it reaches that tensor."""
+
+    def __init__(self, importance=None, method="search"):
+        super().__init__(importance, method)
+        self.pending = {}                      # id(placeholder) -> (job, index, placeholder)
+
+    def __enter__(self):
+        import mlx.core as mx
+        self._orig = mx.quantize
+
+        def quantize(w, group_size=None, bits=None, mode="affine", **kw):
+            gs, b = group_size or 64, bits or 4
+            out = self._orig(w, group_size, bits, mode=mode, **kw)
+            if (self.method != "search" or mode != "affine" or kw.get("global_scale") is not None
+                    or b not in MLX_BITS or w is not getattr(self, "current_w", None)):
+                self.stats["passthrough"] += 1
+                return out
+            path, shape = self.current or (None, None)
+            imp = self.importance.get(path) if (path and shape == tuple(w.shape)) else None
+            if imp is not None and imp.size not in (w.shape[-1], w.size) and imp.size % w.shape[-1]:
+                imp = None
+            out = (out[0], out[1].astype(w.dtype), out[2].astype(w.dtype))
+            job = {"w": w, "bits": b, "gs": gs, "imp": imp, "path": path, "out": None, "left": 3}
+            for i, a in enumerate(out):
+                self.pending[id(a)] = (job, i, a)
+            self.stats["searched"] += 1
+            self.stats["weighted"] += imp is not None
+            return out
+        mx.quantize = quantize
+        return self
+
+    def source_of(self, a):
+        """The source weight a placeholder stands for (None once encoded, or for any other array)."""
+        ent = self.pending.get(id(a))
+        return ent[0]["w"] if ent is not None and ent[2] is a else None
+
+    def take(self, a):
+        """The final array for placeholder `a` (the search runs at the first of its three outputs), else None."""
+        ent = self.pending.get(id(a))
+        if ent is None or ent[2] is not a:
+            return None
+        job, i, _ = ent
+        if job["out"] is None:
+            job["out"] = self.encode(job)
+            job["w"] = None
+        out = job["out"][i]
+        del self.pending[id(a)]
+        job["left"] -= 1
+        if not job["left"]:
+            job["out"] = None
+        return out
+
+    def encode(self, job):
+        import mlx.core as mx
+        w, gs, b = job["w"], job["gs"], job["bits"]
+        mx.eval(w)                                         # the source tensor (an expert stack) once, then by rows
+        K = w.shape[-1]
+        w2 = w.reshape(-1, K)
+        orig = self._orig
+        init = (lambda r0, r1: orig(w2[r0:r1], gs, b)[1:])  # MLX's own answer, chunk by chunk
+        packed, s, bb = encode_affine(w, b, gs, imp=job["imp"], method=self.method, xp=mx, init=init)
+        out = (mx.array(packed), s.astype(w.dtype), bb.astype(w.dtype))
+        mx.eval(*out)
+        return out
+
+
+def _np_bytes(a):
+    """A materialized mx.array as a contiguous numpy view of its bytes (bf16 through uint16)."""
+    import mlx.core as mx
+    import numpy as np
+    if a.dtype == mx.bfloat16:
+        return np.ascontiguousarray(np.array(a.view(mx.uint16), copy=False))
+    return np.ascontiguousarray(np.array(a, copy=False))
+
+
+def peak_footprint_bytes():
+    """macOS: this process's lifetime maximum physical footprint (proc_pid_rusage, rusage_info_v4); None elsewhere."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+        buf = (ctypes.c_uint64 * 64)()
+        if lib.proc_pid_rusage(os.getpid(), 4, buf):
+            return None
+        return int(buf[2 + 28])                          # after the 16-byte uuid: ri_lifetime_max_phys_footprint
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+class MemoryGuard:
+    """Stops a streamed step cleanly when free RAM drops under `min_free_gb` (checked at most every `every_s`), and
+    keeps the numbers: peak physical footprint, peak RSS, lowest free RAM seen."""
+
+    def __init__(self, min_free_gb=None, every_s=2.0, log=print):
+        self.min_free = float(os.environ.get("POLLARD_MIN_FREE_GB", 2.0)) if min_free_gb is None else min_free_gb
+        self.every, self.log = every_s, log
+        self.last, self.low = 0.0, None
+
+    def check(self, what, force=False):
+        import time
+        now = time.time()
+        if not force and now - self.last < self.every:
+            return
+        self.last = now
+        import pollard_stream as S
+        free = S.free_ram_gb()
+        if free is None:
+            return
+        self.low = free if self.low is None else min(self.low, free)
+        if free < self.min_free:
+            raise S.OutOfMemoryBudget(f"stopped at {what}: free RAM is {free:.2f} GB, under the {self.min_free:g} GB "
+                                      "floor -- nothing more is written; free memory and run it again")
+
+    def numbers(self):
+        """peak_gb = the process's lifetime peak PHYSICAL FOOTPRINT on macOS (what the memory-pressure system charges it:
+        RSS misses Metal buffers, mx.get_peak_memory counts file-backed loads it never made resident), else peak RSS."""
+        import pollard_stream as S
+        foot = peak_footprint_bytes()
+        rss = S.peak_rss_bytes()
+        return {"peak_gb": round(max(foot or 0, rss) / 1e9, 2), "peak_rss_gb": round(rss / 1e9, 2),
+                "min_free_ram_gb": None if self.low is None else round(self.low, 2)}
+
+
+class StreamWriter:
+    """While active, mx.save_safetensors writes a shard one tensor at a time (same file bytes as MLX's own)."""
+
+    def __init__(self, quantizer=None, guard=None, log=print, cache_limit_gb=0.25, mirror=None, out_bytes=0):
+        self.q, self.guard, self.log = quantizer, guard or MemoryGuard(log=log), log
+        self.cache_limit = int(cache_limit_gb * (1 << 30))
+        self.n, self.bytes, self.files = 0, 0, 0
+        self.mirror, self.out_bytes = mirror, out_bytes      # a remote source: fetch what each tensor reads
+
+    def _reserve_gb(self):
+        """Disk the mirror must leave free: the rest of this rung + a margin."""
+        return max(0, self.out_bytes * 1.1 - self.bytes) / 1e9 + 3.0
+
+    def __enter__(self):
+        import mlx.core as mx
+        self._orig = mx.save_safetensors
+        mx.save_safetensors = self.save
+        try:
+            self._old_cache = mx.set_cache_limit(self.cache_limit)
+        except Exception:                                  # noqa: BLE001
+            self._old_cache = None
+        return self
+
+    def __exit__(self, *exc):
+        import mlx.core as mx
+        mx.save_safetensors = self._orig
+        if self._old_cache is not None:
+            mx.set_cache_limit(self._old_cache)
+        return False
+
+    def mlx_layout(self, arrays, metadata):
+        """MLX's own data order and dtype names for this key set: a probe file of one-element arrays written by
+        mx.save_safetensors itself (its map iterates the keys in an order only it knows)."""
+        import mlx.core as mx
+        import tempfile
+        probe = {k: mx.zeros((1,), dtype=v.dtype) for k, v in arrays.items()}
+        fd, tmp = tempfile.mkstemp(suffix=".safetensors")
+        os.close(fd)
+        try:
+            self._orig(tmp, probe, metadata=metadata) if metadata is not None else self._orig(tmp, probe)
+            import pollard_stream as S
+            hdr, _ = S.st_header(tmp)
+        finally:
+            os.remove(tmp)
+        hdr.pop("__metadata__", None)
+        order = sorted(hdr, key=lambda k: hdr[k]["data_offsets"][0])
+        return order, {k: hdr[k]["dtype"] for k in hdr}
+
+    def save(self, file, arrays, metadata=None):
+        import mlx.core as mx
+        import time
+        file = str(file)
+        if not file.endswith(".safetensors"):
+            file += ".safetensors"
+        order, dts = self.mlx_layout(arrays, metadata)
+        hdr, off = {}, 0
+        for k in order:
+            n = int(arrays[k].nbytes)
+            hdr[k] = {"data_offsets": [off, off + n], "dtype": dts[k], "shape": list(arrays[k].shape)}
+            off += n
+        if metadata:
+            hdr["__metadata__"] = dict(metadata)
+        h = json.dumps(hdr, sort_keys=True, separators=(",", ":")).encode()
+        tmp = file + ".partial"
+        t0, total = time.time(), len(order)
+        with open(tmp, "wb") as f:
+            f.write(struct.pack("<Q", len(h)))
+            f.write(h)
+            for j, k in enumerate(order):
+                a = arrays[k]
+                deps = set()
+                if self.mirror is not None:
+                    src = self.q.source_of(a) if self.q is not None else None
+                    deps = self.mirror.deps(src if src is not None else a)
+                    if deps:
+                        self.mirror.ensure(deps, reserve_gb=self._reserve_gb())
+                got = self.q.take(a) if self.q is not None else None
+                if got is None:
+                    mx.eval(a)
+                    got = a
+                arrays[k] = _WRITTEN                       # the caller only reads the keys back
+                del a
+                buf = _np_bytes(got)
+                if buf.nbytes != hdr[k]["data_offsets"][1] - hdr[k]["data_offsets"][0]:
+                    raise RuntimeError(f"{k}: {buf.nbytes} bytes, the header says "
+                                       f"{hdr[k]['data_offsets'][1] - hdr[k]['data_offsets'][0]}")
+                f.write(memoryview(buf).cast("B"))
+                if deps:
+                    self.mirror.done(deps)
+                self.n += 1
+                self.bytes += buf.nbytes
+                del got, buf
+                if mx.get_cache_memory() > self.cache_limit:
+                    mx.clear_cache()
+                self.guard.check(f"{os.path.basename(file)}:{k}")
+                if j % 400 == 0 or j == total - 1:
+                    nb = self.guard.numbers()
+                    mir = (f"; mirror fetched {self.mirror.fetched / 1e9:.1f} GB, cached "
+                           f"{self.mirror.resident_gb():.1f} GB") if self.mirror is not None else ""
+                    self.log(f"   wrote {j + 1}/{total} tensors of {os.path.basename(file)}  "
+                             f"({self.bytes / 1e9:.2f} GB, {time.time() - t0:.0f}s; peak footprint {nb['peak_gb']} GB, "
+                             f"peak RSS {nb['peak_rss_gb']} GB, free RAM low {nb['min_free_ram_gb']} GB{mir})",
+                             flush=True)
+        os.replace(tmp, file)
+        self.files += 1
+
+
+def plan_build(model_dir, low=4, high=8, method="search", encoded=False, avg_bits=None):
+    """The streamed build's peak RAM and output size from the shapes on disk (pollard_stream.Source reads headers
+    only). The unit of work is one output tensor: an expert stack (one projection of one layer, every expert) or a
+    plain tensor -- its source bytes twice (the per-expert reads and the stack live together while it is built) +
+    its encoding at the high bits + the range search's chunk + the base process."""
+    import pollard_stream as S
+    src = S.Source(model_dir)
+    groups = {}
+    for k in src.logical:
+        g = re.sub(r"\.experts\.\d+\.", ".experts.*.", k)
+        n = S._prod(src.shape(k))
+        b = n * 2 if src.encoding(k) else src.nbytes(k)
+        e = groups.setdefault(g, [0, 0, 0])
+        e[0] += n
+        e[1] += b
+        e[2] += 1
+    worst, wname, src_bytes, out_bytes = 0.0, None, 0, 0.0
+    for g, (n, b, cnt) in groups.items():
+        src_bytes += b
+        work = b * (2 if cnt > 1 else 1) + n * max(high, 8) / 8
+        out_bytes += n * ((avg_bits or low) + 0.5) / 8 if b // max(n, 1) >= 2 and n >= 4096 else b
+        if work > worst:
+            worst, wname = work, g
+    peak = worst / 1e9 + BASE_GB + (SEARCH_GB if method == "search" else 0.0)
+    return {"tensors": len(groups), "largest": wname, "largest_gb": round(worst / 1e9, 2),
+            "peak_gb": round(peak, 2), "source_gb": round(src_bytes / 1e9, 2), "out_gb": round(out_bytes / 1e9, 2),
+            "largest_bytes": int(worst), "source_bytes": int(src_bytes), "out_bytes": int(out_bytes),
+            "encoded": bool(encoded)}
+
+
+def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
+    """Refuse (OutOfMemoryBudget, with the numbers) a streamed build whose peak does not fit free RAM minus the
+    floor, or whose output does not fit the disk. A remote-source `mirror` on the same disk counts its cache as free:
+    what the rung needs is evicted from it here, before the first byte is written (a build whose source tensors are
+    all cached never fetches, so the writer alone would never make room)."""
+    import shutil
+    import pollard_stream as S
+    floor = float(os.environ.get("POLLARD_MIN_FREE_GB", 2.0))
+    free = S.free_ram_gb()
+    budget = min([x for x in (max_ram_gb, (free - floor) if free is not None else None) if x is not None] or [None])
+    log(f"   memory plan: peak ~{plan['peak_gb']} GB (largest unit {plan['largest']} = {plan['largest_gb']} GB, "
+        f"base {BASE_GB} GB) | free RAM {('%.1f' % free) if free is not None else '?'} GB, floor {floor:g} GB"
+        + (f", cap {max_ram_gb:g} GB" if max_ram_gb else ""))
+    if budget is not None and plan["peak_gb"] > budget:
+        raise S.OutOfMemoryBudget(
+            f"the streamed MLX build needs ~{plan['peak_gb']} GB at its peak (one tensor: {plan['largest']}, "
+            f"{plan['largest_gb']} GB, + {BASE_GB} GB base) and {budget:.1f} GB is usable here "
+            f"({'%.1f' % free if free is not None else '?'} GB free, {floor:g} GB floor"
+            + (f", --max-ram-gb {max_ram_gb:g}" if max_ram_gb else "") + ")")
+    parent = os.path.dirname(os.path.abspath(out_dir)) or "."
+    while not os.path.exists(parent) and os.path.dirname(parent) != parent:
+        parent = os.path.dirname(parent)
+    disk = shutil.disk_usage(parent).free / 1e9
+    same_disk = mirror is not None and os.stat(parent).st_dev == os.stat(mirror.dir).st_dev
+    cache = mirror.reclaimable_bytes() / 1e9 if same_disk else 0.0
+    if disk + cache < plan["out_gb"] + 1.0:
+        raise S.OutOfMemoryBudget(f"the MLX rung needs ~{plan['out_gb']:.1f} GB of disk at {out_dir} and "
+                                  f"{disk:.1f} GB is free" + (f" (+ {cache:.1f} GB the mirror's cache can give back)"
+                                                             if same_disk else ""))
+    # the room the build will want: the rung (+10%, as the writer reserves it) and one source unit fetched beside it
+    want = plan["out_gb"] * 1.1 + plan.get("largest_gb", 0.0) + 3.0
+    if same_disk and disk < want and cache:
+        freed = mirror.make_room(want)
+        disk = shutil.disk_usage(parent).free / 1e9
+        log(f"   disk: {freed / 1e9:.1f} GB of the mirror's cache evicted for the rung ({disk:.1f} GB free now)")
+
+
+# ----------------------------------------------------------------- streamed fidelity: block by block, in MLX
+#
+# The verify gate compares the rung's logits with the source's over the same held-out chunks. Loading the source
+# whole (48 GB of bf16 for LFM2.5, 70 GB for clef-omni) cannot happen on a 16 GB Mac, so the model runs LAYER-MAJOR:
+# the decoder blocks are swapped for taps, one forward per chunk records each block's call (its masks, positions,
+# rotary tables -- whatever that architecture passes) without running any block, then every chunk goes through
+# block 0, block 0 is emptied, every chunk through block 1, ... Only the embeddings, one block and the chunks'
+# hidden states are ever in memory; a last forward per chunk with the final hidden state injected runs the model's
+# own norm + head. The model code is the converter's own (mlx-lm, or mlx-vlm's language model for a VLM / omni);
+# towers, talkers and code2wav are never evaluated.
+
+
+class _Tap:
+    """Stands in for one decoder block: records its call (record), passes the hidden state through, or hands the
+    final hidden state to the model's head (final). Attribute reads go to the real block (is_attention_layer, ...)."""
+
+    def __init__(self, inner, i, run):
+        self.__dict__.update(_inner=inner, _i=i, _run=run)
+
+    def __getattr__(self, k):
+        return getattr(self.__dict__["_inner"], k)
+
+    def __call__(self, x, *args, **kw):
+        return self.__dict__["_run"].tap(self.__dict__["_i"], x, args, kw)
+
+
+def _decoder(model):
+    """(language model to call, its block list): the longest list of blocks outside any tower / talker."""
+    import mlx.nn as nn
+    lm = getattr(model, "language_model", None) or model
+    best = None
+    for name, mod in lm.named_modules():
+        for attr, val in list(mod.items()) if isinstance(mod, dict) else []:
+            if isinstance(val, list) and val and all(isinstance(x, nn.Module) for x in val):
+                path = f"{name}.{attr}" if name else attr
+                if SPEECH_RE.search(path) or VISION_RE.search(path) or PROJ_RE.search(path):
+                    continue
+                if best is None or len(val) > len(best[1]):
+                    best = (path, val)
+    if best is None:
+        raise SystemExit("could not find the decoder blocks of this MLX model")
+    return lm, best[1]
+
+
+def _lazy_load(path, engine):
+    """The model built lazily from `path` (nothing read until evaluated)."""
+    from pathlib import Path
+    if engine == "mlx_vlm":
+        from mlx_vlm.utils import load_model
+        return load_model(Path(path), lazy=True)
+    from mlx_lm.utils import load_model
+    return load_model(Path(path), lazy=True)[0]
+
+
+def _materialize(x):
+    import mlx.core as mx
+    if isinstance(x, mx.array):
+        mx.eval(x)
+    elif isinstance(x, (list, tuple)):
+        for y in x:
+            _materialize(y)
+    elif isinstance(x, dict):
+        for y in x.values():
+            _materialize(y)
+    return x
+
+
+class StreamedLM:
+    """One model (source or rung), run layer-major over `rows` (lists of token ids). final_h[b] after run()."""
+
+    def __init__(self, path, engine="mlx_lm", guard=None, log=print):
+        import contextlib
+        self.path, self.engine, self.log = path, engine, log
+        self.guard = guard or MemoryGuard(log=log)
+        self.mirror = RemoteMirror.of(path, log) if os.path.isdir(str(path)) else None
+        with (self.mirror.hook() if self.mirror is not None else contextlib.nullcontext()):
+            self.model = _lazy_load(path, engine)
+        self.lm, self.layers = _decoder(self.model)
+        self.mode, self.calls, self.h, self.final, self.start = None, {}, {}, {}, 0
+
+    def tap(self, i, x, args, kw):
+        if self.mode == "record":
+            if i == 0:
+                self.h[self.b] = _materialize(x)
+            self.calls[(self.b, i)] = (_materialize(list(args)), _materialize(dict(kw)))
+            return x
+        if self.mode == "final" and i == len(self.layers) - 1:
+            h = self.final[self.b]
+            return h[:, self.start:] if self.start else h   # norm + head are per position: only the scored ones
+        return x
+
+    def _forward(self, ids):
+        import mlx.core as mx
+        out = self.lm(mx.array([ids]))
+        return getattr(out, "logits", out)
+
+    def _swap(self, taps):
+        orig = list(self.layers)
+        for i in range(len(self.layers)):
+            self.layers[i] = _Tap(orig[i], i, self) if taps else orig[i]
+        return orig
+
+    def run(self, rows):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten, tree_map
+        self.rows = rows
+        mir = self.mirror
+        if mir is not None:                                # embeddings / final norm / head: kept for the whole run
+            blockdeps = set()
+            for blk in self.layers:
+                blockdeps |= mir.deps(*[v for _, v in tree_flatten(blk.parameters())])
+            mir.ensure(mir.deps(*[v for _, v in tree_flatten(self.lm.parameters())]) - blockdeps, reserve_gb=3.0)
+        orig = self._swap(True)
+        try:
+            self.mode = "record"
+            for b, ids in enumerate(rows):
+                self.b = b
+                self._forward(ids)                         # taps only: no block runs, the logits are never evaluated
+            self.mode = None
+            for i, blk in enumerate(orig):
+                deps = mir.deps(*[v for _, v in tree_flatten(blk.parameters())]) if mir is not None else set()
+                if deps:
+                    mir.ensure(deps, reserve_gb=3.0)
+                for _, p in tree_flatten(blk.parameters()):  # one tensor at a time: an expert stack's reads + the
+                    mx.eval(p)                             # stack never sit beside the rest of the block's stacks
+                for b in range(len(rows)):
+                    args, kw = self.calls.pop((b, i))
+                    self.h[b] = blk(self.h[b], *args, **kw)
+                    mx.eval(self.h[b])
+                blk.update(tree_map(lambda _: mx.array([]), blk.parameters()))
+                if deps:
+                    mir.done(deps)
+                mx.clear_cache()
+                self.guard.check(f"block {i}")
+                if i % 8 == 0 or i == len(orig) - 1:
+                    nb = self.guard.numbers()
+                    self.log(f"   {os.path.basename(str(self.path).rstrip('/'))}: block {i + 1}/{len(orig)}  "
+                             f"(peak footprint {nb['peak_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, free RAM low "
+                             f"{nb['min_free_ram_gb']} GB)", flush=True)
+            self.final = dict(self.h)
+            self.h = {}
+        finally:
+            self.mode = None                               # the taps stay: logits() runs the head through them
+        return self
+
+    def logits(self, b, start=0):
+        """float32 numpy [len(row) - start, vocab] for row b from position `start`: the model's own norm + head on the
+        streamed final state."""
+        import mlx.core as mx
+        import numpy as np
+        self.mode, self.b, self.start = "final", b, int(start)
+        try:
+            out = self._forward(self.rows[b])[0].astype(mx.float32)
+            mx.eval(out)
+            return np.array(out)
+        finally:
+            self.mode, self.start = None, 0
+
+
+def plan_verify(source, rung=None, length=1024, chunks=16, vocab=None):
+    """Peak RAM of the streamed verify: the biggest decoder block of the source (bf16, + one tensor's transient) and
+    its embeddings, the logits of one chunk's SCORED positions (`length`: the second half of a pollard_verify.MLX_LENGTH
+    chunk; source + rung, float32 + the float64 KL math), the base process."""
+    import pollard_stream as S
+    src = S.Source(source)
+    blocks, outer, biggest, vocab_seen, embed = {}, 0, 0, 0, 0
+    for k in src.logical:
+        n = S._prod(src.shape(k))
+        b = n * 2 if src.encoding(k) else src.nbytes(k)
+        m = re.match(r"^(.*?(?:layers|h|blocks))\.(\d+)\.", k)
+        if m and not SPEECH_RE.search(k) and not VISION_RE.search(k):
+            key = (m.group(1), int(m.group(2)))
+            blocks[key] = blocks.get(key, 0) + b
+            g = re.sub(r"\.experts\.\d+\.", ".experts.*.", k)
+            biggest = max(biggest, b)
+            blocks[(g, -1)] = blocks.get((g, -1), 0) + b
+        elif "embed" in k or k.endswith("lm_head.weight"):
+            outer += b
+            embed = max(embed, b) if "embed" in k else embed
+            if len(src.shape(k)) == 2 and not vocab:
+                vocab_seen = max(vocab_seen, src.shape(k)[0])
+    stacks = [v for (g, i), v in blocks.items() if i == -1]
+    layer = max([v for (g, i), v in blocks.items() if i != -1] or [0])
+    V = vocab or vocab_seen or 152064
+    logits = length * V * 4 * 3 + 64 * V * 8 * 5            # rung + reference + head output; KL 64 rows at a time
+    # two phases: the blocks (the embeddings read by the record pass + one block + one tensor's transient), then the
+    # head (embeddings + head + one chunk's logits) -- the head is never evaluated while a block is in memory
+    blocks_phase = embed + layer + max(stacks or [biggest])
+    head_phase = outer + logits
+    peak = max(blocks_phase, head_phase) / 1e9 + BASE_GB
+    return {"layer_gb": round(layer / 1e9, 2), "outer_gb": round(outer / 1e9, 2),
+            "logits_gb": round(logits / 1e9, 2), "peak_gb": round(peak, 2)}
+
+
+# ----------------------------------------------------------------- remote source: a sparse, disk-budgeted mirror
+#
+# A source that does not fit this disk (clef-omni: 70.8 GB of bf16 on a Mac with ~70 GB free, before the rung) or
+# that sits on the build box already is MIRRORED instead of downloaded: the folder holds the small files whole and each
+# weight shard as a SPARSE file -- its safetensors header, every tensor's bytes a hole -- so every reader of headers
+# (mlx-lm / mlx-vlm loading lazily, pollard_stream.Source, pollard-complete) sees the checkpoint as it is. A tensor's
+# bytes are fetched over ssh just before MLX reads them, and kept as a cache within a disk budget (least recently used
+# tensors punched out again when the disk is needed). Which tensors an output needs is READ OFF MLX'S GRAPH: every
+# array mx.load returns is a Load node, and mx.export_to_dot of an output lists the Load nodes it depends on -- the
+# expert stack of one layer, the conv weight a sanitize transposed -- never guessed from names. A read from a hole
+# would be zeros, so a Load that is not registered or a byte range not fetched is an error, never a silent zero.
+
+MIRROR_MARK = ".pollard-remote"                  # dotfiles: the converters copy *.json / *.py, never these
+MIRROR_STATE = ".pollard-remote-present"
+_LOAD_RE = re.compile(r"\{ (\d+) \[label =\"Load\"")
+_BLOCK = 4096
+
+
+def _parse_ssh(url):
+    from urllib.parse import urlparse, parse_qs, unquote
+    u = urlparse(url)
+    if u.scheme != "ssh" or not u.hostname:
+        raise SystemExit(f"{url}: expected ssh://user@host[:port]/<remote dir>?python=<python>&key=<identity>")
+    q = {k: v[-1] for k, v in parse_qs(u.query).items()}
+    path = unquote(u.path)
+    return {"host": f"{u.username}@{u.hostname}" if u.username else u.hostname, "port": str(u.port or 22),
+            "dir": path[1:] if len(path) > 2 and path[2] == ":" else path, "python": q.get("python", "python3"),
+            "key": os.path.expanduser(q["key"]) if q.get("key") else None}
+
+
+def _load_ids(*arrays):
+    """The Load nodes (mx.load reads) the arrays depend on, from MLX's own graph."""
+    import io
+    import mlx.core as mx
+    buf = io.StringIO()
+    mx.export_to_dot(buf, *arrays)
+    return {int(x) for x in _LOAD_RE.findall(buf.getvalue())}
+
+
+def punch(path, off, n):
+    """Give back the disk blocks lying wholly inside [off, off + n) -- F_PUNCHHOLE on macOS, fallocate(PUNCH_HOLE)
+    on Linux; bytes read there become 0. Blocks shared with a neighbouring tensor are never touched."""
+    a, b = -(-off // _BLOCK) * _BLOCK, (off + n) // _BLOCK * _BLOCK
+    if b <= a:
+        return 0
+    fd = os.open(path, os.O_RDWR)
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+            fcntl.fcntl(fd, 99, struct.pack("IIqq", 0, 0, a, b - a))    # F_PUNCHHOLE
+        else:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
+            if libc.fallocate(fd, 0x03, a, b - a):                     # PUNCH_HOLE | KEEP_SIZE
+                raise OSError(ctypes.get_errno(), "fallocate(PUNCH_HOLE)")
+    finally:
+        os.close(fd)
+    return b - a
+
+
+class RemoteMirror:
+    """A local, sparse stand-in for a checkpoint folder on another machine (see above). `ensure(keys)` fetches,
+    `done(keys)` unpins (the bytes stay as cache), eviction punches the least recently used when the disk is needed."""
+
+    def __init__(self, local_dir, log=print, runner=None):
+        import collections
+        self.dir, self.log = str(local_dir), log
+        meta = json.load(open(os.path.join(self.dir, MIRROR_MARK), encoding="utf-8"))
+        self.url, self.shards = meta["url"], meta["shards"]
+        self.ssh = _parse_ssh(self.url)
+        self.run_ = runner
+        import pollard_stream as S
+        self.entries = {}
+        for name in self.shards:
+            hdr, base = S.st_header(os.path.join(self.dir, name))
+            for k, info in hdr.items():
+                if k != "__metadata__":
+                    a, b = info["data_offsets"]
+                    self.entries[k] = (name, base + a, b - a)
+        self.present = collections.OrderedDict()               # key -> True, least recently used first
+        try:
+            for k in json.load(open(os.path.join(self.dir, MIRROR_STATE), encoding="utf-8")):
+                if k in self.entries:
+                    self.present[k] = True
+        except (OSError, ValueError):
+            pass
+        self.pinned, self.by_load, self.reserve_gb = set(), {}, 3.0
+        self.fetched, self.evicted = 0, 0
+        import shutil
+        self.free_bytes = lambda: shutil.disk_usage(self.dir).free
+
+    @classmethod
+    def of(cls, local_dir, log=print):
+        return cls(local_dir, log) if os.path.isfile(os.path.join(str(local_dir), MIRROR_MARK)) else None
+
+    # -- ssh
+    def _cmd(self):
+        s = self.ssh
+        return ["ssh"] + (["-i", s["key"]] if s["key"] else []) + ["-o", "BatchMode=yes", "-p", s["port"], s["host"],
+                                                                     f'"{s["python"]}" -']
+
+    def _remote_json(self, code):
+        import subprocess
+        r = (self.run_ or subprocess.run)(self._cmd(), input="import json, os, sys, base64\n" + code,
+                                         capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"{self.ssh['host']}: remote python exited {r.returncode}: {(r.stderr or '')[-600:]}")
+        return json.loads([x for x in r.stdout.splitlines() if x.strip()][-1])
+
+    def _stream(self, ranges):
+        """[(file, offset, n)] read on the remote side, in order, as one byte stream; yields (file, offset, bytes)."""
+        import subprocess
+        rd = self.ssh["dir"].rstrip("/")
+        code = ("import sys\nR = %s\no = sys.stdout.buffer\nfor f, off, n in R:\n"
+                "    with open(%r + '/' + f, 'rb') as h:\n        h.seek(off)\n        while n:\n"
+                "            b = h.read(min(n, 1 << 24))\n            if not b:\n                sys.exit(5)\n"
+                "            o.write(b)\n            n -= len(b)\no.flush()\n") % (json.dumps(ranges), rd)
+        p = subprocess.Popen(self._cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p.stdin.write(code.encode())
+        p.stdin.close()
+        try:
+            for f, off, n in ranges:
+                got, pos = 0, off
+                while got < n:
+                    b = p.stdout.read(min(n - got, 1 << 24))
+                    if not b:
+                        raise RuntimeError(f"{self.ssh['host']}: stream ended {n - got} bytes short in {f}")
+                    yield f, pos, b
+                    got += len(b)
+                    pos += len(b)
+        finally:
+            rc = p.wait()
+            if rc:
+                raise RuntimeError(f"{self.ssh['host']}: remote read exited {rc}: {p.stderr.read()[-400:]!r}")
+
+    # -- creation
+    @classmethod
+    def create(cls, url, local_dir, log=print, small_max_gb=2.0):
+        """Mirror the remote folder at local_dir: small files whole, shards as sparse files (header only)."""
+        import base64
+        self = cls.__new__(cls)
+        self.ssh, self.run_, self.log = _parse_ssh(url), None, log
+        rd = self.ssh["dir"].rstrip("/")
+        files = self._remote_json(
+            f"d = {rd!r}\nfs = {{f: os.path.getsize(os.path.join(d, f)) for f in os.listdir(d) "
+            "if os.path.isfile(os.path.join(d, f))}\nidx = os.path.join(d, 'model.safetensors.index.json')\n"
+            "sh = sorted(set(json.load(open(idx))['weight_map'].values())) if os.path.exists(idx) else "
+            "[f for f in fs if f.endswith('.safetensors')]\nprint(json.dumps({'files': fs, 'shards': sh}))\n")
+        os.makedirs(local_dir, exist_ok=True)
+        shards = {s: files["files"][s] for s in files["shards"]}
+        heads = self._remote_json(
+            f"d = {rd!r}\nout = {{}}\nfor s in {sorted(shards)!r}:\n    with open(os.path.join(d, s), 'rb') as h:\n"
+            "        n = int.from_bytes(h.read(8), 'little')\n        h.seek(0)\n"
+            "        out[s] = base64.b64encode(h.read(8 + n)).decode()\nprint(json.dumps(out))\n")
+        for s, size in shards.items():
+            p = os.path.join(local_dir, s)
+            with open(p, "wb") as f:
+                f.write(base64.b64decode(heads[s]))
+                f.truncate(size)                                 # a hole: no disk until a tensor is fetched
+        small = [(f, n) for f, n in files["files"].items() if f not in shards and n <= small_max_gb * 1e9]
+        skipped = [f for f, n in files["files"].items() if f not in shards and n > small_max_gb * 1e9]
+        for f, n in small:
+            with open(os.path.join(local_dir, f), "wb") as h:
+                for _, _, b in self._stream([(f, 0, n)]):
+                    h.write(b)
+        json.dump({"url": url, "shards": shards, "created": __import__("time").strftime("%Y-%m-%dT%H:%M:%S")},
+                  open(os.path.join(local_dir, MIRROR_MARK), "w", encoding="utf-8"), indent=1)
+        log(f"   mirror: {len(shards)} shard(s) ({sum(shards.values()) / 1e9:.1f} GB, sparse) + {len(small)} file(s) "
+            f"of {url} -> {local_dir}" + (f"; not mirrored (too big): {skipped}" if skipped else ""))
+        return cls(local_dir, log)
+
+    # -- MLX graph -> tensors
+    def hook(self):
+        """While active, every mx.load of a mirrored shard registers its arrays' Load nodes by tensor name."""
+        import contextlib
+        import mlx.core as mx
+        mirror = self
+
+        @contextlib.contextmanager
+        def ctx():
+            orig = mx.load
+
+            def load(file, *a, **k):
+                out = orig(file, *a, **k)
+                name = os.path.basename(str(file))
+                if (os.path.normcase(os.path.dirname(os.path.abspath(str(file)))) == os.path.normcase(
+                        os.path.abspath(mirror.dir)) and name in mirror.shards and isinstance(out, dict)):
+                    for key, arr in out.items():
+                        for i in _load_ids(arr):
+                            mirror.by_load[i] = key
+                return out
+            mx.load = load
+            try:
+                yield mirror
+            finally:
+                mx.load = orig
+        return ctx()
+
+    def deps(self, *arrays):
+        """The mirrored tensors the arrays read (only the ones not evaluated yet)."""
+        out = set()
+        for i in _load_ids(*arrays):
+            k = self.by_load.get(i)
+            if k is not None:
+                out.add(k)
+        return out
+
+    # -- cache
+    def _save_state(self):
+        tmp = os.path.join(self.dir, MIRROR_STATE + ".tmp")
+        json.dump(list(self.present), open(tmp, "w", encoding="utf-8"))
+        os.replace(tmp, os.path.join(self.dir, MIRROR_STATE))
+
+    def _evict_for(self, need, keep):
+        free = self.free_bytes()
+        drop = []
+        for k in list(self.present):
+            if free - need >= self.reserve_gb * 1e9:
+                break
+            if k in keep or k in self.pinned:
+                continue
+            drop.append(k)
+            free += self.entries[k][2]
+        if free - need < self.reserve_gb * 1e9:
+            import pollard_stream as S
+            raise S.OutOfMemoryBudget(f"disk: the mirror needs {need / 1e9:.2f} GB more and only "
+                                      f"{(free - self.reserve_gb * 1e9) / 1e9:.2f} GB can be freed over the "
+                                      f"{self.reserve_gb:.1f} GB reserve at {self.dir}")
+        if drop:
+            for k in drop:                                        # forget first, punch second: a crash in between
+                del self.present[k]                               # only means a refetch, never a zero read
+            self._save_state()
+            for k in drop:
+                f, off, n = self.entries[k]
+                punch(os.path.join(self.dir, f), off, n)
+                self.evicted += n
+
+    def ensure(self, keys, reserve_gb=None):
+        """Fetch what of `keys` is not on disk (after making room), pin all of them."""
+        if reserve_gb is not None:
+            self.reserve_gb = float(reserve_gb)
+        keys = set(keys)
+        self.pinned |= keys
+        todo = sorted((k for k in keys if k not in self.present), key=lambda k: self.entries[k][:2])
+        for k in keys:
+            if k in self.present:
+                self.present.move_to_end(k)
+        if not todo:
+            return 0
+        need = sum(self.entries[k][2] for k in todo)
+        self._evict_for(need, keys)
+        ranges = []
+        for k in todo:                                           # adjacent tensors of one file: one range
+            f, off, n = self.entries[k]
+            if ranges and ranges[-1][0] == f and ranges[-1][1] + ranges[-1][2] == off:
+                ranges[-1][2] += n
+            else:
+                ranges.append([f, off, n])
+        fds = {}
+        try:
+            for f, pos, b in self._stream([tuple(r) for r in ranges]):
+                if f not in fds:
+                    fds[f] = os.open(os.path.join(self.dir, f), os.O_RDWR)
+                os.pwrite(fds[f], b, pos)
+        finally:
+            for fd in fds.values():
+                os.close(fd)
+        for k in todo:
+            self.present[k] = True
+        self.fetched += need
+        self._save_state()
+        return need
+
+    def ensure_keys(self, keys):
+        return self.ensure([k for k in keys if k in self.entries])
+
+    def done(self, keys):
+        """Unpin: the bytes stay as cache until the disk is needed."""
+        self.pinned -= set(keys)
+
+    def resident_gb(self):
+        return sum(self.entries[k][2] for k in self.present) / 1e9
+
+    def reclaimable_bytes(self):
+        """Cache bytes eviction can give back (everything on disk that is not pinned)."""
+        return sum(self.entries[k][2] for k in self.present if k not in self.pinned)
+
+    def make_room(self, free_gb):
+        """Evict least-recently-used cache until `free_gb` of disk is free, or the cache is spent; bytes evicted."""
+        before, free, drop = self.evicted, self.free_bytes(), []
+        for k in list(self.present):                       # least recently used first
+            if free >= free_gb * 1e9:
+                break
+            if k not in self.pinned:
+                drop.append(k)
+                free += self.entries[k][2]
+        if drop:
+            for k in drop:                                 # forget first, punch second (as _evict_for)
+                del self.present[k]
+            self._save_state()
+            for k in drop:
+                f, off, n = self.entries[k]
+                punch(os.path.join(self.dir, f), off, n)
+                self.evicted += n
+        return self.evicted - before
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -547,9 +1446,26 @@ def main():
     ap.add_argument("--imatrix", help="activation importance for --range search: a llama.cpp imatrix (.dat/.gguf, "
                     "llama-family names mapped) or .npz/.safetensors keyed by module path. Without it the "
                     "search minimises plain weight error")
+    ap.add_argument("--stream", default="auto", choices=STREAM_MODES,
+                    help="write the model one tensor at a time (bounded RAM, any size; the default). off = the "
+                         "converter's own save (the whole quantized model in memory first)")
+    ap.add_argument("--max-ram-gb", type=float, default=None,
+                    help="cap the streamed build's RAM (default: free RAM minus the POLLARD_MIN_FREE_GB floor, 2 GB)")
+    ap.add_argument("--remote-source", metavar="SSH_URL",
+                    help="--model is (or becomes) a sparse local MIRROR of the checkpoint at ssh://user@host[:port]/"
+                         "<dir>?python=<python>&key=<identity>: headers and small files local, every tensor fetched "
+                         "over ssh when MLX reads it and cached within the free disk (for a source this disk cannot "
+                         "hold next to its rung)")
+    ap.add_argument("--mirror-only", action="store_true", help="with --remote-source: create the mirror and stop")
     ap.add_argument("--plan-only", action="store_true", help="print the per-module bit plan, build nothing")
     a = ap.parse_args()
 
+    if a.remote_source and not os.path.isfile(os.path.join(a.model, MIRROR_MARK)):
+        if os.path.isdir(a.model) and os.listdir(a.model):
+            sys.exit(f"ERROR: {a.model} exists and is not a mirror -- name an empty or new folder for --remote-source")
+        RemoteMirror.create(a.remote_source, a.model)
+    if a.mirror_only:
+        return
     sens = json.load(open(a.sensitivity)) if a.sensitivity else {}
     low, high = rung_bits(a.bits, a.high_bits) if a.bits else (LOW, a.high_bits or HIGH)
     n_layers = a.layers or int(sens.get("layers") or 0)
@@ -570,6 +1486,18 @@ def main():
     if is_moe:
         print(f"   MoE: router + shared experts pinned {high}-bit; cold experts {low}-bit")
 
+    stream = a.stream != "off"
+    mirror = RemoteMirror.of(a.model) if os.path.isdir(a.model) else None
+    if mirror is not None and not stream:
+        print("   (the source is a remote mirror: the build streams, --stream off ignored)")
+        stream = True
+    if a.plan_only and stream and os.path.isdir(a.model):
+        try:
+            mp = plan_build(a.model, low, high, a.range, bool(encoded_source(a.model)), avg_bits=avg)
+            print(f"   streamed build: peak ~{mp['peak_gb']} GB RAM (largest unit {mp['largest']} = "
+                  f"{mp['largest_gb']} GB + {BASE_GB} GB base), source {mp['source_gb']} GB -> rung ~{mp['out_gb']} GB")
+        except (Exception, SystemExit) as e:                # noqa: BLE001 -- a plan is advice, never a failure
+            print(f"   (memory plan unavailable: {e})")
     if a.plan_only:
         # representative module paths for the first 2 layers + the vocab carriers
         print("   per-module plan (sample):")
@@ -594,6 +1522,9 @@ def main():
         except Exception:
             sys.exit("ERROR: --out required unless --plan-only.")
     engine, why = mlx_engine(a.model)
+    bad = mlx_runtime_problem(a.model)
+    if bad:
+        print(f"   NOTE: {bad} (the rung's weights do not depend on it; measuring and running it do)")
     if engine == "hold":
         print(f"HELD: {why} -- an MLX build of the text alone would not be this model")
         sys.exit(EXIT_HELD)
@@ -608,11 +1539,14 @@ def main():
         sys.exit(f"ERROR: {engine} not installed. On Apple Silicon: pip install {engine.replace('_', '-')} ; then rerun.")
 
     rs = None
+    imp = load_importance(a.imatrix) if (a.imatrix and a.range == "search") else {}
     if a.range == "search":
-        imp = load_importance(a.imatrix) if a.imatrix else {}
-        rs = RangeSearchQuantize(imp, "search")
         print(f"   range: imatrix-weighted search ({len(imp)} module rows from {a.imatrix})" if imp else
               "   range: search on weight error (no --imatrix; pass one for the activation-weighted search)")
+    if stream:
+        rs = StreamedQuantize(imp, a.range)
+    elif a.range == "search":
+        rs = RangeSearchQuantize(imp, "search")
 
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
         if rs is not None:
@@ -621,27 +1555,66 @@ def main():
 
     import contextlib, shutil
     import pollard_workspace as ws
+    import pollard_stream as S
     src_dir, staging = a.model, None
-    if engine == "mlx_vlm" and encoded_source(a.model):     # mlx-vlm reads float weights: decode first
+    # mlx-vlm reads float weights, and so does mlx-lm for most encodings: an already-quantized source is decoded to a
+    # BF16 copy first, itself streamed tensor by tensor (pollard_stream's readers)
+    if (engine == "mlx_vlm" or stream) and encoded_source(a.model):
+        if mirror is not None:
+            sys.exit("ERROR: an already-quantized source cannot be read through a remote mirror -- fetch it")
         staging = a.out.rstrip("/\\") + ".float-src"
         shutil.rmtree(staging, ignore_errors=True)
         src_dir = decode_to_float(a.model, staging)
+    guard = MemoryGuard()
+    bplan = None
+    if stream and os.path.isdir(src_dir):
+        try:
+            bplan = plan_build(src_dir, low, high, a.range, bool(staging), avg_bits=avg)
+            preflight_build(bplan, a.out, a.max_ram_gb, mirror=mirror)
+        except S.OutOfMemoryBudget as e:
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+            print(f"HELD: {e}")
+            sys.exit(EXIT_HELD)
     # mlx-vlm builds the model from its own code: the checkpoint's modelling files are never needed there
     trc = False if engine == "mlx_vlm" else ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     ckw = dict(mlx_path=a.out, quantize=True, q_bits=low, q_group_size=a.group_size, quant_predicate=predicate)
+    existed = os.path.exists(a.out)
     try:
-        with (rs if rs is not None else contextlib.nullcontext()):
+        with (rs if rs is not None else contextlib.nullcontext()), \
+                (mirror.hook() if mirror is not None else contextlib.nullcontext()), \
+                (StreamWriter(rs, guard, mirror=mirror, out_bytes=(bplan or {}).get("out_bytes", 0))
+                 if stream else contextlib.nullcontext()):
             try:
                 convert(src_dir, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
             except TypeError:
                 if trc:
                     print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
                 convert(src_dir, **ckw)
+    except S.OutOfMemoryBudget as e:
+        if not existed:
+            shutil.rmtree(a.out, ignore_errors=True)        # a half-written rung is never left to look built
+        print(f"HELD: {e}")
+        sys.exit(EXIT_HELD)
+    except BaseException:
+        if stream and not existed:
+            shutil.rmtree(a.out, ignore_errors=True)
+        raise
     finally:
         if staging:
             shutil.rmtree(staging, ignore_errors=True)
+    if stream:
+        nb = guard.numbers()
+        print(f"   streamed build: peak footprint {nb['peak_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, "
+              f"lowest free RAM {nb['min_free_ram_gb']} GB"
+              + (f"; mirror fetched {mirror.fetched / 1e9:.1f} GB, evicted {mirror.evicted / 1e9:.1f} GB"
+                 if mirror is not None else ""))
     if os.path.isdir(a.model):                             # the whole model or nothing: no silent text-only MLX
         import pollard_complete as PC
+        if mirror is not None and not PC.check(a.model, a.out, "mlx")["ok"]:   # sidecars copy source bytes: fetch
+            out_keys = PC._out_tensors(a.out)
+            mirror.ensure_keys([k for ks in PC.inventory(a.model)["components"].values() for k in ks
+                                if not PC._carried(k, out_keys)])
         PC.fill(a.model, a.out, "mlx")                      # processor files a converter did not write
         res = PC.check(a.model, a.out, "mlx")
         if not res["ok"]:

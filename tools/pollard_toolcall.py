@@ -1113,6 +1113,8 @@ def preflight(backend, model, ngl="0", kind=None, server=None):
     """Raise NotMeasured when this machine cannot serve `model` with `backend`; else the extra request fields the
     backend wants. Asked BEFORE a server starts: memory first (never start what will not fit), then the GPU rule."""
     kind = kind or {}
+    if model and os.path.isfile(os.path.join(str(model), ".pollard-remote")):
+        raise NotMeasured("a remote mirror (sparse: its tensors are fetched only by the MLX lane) cannot be served")
     need = model_gb(model)
     if backend == "gguf":
         if str(ngl) in ("0", ""):
@@ -1787,11 +1789,28 @@ def record_not_measured(a, rung, backend, reason, lane=None):
         ws.merge_results(a.results, rung, {"toolcall": tc})
 
 
+def load_ref_rows(path):
+    """(rows, meta, backend) of a reference measured elsewhere: the {"rows", "meta"} file the reference cache writes
+    (the f16 GGUF's rows on the box, for a rung on a machine that cannot serve the bf16)."""
+    d = json.load(open(path, encoding="utf-8"))
+    meta = dict(d.get("meta") or {})
+    return d["rows"], meta, meta.get("backend") or "gguf"
+
+
 def _resolve_ref(a, backend, kw):
     """(ref_rows, ref_meta, ref_backend, note) -- the reference served by the rung's own backend when it can be; else
-    the --ref-fallback (the f16 GGUF through llama-server), labelled cross-backend; else no reference at all."""
+    the --ref-fallback (the f16 GGUF through llama-server), labelled cross-backend; else --ref-rows (a reference
+    measured on another machine, labelled as such); else no reference at all."""
+    rr = getattr(a, "ref_rows", None)
+
+    def from_rows(why):
+        rows, meta, rb = load_ref_rows(rr)
+        note = (f"{why + '; ' if why else ''}reference = rows measured elsewhere ({os.path.basename(rr)}, "
+                f"{BACKEND_SERVER.get(rb, rb)})")
+        print(f"   ({note})")
+        return rows, meta, rb, note
     if not (a.ref or a.ref_url):
-        return None, None, None, None
+        return from_rows("") if rr and os.path.exists(rr) else (None, None, None, None)
     rb = a.ref_backend if a.ref_backend != "auto" else pick_backend(a.ref, prefer=backend, url=a.ref_url)
     try:
         rows, meta = run_ref_cached(a.ref, a.ngl, refresh=a.refresh_ref, backend=rb, url=a.ref_url,
@@ -1810,6 +1829,8 @@ def _resolve_ref(a, backend, kw):
         except NotMeasured as e:
             why += f"; fallback {os.path.basename(a.ref_fallback)} not measured either: {e}"
             print(f"   ({why})")
+    if rr and os.path.exists(rr):
+        return from_rows(why)
     return None, None, None, why
 
 
@@ -1834,7 +1855,8 @@ def main_full(a):
     rs, ret = None, (None, None, None)
     if ref_rows is not None:
         rs = score_suite(ref_rows)
-        ref_name = os.path.basename(str((a.ref_fallback if ref_note else None) or a.ref or a.ref_url).rstrip("/\\"))
+        ref_name = os.path.basename(str((a.ref_rows if ref_note and "measured elsewhere" in ref_note else None)
+                                        or (a.ref_fallback if ref_note else None) or a.ref or a.ref_url).rstrip("/\\"))
         print_board(f"{ref_name}  (reference, {BACKEND_SERVER.get(ref_backend, ref_backend)})", rs, ref_rows,
                     a.verbose)
         ret = retention_ci(rows, ref_rows)
@@ -1906,6 +1928,9 @@ def main(argv=None):
     ap.add_argument("--ref-url", help="--ref-backend url: where the reference is already served")
     ap.add_argument("--ref-fallback", help="when the reference cannot be served by the rung's backend here (no GPU, "
                                            "too big): use this one instead (the f16 GGUF) -- labelled cross-backend")
+    ap.add_argument("--ref-rows", help="a reference measured on another machine: the {rows, meta} JSON its reference "
+                    "cache wrote (e.g. the f16 GGUF's rows from the box) -- used when no reference can be served here, "
+                    "labelled with the backend it ran on (cross-backend)")
     ap.add_argument("--quick", action="store_true",
                     help="the old 4-probe plain-prompt check through llama-cli (no chat template, no server)")
     ap.add_argument("--ngl", default="0", help="GPU layers for llama-server (a number, or auto; default 0 -- shared "

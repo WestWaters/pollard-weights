@@ -228,6 +228,9 @@ class Source:
         self.files = weight_files(self.base_dir)
         if not self.files:
             raise SystemExit(f"no safetensors weights in {self.base_dir}")
+        # a sparse remote mirror (pollard_mlx.RemoteMirror): its headers are real, its tensor bytes are holes until
+        # the MLX lane fetches them -- every other reader would read zeros
+        self.mirror = os.path.isfile(os.path.join(self.base_dir, ".pollard-remote"))
         self.entries, self._hdr = {}, {}
         streamed = read_streamed(self.base_dir)
         self._remote = {}                                 # path -> streamed entry: shards that live on the Hub now
@@ -346,6 +349,9 @@ class Source:
     def read_raw(self, name):
         """(safetensors dtype, numpy array in its storage dtype) of a RAW tensor -- the bytes as stored."""
         import numpy as np
+        if getattr(self, "mirror", False):
+            raise SystemExit(f"{self.base_dir} is a remote mirror (sparse: headers only until the MLX lane fetches a "
+                             "tensor) -- this lane needs the checkpoint itself on disk")
         p, dt, shape, off, n = self.entries[name]
         npdt = np.dtype(ST_NP[dt])
         if p in getattr(self, "_remote", {}):

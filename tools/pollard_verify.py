@@ -246,27 +246,189 @@ def measure_gguf(model, ref, eval_path, ngl="0", chunks=16, ppl_bin=None):
             "median_kld": res.get("median_kld")}
 
 
-def measure_mlx(model, source, eval_path, length=512, chunks=8):
-    """mlx_lm: the quantized model and its source over the same token chunks."""
+def _kl_chunk(r, q, ids, rows=64, start=0):
+    """(per-token KL, top-1 hits, rung NLL, reference NLL) of one chunk, computed `rows` positions at a time: the
+    float64 math on a 128k-200k vocabulary is ~1 GB per array for a whole chunk, ~0.1 GB this way. `r` / `q` are the
+    logits of positions start, start + 1, ... of `ids` (the scored part of the chunk)."""
+    import numpy as np
+    ids = np.asarray(ids)
+    kl, t1, nq, nr = [], [], [], []
+    for a in range(0, len(r), rows):
+        k, t, lr, lq = _kl_rows(np.asarray(r[a:a + rows], np.float32), np.asarray(q[a:a + rows], np.float32))
+        kl.append(k), t1.append(t)
+        nxt = ids[start + a + 1:start + a + 1 + len(k)]   # position t predicts ids[t + 1]
+        m = len(nxt)
+        nq.append(-lq[np.arange(m), nxt]), nr.append(-lr[np.arange(m), nxt])
+    return np.concatenate(kl), np.concatenate(t1), np.concatenate(nq), np.concatenate(nr)
+
+
+def _kl_rows(r, q):
+    """Per-token KL(ref || q) (nats, float64) and top-1 agreement for one chunk -- kld_top1's math, row by row."""
+    import numpy as np
+    r = np.asarray(r, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    if r.shape != q.shape:
+        v = min(r.shape[-1], q.shape[-1])
+        r, q = r[..., :v], q[..., :v]
+    r = r - r.max(-1, keepdims=True)
+    q = q - q.max(-1, keepdims=True)
+    lr = r - np.log(np.exp(r).sum(-1, keepdims=True))
+    lq = q - np.log(np.exp(q).sum(-1, keepdims=True))
+    return (np.exp(lr) * (lr - lq)).sum(-1), r.argmax(-1) == q.argmax(-1), lr, lq
+
+
+def mlx_stream_wanted(source, model, mode="auto"):
+    """(True, why) when the MLX lane is measured STREAMED (block by block): asked for, or the source + rung do not
+    fit comfortably in free RAM (the whole-model path loads the source, then the rung, each whole)."""
+    if mode == "on":
+        return True, "--stream on"
+    if os.path.isfile(os.path.join(str(source), ".pollard-remote")):
+        return True, "the source is a remote mirror"
+    if mode == "off":
+        return False, ""
+    def size_gb(d):
+        return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(d) for f in fs
+                   if f.endswith(".safetensors")) / 1e9 if os.path.isdir(str(d)) else 0.0
+    try:
+        import pollard_stream as S
+        need = max(size_gb(source), size_gb(model)) + 1.5
+        free = S.free_ram_gb()
+    except Exception:                                        # noqa: BLE001
+        return True, "free RAM unknown"
+    if free is None or need > 0.5 * free:
+        return True, f"the source is {size_gb(source):.1f} GB, {('%.1f' % free) if free else '?'} GB RAM free"
+    return False, ""
+
+
+#: The MLX lane is scored the way llama-perplexity scores the GGUF lane (measure_gguf: -c 2048 --kl-divergence), so
+#: one gate threshold means the same thing on both: every chunk starts with the model's BOS -- a chunk cut from the
+#: middle of the corpus is otherwise a context the model never saw (LFM2.5-8B-A1B: reference PPL 32.2 without it,
+#: 16.7 with it) -- and only the SECOND HALF of each chunk is scored, every scored token having >= length/2 tokens of
+#: context. Before this the lane scored 256-token BOS-less chunks from position 0 and read LFM2.5-24B-A2B's 3-bit
+#: rung at KLD 1.05; on LFM2.5-8B-A1B the same rung read 0.94 that way and 0.53 this way.
+MLX_PROTOCOL = "bos-second-half"
+MLX_LENGTH = 2048
+
+
+def _bos_id(tok):
+    """The BOS id a chunk should start with, or None when the model does not use one (Qwen: none defined). A model
+    uses it when its tokenizer adds it or its chat template writes it (LFM2's tokenizer does not add
+    <|startoftext|>; its template starts every conversation with it)."""
+    bos = getattr(tok, "bos_token_id", None)
+    if bos is None:
+        return None
+    try:
+        if list(tok.encode("a"))[:1] == [bos]:
+            return bos
+    except Exception:                                        # noqa: BLE001
+        pass
+    tmpl = getattr(tok, "chat_template", None) or ""
+    name = getattr(tok, "bos_token", None)
+    return bos if isinstance(tmpl, str) and ("bos_token" in tmpl or (name and str(name) in tmpl)) else None
+
+
+def _protocol_chunks(ids, length, n, bos):
+    """`n` chunks of `length` tokens, each starting with `bos` (llama-perplexity overwrites a chunk's first token with
+    BOS; the same here), and where each one's scored part begins."""
+    if bos is not None and list(ids[:1]) == [bos]:
+        ids = ids[1:]
+    if bos is None:
+        parts = _chunks(ids, length, n)
+    else:
+        parts = [[bos] + list(p[1:]) for p in _chunks(ids, length, n)]
+    return parts, [len(p) // 2 for p in parts]
+
+
+def _mlx_tokens(source, eval_path, length, chunks, with_starts=False):
+    from pathlib import Path
+    try:
+        from mlx_lm.utils import load_tokenizer
+        tok = load_tokenizer(Path(source))
+    except Exception:                                        # noqa: BLE001 -- a processor-only folder
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(source)
+    parts, starts = _protocol_chunks(list(tok.encode(_eval_text(eval_path))), length, chunks, _bos_id(tok))
+    return (parts, starts) if with_starts else parts
+
+
+def measure_mlx(model, source, eval_path, length=None, chunks=8, stream="auto", log=print):
+    """mlx_lm / mlx-vlm: the quantized model and its source over the same token chunks -- KLD, top-1, PPL, scored as
+    llama-perplexity scores the GGUF lane (MLX_PROTOCOL: BOS-led chunks, second half). Streamed (pollard_mlx.StreamedLM:
+    block by block, bounded RAM, any size; a VLM / omni through its language model) when the models do not fit whole,
+    else loaded whole. The source's logits (the scored positions) are cached (fp16) for every later rung."""
     try:
         import mlx.core as mx
         from mlx_lm import load
     except ImportError:
         raise SystemExit("the mlx lane needs mlx-lm (Apple Silicon): pip install mlx-lm") from None
     import numpy as np
-    smodel, tok = load(source)
-    ids = tok.encode(_eval_text(eval_path))
-    parts = _chunks(ids, length, chunks)
-    cache = _ref_cache(source, eval_path, length, chunks, "mlx")
-    if os.path.exists(cache):
-        ref = np.load(cache)
+    import pollard_mlx as M
+    bad = M.mlx_runtime_problem(source)
+    if bad:
+        raise SystemExit(f"the mlx lane cannot measure this model with the installed runtime: {bad}")
+    length = length or MLX_LENGTH
+    parts, starts = _mlx_tokens(source, eval_path, length, chunks, with_starts=True)
+    cache = _ref_cache(source, eval_path, length, chunks, f"mlx-{MLX_PROTOCOL}")
+    engine, _ = M.mlx_engine(source)
+    engine = "mlx_vlm" if engine == "mlx_vlm" else "mlx_lm"
+    streamed, why = mlx_stream_wanted(source, model, stream)
+    if engine == "mlx_vlm" and not streamed:                 # mlx-lm cannot load a VLM / omni whole: its LM, streamed
+        streamed, why = True, "a VLM / omni: its language model through mlx-vlm"
+    kls, top, nll_q, nll_r = [], [], [], []
+    if streamed:
+        guard = M.MemoryGuard(log=log)
+        log(f"   streamed ({why}): source and rung block by block through {engine}")
+        try:
+            plan = M.plan_verify(source, model, length - length // 2, chunks)   # logits of the scored half only
+            log(f"   memory plan: peak ~{plan['peak_gb']} GB (one block {plan['layer_gb']} GB, embeddings "
+                f"{plan['outer_gb']} GB, one chunk's logits {plan['logits_gb']} GB)")
+        except (Exception, SystemExit) as e:                 # noqa: BLE001
+            log(f"   (memory plan unavailable: {e})")
+        offs = np.cumsum([0] + [len(p) - s for p, s in zip(parts, starts)])
+        if not os.path.exists(cache):
+            src = M.StreamedLM(source, engine, guard, log).run(parts)
+            ref_mm = None
+            for b in range(len(parts)):
+                lg = src.logits(b, starts[b])
+                if ref_mm is None:
+                    ref_mm = np.lib.format.open_memmap(cache + ".partial.npy", mode="w+", dtype=np.float16,
+                                                       shape=(int(offs[-1]), lg.shape[-1]))
+                ref_mm[offs[b]:offs[b + 1]] = lg.astype(np.float16)
+            ref_mm.flush()
+            del ref_mm, src
+            mx.clear_cache()
+            os.replace(cache + ".partial.npy", cache)
+        ref = np.load(cache, mmap_mode="r")
+        q = M.StreamedLM(model, engine, guard, log).run(parts)
+        for b, ids in enumerate(parts):
+            kl, t1, nq_, nr_ = _kl_chunk(ref[offs[b]:offs[b + 1]], q.logits(b, starts[b]), ids, start=starts[b])
+            kls.append(kl), top.append(t1), nll_q.append(nq_), nll_r.append(nr_)
+        nb = guard.numbers()
+        log(f"   streamed verify: peak footprint {nb['peak_gb']} GB, peak RSS {nb['peak_rss_gb']} GB, lowest free RAM "
+            f"{nb['min_free_ram_gb']} GB")
     else:
-        ref = np.concatenate([np.array(smodel(mx.array(c)[None])[0].astype(mx.float32)) for c in parts]).astype(np.float16)
-        np.save(cache, ref)
-    del smodel
-    qmodel, _ = load(model)
-    q = np.concatenate([np.array(qmodel(mx.array(c)[None])[0].astype(mx.float32)) for c in parts])
-    return kld_top1(ref.astype(np.float32), q)
+        smodel = None
+        if os.path.exists(cache):
+            ref = np.load(cache)
+        else:
+            smodel, _ = load(source)
+            ref = np.concatenate([np.array(smodel(mx.array(c)[None])[0, s:].astype(mx.float32))
+                                  for c, s in zip(parts, starts)]).astype(np.float16)
+            np.save(cache, ref)
+        del smodel
+        qmodel, _ = load(model)
+        off = 0
+        for ids, s in zip(parts, starts):
+            qq = np.array(qmodel(mx.array(ids)[None])[0, s:].astype(mx.float32))
+            kl, t1, nq_, nr_ = _kl_chunk(ref[off:off + len(ids) - s], qq, ids, start=s)
+            off += len(ids) - s
+            kls.append(kl), top.append(t1), nll_q.append(nq_), nll_r.append(nr_)
+    kl, t1 = np.concatenate(kls), np.concatenate(top)
+    nq, nr = np.concatenate(nll_q), np.concatenate(nll_r)
+    return {"kld": float(kl.mean()), "top1": float(t1.mean() * 100.0), "kld_p99": float(np.percentile(kl, 99)),
+            "n": int(kl.size), "ppl": float(np.exp(nq.mean())) if nq.size else None,
+            "ref_ppl": float(np.exp(nr.mean())) if nr.size else None, "streamed": bool(streamed),
+            "protocol": f"{MLX_PROTOCOL} (length {length}, {len(parts)} chunks)"}
 
 
 def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False,
@@ -666,7 +828,9 @@ def main():
                          "gated on the pollard-draft measure numbers in --results (nothing is run)")
     ap.add_argument("--eval", help="HELD-OUT text for the KLD/top-1 measurement (gguf/mlx/gptq/mx)")
     ap.add_argument("--chunks", type=int, default=16, help="eval chunks (gguf: llama-perplexity --chunks)")
-    ap.add_argument("--length", type=int, default=256, help="tokens per chunk (mlx/gptq/mx) / e2e length (exl3)")
+    ap.add_argument("--length", type=int, default=None,
+                    help="tokens per chunk (gptq/mx: 256; mlx: 2048, scored like llama-perplexity -c 2048) / e2e "
+                         "length (exl3: 256)")
     ap.add_argument("--ngl", default="0", help="gguf: GPU layers for llama-perplexity (default 0 -- shared boxes)")
     ap.add_argument("--no-measure", dest="measure", action="store_false",
                     help="gate only on numbers already in --results (no model is run)")
@@ -684,12 +848,13 @@ def main():
     ap.add_argument("--trust-remote-code", nargs="?", const="on", default="auto", choices=["auto", "on", "off"],
                     help="run the source's own code where no native transformers class covers it (never silent)")
     ap.add_argument("--stream", default="auto", choices=["auto", "on", "off"],
-                    help="gptq / mx / exlr8: measure source and rung streamed block by block (any size, VLM / omni "
-                         "text backbones, custom code, already-quantized sources). auto = when transformers cannot "
-                         "load the source whole here")
+                    help="gptq / mx / exlr8 / mlx: measure source and rung streamed block by block (any size, VLM / "
+                         "omni text backbones, custom code, already-quantized sources). auto = when the source cannot "
+                         "be loaded whole here (transformers), or source + rung do not fit free RAM comfortably (mlx)")
     ap.add_argument("--sanitizer", action="store_true",
                     help="re-run this verify under NVIDIA compute-sanitizer (memcheck+racecheck)")
     a = ap.parse_args()
+    mlx_length, a.length = a.length, a.length or 256       # the mlx lane's own default: MLX_LENGTH
     if a.print_gates:
         sys.stdout.write(DEFAULT_GATES)
         return
@@ -746,7 +911,7 @@ def main():
         if lane == "gguf":
             measured = measure_gguf(a.model, a.source, a.eval, a.ngl, a.chunks)
         elif lane == "mlx":
-            measured = measure_mlx(a.model, a.source, a.eval, a.length, a.chunks)
+            measured = measure_mlx(a.model, a.source, a.eval, mlx_length, a.chunks, a.stream)
         elif streamed:
             print(f"   streamed: source and rung block by block ({why})")
             measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc)
