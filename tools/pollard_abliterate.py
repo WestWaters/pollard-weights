@@ -270,7 +270,7 @@ def main():
                          "A. Measure with pollard-kl before trusting any positive value.")
     ap.add_argument("--out", help="output dir for the abliterated FP16 model")
     ap.add_argument("--layer", default="auto", help="direction layer index, or 'auto'")
-    ap.add_argument("--device", default="mps")
+    ap.add_argument("--device", default="auto", help="auto (CUDA > MPS > CPU) | cuda[:N] | mps | cpu")
     ap.add_argument("--trust-remote-code", default="auto", choices=["auto", "on", "off"],
                     help="run a model's own modeling code (custom archs); 'auto' = only if config has auto_map")
     ap.add_argument("--embed", default="auto", choices=["auto", "on", "off"],
@@ -296,7 +296,8 @@ def main():
     from transformers import AutoTokenizer
     import pollard_workspace as ws
     trc = ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
-    dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
+    import pollard_device
+    dev = pollard_device.pick(a.device, torch)          # auto / cuda / mps / cpu -> what runs here
     print(f"== pollard-abliterate :: {a.model}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=trc)
     if tok.pad_token is None:

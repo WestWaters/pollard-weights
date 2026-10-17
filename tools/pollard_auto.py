@@ -30,6 +30,7 @@ Plans by default (prints the exact commands for THIS model); `--run` executes th
     pollard tune --base Qwen/Qwen3.5-9B --data cases.csv --out runs/x --ship   # fine-tune + eval + ship (pollard-tune)
     pollard serve Org/Model:Q4_K_M --harness claude-code       # run a rung for an agent harness (pollard-serve)
     pollard release --hf Qwen/Qwen3-8B --plan release.yaml     # EVERY lane as a ladder, gated + carded (pollard-release)
+    pollard setup                                              # what each lane needs here; install what is missing
 
 EVERY lane runs the GOLD Pollard method one-shot: GGUF = auto Calib-3.0 imatrix -> measured automap mix
 -> coherence gate; GPTQ/MLX/MX = smoothing (default, low-bit lanes) + auto-measured allocation (a cheap
@@ -1031,6 +1032,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "tune":
         from pollard_tune import main as tune_main
         sys.exit(tune_main(sys.argv[2:]))
+    # `pollard setup ...` -- is everything each lane needs here and working; offer to install what is not
+    if len(sys.argv) > 1 and sys.argv[1] == "setup":
+        from pollard_setup import main as setup_main
+        sys.exit(setup_main(sys.argv[2:]))
     # `pollard release ...` -- every lane, each a ladder of rungs, gated, carded, (optionally) published
     if len(sys.argv) > 1 and sys.argv[1] == "release":
         from pollard_release import main as release_main
@@ -1136,7 +1141,23 @@ def main():
                          "MoE build appends after the mix -- by default it runs so you learn if the "
                          "model is usable and which sampling to ship, without a manual step.")
     ap.set_defaults(gate=True)
+    ap.add_argument("--skip-setup-check", action="store_true",
+                    help="start even when `pollard setup` says this lane is missing a piece here")
     a = ap.parse_args()
+
+    # First-run hook: a fast, cached (per environment) check that the requested lane can run here -- a one-line
+    # hint when it cannot. With --run, a lane missing a piece stops HERE with the fix, not an hour into the build.
+    try:
+        import pollard_setup as S
+        if a.run and not a.skip_setup_check:
+            if S.require([a.format]):
+                sys.exit(2)
+        else:
+            S.hint([a.format])
+    except SystemExit:
+        raise
+    except Exception:                                            # noqa: BLE001  (a check never blocks a build)
+        pass
 
     # One heavy job per machine. Everything below contends for the same GPU, disk and cores.
     with MachineLock(" ".join(sys.argv[1:])[:120], force=getattr(a, "force", False)) if a.run \

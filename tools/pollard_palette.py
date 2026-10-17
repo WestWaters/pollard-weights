@@ -162,11 +162,12 @@ def main():
                     "measured = solo NLL-delta from fp16 (ignores interactions); proxy = per-tensor H-error (fast, mis-ranks)")
     ap.add_argument("--probe-chunks", type=int, default=4, help="calib chunks per crush measurement")
     ap.add_argument("--profile-out", default="palette_profile.json")
-    ap.add_argument("--device", default="mps")
+    ap.add_argument("--device", default="auto", help="auto (CUDA > MPS > CPU) | cuda[:N] | mps | cpu")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    dev = a.device if (a.device != "mps" or torch.backends.mps.is_available()) else "cpu"
+    import pollard_device
+    dev = pollard_device.pick(a.device, torch)          # auto / cuda / mps / cpu -> what runs here
     print(f"== pollard-palette :: {a.model}  gs={a.groupsize}  dev={dev}", flush=True)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = load_backbone(a.model, torch.float16, dev, eval_mode=False)
