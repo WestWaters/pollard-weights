@@ -22,9 +22,14 @@ ALL = {"any": True, "apple": True, "cuda": True}
 REPO = "PollardWeights/Tiny-1B-Pollard"
 
 
+def _meta(path):
+    import hashlib
+    return os.path.getsize(path), hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
 class Hub:
     def __init__(self):
-        self.files, self.private, self.calls = {}, {}, []
+        self.files, self.private, self.calls, self.meta = {}, {}, [], {}
 
     def api(self):
         hub = self
@@ -37,11 +42,18 @@ class Hub:
             def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
                 hub.calls.append(("file", path_in_repo))
                 hub.files.setdefault(repo_id, set()).add(path_in_repo)
+                hub.meta[(repo_id, path_in_repo)] = _meta(path_or_fileobj)
 
             def upload_folder(self, folder_path, repo_id, path_in_repo=""):
                 hub.calls.append(("folder", path_in_repo))
                 for f in os.listdir(folder_path):
-                    hub.files.setdefault(repo_id, set()).add(f"{path_in_repo}/{f}" if path_in_repo else f)
+                    rp = f"{path_in_repo}/{f}" if path_in_repo else f
+                    hub.files.setdefault(repo_id, set()).add(rp)
+                    hub.meta[(repo_id, rp)] = _meta(os.path.join(folder_path, f))
+
+            def get_paths_info(self, repo, paths):
+                return [types.SimpleNamespace(path=p, size=hub.meta[(repo, p)][0], lfs={"sha256": hub.meta[(repo, p)][1]},
+                                              blob_id=None) for p in paths if (repo, p) in hub.meta]
 
             def list_repo_files(self, repo):
                 return sorted(hub.files.get(repo, set()))

@@ -39,24 +39,47 @@ def inputs(tmp_path):
             "calib_file": str(src / "calib.txt"), "heldout_file": str(src / "heldout.txt")}
 
 
+def _sha(path):
+    import hashlib
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
 class FakeApi:
+    """The Hub as far as the release uses it: the file list per repo, and per file the size + LFS sha256 that
+    get_paths_info reads back (what --free-after-upload checks before it deletes anything)."""
     def __init__(self, store):
         self.store = store
+        self.meta = store.setdefault("__meta__", {})
 
     def create_repo(self, repo, **k):
         self.store.setdefault(repo, set())
 
+    def _put(self, repo, path_in_repo, local):
+        self.store.setdefault(repo, set()).add(path_in_repo)
+        self.meta[(repo, path_in_repo)] = (os.path.getsize(local), _sha(local))
+
     def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
         assert os.path.exists(path_or_fileobj), "uploads read the local file before it is freed"
-        self.store.setdefault(repo_id, set()).add(path_in_repo)
+        if self.store.get("__fail_upload__"):
+            raise ConnectionError("upload interrupted")
+        self._put(repo_id, path_in_repo, path_or_fileobj)
 
     def upload_folder(self, folder_path, repo_id, path_in_repo=""):
         assert os.path.isdir(folder_path)
         for f in os.listdir(folder_path):
-            self.store.setdefault(repo_id, set()).add(f"{path_in_repo}/{f}" if path_in_repo else f)
+            self._put(repo_id, f"{path_in_repo}/{f}" if path_in_repo else f, os.path.join(folder_path, f))
 
     def list_repo_files(self, repo):
         return sorted(self.store.get(repo, set()))
+
+    def get_paths_info(self, repo, paths):
+        import types
+        out = []
+        for p in paths:
+            if (repo, p) in self.meta:
+                size, sha = self.meta[(repo, p)]
+                out.append(types.SimpleNamespace(path=p, size=size, lfs={"sha256": sha}, blob_id=None))
+        return out
 
 
 @pytest.fixture
@@ -143,19 +166,21 @@ def test_each_rung_is_uploaded_then_freed_and_the_inputs_never_are(model, inputs
     monkeypatch.setattr(R, "run_cmd", fake)
     monkeypatch.setattr(R, "disk_free_gb", lambda p: 1000.0)
     st = R.execute(steps, c, cfg, run=True, run_upload=True, have=ALL, out=lambda *_: None)
-    assert max(peak) == 1, "never more than one rung on disk"
+    assert max(peak) <= 2, "one rung on disk at a time (+ the failed one kept)"
     repo = "PollardWeights/Tiny-1B-Pollard"
     assert {"Tiny-1B-Pollard-Q6_K.gguf", "Tiny-1B-Pollard-IQ4_XS.gguf", "Tiny-1B-Pollard-IQ1_KT.gguf",
             "README.md", "Tiny-1B.imatrix"} <= hub[repo]
     assert "Tiny-1B-Pollard-IQ3_S.gguf" not in hub[repo], "a rung that failed its gate is not published"
-    assert st["gguf/IQ3_S/verify"] == "failed" and st["gguf/IQ3_S/publish"] == "done"
-    assert not any(os.path.exists(p) for p in live), "every rung freed, the failed one too"
+    assert st["gguf/IQ3_S/verify"] == "failed" and st["gguf/IQ3_S/publish"] == "kept: upstream failed"
+    left = [p for p in (b["path"] for b in R.gguf_builds(c)) if os.path.exists(p)]
+    assert [os.path.basename(p) for p in left] == ["Tiny-1B-Pollard-IQ3_S.gguf"], \
+        "every published rung freed; the one that failed its gate KEPT on disk"
     for k in ("f16", "imatrix", "sensitivity", "calib_file", "heldout_file"):
         assert os.path.exists(inputs[k]), f"input {k} must never be deleted"
     assert st["gguf/upload"] == "done"
     man = {b["tag"]: b for b in R.gguf_builds(c)}
-    assert man["Q6_K"]["uploaded"] == repo and man["Q6_K"]["freed"] == "uploaded"
-    assert man["IQ3_S"].get("uploaded") is None and "gate" in man["IQ3_S"]["freed"]
+    assert man["Q6_K"]["uploaded"] == repo and man["Q6_K"]["freed"].startswith("uploaded")
+    assert man["IQ3_S"].get("uploaded") is None and not man["IQ3_S"].get("freed")
 
 
 def test_a_rung_that_does_not_fit_is_held_and_the_release_goes_on(model, inputs, hub, monkeypatch):

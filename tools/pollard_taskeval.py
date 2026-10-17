@@ -163,51 +163,35 @@ def served(gguf: str, ngl: str, port: int, ctx: int, server: str | None = None):
     would not be measuring what ships: the point of the number is the quantized build on the
     quantized kernel. llama-server keeps it quantized and on the GPU, and lm-eval's `gguf` backend
     talks to it over HTTP."""
-    import urllib.request
-    from pollard_calc import find_llama_bin
     # An explicit --llama-server wins outright. It has to: find_llama_bin prefers
     # $POLLARD_HOME/bin over PATH, so on a box that keeps a stock llama.cpp there, a trellis
     # build (IQ*_KT is ggml type >= 43, which stock caps out below) can never be scored -- the
     # stock server refuses the file and no ordering of PATH changes which binary is chosen.
-    binsrv = server or find_llama_bin("llama-server") or "llama-server"
     # --jinja: apply the model's OWN chat template. Without it an instruct model is scored as a
     # base model -- it never reaches its end-of-turn token, runs past the answer, and the harness
-    # scrapes a stop string out of the overrun. Every generative task loses points to that, and
-    # the release being answered quoted numbers measured WITH their template, so the comparison
-    # was biased against us rather than merely noisy.
+    # scrapes a stop string out of the overrun.
     # --reasoning-format deepseek: a thinking model's <think> block lands in reasoning_content
     # instead of being parsed as the answer.
-    cmd = [binsrv, "-m", gguf, "--host", "127.0.0.1", "--port", str(port),
-           "-ngl", str(ngl), "-c", str(ctx), "--jinja",
-           "--reasoning-format", "deepseek"]
-    print(f"   serving: {binsrv} ... -ngl {ngl}", flush=True)
-    # NOT DEVNULL. A server that dies on load says exactly why ("invalid ggml type 153",
-    # "failed to allocate", a missing DLL); discarding it leaves only "exited (1)" and turns a
-    # one-line diagnosis into an afternoon.
-    log = open(_SERVER_LOG, "w", encoding="utf-8", errors="replace")
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-    base = f"http://127.0.0.1:{port}"
+    # The launch itself is pollard_llamaserve's: -ngl from free VRAM (never a bare `auto`), one slot, a wait
+    # scaled to the file, the server's own log tail on failure, one retry on the CPU. Each served model gets
+    # its OWN log (a second serve used to overwrite the first, so a failed rung's reason was gone by morning).
+    global _CURRENT
+    import pollard_llamaserve as LS
+    stem = os.path.splitext(os.path.basename(gguf))[0]
+    log_path = os.path.join(os.path.dirname(os.path.abspath(_SERVER_LOG)) or ".", f"taskeval-server-{stem}.log")
     try:
-        for _ in range(600):                                   # a big model takes a while to load
-            if proc.poll() is not None:
-                raise SystemExit(f"llama-server exited ({proc.returncode}) before serving "
-                                 f"{gguf}\n{_server_tail()}")
-            try:
-                with urllib.request.urlopen(base + "/health", timeout=2) as r:
-                    if r.status == 200:
-                        break
-            except Exception:
-                time.sleep(1)
-        else:
-            raise SystemExit(f"llama-server never became ready for {gguf}\n{_server_tail()}")
-        yield base
+        with LS.serve(gguf, ngl, ctx, port=port, binary=server, log_path=log_path,
+                      extra=["--jinja", "--reasoning-format", "deepseek"]) as srv:
+            _CURRENT = srv
+            yield srv.base
+    except LS.ServerFailed as e:
+        raise SystemExit(str(e)) from None
     finally:
-        log.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except Exception:
-            proc.kill()
+        _CURRENT = None
+
+
+#: the server of the serve in progress (pollard_llamaserve.Server), for a harness failure to say whether it died
+_CURRENT = None
 
 
 def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_dir: str,
@@ -271,13 +255,15 @@ def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_di
                     # template. local-chat-completions posts to /v1/chat/completions, where the
                     # server applies the model's own template and the model stops on its own
                     # end-of-turn token.
-                    results.append((subset, _invoke(
-                        "local-chat-completions",
-                        f"base_url={base}/v1/chat/completions,"
-                        f"model=pollard,num_concurrent=1,tokenized_requests=False",
-                        ("--apply_chat_template",), subset)))
+                    r = _invoke("local-chat-completions",
+                                f"base_url={base}/v1/chat/completions,"
+                                f"model=pollard,num_concurrent=1,tokenized_requests=False",
+                                ("--apply_chat_template",), subset)
                 else:
-                    results.append((subset, _invoke("gguf", f"base_url={base}", (), subset)))
+                    r = _invoke("gguf", f"base_url={base}", (), subset)
+                if r.returncode and _CURRENT is not None and not _CURRENT.alive():
+                    r.server_state = "the server DIED under the harness: " + _CURRENT.why()
+                results.append((subset, r))
     else:
         for subset in groups:
             results.append((subset, _invoke(backend, margs, ("--device", device), subset)))
@@ -297,6 +283,8 @@ def run(path: str, tasks: list[str], limit: int, device: str, batch: str, out_di
         detail = "\n".join(hits or blob[-10:]) or "(no output at all -- likely killed by the OS)"
         msg = (f"{harness} failed on {os.path.basename(path)} for "
                f"{', '.join(subset)} (exit {r.returncode}):\n{detail}")
+        if getattr(r, "server_state", None):
+            msg += "\n" + r.server_state
         if fatal:
             raise SystemExit(msg)
         print(f"   (!) {msg}\n       the other task group(s) still ran; their numbers stand.",
@@ -558,6 +546,20 @@ def run_mt(a) -> None:
                                     "comet": a.comet_model if a.comet else None}})
 
 
+
+def ref_cache_path(ref, tasks, limit, out):
+    """Where one reference's scores for this task list + limit are kept: beside the rung reports, keyed by the
+    reference file (path, size, mtime) so a rebuilt f16 is measured again."""
+    import hashlib
+    try:
+        st = os.stat(ref)
+        ident = f"{os.path.abspath(ref)}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        ident = os.path.abspath(ref)
+    h = hashlib.sha1(f"{ident}|{','.join(tasks)}|{limit}".encode()).hexdigest()[:12]
+    return os.path.join(os.path.dirname(os.path.abspath(out.rstrip("/\\"))), "_ref",
+                        f"{os.path.splitext(os.path.basename(ref))[0]}-{h}.json")
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -584,6 +586,8 @@ def main() -> None:
     ap.set_defaults(serve=True)
     ap.add_argument("--ngl", default="99", help="GPU layers for the served GGUF (default all)")
     ap.add_argument("--port", type=int, default=8080, help="llama-server port (--ref uses port+1)")
+    ap.add_argument("--no-ref-cache", dest="ref_cache", action="store_false",
+                    help="measure --ref again even when this ladder already has its scores (default: reuse)")
     ap.add_argument("--allow-code-exec", dest="allow_code", action="store_true",
                     help="run the coding tasks (humaneval*/mbpp*), which EXECUTE code the model "
                          "wrote, on this machine. Off by default. Without it lm-eval refuses the "
@@ -640,9 +644,20 @@ def main() -> None:
               os.path.join(a.out, "model"), harness, a.serve, a.ngl, a.port, a.ctx,
               a.llama_server, a.allow_code)
     # a second server would collide on the port, so the reference gets its own
-    ref = run(a.ref, tasks, a.limit, a.device, a.batch_size,
-              os.path.join(a.out, "ref"), harness, a.serve, a.ngl, a.port + 1, a.ctx,
-              a.llama_server, a.allow_code) if a.ref else {}
+    # the reference scores are the same for every rung of a ladder: measured once, then read back (a 24B f16 is
+    # an hour of generation per pass; the LFM2.5 release re-ran it for every rung)
+    ref, cache = {}, ref_cache_path(a.ref, tasks, a.limit, a.out) if a.ref and a.ref_cache else None
+    if cache and os.path.exists(cache):
+        ref = json.load(open(cache, encoding="utf-8")).get("scores", {})
+        print(f"   reference: {os.path.basename(a.ref)} scores from {cache} (measured once for this ladder)")
+    elif a.ref:
+        ref = run(a.ref, tasks, a.limit, a.device, a.batch_size,
+                  os.path.join(a.out, "ref"), harness, a.serve, a.ngl, a.port + 1, a.ctx,
+                  a.llama_server, a.allow_code)
+        if cache and ref:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            json.dump({"ref": os.path.abspath(a.ref), "tasks": tasks, "limit": a.limit, "scores": ref},
+                      open(cache, "w", encoding="utf-8"), indent=1)
 
     print(f"\n  {'task':30s} {'score':>8s}" + (f" {'ref':>8s} {'retention':>10s}" if ref else ""))
     cats: dict[str, list[float]] = {}
@@ -669,6 +684,7 @@ def main() -> None:
     if a.results:
         save_results(a.results, a.rung or os.path.basename(a.model), {"retention": retention_table(got, ref, tasks)},
                      {"_retention_suite": {"suite": a.tasks and "custom" or a.suite, "tasks": tasks,
+                                           "ref": os.path.basename(a.ref) if a.ref else None,
                                            "limit": a.limit or "full", "harness": harness}})
 
 

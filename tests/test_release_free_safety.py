@@ -1,0 +1,192 @@
+"""--free-after-upload deletes a local rung ONLY after the Hub holds that exact file (size + sha256 read back).
+
+The LFM2.5-24B-A2B release (2026-10-16) built Q6_K / IQ4_XS / IQ3_S for five hours, pollard-taskeval failed on each
+(its llama-server died), verify was skipped -- and the publish step "freed" all three, unverified and never uploaded.
+These tests pin the opposite: a failed / skipped measure keeps the file, an upload error keeps the file, a file the
+Hub does not hold intact keeps the file, and only a verified rung confirmed on the Hub is deleted. Fakes only."""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "tests"))
+import pollard_release as R  # noqa: E402
+import pollard_workspace as ws  # noqa: E402
+from test_release_free import ALL, hub, inputs, model, plan  # noqa: E402,F401 -- shared fixtures
+
+REPO = "PollardWeights/Tiny-1B-Pollard"
+
+
+def _ladder(c, monkeypatch, fail=None):
+    """run_cmd for a full free-mode GGUF run: builds each rung, `fail` = {rung: step} makes that step fail."""
+    fail = fail or {}
+    rdir = ws.model_dir(c["f16"], create=True)
+    built = {}
+
+    def fake(cmd, ok=(0,)):
+        tool = cmd[0]
+        if tool == "pollard":
+            label = cmd[cmd.index("--rung") + 1]
+            if label in ("IQ2", "flagship"):
+                return
+            p = os.path.join(rdir, f"Tiny-1B-f16.gguf-Pollard-GGUF-{label}.gguf")
+            open(p, "wb").write(b"GGUF" + label.encode() * 50)
+            ws.record_build(c["f16"], "gguf", p, tag=label)
+            built[label] = p
+            return
+        rung = cmd[cmd.index("--rung") + 1] if "--rung" in cmd else None
+        if tool == "pollard-taskeval" and fail.get(rung) == "taskeval":
+            raise RuntimeError("exit 1")                  # the LFM2.5 failure: the measure never produced a number
+        if tool == "pollard-verify":
+            m = cmd[cmd.index("--model") + 1]
+            ok_gate = fail.get(rung) != "verify"
+            ws.record_gate(m, {"pass": ok_gate})
+            if not ok_gate:
+                raise RuntimeError("exit 1")
+        if tool == "pollard-card":
+            out = cmd[cmd.index("--out") + 1]
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            open(out, "w").write("card")
+    monkeypatch.setattr(R, "run_cmd", fake)
+    monkeypatch.setattr(R, "disk_free_gb", lambda p: 1000.0)
+    return built
+
+
+def _paths(c):
+    return {b["tag"]: b["path"] for b in R.gguf_builds(c)}
+
+
+def test_a_failed_measure_keeps_the_rung_on_disk_and_off_the_hub(model, inputs, hub, monkeypatch):
+    cfg = plan(inputs, measure={"taskeval": {"suite": "quick", "limit": 5}, "toolcall": False})
+    c, _, steps = R.plan_steps(cfg, model, {"gguf"})
+    _ladder(c, monkeypatch, fail={"Q6_K": "taskeval", "IQ4_XS": "taskeval", "IQ3_S": "taskeval"})
+    said = []
+    st = R.execute(steps, c, cfg, run=True, run_upload=True, have=ALL, out=said.append)
+    for tag in ("Q6_K", "IQ4_XS", "IQ3_S"):
+        assert st[f"gguf/{tag}/taskeval"] == "failed"
+        assert st[f"gguf/{tag}/verify"] == "skipped: upstream failed"
+        assert st[f"gguf/{tag}/publish"] == "kept: upstream failed"
+        assert os.path.exists(_paths(c)[tag]), f"{tag}: unverified and never uploaded -- must NOT be deleted"
+        assert f"Tiny-1B-Pollard-{tag}.gguf" not in hub.get(REPO, set())
+    assert any("KEPT on disk, NOT published" in x for x in said), "the kept rungs are reported at the end"
+
+
+def test_a_rung_that_is_not_verified_is_kept_by_publish_rung_itself(model, inputs, hub):
+    """Even called directly (a resumed run, a stale state file), publish_rung never deletes an unverified rung."""
+    cfg = plan(inputs)
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    p = os.path.join(ws.model_dir(c["f16"], create=True), "Tiny-1B-Pollard-Q6_K.gguf")
+    Path(p).write_bytes(b"GGUF" * 10)
+    ws.record_build(c["f16"], "gguf", p, tag="Q6_K")            # verified: None -- what the LFM2.5 MANIFEST held
+    res = R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", p), c, cfg, True, out=lambda *_: None)
+    assert res.startswith("kept") and os.path.exists(p)
+    b = R.gguf_builds(c)[0]
+    assert "not verified" in b["kept"] and not b.get("freed") and not b.get("uploaded")
+    assert REPO not in hub or "Tiny-1B-Pollard-Q6_K.gguf" not in hub[REPO]
+
+
+def test_an_upload_error_keeps_the_rung(model, inputs, hub, monkeypatch):
+    cfg = plan(inputs)
+    c, _, steps = R.plan_steps(cfg, model, {"gguf"})
+    _ladder(c, monkeypatch)
+    hub["__fail_upload__"] = True
+    st = R.execute(steps, c, cfg, run=True, run_upload=True, have=ALL, out=lambda *_: None)
+    for tag in ("Q6_K", "IQ4_XS", "IQ3_S"):
+        assert st[f"gguf/{tag}/verify"] == "done" and st[f"gguf/{tag}/publish"] == "failed"
+        assert os.path.exists(_paths(c)[tag]), f"{tag}: the upload raised -- the local copy is all there is"
+        assert not R.gguf_builds(c)[0].get("uploaded")
+
+
+def test_a_file_the_hub_does_not_hold_intact_is_kept(model, inputs, hub, monkeypatch):
+    """The upload 'succeeded' but the Hub's copy is short / different: size + sha256 say so, nothing is deleted."""
+    cfg = plan(inputs)
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    p = os.path.join(ws.model_dir(c["f16"], create=True), "Tiny-1B-Pollard-Q6_K.gguf")
+    Path(p).write_bytes(b"GGUF" * 100)
+    ws.record_build(c["f16"], "gguf", p, tag="Q6_K")
+    ws.record_gate(p, {"pass": True})
+    import test_release_free as T
+    orig = T.FakeApi._put
+
+    def truncated(self, repo, path_in_repo, local):
+        orig(self, repo, path_in_repo, local)
+        size, sha = self.meta[(repo, path_in_repo)]
+        self.meta[(repo, path_in_repo)] = (size - 7, sha)         # an interrupted transfer
+    monkeypatch.setattr(T.FakeApi, "_put", truncated)
+    with pytest.raises(RuntimeError, match="keeping the local copy"):
+        R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", p), c, cfg, True, out=lambda *_: None)
+    assert os.path.exists(p)
+    b = R.gguf_builds(c)[0]
+    assert not b.get("uploaded") and "not confirmed" in b["kept"]
+
+    monkeypatch.setattr(T.FakeApi, "_put", orig)                    # same bytes, wrong hash
+    def wrong_hash(self, repo, path_in_repo, local):
+        orig(self, repo, path_in_repo, local)
+        size, _ = self.meta[(repo, path_in_repo)]
+        self.meta[(repo, path_in_repo)] = (size, "0" * 64)
+    monkeypatch.setattr(T.FakeApi, "_put", wrong_hash)
+    with pytest.raises(RuntimeError):
+        R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", p), c, cfg, True, out=lambda *_: None)
+    assert os.path.exists(p)
+
+
+def test_a_hub_that_cannot_be_asked_frees_nothing(model, inputs, hub, monkeypatch):
+    cfg = plan(inputs)
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    p = os.path.join(ws.model_dir(c["f16"], create=True), "Tiny-1B-Pollard-Q6_K.gguf")
+    Path(p).write_bytes(b"GGUF" * 10)
+    ws.record_build(c["f16"], "gguf", p, tag="Q6_K")
+    ws.record_gate(p, {"pass": True})
+    import test_release_free as T
+    monkeypatch.delattr(T.FakeApi, "get_paths_info")
+    with pytest.raises(RuntimeError):
+        R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", p), c, cfg, True, out=lambda *_: None)
+    assert os.path.exists(p)
+
+
+def test_a_verified_rung_confirmed_on_the_hub_is_deleted(model, inputs, hub, monkeypatch):
+    cfg = plan(inputs)
+    c, _, steps = R.plan_steps(cfg, model, {"gguf"})
+    built = _ladder(c, monkeypatch, fail={"IQ3_S": "verify"})
+    st = R.execute(steps, c, cfg, run=True, run_upload=True, have=ALL, out=lambda *_: None)
+    for tag in ("Q6_K", "IQ4_XS"):
+        assert st[f"gguf/{tag}/publish"] == "done"
+        assert not os.path.exists(built[tag]) and not os.path.exists(_paths(c)[tag]), f"{tag}: on the Hub, freed"
+        assert f"Tiny-1B-Pollard-{tag}.gguf" in hub[REPO]
+    b = {x["tag"]: x for x in R.gguf_builds(c)}
+    assert b["Q6_K"]["uploaded"] == REPO and "confirmed" in b["Q6_K"]["freed"]
+    assert os.path.exists(_paths(c)["IQ3_S"]), "the rung that failed its gate stays"
+
+
+def test_remote_mismatches_checks_size_and_hash(tmp_path):
+    import types
+    f = tmp_path / "a.gguf"
+    f.write_bytes(b"x" * 33)
+    sha = R._sha256(str(f))
+
+    class Api:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def get_paths_info(self, repo, paths):
+            return [types.SimpleNamespace(**r) for r in self.rows if r["path"] in paths]
+    ok = Api([{"path": "a.gguf", "size": 33, "lfs": {"sha256": sha}, "blob_id": None}])
+    assert R.remote_mismatches(ok, "r", [("a.gguf", str(f))]) == []
+    assert R.remote_mismatches(Api([]), "r", [("a.gguf", str(f))])[0].endswith("not on the Hub")
+    short = Api([{"path": "a.gguf", "size": 30, "lfs": {"sha256": sha}, "blob_id": None}])
+    assert "bytes on the Hub" in R.remote_mismatches(short, "r", [("a.gguf", str(f))])[0]
+    small = Api([{"path": "a.gguf", "size": 33, "lfs": None, "blob_id": R._git_blob_sha1(str(f))}])
+    assert R.remote_mismatches(small, "r", [("a.gguf", str(f))]) == [], "a non-LFS file is checked by its git blob id"
+    nohash = Api([{"path": "a.gguf", "size": 33, "lfs": None, "blob_id": None}])
+    assert R.remote_mismatches(nohash, "r", [("a.gguf", str(f))]), "no hash to compare = not confirmed"
+
+
+def test_git_blob_id_matches_git(tmp_path):
+    f = tmp_path / "hello.txt"
+    f.write_bytes(b"hello\n")
+    assert R._git_blob_sha1(str(f)) == "ce013625030ba8dba906f756967f9e9ca394464a"   # `git hash-object` of "hello\n"

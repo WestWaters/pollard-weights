@@ -43,8 +43,9 @@ How it runs -- and why:
     uploaded. The cards are pollard-card per lane, --verified-only, from the numbers this run measured.
   * nothing is uploaded unless the plan says `upload: true` AND the command line says --upload.
   * --free-after-upload (with --upload): for a box whose free disk is smaller than a lane's whole ladder. Each rung
-    is built -> measured -> gated -> uploaded on its own, then its LOCAL file is deleted before the next rung (a
-    rung that fails the gate is deleted unpublished). The GGUF ladder is built one rung at a time (pollard --rung).
+    is built -> measured -> gated -> uploaded on its own, and its LOCAL file is deleted only once the Hub holds that
+    exact file (size + sha256 read back from the Hub). A rung that failed or skipped a measure / verify / gate, or
+    whose upload did not land intact, is KEPT on disk unpublished and listed at the end. The GGUF ladder is built one rung at a time (pollard --rung).
     Every build step first checks free disk against the rung's estimated size and holds the rung (not the release)
     when it does not fit. Only files this release built are ever deleted -- never the source, f16, imatrix or calib.
   * existing inputs can be named in the plan instead of rebuilt: `f16:` (an f16/bf16 GGUF), `imatrix:`,
@@ -438,6 +439,7 @@ def gguf_rung_steps(cfg, c, builds):
     """Measure + verify for every rung the GGUF ladder produced (read back from the MANIFEST)."""
     m, res, steps = dict(cfg.get("measure") or {}), results_path(c, "gguf"), []
     m["toolcall"] = toolcall_wanted(cfg, c)
+    ref = c.get("measure_ref") or c["f16"]                        # served measurements; verify stays on the f16
     for b in builds:
         tag, path = b.get("tag") or b.get("name"), b.get("path")
         common = ["--results", res, "--rung", tag]
@@ -445,21 +447,21 @@ def gguf_rung_steps(cfg, c, builds):
         if m.get("taskeval"):
             t = m["taskeval"]
             steps.append(Step(id=f"{rid}/taskeval", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-taskeval", "--model", path, "--ref", c["f16"], "--suite",
+                              cmd=["pollard-taskeval", "--model", path, "--ref", ref, "--suite",
                                    str(t.get("suite", "quick")), "--limit", str(t.get("limit", 200)),
                                    "--ngl", c["ngl"], "--out", os.path.join(c["mdir"], "reports", "taskeval", tag)]
                               + common))
         if m.get("mt"):
             steps.append(Step(id=f"{rid}/mt", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-taskeval", "--model", path, "--ref", c["f16"], "--suite", "mt",
+                              cmd=["pollard-taskeval", "--model", path, "--ref", ref, "--suite", "mt",
                                    "--limit", str((m["mt"] or {}).get("limit", 100)), "--ngl", c["ngl"]] + common))
         if m.get("toolcall"):
             steps.append(Step(id=f"{rid}/toolcall", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-toolcall", "--gguf", path, "--ref", c["f16"], "--ngl", c["ngl"]] + common,
+                              cmd=["pollard-toolcall", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
                               ok_codes=(0, 1)))                        # a FAIL is a number for the gate, not a crash
         if m.get("decision"):
             steps.append(Step(id=f"{rid}/decision", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-decision", "--gguf", path, "--ref", c["f16"], "--ngl", c["ngl"]] + common,
+                              cmd=["pollard-decision", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
                               ok_codes=(0, 1)))
         steps.append(Step(id=f"{rid}/verify", lane="gguf", rung=tag, kind="verify", requires="any", out=path,
                           cmd=["pollard-verify", "--lane", "gguf", "--model", path, "--ref", c["f16"],
@@ -992,8 +994,12 @@ def _freeable(c, b):
              ws.model_dir(c["smooth_dir"]), c["mdir"]]
     if any(path.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots):
         return True
+    # the flagship mix lives next to the f16: as automap wrote it (<stem>-mix.gguf) or under its published name
+    # once canonical_gguf renamed it (<M>-Pollard-<TAG>.gguf)
+    name = os.path.basename(path)
     return bool(b.get("flagship")) and os.path.dirname(path) == os.path.normcase(
-        os.path.dirname(os.path.abspath(c["f16"]))) and path.endswith("-mix.gguf")
+        os.path.dirname(os.path.abspath(c["f16"]))) and (
+        path.endswith("-mix.gguf") or name.startswith(os.path.normcase(f"{c['name']}-Pollard-")))
 
 
 def _free_local(c, b, out=print):
@@ -1009,10 +1015,92 @@ def _free_local(c, b, out=print):
     return True
 
 
+def _sha256(path, bufsize=1 << 24):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(bufsize), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_blob_sha1(path):
+    """The id git (and the Hub) gives a small, non-LFS file: sha1 of "blob <size>\\0" + its bytes."""
+    import hashlib
+    h = hashlib.sha1(f"blob {os.path.getsize(path)}\0".encode())
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _local_pairs(path, path_in_repo):
+    """[(path in the repo, local file)] for one file or every file under a folder."""
+    if os.path.isfile(path):
+        return [(path_in_repo, path)]
+    pairs = []
+    for root, _, files in os.walk(path):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, path).replace(os.sep, "/")
+            pairs.append((f"{path_in_repo}/{rel}" if path_in_repo else rel, full))
+    return sorted(pairs)
+
+
+def remote_mismatches(api, repo, pairs):
+    """[why] for every (path in repo, local file) the Hub does NOT hold byte-for-byte: missing, a different size,
+    or a different hash (the LFS sha256, or the git blob id of a small file). [] = every file is there, intact.
+    A Hub that cannot be asked counts as a mismatch: nothing is freed on a guess."""
+    if not pairs:
+        return ["nothing to check"]
+    try:
+        info = {f.path: f for f in api.get_paths_info(repo, [p for p, _ in pairs])}
+    except Exception as e:                                       # noqa: BLE001
+        return [f"could not read the file list of {repo} back ({type(e).__name__}: {e})"]
+    bad = []
+    for rp, local in pairs:
+        f = info.get(rp)
+        size = os.path.getsize(local)
+        if f is None:
+            bad.append(f"{rp}: not on the Hub")
+            continue
+        if getattr(f, "size", None) != size:
+            bad.append(f"{rp}: {getattr(f, 'size', None)} bytes on the Hub, {size} here")
+            continue
+        lfs = getattr(f, "lfs", None)
+        sha = (lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)) if lfs else None
+        if sha:
+            if sha != _sha256(local):
+                bad.append(f"{rp}: sha256 differs from the local file")
+        elif getattr(f, "blob_id", None):
+            if f.blob_id != _git_blob_sha1(local):
+                bad.append(f"{rp}: git blob id differs from the local file")
+        else:
+            bad.append(f"{rp}: the Hub gave no hash to check against")
+    return bad
+
+
+def _keep(c, lane, key, man, b, why, out):
+    """A rung that is NOT freed: recorded in the MANIFEST (kept = why) and said out loud."""
+    b["kept"] = why
+    b.pop("freed", None)
+    ws_write(key, man)
+    out(f"      KEPT {b.get('path')} -- {why}")
+
+
+def ws_write(key, man):
+    import pollard_workspace as ws
+    ws._write_manifest(key, man)
+
+
 def publish_rung(step, c, cfg, run_upload, out=print):
-    """--free-after-upload: upload ONE gated rung to its lane repo, check it landed, mark it uploaded in the MANIFEST,
-    then delete the local copy. A rung that did not pass the gate is not published; its file is freed too (its
-    numbers stay in the results file)."""
+    """--free-after-upload: upload ONE gated rung, confirm THAT file is on the Hub byte-for-byte (size + sha256
+    against the Hub's own listing), mark it uploaded in the MANIFEST, and only then delete the local copy.
+
+    Anything short of that keeps the file: a rung that failed or skipped its measure / verify / gate is NOT
+    published and NOT deleted (the LFM2.5 release, 2026-10-16, deleted three unverified, never-uploaded rungs --
+    five hours of builds -- because "did not pass the gate" was treated as "done with it"); an upload that raises,
+    or a file the Hub does not hold intact, keeps the local copy and fails the step."""
     import pollard_workspace as ws
     from pollard_card import rung_subfolder
     lane, repo = step.lane, step.repo
@@ -1026,13 +1114,12 @@ def publish_rung(step, c, cfg, run_upload, out=print):
             out("      (nothing to publish: the rung was not built)")
             return "skipped: not built"
         raise RuntimeError(f"{step.out} is not in the MANIFEST")
-    if b.get("uploaded"):
+    if b.get("uploaded") and not os.path.exists(b.get("path", "")):
         return "done"
     if b.get("verified") is not True:
-        _free_local(c, b, out)
-        b["freed"] = "did not pass the gate -- not published"
-        ws._write_manifest(key, man)
-        return "done"
+        _keep(c, lane, key, man, b, "not verified (measure / verify / gate failed or did not run) -- not published",
+              out)
+        return "kept: not verified"
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -1047,60 +1134,76 @@ def publish_rung(step, c, cfg, run_upload, out=print):
             out(f"      ggufcheck: {name} -> {b['runtime']}")
         except Exception as e:                                   # noqa: BLE001
             out(f"      ggufcheck: could not read {name} ({e}) -- the card will not state its runtime")
-        api.upload_file(path_or_fileobj=b["path"], path_in_repo=name, repo_id=repo)
-        landed = name in set(api.list_repo_files(repo))
-        b["uploaded_as"] = name
+        dest = name
+        if not b.get("uploaded"):
+            api.upload_file(path_or_fileobj=b["path"], path_in_repo=dest, repo_id=repo)
     else:
-        sub = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
-        api.upload_folder(folder_path=b["path"], path_in_repo=sub, repo_id=repo)
-        landed = f"{sub}/config.json" in set(api.list_repo_files(repo))
-        b["uploaded_as"] = sub
-    if not landed:
-        raise RuntimeError(f"{b['uploaded_as']} is not in {repo} after the upload -- keeping the local copy")
+        dest = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
+        if not b.get("uploaded"):
+            api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo)
+    b["uploaded_as"] = dest
+    bad = remote_mismatches(api, repo, _local_pairs(b["path"], dest))
+    if bad:
+        _keep(c, lane, key, man, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
+        raise RuntimeError(f"{dest} is not intact in {repo} after the upload ({bad[0]}) -- keeping the local copy")
     b["uploaded"] = repo
+    b.pop("kept", None)
     ws._write_manifest(key, man)
-    out(f"      uploaded {b['uploaded_as']} -> https://huggingface.co/{repo}")
+    out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if _free_local(c, b, out):
-        b["freed"] = "uploaded"
+        b["freed"] = "uploaded + confirmed on the Hub"
         ws._write_manifest(key, man)
     return "done"
 
 
 def _free_vram_mib():
-    """Free VRAM on the first NVIDIA GPU in MiB, 0 when there is none (or nvidia-smi is missing)."""
-    if not shutil.which("nvidia-smi"):
-        return 0
-    try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=30)
-        return int(float(r.stdout.strip().splitlines()[0]))
-    except Exception:                                             # noqa: BLE001
-        return 0
+    """Free VRAM on the first NVIDIA GPU in MiB, 0 when there is none (pollard_llamaserve, shared with the tools)."""
+    import pollard_llamaserve as LS
+    return LS.free_vram_mib()
 
 
 def partial_ngl(gguf, free_mib, headroom_mib=1536, overhead_mib=1536):
-    """-ngl from FREE VRAM: llama.cpp offloads the LAST N blocks, so sum blk.* bytes from the end until the budget
-    is spent. Never the whole model unless the whole file fits -- a GPU somebody else is using stays usable."""
-    import re
-    from gguf import GGUFReader
-    blk, total = {}, 0
-    for t in GGUFReader(gguf).tensors:
-        total += int(t.n_bytes)
-        m = re.match(r"blk\.(\d+)\.", t.name)
-        if m:
-            blk[int(m.group(1))] = blk.get(int(m.group(1)), 0) + int(t.n_bytes)
-    budget = (free_mib - headroom_mib - overhead_mib) * 2 ** 20
-    if budget <= 0 or not blk:
-        return 0
-    if total <= budget:
-        return 99
-    n, ngl, used = max(blk) + 1, 0, 0
-    for i in range(n - 1, -1, -1):
-        if used + blk.get(i, 0) > budget or ngl >= n - 1:
-            break
-        used += blk.get(i, 0)
-        ngl += 1
-    return ngl
+    """-ngl from FREE VRAM: the last N blocks that fit, 99 only when the whole file does (pollard_llamaserve)."""
+    import pollard_llamaserve as LS
+    return LS.partial_ngl(gguf, free_mib, headroom_mib, overhead_mib)
+
+
+def _total_ram_gb():
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ae", ctypes.c_ulonglong)]
+            m = MS()
+            m.l = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return m.total / 1e9
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+    except Exception:                                             # noqa: BLE001
+        return 0.0
+
+
+def measure_ref(cfg, c):
+    """The GGUF the SERVED measurements (taskeval / toolcall / mt / decision) compare each rung against. The f16,
+    unless the plan names `measure_ref:` -- or the f16 cannot be served here: bigger than RAM + VRAM it pages off
+    disk at well under a token a second (the LFM2.5 f16, 48 GB on a 32 GB + 16 GB box: 0.75 tok/s, then the server
+    died). Then the release's own Q8_0 imatrix host stands in when it exists, and says so. The KLD verify always
+    runs against the f16 (prompt processing only, which paging survives)."""
+    if cfg.get("measure_ref"):
+        return os.path.abspath(str(cfg["measure_ref"]))
+    f16 = c["f16"]
+    room = _total_ram_gb() * 0.85 + _free_vram_mib() / 1024 * 1.073741824
+    if room and _size_gb(f16) > room:
+        for cand in (os.path.join(c["gguf_dir"], f"{c['name']}-Q8_0-host.gguf"),
+                     os.path.join(os.path.dirname(f16), f"{c['name']}-Q8_0.gguf")):
+            if os.path.isfile(cand):
+                print(f"   measure reference: {cand} (the f16 is {_size_gb(f16):.0f} GB, more than RAM + VRAM "
+                      f"~{room:.0f} GB, so it cannot be served at a usable speed; the KLD verify stays on the f16)")
+                return cand
+    return f16
 
 
 def imatrix_host(cfg, c):
@@ -1198,6 +1301,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
     have = have or machine()
     state = load_state(c["state"])
     statuses, failed_rungs, failed_lanes, unbuildable = {}, set(), set(), set()
+    kept = []                                        # (lane, rung, path) left on disk unpublished -- reported at the end
     queue, n = list(steps), 0
     while queue:
         st = queue.pop(0)
@@ -1220,6 +1324,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
         if st.kind == "expand":
             if run and have.get("any"):
                 canonical_gguf(c)
+                if "measure_ref" not in c:
+                    c["measure_ref"] = measure_ref(cfg, c)
             builds = gguf_builds(c)
             if c.get("free"):                        # one rung at a time: only what is built and not yet published
                 done = {s.get("id") for s in queue} | set(statuses)
@@ -1259,9 +1365,13 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 f"with --lanes {st.lane}) -- {what}")
             statuses[st.id] = f"skipped: needs {REQUIRES[st.lane]}"
             continue
-        if st.kind == "publish" and (st.lane, st.rung) in failed_rungs and st.lane not in failed_lanes:
-            pass                                     # free mode: a rung that failed is still freed (not published)
-        elif st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
+        if st.kind == "publish" and (st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs):
+            # free mode: a rung whose build / measure / verify failed or was skipped is neither published NOR deleted
+            out(f"{head}: KEPT locally, not published (an earlier step of this rung failed) -- {st.out}")
+            statuses[st.id] = "kept: upstream failed"
+            kept.append((st.lane, st.rung, st.out))
+            continue
+        if st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
             out(f"{head}: SKIP (an earlier step of this {'rung' if st.rung else 'lane'} failed) -- {what}")
             statuses[st.id] = "skipped: upstream failed"
             continue
@@ -1325,9 +1435,15 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             elif st.kind in ("build", "card"):
                 failed_lanes.add(st.lane)                    # no card -> nothing to publish
         statuses[st.id] = res
+        if str(res).startswith("kept"):
+            kept.append((st.lane, st.rung, st.out))
         if res != "held":
             state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
             save_state(c["state"], state)
+    if run and kept:
+        out("\n   KEPT on disk, NOT published (fix the measure / gate and re-run the plan to publish them):")
+        for lane, rung, path in kept:
+            out(f"     {lane}/{rung}: {path}")
     return statuses
 
 

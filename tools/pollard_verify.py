@@ -206,18 +206,35 @@ def measure_gguf(model, ref, eval_path, ngl="0", chunks=16, ppl_bin=None):
                             + f".c{chunks}.klbase.dat")
     except Exception:
         base = os.path.splitext(ref)[0] + f".c{chunks}.klbase.dat"
+    # -ngl per file from free VRAM (pollard_llamaserve): `auto` is never handed to llama.cpp, and a GPU run that
+    # fails is retried once on the CPU
+    import pollard_llamaserve as LS
+
+    def tries(path):
+        n = LS.resolve_ngl(path, ngl)
+        return [n] + (["0"] if n != "0" else [])
+
     if not (os.path.exists(base) and os.path.getsize(base) > 0):
-        cmd = [ppl_bin, "-m", ref, "-f", eval_path, "-c", "2048", "-ngl", str(ngl),
-               "--kl-divergence-base", base] + (["--chunks", str(chunks)] if chunks else [])
-        print("   KL base: $ " + " ".join(cmd), flush=True)
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
-        if (r.returncode or free < 1e9) and os.path.exists(base):
-            os.remove(base)                              # a short base poisons every later rung
+        for n in tries(ref):
+            cmd = [ppl_bin, "-m", ref, "-f", eval_path, "-c", "2048", "-ngl", str(n),
+                   "--kl-divergence-base", base] + (["--chunks", str(chunks)] if chunks else [])
+            print("   KL base: $ " + " ".join(cmd), flush=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(base)) or ".").free
+            if (r.returncode or free < 1e9) and os.path.exists(base):
+                os.remove(base)                          # a short base poisons every later rung
+            if os.path.exists(base):
+                break
+            tail = "\n".join(((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-8:])
+            print(f"   KL base -ngl {n} failed (exit {r.returncode}):\n{tail}", flush=True)
         if not os.path.exists(base):
             raise SystemExit(f"could not build the KL base from {ref} (exit {r.returncode}, "
                              f"{free/1e9:.1f} GB free)")
-    res = _ppl_kl(ppl_bin, model, eval_path, base, ngl, chunks)
+    for n in tries(model):
+        res = _ppl_kl(ppl_bin, model, eval_path, base, n, chunks)
+        if res.get("mean_kld") is not None:
+            break
+        print(f"   llama-perplexity -ngl {n} produced no KLD for {model}", flush=True)
     if res.get("mean_kld") is None:
         raise SystemExit(f"llama-perplexity produced no KLD for {model}")
     return {"kld": res["mean_kld"], "top1": res.get("top1"), "ppl": res.get("ppl"), "ref_ppl": res.get("ref_ppl"),
@@ -652,7 +669,9 @@ def main():
     if a.coherence and lane == "gguf":
         from pollard_bench import coherence_gate
         from pollard_calc import find_llama_bin
-        res = coherence_gate(find_llama_bin("llama-cli") or "llama-cli", a.model, a.ngl, quick=True)
+        import pollard_llamaserve as LS
+        res = coherence_gate(find_llama_bin("llama-cli") or "llama-cli", a.model, LS.resolve_ngl(a.model, a.ngl),
+                             quick=True)
         measured["coherence"] = res.get("verdict")
 
     if a.results and measured:
