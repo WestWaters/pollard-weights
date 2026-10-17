@@ -1105,6 +1105,8 @@ def preflight(backend, model, ngl="0", kind=None, server=None):
     """Raise NotMeasured when this machine cannot serve `model` with `backend`; else the extra request fields the
     backend wants. Asked BEFORE a server starts: memory first (never start what will not fit), then the GPU rule."""
     kind = kind or {}
+    if model and os.path.isfile(os.path.join(str(model), ".pollard-remote")):
+        raise NotMeasured("a remote mirror (sparse: its tensors are fetched only by the MLX lane) cannot be served")
     need = model_gb(model)
     if backend == "gguf":
         if str(ngl) in ("0", ""):

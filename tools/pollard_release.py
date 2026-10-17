@@ -1333,6 +1333,16 @@ def build_imatrix(c, cfg, out=print):
 # HELD with the numbers (the rest of the ladder carries on); a tool-call gate whose rung cannot be served whole in
 # mlx_lm.server is recorded as not measured, with the reason, and the card says so.
 
+def mirror_cache_gb(c):
+    """GB a remote-source mirror at the HF folder holds as cache -- disk it evicts when a rung needs it."""
+    try:
+        import pollard_mlx as M
+        m = M.RemoteMirror.of(c["hf_dir"], log=lambda *a: None) if os.path.isdir(str(c.get("hf_dir"))) else None
+        return m.resident_gb() if m is not None else 0.0
+    except Exception:                                 # noqa: BLE001
+        return 0.0
+
+
 def memory_need(st, c):
     """GB of RAM an MLX step needs on this machine, or None when it cannot be told yet (source not there)."""
     try:
@@ -1534,6 +1544,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
     have = have or machine()
     state = load_state(c["state"])
     statuses, failed_rungs, failed_lanes, unbuildable = {}, set(), set(), set()
+    held_mem = set()                                 # (lane, rung) held for RAM: kept on disk for a re-run
     queue, n = list(steps), 0
     while queue:
         st = queue.pop(0)
@@ -1595,6 +1606,10 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 f"with --lanes {st.lane}) -- {what}")
             statuses[st.id] = f"skipped: needs {REQUIRES[st.lane]}"
             continue
+        if st.kind == "publish" and (st.lane, st.rung) in held_mem:
+            out(f"{head}: KEPT -- a step of this rung was held for memory; re-run the plan to finish it -- {what}")
+            statuses[st.id] = "held: memory (rung kept for a re-run)"
+            continue
         if st.kind == "publish" and (st.lane, st.rung) in failed_rungs and st.lane not in failed_lanes:
             pass                                     # free mode: a rung that failed is still freed (not published)
         elif st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
@@ -1603,7 +1618,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             continue
         need = st.disk_gb or 0
         if run and need and st.kind in ("build", "prep") and resume_reason(st, state, redo) is None:
-            free = disk_free_gb(st.out or c["mdir"])
+            free = disk_free_gb(st.out or c["mdir"]) + mirror_cache_gb(c)     # a mirror's cache gives room back
             margin = float(cfg.get("disk_margin_gb", 3))
             if free < need + margin:
                 msg = f"held: disk (needs ~{need:.1f} GB + {margin:g} margin, {free:.1f} GB free)"
@@ -1643,6 +1658,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 statuses[st.id] = f"held: memory ({short})"
                 if st.rung:
                     failed_rungs.add((st.lane, st.rung))
+                    held_mem.add((st.lane, st.rung))
                 else:
                     failed_lanes.add(st.lane)
                 continue

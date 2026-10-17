@@ -174,6 +174,10 @@ def test_release_holds_an_mlx_build_that_does_not_fit_and_labels_the_tool_gate(t
     tc = json.loads(res.read_text())["M-MLX-4bit"]["toolcall"]
     assert tc["status"] == "not-measured" and "mlx_lm.server" in tc["reason"] and tc["backend"] == "mlx"
     assert st["mlx/4bit/verify"] == "done"                              # 2 GB fits: it ran
+    pub = [R.Step(id="mlx/3bit/publish", lane="mlx", rung="3bit", kind="publish", requires="any", fn="publish_rung",
+                  out=str(tmp_path / "r3"))]
+    st = R.execute(steps[:1] + pub, c, {}, run=True, have={"any": True}, out=lines.append)
+    assert st["mlx/3bit/publish"].startswith("held: memory"), "a rung held for memory is kept, never freed"
     plan = []
     R.execute(steps[:1], c, {}, run=False, have={"any": True}, out=plan.append)
     assert any("needs ~9.0 GB of RAM" in x for x in plan)

@@ -681,7 +681,7 @@ class StreamWriter:
 
     def _reserve_gb(self):
         """Disk the mirror must leave free: the rest of this rung + a margin."""
-        return max(0, self.out_bytes - self.bytes) / 1e9 + 3.0
+        return max(0, self.out_bytes * 1.1 - self.bytes) / 1e9 + 3.0
 
     def __enter__(self):
         import mlx.core as mx
