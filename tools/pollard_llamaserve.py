@@ -224,9 +224,17 @@ def _stop(proc):
             proc.kill()
 
 
+def thread_args(extra=()):
+    """-t / -tb from POLLARD_THREADS (a shared box leaves the rest of the CPU to its owner), unless already given."""
+    t = os.environ.get("POLLARD_THREADS", "").strip()
+    if not t or "-t" in extra or "--threads" in extra:
+        return []
+    return ["-t", t, "-tb", t]
+
+
 def server_cmd(binary, gguf, port, ngl, ctx, extra=()):
     return [binary, "-m", gguf, "--host", "127.0.0.1", "--port", str(port), "-ngl", str(ngl), "-c", str(ctx)] \
-        + slot_args(gguf) + list(extra)
+        + slot_args(gguf) + thread_args(extra) + list(extra)
 
 
 @contextlib.contextmanager

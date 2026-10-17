@@ -235,3 +235,13 @@ def test_rung_iq2_by_name_builds_the_stock_2bit_on_an_ik_box(monkeypatch, capsys
     a.rung = None
     A._build_ladder(a, ik_flagship=True)
     assert all(c[c.index("--ram") + 1] != "5.0" for c in ran), "the full ladder still leaves 2-bit to the flagship"
+
+
+def test_threads_follow_pollard_threads(monkeypatch):
+    monkeypatch.setenv("POLLARD_THREADS", "19")
+    cmd = LS.server_cmd("llama-server", "m.gguf", 9000, "0", 4096, ["--jinja"])
+    assert cmd[cmd.index("-t") + 1] == "19" and cmd[cmd.index("-tb") + 1] == "19"
+    cmd = LS.server_cmd("llama-server", "m.gguf", 9000, "0", 4096, ["-t", "8"])
+    assert cmd.count("-t") == 1, "an explicit -t wins"
+    monkeypatch.delenv("POLLARD_THREADS")
+    assert "-t" not in LS.server_cmd("llama-server", "m.gguf", 9000, "0", 4096)

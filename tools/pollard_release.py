@@ -907,6 +907,17 @@ def canonical_gguf(c):
         b["path"], b["name"] = os.path.abspath(target), want
         changed = True
     if changed:
+        # a re-run's rung lands on the published name an earlier, freed / kept / replaced build of the same tag had:
+        # the newest entry for a path is the build that is there now, so older entries for it go (publish_rung would
+        # otherwise find the stale one first -- unverified -- and keep the fresh, verified file off the Hub)
+        seen, keepl = set(), []
+        for b in reversed(man.get("builds", [])):
+            p = os.path.normcase(os.path.abspath(str(b.get("path", ""))))
+            if b.get("lane") == "gguf" and p in seen:
+                continue
+            seen.add(p)
+            keepl.append(b)
+        man["builds"] = list(reversed(keepl))
         ws._write_manifest(key, man)
 
 

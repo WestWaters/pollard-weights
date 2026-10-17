@@ -190,3 +190,22 @@ def test_git_blob_id_matches_git(tmp_path):
     f = tmp_path / "hello.txt"
     f.write_bytes(b"hello\n")
     assert R._git_blob_sha1(str(f)) == "ce013625030ba8dba906f756967f9e9ca394464a"   # `git hash-object` of "hello\n"
+
+
+def test_a_rerun_rung_replaces_the_stale_entry_at_its_published_name(model, inputs, hub, monkeypatch):
+    """The LFM2.5 MANIFEST after the bad night: Q6_K 'freed' at its published name. A rebuilt Q6_K renamed onto that
+    name must be the entry publish_rung finds -- not the stale, unverified one."""
+    cfg = plan(inputs)
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    rdir = ws.model_dir(c["f16"], create=True)
+    canon = os.path.join(rdir, "Tiny-1B-Pollard-Q6_K.gguf")
+    ws.record_build(c["f16"], "gguf", canon, tag="Q6_K", extra={"freed": "did not pass the gate -- not published"})
+    fresh = os.path.join(rdir, "Tiny-1B-f16.gguf-Pollard-GGUF-Q6_K.gguf")
+    Path(fresh).write_bytes(b"GGUF" * 9)
+    ws.record_build(c["f16"], "gguf", fresh, tag="Q6_K")
+    R.canonical_gguf(c)
+    builds = R.gguf_builds(c)
+    assert len(builds) == 1 and builds[0]["path"] == os.path.abspath(canon) and not builds[0].get("freed")
+    ws.record_gate(canon, {"pass": True})
+    assert R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", canon), c, cfg, True, out=lambda *_: None) == "done"
+    assert "Tiny-1B-Pollard-Q6_K.gguf" in hub[REPO] and not os.path.exists(canon)
