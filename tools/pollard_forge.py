@@ -46,14 +46,8 @@ def _torch():
 
 
 def _device(want="auto"):
-    torch = _torch()
-    if want != "auto":
-        return want
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    import pollard_device
+    return pollard_device.pick(want, _torch())
 
 
 def _lineage(d, entry):

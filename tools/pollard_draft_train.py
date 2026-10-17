@@ -450,17 +450,8 @@ def heavy_lock(path=None, poll=20, log=print):
 
 
 def pick_device(want="auto"):
-    if want != "auto":
-        return want
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda"
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
-    except ImportError:
-        pass
-    return "cpu"
+    import pollard_device                    # CUDA > MPS > CPU, and a wheel with no kernels for the card is not CUDA
+    return pollard_device.pick(want)
 
 
 def gpu_guard(need_gb=0.0, users=None, free=None):
@@ -582,7 +573,13 @@ def build_meta(prov):
 
 
 def _python_for_trainer(explicit=None):
-    return explicit or os.environ.get("POLLARD_SPECULATORS_PYTHON") or sys.executable
+    if explicit or os.environ.get("POLLARD_SPECULATORS_PYTHON"):
+        return explicit or os.environ.get("POLLARD_SPECULATORS_PYTHON")
+    try:                                     # the separate env `pollard setup --lanes draft-train` made + recorded
+        from pollard_setup import env_python
+        return env_python("speculators") or sys.executable
+    except Exception:                                            # noqa: BLE001
+        return sys.executable
 
 
 def has_speculators(python):

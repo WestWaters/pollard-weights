@@ -193,6 +193,14 @@ def smoke(r: dict) -> tuple[str, list]:
     return "pollard_smoke", a
 
 
+def setup(r: dict) -> tuple[str, list]:
+    """What every lane needs on this machine, checked working. Report + the exact commands only: installing
+    asks for a terminal (`pollard setup`), never a button."""
+    a: list[str] = ["--dry-run"]
+    _opt(a, "--lanes", r.get("lanes"))
+    return "pollard_setup", a
+
+
 def ggufcheck(r: dict) -> tuple[str, list]:
     return "pollard_ggufcompat", ([r["gguf"]] if r.get("gguf") else [])
 
@@ -622,7 +630,7 @@ def publish(r: dict) -> tuple[str, list]:
 
 ACTIONS = {
     "build": lane, "fit": build, "automap": automap, "bench": bench, "bench-all": bench,
-    "eval": evaluate, "doctor": doctor, "smoke": smoke, "ggufcheck": ggufcheck,
+    "eval": evaluate, "doctor": doctor, "smoke": smoke, "ggufcheck": ggufcheck, "setup": setup,
     "verify": verify, "gate": verify, "card": card_local, "fragile": fragile, "train": train,
     "ls": ls, "publish": publish, "routecheck": routecheck,
     "mmeval": mmeval, "taskeval": taskeval, "failmode": failmode,
