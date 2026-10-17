@@ -62,7 +62,7 @@ def _paths(c):
 
 
 def test_a_failed_measure_keeps_the_rung_on_disk_and_off_the_hub(model, inputs, hub, monkeypatch):
-    cfg = plan(inputs, measure={"taskeval": {"suite": "quick", "limit": 5}, "toolcall": False})
+    cfg = plan(inputs, measure={"taskeval": {"suite": "quick", "limit": 5}, "toolcall": False}, _taskeval=True)
     c, _, steps = R.plan_steps(cfg, model, {"gguf"})
     _ladder(c, monkeypatch, fail={"Q6_K": "taskeval", "IQ4_XS": "taskeval", "IQ3_S": "taskeval"})
     said = []
@@ -215,9 +215,45 @@ def test_measure_ref_from_the_plan_is_the_served_reference_and_verify_stays_on_t
     q8 = tmp_path / "Tiny-1B-Q8_0.gguf"
     q8.write_bytes(b"GGUF")
     cfg = plan(inputs, measure={"taskeval": {"suite": "quick", "limit": 5}, "toolcall": True},
-               measure_ref=str(q8))
+               measure_ref=str(q8), _taskeval=True)
     c, _, _ = R.plan_steps(cfg, model, {"gguf"})
     steps = {s.id.split("/")[-1]: s for s in R.gguf_rung_steps(cfg, c, [{"tag": "Q6_K", "path": "r.gguf"}])}
     ref = lambda s: s.cmd[s.cmd.index("--ref") + 1]
     assert ref(steps["taskeval"]) == str(q8) and ref(steps["toolcall"]) == str(q8)
     assert ref(steps["verify"]) == c["f16"], "the KLD gate is always against the f16"
+
+
+
+def test_taskeval_is_opt_in_and_the_release_path_is_the_fast_measure_set(model, inputs):
+    """Owner (2026-10-16): Pollard publishes per rung on KLD + PPL vs the f16, the tool-call gate and the complete-model
+    gate -- no lm-eval per rung (it took ~1 h a rung). --taskeval opts in; --taskeval-only measures published rungs later."""
+    cfg = plan(inputs, measure={"taskeval": {"suite": "quick", "limit": 200}, "toolcall": True})
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    ids = [s.id.split("/")[-1] for s in R.gguf_rung_steps(cfg, c, [{"tag": "Q6_K", "path": "r.gguf"}])]
+    assert "taskeval" not in ids and {"toolcall", "verify", "publish"} <= set(ids)
+    cfg["_taskeval"] = True
+    ids = [s.id.split("/")[-1] for s in R.gguf_rung_steps(cfg, c, [{"tag": "Q6_K", "path": "r.gguf"}])]
+    assert "taskeval" in ids
+
+
+def test_taskeval_only_measures_published_rungs_from_a_temporary_download(model, inputs, hub, monkeypatch, tmp_path):
+    cfg = plan(inputs)
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    p = os.path.join(ws.model_dir(c["f16"], create=True), "Tiny-1B-Pollard-Q6_K.gguf")
+    ws.record_build(c["f16"], "gguf", p, tag="Q6_K", extra={"uploaded": REPO, "uploaded_as": "Tiny-1B-Pollard-Q6_K.gguf"})
+    ws.record_gate(p, {"pass": True})
+    steps = R.taskeval_only_steps(cfg, c)
+    assert [s.id for s in steps] == ["gguf/Q6_K/taskeval", "gguf/card", "gguf/card-upload"]
+    got = {}
+    dl = tmp_path / "dl.gguf"
+    import types
+    fake = sys.modules["huggingface_hub"]
+    def hf_hub_download(repo, name, local_dir=None):
+        dl.write_bytes(b"GGUF")
+        got["fetched"] = (repo, name)
+        return str(dl)
+    monkeypatch.setattr(fake, "hf_hub_download", hf_hub_download, raising=False)
+    monkeypatch.setattr(R, "run_cmd", lambda cmd, ok=(0,): got.setdefault("model", cmd[cmd.index("--model") + 1]))
+    assert R.taskeval_rung(steps[0], c, True, out=lambda *_: None) == "done"
+    assert got["fetched"] == (REPO, "Tiny-1B-Pollard-Q6_K.gguf") and got["model"] == str(dl)
+    assert not dl.exists(), "the temporary download is deleted after the measurement"

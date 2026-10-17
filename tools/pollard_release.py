@@ -90,7 +90,8 @@ calib:
   reasoning: auto              # auto | on | off | toggle -- thinking traces in the model's own delimiters
   reasoning_share: null        # null = 0.35 of the corpus when the model reasons
 measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
-  taskeval: {suite: quick, limit: 200}   # null to skip; retention vs f16 per task
+  taskeval: {suite: quick, limit: 200}   # OPT-IN (--taskeval, or later --taskeval-only): ~1 h per rung of lm-eval,
+                                         # so the release path does not run it; retention vs f16 per task
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
@@ -522,7 +523,7 @@ def gguf_rung_steps(cfg, c, builds):
         tag, path = b.get("tag") or b.get("name"), b.get("path")
         common = ["--results", res, "--rung", tag]
         rid = f"gguf/{tag}"
-        if m.get("taskeval"):
+        if m.get("taskeval") and (cfg.get("_taskeval") or cfg.get("_taskeval_only")):
             t = m["taskeval"]
             steps.append(Step(id=f"{rid}/taskeval", lane="gguf", rung=tag, kind="measure", requires="any",
                               cmd=["pollard-taskeval", "--model", path, "--ref", ref, "--suite",
@@ -547,6 +548,66 @@ def gguf_rung_steps(cfg, c, builds):
         if c.get("free"):
             steps.append(_publish_rung_step(c, "gguf", tag, path))
     return steps
+
+
+def taskeval_only_steps(cfg, c):
+    """`pollard release --taskeval-only`: the task-retention numbers for rungs that are ALREADY published, after the
+    fact (overnight), then the card again. Each verified GGUF rung is measured from its local file, or -- freed after
+    its upload -- from a temporary download of its published copy, deleted again once measured. Not part of the
+    publish path: Pollard publishes on KLD + PPL + the tool-call gate + the complete-model gate."""
+    t = dict((cfg.get("measure") or {}).get("taskeval") or {"suite": "quick", "limit": 200})
+    ref = c.get("measure_ref") or c["f16"]
+    repo = repo_name(c["org"], c["src"])
+    steps = []
+    for b in gguf_builds(c):
+        if b.get("verified") is not True:
+            continue
+        tag = b.get("tag") or b.get("name")
+        cmd = ["pollard-taskeval", "--model", b["path"], "--ref", ref, "--suite", str(t.get("suite", "quick")),
+               "--limit", str(t.get("limit", 200)), "--ngl", c["ngl"],
+               "--out", os.path.join(c["mdir"], "reports", "taskeval", tag), "--results", results_path(c, "gguf"),
+               "--rung", tag]
+        steps.append(Step(id=f"gguf/{tag}/taskeval", lane="gguf", rung=tag, kind="measure", requires="any",
+                          fn="taskeval_rung", cmd=cmd, out=b["path"], repo=repo,
+                          remote=b.get("uploaded_as") if b.get("uploaded") == repo else None,
+                          desc=f"task retention of {tag} ({t.get('suite', 'quick')}, limit {t.get('limit', 200)})"))
+    steps.append(Step(id="gguf/card", lane="gguf", kind="card", requires="any", cmd=card_cmd(cfg, c, ["gguf"]),
+                      out=c["release_dir"], repo=repo))
+    steps.append(Step(id="gguf/card-upload", lane="gguf", kind="upload", requires="any", fn="card_upload", repo=repo,
+                      out=c["release_dir"], desc=f"the card with the retention numbers -> https://huggingface.co/{repo}"))
+    return steps
+
+
+def taskeval_rung(step, c, run_upload, out=print):
+    """Measure one published rung: its local file, else a temporary download of its published copy (deleted after)."""
+    cmd = list(step.cmd)
+    if os.path.exists(str(step.out)):
+        run_cmd(cmd)
+        return "done"
+    if not step.remote:
+        raise RuntimeError(f"{step.out} is neither on disk nor recorded as published")
+    from huggingface_hub import hf_hub_download
+    tmp = os.path.join(c["mdir"], "taskeval-download")
+    os.makedirs(tmp, exist_ok=True)
+    out(f"      fetching the published {step.remote} for the measurement (deleted afterwards)")
+    local = hf_hub_download(step.repo, step.remote, local_dir=tmp)
+    try:
+        cmd[cmd.index("--model") + 1] = local
+        run_cmd(cmd)
+    finally:
+        if os.path.exists(local):
+            os.remove(local)
+    return "done"
+
+
+def card_upload(step, c, run_upload, out=print):
+    card = os.path.join(step.out, "README.md")
+    if not run_upload:
+        out("      (not uploading the card: uploads are off)")
+        return "held"
+    from huggingface_hub import HfApi
+    HfApi().upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=step.repo)
+    return "done"
 
 
 def _publish_rung_step(c, lane, tag, path):
@@ -1560,6 +1621,10 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 res = "done"
             elif st.fn == "publish_rung":
                 res = publish_rung(st, c, cfg, run_upload, out)
+            elif st.fn == "taskeval_rung":
+                res = taskeval_rung(st, c, run_upload, out)
+            elif st.fn == "card_upload":
+                res = card_upload(st, c, run_upload, out)
             elif st.kind == "measure" and (st.lane, st.rung) in streamed and "pollard-toolcall" in str(st.cmd[0]):
                 res = _toolcall_not_measured(st, "the rung was streamed to the Hub shard by shard while it was built "
                                                  "(bigger than the free disk); the tool-call probe needs it on disk")
@@ -1634,6 +1699,12 @@ def main(argv=None):
     ap.add_argument("--free-after-upload", action="store_true",
                     help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
                          "needs --upload and `upload: true`")
+    ap.add_argument("--taskeval", action="store_true",
+                    help="also run pollard-taskeval (lm-eval gsm8k/ifeval, ~1 h per rung) on every GGUF rung before "
+                         "it is gated -- off by default: the release publishes on KLD + PPL + tool calls + coherence")
+    ap.add_argument("--taskeval-only", action="store_true",
+                    help="after publishing: task retention for every verified GGUF rung (its local file or a temporary "
+                         "download of the published one), then regenerate + upload the card")
     a = ap.parse_args(argv)
 
     if a.init:
@@ -1656,7 +1727,11 @@ def main(argv=None):
     if only and only - set(LANES):
         ap.error(f"unknown lane(s) {sorted(only - set(LANES))}; choose from {LANES}")
     run = a.run and not a.dry_run
+    cfg["_taskeval"] = bool(a.taskeval)
+    cfg["_taskeval_only"] = bool(a.taskeval_only)
     c, lanes, steps = plan_steps(cfg, src, only)
+    if a.taskeval_only:
+        steps = taskeval_only_steps(cfg, c)
     have = machine()
     print(f"== pollard release :: {src}  (preset {cfg['preset']}, {'RUN' if run else 'plan only'})")
     print(f"   lanes: {', '.join(lanes) or 'none'}   |   this machine: "
