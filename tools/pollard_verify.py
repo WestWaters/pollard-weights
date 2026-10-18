@@ -151,23 +151,32 @@ def end_to_end(model_dir, source_dir, device, rows, length):
 
 # ----------------------------------------------------------------------- shared fidelity math
 
-def kld_top1(ref_logits, q_logits):
+def kld_top1(ref_logits, q_logits, rows=256):
     """{kld, top1, kld_p99, n} for two [N, V] logit arrays (numpy): mean KL(ref || q) per token in nats,
     and top-1 agreement in percent -- the same two numbers llama-perplexity reports for a GGUF, so every
-    lane is gated on the same scale."""
+    lane is gated on the same scale.
+
+    Computed `rows` positions at a time in float32, each row's KL summed in float64: the whole-array float64 cast
+    this used to do is 4.64 GiB PER COPY at 4096 x 151936 (16 x 256 tokens of a Qwen vocabulary), several copies
+    deep -- a numpy MemoryError on a 32 GB box that failed every GPTQ rung's gate regardless of its quality."""
     import numpy as np
-    r = np.asarray(ref_logits, dtype=np.float64)
-    q = np.asarray(q_logits, dtype=np.float64)
-    if r.shape != q.shape:
-        v = min(r.shape[-1], q.shape[-1])               # padded vocab rows on one side
-        r, q = r[..., :v], q[..., :v]
-    r = r - r.max(-1, keepdims=True)
-    q = q - q.max(-1, keepdims=True)
-    lr = r - np.log(np.exp(r).sum(-1, keepdims=True))
-    lq = q - np.log(np.exp(q).sum(-1, keepdims=True))
-    kl = (np.exp(lr) * (lr - lq)).sum(-1)
-    top1 = (r.argmax(-1) == q.argmax(-1)).mean() * 100.0
-    return {"kld": float(kl.mean()), "top1": float(top1), "kld_p99": float(np.percentile(kl, 99)), "n": int(kl.size)}
+    r_all, q_all = np.asarray(ref_logits), np.asarray(q_logits)
+    v = min(r_all.shape[-1], q_all.shape[-1])               # padded vocab rows on one side
+    r_all, q_all = r_all.reshape(-1, r_all.shape[-1]), q_all.reshape(-1, q_all.shape[-1])
+    kl, hit = [], []
+    for a in range(0, len(r_all), max(1, int(rows))):
+        r = np.asarray(r_all[a:a + rows, :v], dtype=np.float32)
+        q = np.asarray(q_all[a:a + rows, :v], dtype=np.float32)
+        r = r - r.max(-1, keepdims=True)
+        q = q - q.max(-1, keepdims=True)
+        lr = r - np.log(np.exp(r).sum(-1, keepdims=True, dtype=np.float64)).astype(np.float32)
+        lq = q - np.log(np.exp(q).sum(-1, keepdims=True, dtype=np.float64)).astype(np.float32)
+        kl.append((np.exp(lr) * (lr - lq)).sum(-1, dtype=np.float64))
+        hit.append(r.argmax(-1) == q.argmax(-1))
+    kl = np.concatenate(kl) if kl else np.zeros(0)
+    hit = np.concatenate(hit) if hit else np.zeros(0, bool)
+    return {"kld": float(kl.mean()), "top1": float(hit.mean() * 100.0), "kld_p99": float(np.percentile(kl, 99)),
+            "n": int(kl.size)}
 
 
 def _chunks(ids, length, n):
@@ -307,6 +316,8 @@ def mlx_stream_wanted(source, model, mode="auto"):
 #: context. Before this the lane scored 256-token BOS-less chunks from position 0 and read LFM2.5-24B-A2B's 3-bit
 #: rung at KLD 1.05; on LFM2.5-8B-A1B the same rung read 0.94 that way and 0.53 this way.
 MLX_PROTOCOL = "bos-second-half"
+#: exit code of a step held for disk / RAM (pollard release: resumable, the rung is kept), as pollard-mlx's
+EXIT_HELD = 3
 MLX_LENGTH = 2048
 
 
@@ -351,6 +362,25 @@ def _mlx_tokens(source, eval_path, length, chunks, with_starts=False):
     return (parts, starts) if with_starts else parts
 
 
+def ref_disk_room(cache, nbytes, mirror=None, log=print):
+    """Before the source's reference logits (`nbytes`) are written at `cache`: room for them over the disk reserve
+    (pollard_mlx.disk_reserve_gb). A remote mirror's cache on the same disk is evicted for it first; still short ->
+    OutOfMemoryBudget (the step is held, nothing half-written)."""
+    import shutil
+    import pollard_mlx as M
+    import pollard_stream as S
+    d = os.path.dirname(os.path.abspath(cache))
+    reserve = M.disk_reserve_gb(d)
+    free = shutil.disk_usage(d).free
+    if free < nbytes + reserve * 1e9 and mirror is not None and os.stat(d).st_dev == os.stat(mirror.dir).st_dev:
+        freed = mirror.make_room(reserve + nbytes / 1e9)
+        free = shutil.disk_usage(d).free
+        log(f"   disk: {freed / 1e9:.1f} GB of the mirror's cache evicted for the reference logits")
+    if free < nbytes + reserve * 1e9:
+        raise S.OutOfMemoryBudget(f"disk: the reference logits need {nbytes / 1e9:.2f} GB at {d} over the "
+                                  f"{reserve:.1f} GB reserve and {free / 1e9:.2f} GB is free")
+
+
 def measure_mlx(model, source, eval_path, length=None, chunks=8, stream="auto", log=print):
     """mlx_lm / mlx-vlm: the quantized model and its source over the same token chunks -- KLD, top-1, PPL, scored as
     llama-perplexity scores the GGUF lane (MLX_PROTOCOL: BOS-led chunks, second half). Streamed (pollard_mlx.StreamedLM:
@@ -388,13 +418,22 @@ def measure_mlx(model, source, eval_path, length=None, chunks=8, stream="auto", 
         if not os.path.exists(cache):
             src = M.StreamedLM(source, engine, guard, log).run(parts)
             ref_mm = None
-            for b in range(len(parts)):
-                lg = src.logits(b, starts[b])
-                if ref_mm is None:
-                    ref_mm = np.lib.format.open_memmap(cache + ".partial.npy", mode="w+", dtype=np.float16,
-                                                       shape=(int(offs[-1]), lg.shape[-1]))
-                ref_mm[offs[b]:offs[b + 1]] = lg.astype(np.float16)
-            ref_mm.flush()
+            try:
+                for b in range(len(parts)):
+                    lg = src.logits(b, starts[b])
+                    if ref_mm is None:
+                        ref_disk_room(cache, int(offs[-1]) * lg.shape[-1] * 2, src.mirror, log)
+                        ref_mm = np.lib.format.open_memmap(cache + ".partial.npy", mode="w+", dtype=np.float16,
+                                                           shape=(int(offs[-1]), lg.shape[-1]))
+                    ref_mm[offs[b]:offs[b + 1]] = lg.astype(np.float16)
+                ref_mm.flush()
+            except BaseException:
+                del ref_mm
+                try:
+                    os.remove(cache + ".partial.npy")      # never a half-written reference left taking the disk
+                except OSError:
+                    pass
+                raise
             del ref_mm, src
             mx.clear_cache()
             os.replace(cache + ".partial.npy", cache)
@@ -478,6 +517,15 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
     return kld_top1(ref, logits(model, loader))
 
 
+def _quant_method(d):
+    try:
+        with open(os.path.join(str(d), "config.json"), encoding="utf-8") as f:
+            q = json.load(f).get("quantization_config") or {}
+        return str(q.get("quant_method") or "").lower() if isinstance(q, dict) else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def stream_wanted(source, mode="auto", rung=None):
     """(True, why) when the transformers lanes are measured STREAMED (pollard_stream: source and rung one block at a
     time) -- for a source transformers' AutoModelForCausalLM cannot load whole here: a VLM / omni wrapper, custom
@@ -492,6 +540,11 @@ def stream_wanted(source, mode="auto", rung=None):
             # whole, block by block -- swapping only its linears into the original source would pair smoothed
             # weights with unsmoothed norms
             return True, f"a Pollard rung ({side}): every tensor read from the rung"
+    if rung and os.path.isdir(str(rung)) and _quant_method(rung) == "gptq":
+        # any GPTQ rung (pollard-export's gptqmodel build writes pollard-allocation.json, not pollard-gptq.json):
+        # transformers' GPTQ loader (optimum) builds EVERY linear at the base bits and ignores the per-layer `dynamic`
+        # map, so a 4/8 mix reads as noise there; the stream reader decodes each module at the bits it was stored at
+        return True, "a GPTQ rung: every module decoded at its own bits (transformers ignores `dynamic`)"
     if not os.path.isdir(str(source)):
         return False, ""
     try:
@@ -911,7 +964,12 @@ def main():
         if lane == "gguf":
             measured = measure_gguf(a.model, a.source, a.eval, a.ngl, a.chunks)
         elif lane == "mlx":
-            measured = measure_mlx(a.model, a.source, a.eval, mlx_length, a.chunks, a.stream)
+            import pollard_stream as S
+            try:
+                measured = measure_mlx(a.model, a.source, a.eval, mlx_length, a.chunks, a.stream)
+            except S.OutOfMemoryBudget as e:           # disk / RAM short: the rung stays on disk, the step is held
+                print(f"HELD: {e}", flush=True)
+                sys.exit(EXIT_HELD)
         elif streamed:
             print(f"   streamed: source and rung block by block ({why})")
             measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc)
@@ -942,7 +1000,11 @@ def main():
         import pollard_workspace as ws
         keep = {k: measured[k] for k in ("kld", "top1", "ppl", "coherence") if measured.get(k) is not None}
         if keep:
-            ws.merge_results(a.results, rung, keep)
+            try:
+                ws.merge_results(a.results, rung, keep)
+            except OSError as e:                       # a full disk: the old results stay whole, the step is held
+                print(f"HELD: {e}", flush=True)
+                sys.exit(EXIT_HELD)
 
     gate_res = None
     if a.gate is not None:
@@ -962,8 +1024,13 @@ def main():
             fails += 1
         if a.results:
             import pollard_workspace as ws
-            ws.merge_results(a.results, rung, {"verified": {"pass": gate_res["pass"], "gates": gate_res["gates"],
-                                                            "failed": [c["check"] for c in gate_res["checks"] if not c["ok"]]}})
+            try:
+                ws.merge_results(a.results, rung, {"verified": {"pass": gate_res["pass"], "gates": gate_res["gates"],
+                                                                "failed": [c["check"] for c in gate_res["checks"]
+                                                                           if not c["ok"]]}})
+            except OSError as e:
+                print(f"HELD: {e}", flush=True)
+                sys.exit(EXIT_HELD)
 
     # stamp the workspace manifest so `pollard-ls` / the card / pollard release see the verdict
     # (no-op if the build was made outside the workspace)

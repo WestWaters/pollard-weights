@@ -264,6 +264,29 @@ def calib_samples(path: str) -> list:
         return [ln.strip() for ln in f if ln.strip()]
 
 
+def write_json_atomic(path: str, obj, indent=2) -> None:
+    """Write `obj` as JSON to `path` through `path`.tmp + fsync + rename: a full disk (ENOSPC) or a crash mid-write
+    leaves the previous file exactly as it was, and the half-written temp file is removed. Raises OSError (same errno)
+    naming the file."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        if isinstance(e, OSError):
+            raise OSError(e.errno, f"could not write {path}: {e.strerror or e} -- the previous file is kept") from e
+        raise
+
+
 def merge_results(path: str, rung: str, patch: dict, meta: dict | None = None) -> dict:
     """Merge measured numbers for one rung into a results.json (the file pollard-card --results reads:
     {rung: {ppl, kld, top1, toolcall, decision, retention, mt, ...}, _meta keys...}). Nested dicts are
@@ -280,12 +303,7 @@ def merge_results(path: str, rung: str, patch: dict, meta: dict | None = None) -
             cur[k] = v
     for k, v in (meta or {}).items():
         res[k] = v
-    d = os.path.dirname(os.path.abspath(path))
-    os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(res, f, indent=2)
-    os.replace(tmp, path)
+    write_json_atomic(path, res, indent=2)
     return res
 
 

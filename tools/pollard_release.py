@@ -70,12 +70,13 @@ How it runs -- and why:
 """
 from __future__ import annotations
 
-import argparse, copy, json, os, platform, shutil, subprocess, sys, time
+import argparse, copy, json, os, platform, re, shutil, subprocess, sys, time
 
 TEMPLATE = """\
 # pollard release plan -- every lane, each a ladder of rungs. `pollard release --hf <model> --plan this.yaml`
 # prints the plan; add --run to build, --upload to publish (and set upload: true below).
 org: PollardWeights            # the HF account the lane repos go to
+base_model: null               # the HF repo id the card names as base_model (null = the --hf id / its config)
 preset: text                   # text | vlm | decision | moe -- fills anything not set here
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line
@@ -843,7 +844,8 @@ def lane_steps(cfg, c, lane):
                 ver += ["--device", "cpu"]
         ver += ["--end-to-end"] if lane == "exl3" else ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
-                          cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None))
+                          cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None,
+                          held_codes=(EXIT_HELD,) if lane == "mlx" else ()))   # disk / RAM short: held, rung kept
         if c.get("free"):
             st = _publish_rung_step(c, lane, tag, out)
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
@@ -878,6 +880,47 @@ def _draft_on(cfg):
     return bool(((cfg.get("lanes") or {}).get("draft") or {}).get("enabled"))
 
 
+_HF_ID = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+
+
+def _is_hf_id(x):
+    """An HF repo id (org/name), not a local path that happens to contain one slash."""
+    x = str(x or "")
+    return bool(_HF_ID.match(x)) and not os.path.exists(x)
+
+
+def base_model_id(cfg, c):
+    """The HF repo id the card names as base_model (its frontmatter, links, licence lookup): the plan's `base_model:`,
+    the --hf argument when it is a repo id, `hf_weights:` when that is one, the source config's `_name_or_path`, a
+    workspace folder named <Org>__<Model>. None when nothing says -- a local path is never a base_model (the LFM2.5
+    card went out with base_model: C:\\pollard\\src\\LFM2.5-24B-A2B, 2026-10-17)."""
+    if _is_hf_id(cfg.get("base_model")):
+        return str(cfg["base_model"])
+    if _is_hf_id(c.get("src")):
+        return str(c["src"])
+    if _is_hf_id(c.get("hf_repo")):
+        return str(c["hf_repo"])
+    for d in (c.get("hf_dir"), c.get("src")):
+        try:
+            with open(os.path.join(str(d), "config.json"), encoding="utf-8") as f:
+                nop = json.load(f).get("_name_or_path")
+            if _is_hf_id(nop):
+                return str(nop)
+        except (OSError, ValueError, AttributeError):
+            pass
+    for d in (c.get("hf_dir"), c.get("src")):
+        base = os.path.basename(str(d or "").rstrip("/\\"))
+        if base.count("__") == 1 and _is_hf_id(base.replace("__", "/")):
+            return base.replace("__", "/")
+    return None
+
+
+def source_params(d):
+    """pollard_card.source_params (parameters from the safetensors headers)."""
+    from pollard_card import source_params as sp
+    return sp(d)
+
+
 def card_cmd(cfg, c, lanes):
     """The ONE card for the one repo: the primary lane (GGUF when it is in the run) in full, every other lane as its
     own folder section with its measured numbers and download + serve commands, the drafter in DRAFT/. Every lane's
@@ -885,8 +928,9 @@ def card_cmd(cfg, c, lanes):
     repo = repo_name(cfg.get("org", "PollardWeights"), c["src"])
     body = [l for l in lanes if l != "draft"]
     primary = "gguf" if "gguf" in body else (body[0] if body else "gguf")
+    base = base_model_id(cfg, c)
     card = ["pollard-card", "--model", c["src"] if not os.path.isdir(c["src"]) else c["hf_dir"],
-            "--base-model", c["src"], "--lane", primary, "--builds-from", lane_key(c, primary),
+            "--base-model", base or c["src"], "--lane", primary, "--builds-from", lane_key(c, primary),
             "--results", results_path(c, primary), "--repo", repo, "--out", os.path.join(c["release_dir"], "README.md"),
             "--verified-only"]
     for other in body:
@@ -895,6 +939,12 @@ def card_cmd(cfg, c, lanes):
     if "draft" in lanes or _draft_on(cfg):
         card += ["--also", "draft", c["src"], results_path(c, "draft"),
                  "--draft-results", results_path(c, "draft"), "--draft-repo", repo]
+    params = source_params(c.get("hf_dir")) or source_params(c.get("src"))
+    if params:
+        card += ["--params", f"{params / 1e9:.3f}B"]
+    if primary == "gguf" and c.get("imatrix"):
+        # the release uploads it as <name>.imatrix (upload()); the card then says imatrix: yes and links it
+        card += ["--imatrix-file", f"{c['name']}.imatrix"]
     if primary == "gguf":
         card += ["--calib-file", os.path.basename(c["calib"]),
                  "--calib-note", f"the pollard-calib '{(cfg.get('calib') or {}).get('profile', 'auto')}' profile "
@@ -965,15 +1015,19 @@ def save_entry(path, sid, entry):
     with _STATE_LOCK:
         disk = load_state(path)
         disk[sid] = entry
-        save_state(path, disk)
+        try:
+            save_state(path, disk)
+        except OSError as e:                      # a full disk: the old state stays whole, this step re-runs next time
+            print(f"      WARNING: {e} -- {sid} is not recorded and runs again on the next release run",
+                  file=sys.stderr, flush=True)
+            return False
+    return True
 
 
 def save_state(path, state):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=1)
-    os.replace(tmp, path)
+    """tmp + fsync + rename (pollard_workspace.write_json_atomic): ENOSPC leaves the previous state intact."""
+    import pollard_workspace as ws
+    ws.write_json_atomic(path, state, indent=1)
 
 
 def _manifest_entry(path):
@@ -1758,6 +1812,66 @@ def gpu_returned():
     return not LS.gpu_lent()
 
 
+#: the lanes whose steps load exllamav3 (its JIT-built CUDA extension): the build, the in-process tool gate, the verify
+EXL3_ENV_LANES = ("exl3",)
+
+
+def _is_system_account(env):
+    """True when this process runs as Windows' SYSTEM account (a scheduled task with no user logged in)."""
+    user = str(env.get("USERNAME") or "").strip().upper()
+    prof = str(env.get("USERPROFILE") or env.get("LOCALAPPDATA") or "").lower()
+    return user == "SYSTEM" or user.endswith("$") or "systemprofile" in prof
+
+
+def _user_torch_extensions(env, exe, users_root=None, P=os.path):
+    """The torch_extensions cache of the person who owns this install (where exllamav3's extension was built), for a
+    SYSTEM run whose own profile has none: the user that POLLARD_HOME / the venv / this checkout lives under, else the
+    one user profile that holds a cache. `P` = the path module of the target OS (ntpath on Windows)."""
+    import glob
+    sub = P.join("AppData", "Local", "torch_extensions", "torch_extensions", "Cache")
+    root = users_root or P.join((env.get("SystemDrive") or "C:") + P.sep, "Users")
+    rootn = P.normcase(P.normpath(root))
+    owners = []
+    for p in (env.get("POLLARD_HOME"), exe, os.path.abspath(__file__)):
+        p = P.normcase(P.normpath(str(p or "")))
+        if p.startswith(rootn + P.sep):
+            name = p[len(rootn) + 1:].split(P.sep)[0]
+            if name and name not in owners:
+                owners.append(name)
+    for name in owners:
+        cand = P.join(root, name, sub)
+        if os.path.isdir(cand):
+            return cand
+    found = sorted(d for d in glob.glob(P.join(root, "*", sub)) if os.path.isdir(d))
+    return found[0] if len(found) == 1 else None
+
+
+def exl3_env(base=None, exe=None, platform_name=None, users_root=None):
+    """The environment an EXL3 step runs in. exllamav3 builds its CUDA extension on first use with torch's JIT, which
+    needs `ninja` on PATH and finds the built extension in the account's torch_extensions cache. A Windows scheduled
+    task as SYSTEM has neither -- the venv's Scripts is not on its PATH and SYSTEM's profile holds no cache -- so the
+    import died with 'DLL load failed' on the box (2026-10-17, qualification) while the same step ran fine as the user.
+    The venv's Scripts / bin dir goes first on PATH; as SYSTEM, TORCH_EXTENSIONS_DIR points at the owner's cache
+    (an explicit TORCH_EXTENSIONS_DIR is never overridden)."""
+    import ntpath, posixpath
+    env = dict(os.environ if base is None else base)
+    win = (platform_name or sys.platform).startswith("win")
+    P, sep = (ntpath, ";") if win else (posixpath, ":")
+    exe = exe or sys.executable
+    scripts = P.dirname(exe)
+    key = next((k for k in env if k.upper() == "PATH"), "PATH")       # Windows spells it Path
+    parts = [p for p in str(env.pop(key, "") or "").split(sep) if p]
+    norm = lambda p: P.normcase(P.normpath(p))                        # noqa: E731
+    if scripts and norm(scripts) not in {norm(p) for p in parts}:
+        parts.insert(0, scripts)
+    env[key] = sep.join(parts)
+    if win and not env.get("TORCH_EXTENSIONS_DIR") and _is_system_account(env):
+        cache = _user_torch_extensions(env, exe, users_root, P)
+        if cache:
+            env["TORCH_EXTENSIONS_DIR"] = cache
+    return env
+
+
 def run_cmd(cmd, ok_codes=(0,), env=None):
     from pollard_auto import _resolve_tool
     r = subprocess.run(_resolve_tool(list(cmd)), env=env) if env else subprocess.run(_resolve_tool(list(cmd)))
@@ -1945,8 +2059,14 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                                                  "(bigger than the free disk); the tool-call probe needs it on disk")
                 out("      tool calls: not measured (streamed rung)")
             else:
+                env = stream_env
+                if st.lane in EXL3_ENV_LANES:
+                    env = exl3_env(stream_env)
+                if st.lane == "mlx" and cfg.get("disk_margin_gb") is not None:
+                    # the streamed MLX tools size their disk reserve from the plan's margin (never under their floor)
+                    env = dict(env or os.environ, POLLARD_DISK_MARGIN_GB=str(float(cfg["disk_margin_gb"])))
                 try:
-                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": stream_env} if stream_env else {}))
+                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": env} if env else {}))
                 except RuntimeError as e:
                     if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
                         raise Held(f"{e} (the reason is the HELD: line above)") from None

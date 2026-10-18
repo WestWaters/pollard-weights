@@ -57,6 +57,54 @@ import argparse, json, os, sys
 import pollard_workspace as ws
 
 
+#: profile keys that are bookkeeping, never a group of per-layer scores (pollard-probe / pollard-sensitivity)
+PROFILE_META = frozenset({"noise", "probe", "layers", "source", "method", "stability", "excluded_tensors", "ref",
+                          "base"})
+
+
+def _score(v):
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _layer_key(k):
+    return isinstance(k, str) and k.isdigit() or isinstance(k, int) and not isinstance(k, bool)
+
+
+def layer_sensitivity(profile):
+    """{layer index (str): score} from a sensitivity profile, whichever shape it has.
+
+    pollard-probe / pollard-sensitivity write one dict of per-layer scores PER GROUP -- {"attn": {"0": ..}, "ffn":
+    {"0": ..}, ..., "layers": <the layer COUNT, an int>, "noise": {..}, "excluded_tensors": {..}}; a layer's damage is
+    the sum over its groups. Older / hand-written profiles keep one flat map, either at the top level ({"0": ..}) or
+    under "layers" ({"layers": {"0": ..}}). Reading `profile.get("layers", profile)` took the first shape's layer
+    COUNT for the map, so every NVFP4 / MXFP4 / --mix rung died on `'int' object has no attribute 'items'`."""
+    if not isinstance(profile, dict):
+        return {}
+    lay = profile.get("layers")
+    if isinstance(lay, dict):
+        return {str(int(k)): float(v) for k, v in lay.items() if _layer_key(k) and _score(v)}
+    flat = {str(int(k)): float(v) for k, v in profile.items() if _layer_key(k) and _score(v)}
+    if flat:
+        return flat
+    out = {}
+    for g, d in profile.items():
+        if g in PROFILE_META or not isinstance(d, dict) or not d or not all(_layer_key(k) for k in d):
+            continue
+        for k, v in d.items():
+            if _score(v):
+                out[str(int(k))] = out.get(str(int(k)), 0.0) + float(v)
+    return out
+
+
+def load_layer_sensitivity(path):
+    """layer_sensitivity() of the profile at `path` ({} when there is none)."""
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return layer_sensitivity(json.load(f))
+
+
 def allocate(sens, n_layers, hot_frac, focus=None):
     """Rank layers by measured sensitivity; the hottest `hot_frac` stay FP8, the rest go FP4.
     Mirrors pollard-export's hot/cold split so the FP4 lane inherits the same measured allocation.
@@ -398,10 +446,7 @@ def mx6_main(a):
     if a.format and a.mix is not None:
         sys.exit("ERROR: --format and --mix are separate rungs; pass one")
     src = a.model if os.path.isdir(a.model) else _snapshot(a.model)
-    sens = {}
-    if a.sensitivity and os.path.exists(a.sensitivity):
-        sens = json.load(open(a.sensitivity))
-        sens = sens.get("layers", sens) if isinstance(sens, dict) else {}
+    sens = load_layer_sensitivity(a.sensitivity)
     imp = {}
     if a.imatrix:
         from pollard_mlx import load_importance
@@ -579,10 +624,7 @@ def main():
         n_layers = n_layers or int(cfg.get("num_hidden_layers") or 0)
         moe = is_moe_config(cfg) or any(isinstance(b, dict) and b.get("block_type") == "moe"
                                         for b in (cfg.get("block_configs") or []))
-    sens = {}
-    if a.sensitivity and os.path.exists(a.sensitivity):
-        sens = json.load(open(a.sensitivity))
-        sens = sens.get("layers", sens) if isinstance(sens, dict) else {}
+    sens = load_layer_sensitivity(a.sensitivity)
 
     focus = ws.parse_layers(a.focus_layers)
     if focus:

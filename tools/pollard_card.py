@@ -410,6 +410,45 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
     return facts
 
 
+def source_params(d):
+    """Parameter count of an HF checkpoint folder from its safetensors HEADERS (every tensor's shape; no weights are
+    read): the index's metadata.total_parameters when it records one, else the sum over the shards. 0 = unknown.
+    The card's config estimate (12 L h^2 + 2 V h) is a dense formula -- it called the 24B LFM2.5 MoE ~2.5B."""
+    import struct
+    d = str(d or "")
+    if not os.path.isdir(d):
+        return 0
+    idx = os.path.join(d, "model.safetensors.index.json")
+    files = []
+    if os.path.isfile(idx):
+        try:
+            with open(idx, encoding="utf-8") as f:
+                ix = json.load(f)
+            tp = (ix.get("metadata") or {}).get("total_parameters")
+            if isinstance(tp, (int, float)) and tp > 0:
+                return int(tp)
+            files = sorted(set((ix.get("weight_map") or {}).values()))
+        except (OSError, ValueError):
+            files = []
+    if not files:
+        files = sorted(f for f in os.listdir(d) if f.endswith(".safetensors"))
+    total = 0
+    for fn in files:
+        try:
+            with open(os.path.join(d, fn), "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                hdr = json.loads(f.read(n))
+        except (OSError, ValueError, struct.error):
+            return 0
+        for k, v in hdr.items():
+            if k != "__metadata__":
+                p = 1
+                for x in v.get("shape") or []:
+                    p *= int(x)
+                total += p
+    return total
+
+
 def parse_params_b(params, cfg):
     if params:
         s = str(params).upper().replace("B", "").strip()
@@ -644,6 +683,17 @@ def provenance_lines(lane, builds):
     return (["How these rungs were made:", "", *out, ""] if out else [])
 
 
+def gptq_is_mixed(path):
+    """True when a GPTQ rung's quantization_config carries a `dynamic` rule that changes a module's bits."""
+    try:
+        with open(os.path.join(str(path), "config.json"), encoding="utf-8") as f:
+            q = json.load(f).get("quantization_config") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    base = q.get("bits")
+    return any(isinstance(v, dict) and v.get("bits") not in (None, base) for v in (q.get("dynamic") or {}).values())
+
+
 def lane_folder_section(lane, builds, results, repo, tools=None):
     """One lane of the ONE-repo card: its rungs in <LANE>/<rung>/ with the measured numbers (PPL / KLD / top-1 /
     Tool-ready / gate, whichever were recorded), and the exact download + serve command."""
@@ -668,6 +718,11 @@ def lane_folder_section(lane, builds, results, repo, tools=None):
            "```bash", f'hf download {repo} --include "{F}/{pick}/*" --local-dir {here}', *lane_serve(lane, path, tools),
            "```", ""]
     out += provenance_lines(lane, builds)
+    if lane == "gptq" and any(gptq_is_mixed(b.get("path", "")) for b in builds):
+        out += ["Mixed-precision rungs store each layer at the bits its sensitivity earned (a per-layer `dynamic` map in "
+                "`quantization_config`). vLLM and gptqmodel (`GPTQModel.load`) honour that map; transformers' "
+                "`from_pretrained` (optimum's GPTQ loader) builds every layer at the base bits and does not load these "
+                "correctly -- use vLLM or gptqmodel.", ""]
     if lane == "mx":
         import pollard_mxfp6 as M6
         extra = []
@@ -1048,6 +1103,9 @@ def main():
 
     cfg = base_config(a.base_model or a.model)
     base_model = a.base_model or a.model
+    if os.path.exists(str(base_model)):
+        print(f"WARNING: base_model is a local path ({base_model}); the Hub wants the repo id (org/name). Pass "
+              "--base-model <org/name> (pollard release: `base_model:` in the plan).", file=sys.stderr)
     lic = a.license_ or base_license(base_model, cfg)
     if not lic:
         lic = "other"
@@ -1126,7 +1184,11 @@ def main():
     dec_rows = {k: v["decision"] for k, v in results.items()
                 if isinstance(v, dict) and isinstance(v.get("decision"), dict)}
     decision = bool(facts.get("decision") or dec_rows)
-    pb = parse_params_b(a.params, cfg) or facts.get("params_b") or 0.0
+    # what was MEASURED beats the formula: --params, the source's safetensors headers, a built GGUF's tensor sum, and
+    # only then the dense config estimate (12 L h^2 + 2 V h), which reads a 24B MoE as ~2.5B
+    pb = (parse_params_b(a.params, {}) or
+          next((source_params(d) / 1e9 for d in (a.model, a.base_model) if source_params(d)), 0.0) or
+          facts.get("params_b") or parse_params_b(None, cfg) or 0.0)
     f16_gb = pb * 2.0
     builds_sorted = sorted(builds, key=lambda b: -(b.get("bytes") or 0))
     smallest = builds_sorted[-1] if builds_sorted else {}

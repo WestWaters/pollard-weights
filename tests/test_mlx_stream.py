@@ -30,6 +30,13 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 import pollard_mlx as M  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _volume_floor_off(monkeypatch):
+    """The disk floor's 10%-of-the-volume part is this machine's, not the code under test here (a dev Mac's volume can
+    be far bigger than its free disk); test_mlx_disk_reserve tests the floor itself."""
+    monkeypatch.setattr(M, "MAC_DISK_FLOOR_FRAC", 0.0)
+
+
 def _st(path, tensors):
     """A safetensors file from {name: (dtype, shape)} with zero bytes, written by hand (no safetensors package)."""
     size = {"BF16": 2, "F32": 4, "I64": 8}
@@ -578,7 +585,7 @@ def test_mirror_is_sparse_headers_real_and_never_read_by_other_lanes(tmp_path, m
     assert (mir / f).read_bytes()[off:off + n] == (src / f).read_bytes()[off:off + n]
     m2 = M.RemoteMirror(str(mir), log=lambda *a: None)                                  # the cache survives
     assert key in m2.present
-    m2.free_bytes = lambda: int(3e9 + n - 1)                     # the next fetch only fits if the cache gives room
+    m2.free_bytes = lambda: int(m2.floor_gb() * 1e9 + n - 1 + m2.evicted)   # fits only if the cache gives room
     other = "model.layers.1.feed_forward.experts.3.w2.weight"
     m2.done({key})
     m2.ensure({other})
@@ -661,7 +668,7 @@ def test_streamed_verify_from_a_mirror_on_a_tiny_disk_matches(tiny, tmp_path, mo
     def tiny_disk(self, *a, **k):
         orig_init(self, *a, **k)
         seen.append(self)
-        self.free_bytes = lambda: int(3e9 + budget - sum(self.entries[x][2] for x in self.present))
+        self.free_bytes = lambda: int(self.floor_gb() * 1e9 + budget - sum(self.entries[x][2] for x in self.present))
     monkeypatch.setattr(M.RemoteMirror, "__init__", tiny_disk)
     ev = tmp_path / "eval.txt"
     ev.write_text(" ".join(f"word{i % 97} token{i % 13}" for i in range(4000)))

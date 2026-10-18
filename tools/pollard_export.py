@@ -95,8 +95,13 @@ def allocate(sens, n_layers, hot_frac, focus=None, low=None, high=None):
 # GLM-4.5/5.3) replaces them with q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj -- all still end in
 # "proj", none of the norms do -- so "any *proj* under self_attn" catches both without a per-arch table.
 ATTN_PROJ = r"self_attn\.[a-z_]*proj[a-z0-9_]*"
-# Dense FFN is gate/up/down_proj; MoE also carries the same names under experts.<i>. -- this catches both.
-FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.\d+)?\.(?:gate|up|down)_proj"
+# Dense FFN is gate/up/down_proj; MoE also carries the same names under experts.<i>. -- this catches both. vLLM
+# matches the rules against its FUSED module names (`mlp.gate_up_proj`, `self_attn.qkv_proj`, one `mlp.experts` per
+# layer), not the checkpoint's: `(?:gate|up|down)_proj` never matched `gate_up_proj`, so a hot layer's gate/up was
+# built at the base bits while the checkpoint stored them at 8 -- `gate_up` is spelled out for it.
+FFN_PROJ = r"(?:mlp|block_sparse_moe)(?:\.experts\.\d+)?\.(?:gate_up|gate|up|down)_proj"
+#: every rule is a `+:` override (gptqmodel's and vLLM's own spelling; `-:` would exclude)
+POS = "+:"
 
 
 def dynamic_config(alloc, high=None):
@@ -107,12 +112,12 @@ def dynamic_config(alloc, high=None):
     dyn = {}
     # Head-wise attention output gate (Spark2_5 `self_attn.g_proj`): selection-critical, always high.
     # No-op for arches without it. Placed first so it holds regardless of per-layer attn allocation.
-    dyn[r".*\.self_attn\.[a-z_]*g_proj"] = {"bits": HIGH}
+    dyn[POS + r".*\.self_attn\.[a-z_]*g_proj"] = {"bits": HIGH}
     for i, g in alloc.items():
         if g["attn"] == HIGH:
-            dyn[rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
+            dyn[POS + rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
         if g["ffn"] == HIGH:
-            dyn[rf".*\.layers\.{i}\.{FFN_PROJ}"] = {"bits": HIGH}
+            dyn[POS + rf".*\.layers\.{i}\.{FFN_PROJ}"] = {"bits": HIGH}
     return dyn
 
 
@@ -127,14 +132,15 @@ def moe_dynamic_config(alloc, high=None):
     dyn = {}
     # ALWAYS protect the router (selection integrity) and the shared expert (every-token path).
     # `shared_experts?` covers Qwen-MoE's singular `shared_expert` and DeepSeek/GLM's plural `shared_experts`.
-    dyn[r".*\.(mlp|block_sparse_moe)\.gate$"] = {"bits": HIGH}
-    dyn[r".*\.mlp\.shared_experts?(_gate|\.(gate_proj|up_proj|down_proj))"] = {"bits": HIGH}
+    dyn[POS + r".*\.(mlp|block_sparse_moe)\.gate$"] = {"bits": HIGH}
+    dyn[POS + r".*\.mlp\.shared_experts?(_gate|\.(gate_up_proj|gate_proj|up_proj|down_proj))"] = {"bits": HIGH}
     for i, g in alloc.items():
         if g["attn"] == HIGH:                      # standard OR MLA attention (see ATTN_PROJ)
-            dyn[rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
+            dyn[POS + rf".*\.layers\.{i}\.{ATTN_PROJ}"] = {"bits": HIGH}
         if g["ffn"] == HIGH:                       # hot-layer experts kept at 8-bit (Mixtral w1/w2/w3 too)
-            dyn[rf".*\.layers\.{i}\.(mlp|block_sparse_moe)\.experts\.\d+\."
-                r"(gate_proj|up_proj|down_proj|w1|w2|w3)"] = {"bits": HIGH}
+            # one rule for the layer's experts: gptqmodel matches `...experts.<e>.gate_proj` (any projection, w1/w2/w3
+            # too), vLLM the fused `...mlp.experts` module it builds per layer -- both must land on the same bits
+            dyn[POS + rf".*\.layers\.{i}\.(mlp|block_sparse_moe)\.experts(\.|$)"] = {"bits": HIGH}
     return dyn
 
 
