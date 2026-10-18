@@ -6,9 +6,10 @@
       "llama.cpp-composed-sampler",
       "llama.cpp-qwen3omni-deepstack",
       "llama.cpp-qwen3omni-audio",
-      "llama.cpp-clef-omni"
+      "llama.cpp-clef-omni",
+      "llama.cpp-quantize-dec-blk"
     ],
-    "why": "the K-quant ladder, every new architecture the day upstream adds it; composed decoding sampler; Qwen3-Omni deepstack + audio fixes and clef-omni (decision head on Qwen3-Omni), ahead of upstream"
+    "why": "the K-quant ladder, every new architecture the day upstream adds it; composed decoding sampler; Qwen3-Omni deepstack + audio fixes and clef-omni (decision head on Qwen3-Omni), ahead of upstream; llama-quantize reading a decision head's dec.blk.N layer on an MoE body"
   },
   "ik_llama.cpp": {
     "url": "https://github.com/ikawrakow/ik_llama.cpp",

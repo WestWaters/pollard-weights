@@ -1,0 +1,54 @@
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c6066796..a72518973 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -179,6 +179,9 @@ struct quantize_state_impl {
+ 
+     int n_fallback    = 0;
+ 
++    // blocks of a second stack numbered apart from the body: clef-omni's decision head (dec.blk.N) on an MoE body
++    int n_dec_blk     = 0;
++
+     bool has_imatrix = false;
+ 
+     // used to figure out if a model has tied embeddings (tok_embd shares weights with output)
+@@ -458,13 +461,17 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
+     };
+     const int n_expert = std::max(1, (int)qs.model.hparams.n_expert);
+-    auto layer_info = [n_expert] (int i_layer, int n_layer, const char * name) {
++    const int n_dec_blk = qs.n_dec_blk;
++    auto layer_info = [n_expert, n_dec_blk] (int i_layer, int n_layer, const char * name) {
+         if (n_expert > 1) {
+             // Believe it or not, "experts" in the FFN of Mixtral-8x7B are not consecutive, but occasionally randomly
+             // sprinkled in the model. Hence, simply dividing i_ffn_down by n_expert does not work
+             // for getting the current layer as I initially thought, and we need to resort to parsing the
+             // tensor name.
+-            if (sscanf(name, "blk.%d.", &i_layer) != 1) {
++            // A decoder stack next to the body (dec.blk.N, e.g. a decision head) is its own stack of n_dec_blk blocks.
++            if (sscanf(name, "dec.blk.%d.", &i_layer) == 1 && n_dec_blk > 0) {
++                n_layer = n_dec_blk;
++            } else if (sscanf(name, "blk.%d.", &i_layer) != 1) {
+                 throw std::runtime_error(format("Failed to determine layer for tensor %s", name));
+             }
+             if (i_layer < 0 || i_layer >= n_layer) {
+@@ -941,6 +948,11 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
+         if (cat == tensor_category::OUTPUT) {
+             qs.has_tied_embeddings = false;
+         }
++
++        int i_dec = -1;
++        if (sscanf(tm.name.c_str(), "dec.blk.%d.", &i_dec) == 1 && i_dec >= qs.n_dec_blk) {
++            qs.n_dec_blk = i_dec + 1;
++        }
+     }
+     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer_all;
+ }
+@@ -1500,6 +1512,7 @@ void llama_quant_compute_types(
+     qs->i_ffn_gate          = 0;
+     qs->i_ffn_up            = 0;
+     qs->n_fallback          = 0;
++    qs->n_dec_blk           = 0;
+     qs->has_imatrix         = false;
+     qs->has_tied_embeddings = true;
+ 

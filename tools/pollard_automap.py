@@ -69,7 +69,12 @@ _NEEDS_IMATRIX = re.compile(
     # Worth noting it is also the tensor pollard-fragile ranks MOST heavy-tailed on this family
     # (kurtosis ~1044), so it is the last one you want crushed blind.
     r"|nextn\.(eh_proj|shared_head_head)"
-    r"|attn_(q|k|v|qkv|gate|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa))\.weight$")
+    r"|attn_(q|k|v|qkv|gate|output|q_a|q_b|k_b|v_b|kv_b|kv_a_mqa)"
+    # a decision head's decoder blocks (dec.blk.N, matched by the `blk\.N\.` above): self- and cross-attention
+    # with the T5 spelling attn_o
+    r"|(cross_)?attn_(q|k|v|o))\.weight$"
+    # and its projections / scorer -- the matmuls whose output is the decision
+    r"|^decision\.(proj_\w+|scorer(_out)?)\.weight$")
 
 
 def uncovered_pins(all_names, imatrix, fallback="q6_K"):
@@ -80,7 +85,8 @@ def uncovered_pins(all_names, imatrix, fallback="q6_K"):
     cov = imatrix_covered(imatrix)
     if cov is None:
         return [], None
-    pins = [rf"{re.escape(nm)}={fallback}" for nm in all_names
+    # exact-name pins (anchored): `blk\.0\.ffn_down\.weight` unanchored also pinned `dec.blk.0.ffn_down.weight`
+    pins = [rf"^{re.escape(nm)}$={fallback}" for nm in all_names
             if _NEEDS_IMATRIX.search(nm) and nm not in cov]
     return pins, len(cov)
 
@@ -183,7 +189,10 @@ def parse_tensors(path):
     a per-model special case. Accepts dry-run lines or bare tensor names."""
     names = []
     for ln in open(path, encoding="utf-8", errors="ignore"):
-        m = re.search(r"(blk\.\d+\.[\w.]+|token_embd\.weight|output[\w.]*\.weight|output_norm\.weight)", ln)
+        # `dec.blk.N.` is a second stack (clef-omni's decision head): kept whole, or the search below found the
+        # `blk.0.ffn_down.weight` INSIDE `dec.blk.0.ffn_down.weight` and every rule and pin aimed at the wrong tensor
+        m = re.search(r"((?:dec\.)?blk\.\d+\.[\w.]+|decision\.[\w.]+|token_embd\.weight|output[\w.]*\.weight"
+                      r"|output_norm\.weight)", ln)
         if m:
             names.append(m.group(1))
     names = sorted(set(names))
@@ -202,8 +211,18 @@ def parse_tensors(path):
         n_attn = len({m.group(1) for n in names
                       for m in [re.match(r"blk\.(\d+)\.attn_(q|qkv)\.weight", n)] if m})
         feats.append(f"hybrid-SSM {n_ssm}ssm/{max(n_attn - n_ssm, 0)}attn")
+    n_dec = dec_layers(names)
+    if n_dec:
+        feats.append(f"decision-head {n_dec}dec")
     arch = ("MoE" if is_moe else "dense") + (f" +{'+'.join(feats)}" if feats else "")
     return names, n_layers, is_moe, arch
+
+
+def dec_layers(names):
+    """Blocks in a `dec.blk.N.` stack next to the body (0 when there is none): clef-omni's decision head, whose
+    output IS the product, numbered apart from the body's `blk.N.`."""
+    idx = [int(m.group(1)) for n in names for m in [re.match(r"dec\.blk\.(\d+)\.", n)] if m]
+    return (max(idx) + 1) if idx else 0
 
 
 # ---- the real ik_llama.cpp extreme-low ladder (from `llama-quantize --help`) ----
@@ -304,7 +323,7 @@ def fragile_rules(path, protect, floor=3.0, cap=4):
     return rules, notes, lift
 
 
-def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
+def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt", n_dec=0):
     """Emit the Mix as (base_type, custom-q rules). base_type = the crush atom (fills
     everything not matched); every protected role is named explicitly via custom-q
     (lowercase = the reliable path -- role-flags silently fell back for some atoms).
@@ -324,9 +343,19 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
     # (1) edge whole-block protection FIRST so it beats the general role rules below,
     #     fully protecting the first-2 / last-2 blocks (attn AND ffn), as the flag-based
     #     original did (custom-q used to override the role flags).
+    # Anchored: custom-q is an unanchored search, and `blk\.0\.` also hit a decision head's `dec.blk.0.`.
     edge = [0, 1, n_layers - 2, n_layers - 1]
     for i in sorted(set(x for x in edge if 0 <= x < n_layers)):
-        cq.append(rf"blk\.{i}\.={protect}")
+        cq.append(rf"^blk\.{i}\.={protect}")
+    # (1b) a `dec.blk.N` stack (clef-omni's decision head) gets the body's rules on its OWN numbering: its edge
+    #      blocks protected like the body's (a 2-4 block head is all edge), the role rules below by substring --
+    #      plus attn_o / cross_attn_o, the head's spelling of attn_output -- and its decision.* projections, the
+    #      layer whose output is the answer, at the protect tier.
+    if n_dec:
+        dedge = [0, 1, n_dec - 2, n_dec - 1]
+        for i in sorted(set(x for x in dedge if 0 <= x < n_dec)):
+            cq.append(rf"^dec\.blk\.{i}\.={protect}")
+        cq += [rf"^dec\.blk\.\d+\.(cross_)?attn_o\.={protect}", rf"^decision\.={protect}"]
     if is_moe:
         # (2) crush the cold bulk experts to the body atom; keep the residual writer
         # (ffn_down_exps) a tier up, the router high, and the shared experts protected.
@@ -365,7 +394,7 @@ def recipe_flags(n_layers, is_moe, body="iq1_kt", protect="iq2_kt"):
 def emit_bat(a, n_layers, is_moe, names):
     body, protect = _atom(a.body), _atom(a.protect)
     kfree = is_kquant(body) and is_kquant(protect)     # imatrix-free (decoupled MoE) build?
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # dense/MoE (MoE covers MLA/hc/DSA)
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect, dec_layers(names))   # dense/MoE (MoE covers MLA/hc/DSA)
     base = a.model
     stem = re.sub(r"[-.]f16\.gguf$|\.gguf$", "", base.split("\\")[-1].split("/")[-1], flags=re.I)
     # robustness: pin imatrix-uncovered matmul/expert tensors to q6_K (first => wins), so a
@@ -670,7 +699,7 @@ def main():
     print(f"parsed: {len(names)} tensors, {n_layers} layers, {kind}")
     print(f"atoms: body={body} ({QUANT_BPW.get(body,'?')} bpw)  protect={protect} ({QUANT_BPW.get(protect,'?')} bpw)"
           f"  ->  {'imatrix-FREE (K-quant) build' if kfree else 'imatrix-guided (trellis) build'}")
-    flags, cq = recipe_flags(n_layers, is_moe, body, protect)   # HY4 runs through THE MoE recipe
+    flags, cq = recipe_flags(n_layers, is_moe, body, protect, dec_layers(names))   # HY4 runs through THE MoE recipe
     print(f"Mix policy: [{arch} -> {'MoE' if is_moe else 'dense'} recipe]")
     print("  flags   :", " ".join(flags))
     print("  custom-q:", ",".join(cq))

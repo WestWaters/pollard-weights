@@ -532,6 +532,131 @@ def exl3_sc_commands(model, out_dir, bpw, head_bits=6, devices="0"):
     ]
 
 
+# ----------------------------------------------------------------- the recipe A/B (smoothing x calibration, measured)
+#
+# The gold recipe (smoothing + Calib 3.0) was established on Qwen2.5-3B at 4bpw by PPL (8.670 vs EXL3 out-of-box 8.699).
+# The 2026-10-18 lane qualification measured it by KLD on Qwen2.5-0.5B-Instruct and it LOST to exllamav3's own
+# defaults at the same bytes: 0.1610 / 0.0421 vs 0.1205 / 0.0313 at 3.0 / 4.0 bpw (an independent exllamav3 measure,
+# wikitext-2). EXL3 already applies its own Hadamard incoherence processing, which is what SmoothQuant's flattening
+# is for on the other lanes, and Calib 3.0's profile follows the model's use (agent / chat for an instruct model),
+# not the text a KLD is read on. So neither half of the recipe is assumed any more: `--recipe-choice auto` converts
+# ONE rung each way, measures each through exllamav3 on the held-out text (pollard_verify.measure_exl3, the shared
+# protocol), keeps the winner as that rung, and every later rung of the model builds the winning way.
+
+#: variant -> (convert the SMOOTHED model, calibrate on the --calib-text corpus); False/False = exllamav3 out of box
+RECIPE_VARIANTS = {"pollard": (True, True), "raw-calib": (False, True), "smooth-default": (True, False),
+                   "plain": (False, False)}
+#: the order the A/B runs (and breaks an exact tie in)
+AB_ORDER = ("pollard", "raw-calib", "smooth-default", "plain")
+
+
+def read_ab(path):
+    """The recipe A/B record ({winner, variants: {name: {kld, top1, ppl}}, ...}) or None when there is none yet."""
+    import json as _j
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = _j.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    return rec if isinstance(rec, dict) and rec.get("winner") in RECIPE_VARIANTS else None
+
+
+def ab_winner(rows):
+    """The variant with the lowest measured KLD (AB_ORDER breaks an exact tie); None when nothing was measured."""
+    ok = [(rows[n]["kld"], AB_ORDER.index(n), n) for n in AB_ORDER if n in rows and rows[n].get("kld") is not None]
+    return min(ok)[2] if ok else None
+
+
+def variant_inputs(name, smoothed, raw, cal_data):
+    """(the folder to convert, the -cd calibration or None) for a recipe variant."""
+    sm, cal = RECIPE_VARIANTS[name]
+    return (smoothed if sm else raw), (cal_data if cal else None)
+
+
+def convert_cmd(a, model, out, work, cal_data, hq):
+    """exllamav3's convert_model command for one build."""
+    cmd = [sys.executable, "-m", "exllamav3.conversion.convert_model", "-i", model]
+    if out:
+        cmd += ["-o", out]
+    if work:
+        cmd += ["-w", work]                                 # exllamav3 REQUIRES a work dir (checkpoints/resume)
+    if a.recipe:                                            # explicit Pollard per-tensor plan
+        cmd += ["-rcp", a.recipe]
+    else:                                                   # budgeted: Pollard intent -> EXL3 knobs
+        cmd += ["-b", str(a.bpw), "-hb", str(a.head_bits), "-mb", str(a.mtp_bits)]
+        if hq:
+            cmd += ["-hq"]                                  # protect select (MoE) layers
+    if cal_data:
+        cmd += ["-cd", cal_data]
+    # Vision/audio tower. exllamav3 exposes -vb and defaults to 6 bpw on towers it has validated
+    # (16, i.e. unquantized, on anything else). Pollard was not passing it at all, so the lane was
+    # the only one where the user had no say. Default here is "leave exllamav3's architecture
+    # default alone"; --vision-bits 16 matches what Pollard does on GGUF, where the projector is
+    # never quantized at all.
+    if a.vision_bits is not None:
+        cmd += ["-vb", str(a.vision_bits)]
+    cmd += ["-d", a.devices]
+    return cmd
+
+
+def run_convert(cmd, out, run=None):
+    """Run one convert; trust the files, not the return code (convert_model can print an arg error yet exit 0)."""
+    r = (run or subprocess.run)(cmd)
+    made = out and os.path.isdir(out) and any(f.endswith(".safetensors") for f in os.listdir(out)) and \
+        os.path.exists(os.path.join(out, "config.json"))
+    if r.returncode != 0 or not made:
+        sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
+                 f"-- see console above.")
+
+
+def run_ab(a, smoothed, raw, cal_data, hq, measure=None, run=None, log=print):
+    """Convert this rung every RECIPE_VARIANTS way, measure each through exllamav3 against the RAW source on
+    --ab-eval, keep the winner AS this rung (moved to --out), drop the rest, write --ab-record. Returns the winner."""
+    import json as _j
+    import shutil
+    if measure is None:
+        import pollard_verify as V
+        measure = lambda d: V.measure_exl3(d, a.raw_source, a.ab_eval, "cuda:0", None, a.ab_chunks)  # noqa: E731
+    rows, dirs = {}, {}
+    names = [n for n in AB_ORDER if n in (a.ab_variants or AB_ORDER)]
+    for n in names:
+        model, cd = variant_inputs(n, smoothed, raw, cal_data)
+        d = a.out.rstrip("/\\") + f".ab-{n}"
+        dirs[n] = d
+        log(f"   [A/B] {n}: {'smoothed' if RECIPE_VARIANTS[n][0] else 'raw'} weights, "
+            f"{'Calib 3.0' if cd else 'exllamav3 default'} calibration -> {d}")
+        if not os.path.isdir(d) or not os.path.exists(os.path.join(d, "config.json")):
+            run_convert(convert_cmd(a, model, d, d + "_work", cd, hq), d, run)
+        try:
+            r = measure(d)
+        except (Exception, SystemExit) as e:                # noqa: BLE001 -- a variant we cannot measure cannot win
+            rows[n] = {"kld": None, "error": f"{type(e).__name__}: {e}"[:300]}
+            log(f"   [A/B] {n}: not measured ({rows[n]['error']})")
+            continue
+        rows[n] = {k: r.get(k) for k in ("kld", "top1", "kld_p99", "ppl", "ref_ppl", "n", "protocol")}
+        log(f"   [A/B] {n}: KLD {r['kld']:.5f}  top-1 {r.get('top1') or 0:.2f}%")
+    win = ab_winner(rows)
+    if win is None:                                         # nothing measured: the gold recipe, and the record says so
+        win = "pollard" if "pollard" in dirs else names[0]
+        log(f"   [A/B] no variant could be measured -> {win} (unmeasured)")
+    rec = {"winner": win, "bpw": a.bpw, "eval": os.path.abspath(a.ab_eval), "source": os.path.abspath(a.raw_source),
+           "variants": rows, "variant_inputs": {n: {"smoothed": RECIPE_VARIANTS[n][0],
+                                                    "calib_text": RECIPE_VARIANTS[n][1]} for n in rows},
+           "metric": "mean KLD vs the raw source through exllamav3 (pollard_verify.measure_exl3), lowest wins",
+           "measured": ab_winner(rows) is not None}
+    if os.path.isdir(a.out):
+        shutil.rmtree(a.out)
+    os.replace(dirs[win], a.out)
+    for n, d in dirs.items():
+        for x in ((d,) if n != win else ()) + (d + "_work",):
+            shutil.rmtree(x, ignore_errors=True)
+    os.makedirs(os.path.dirname(os.path.abspath(a.ab_record)) or ".", exist_ok=True)
+    with open(a.ab_record, "w", encoding="utf-8") as f:
+        _j.dump(rec, f, indent=1)
+    log(f"   [A/B] winner: {win} -> {a.out}  (record {a.ab_record})")
+    return win
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -566,8 +691,25 @@ def main():
                     help="bits for a vision/audio tower (1-8, or 16 to leave it unquantized). "
                          "Default: exllamav3's architecture default -- 6 on towers it has "
                          "validated, 16 otherwise. Measure any change with pollard-mmeval.")
+    ap.add_argument("--recipe-choice", default="pollard", choices=["auto"] + list(RECIPE_VARIANTS),
+                    help="which inputs this rung converts: pollard (--model as given + --calib-text: the gold recipe), "
+                         "raw-calib / smooth-default / plain (exllamav3 out of box) -- or auto: the winner recorded "
+                         "in --ab-record, measured by an A/B (--ab-eval) when there is no record yet")
+    ap.add_argument("--raw-model", help="the UNSMOOTHED source (when --model is the smoothed copy): the raw variants "
+                                        "convert it and the A/B measures against it")
+    ap.add_argument("--ab-record", help="the recipe A/B record (JSON) this model's rungs share")
+    ap.add_argument("--ab-eval", help="held-out text: run the A/B on THIS rung when --ab-record does not exist yet")
+    ap.add_argument("--ab-chunks", type=int, default=8, help="A/B: eval chunks of 2048 tokens")
+    ap.add_argument("--ab-variants", type=lambda x: [v.strip() for v in x.split(",") if v.strip()], default=None,
+                    help="A/B: comma list of variants to try (default: all four)")
     ap.add_argument("--plan-only", action="store_true", help="print the exllamav3 command, build nothing")
     a = ap.parse_args()
+    if a.ab_variants and set(a.ab_variants) - set(RECIPE_VARIANTS):
+        ap.error(f"--ab-variants: unknown {sorted(set(a.ab_variants) - set(RECIPE_VARIANTS))}")
+    if a.recipe_choice != "pollard" and not a.raw_model:
+        if a.recipe_choice == "auto" or not RECIPE_VARIANTS[a.recipe_choice][0]:
+            ap.error(f"--recipe-choice {a.recipe_choice} needs --raw-model (the unsmoothed source)")
+    a.raw_source = a.raw_model
 
     # --model is documented as "dir OR id", but exllamav3's converter takes a DIRECTORY: an id went
     # through untouched and died as FileNotFoundError on 'Qwen/Qwen2.5-0.5B-Instruct\\config.json',
@@ -596,6 +738,9 @@ def main():
         if src != a.model and not a.plan_only:
             print(f"   exllamav3 reads {src}")
             a.model = src
+    a.raw_input = None
+    if a.raw_model and os.path.isdir(a.raw_model):
+        a.raw_input = exl3_input(a.raw_model)[0] if not a.plan_only else a.raw_model
     if not a.out and not a.plan_only:                       # no --out -> organized workspace path
         import pollard_workspace as ws
         a.out = ws.resolve_out(a.model, "exl3", tag=f"{a.bpw}bpw")
@@ -649,29 +794,25 @@ def main():
     is_moe, _ = detect_moe(a.model)
     hq = is_moe if a.hq is None else a.hq
     kind = "MoE" if is_moe else "dense"
-    # exllamav3 conversion entry: python -m exllamav3.conversion.convert_model
-    cmd = [sys.executable, "-m", "exllamav3.conversion.convert_model", "-i", a.model]
-    if a.out:
-        cmd += ["-o", a.out]
+    # which inputs this rung converts (the recipe A/B): the winner on record, or the A/B itself on this rung
+    choice, ab_run = a.recipe_choice, False
+    if choice == "auto":
+        rec = read_ab(a.ab_record) if a.ab_record else None
+        if rec:
+            choice = rec["winner"]
+            print(f"   recipe: {choice} (the A/B on record, {a.ab_record}: "
+                  + ", ".join(f"{n} {v['kld']:.4f}" for n, v in rec["variants"].items() if v.get("kld") is not None)
+                  + ")")
+        elif a.ab_eval and a.ab_record:
+            ab_run = True
+        else:
+            choice = "pollard"
+            print("   recipe: no A/B on record and no --ab-eval to run one -> the gold recipe (pollard)")
+    model_in, cal_in = (a.model, a.cal_data) if ab_run else variant_inputs(choice, a.model, a.raw_input, a.cal_data)
+    if model_in is None:
+        sys.exit(f"--recipe-choice {choice} converts the unsmoothed source: --raw-model {a.raw_model!r} is not a folder")
     work = a.work_dir or ((a.out.rstrip("/\\") + "_work") if a.out else None)
-    if work:
-        cmd += ["-w", work]                                 # exllamav3 REQUIRES a work dir (checkpoints/resume)
-    if a.recipe:                                            # explicit Pollard per-tensor plan
-        cmd += ["-rcp", a.recipe]
-    else:                                                   # budgeted: Pollard intent -> EXL3 knobs
-        cmd += ["-b", str(a.bpw), "-hb", str(a.head_bits), "-mb", str(a.mtp_bits)]
-        if hq:
-            cmd += ["-hq"]                                  # protect select (MoE) layers
-    if a.cal_data:
-        cmd += ["-cd", a.cal_data]
-    # Vision/audio tower. exllamav3 exposes -vb and defaults to 6 bpw on towers it has validated
-    # (16, i.e. unquantized, on anything else). Pollard was not passing it at all, so the lane was
-    # the only one where the user had no say. Default here is "leave exllamav3's architecture
-    # default alone"; --vision-bits 16 matches what Pollard does on GGUF, where the projector is
-    # never quantized at all.
-    if a.vision_bits is not None:
-        cmd += ["-vb", str(a.vision_bits)]
-    cmd += ["-d", a.devices]
+    cmd = convert_cmd(a, model_in, a.out, work, cal_in, hq)
 
     if a.recipe and a.recipe_mode == "file":
         print(" !! EXPERIMENTAL --recipe FILE: a GGUF/K-quant role map LOSES to EXL3-budgeted (measured: "
@@ -705,16 +846,16 @@ def main():
     except Exception as e:
         sys.exit(f"ERROR: exllamav3 not usable here ({repr(e)[:80]}). Install it AND make sure its CUDA "
                  f"ext loads (a bleeding-edge GPU may need a source build). Then rerun.")
-    if work:
-        os.makedirs(work, exist_ok=True)
-    r = subprocess.run(cmd)
-    # verify REAL output (convert_model can print an arg error yet exit 0) -- trust files, not returncode
-    made = a.out and os.path.isdir(a.out) and any(
-        f.endswith(".safetensors") for f in os.listdir(a.out)) and \
-        os.path.exists(os.path.join(a.out, "config.json"))
-    if r.returncode != 0 or not made:
-        sys.exit(f"exllamav3 convert failed (exit {r.returncode}; output {'present' if made else 'MISSING'}) "
-                 f"-- see console above.")
+    if ab_run:
+        print(f"   recipe: A/B on this rung ({a.bpw} bpw) -- {', '.join(a.ab_variants or AB_ORDER)}, measured on "
+              f"{a.ab_eval}")
+        choice = run_ab(a, a.model, a.raw_input, a.cal_data, hq)
+        if not RECIPE_VARIANTS[choice][0]:
+            model_in = a.raw_input
+    else:
+        if work:
+            os.makedirs(work, exist_ok=True)
+        run_convert(cmd, a.out)
     plan = getattr(a, "exl3_plan", None)
     if plan and plan["mode"] == "text":                     # never ship the lifted-out text model alone
         recompose_complete(a.recorded_as, a.out)
@@ -730,7 +871,9 @@ def main():
         import json as _j
         with open(os.path.join(a.out, "pollard-exl3.json"), "w", encoding="utf-8") as f:
             _j.dump({"input": plan["mode"], "arch": plan.get("arch"), "why": plan.get("why"),
-                     "converted_from": a.model, "shipped": "complete",
+                     "converted_from": model_in, "recipe": choice,
+                     "recipe_ab": os.path.abspath(a.ab_record) if a.ab_record and os.path.exists(a.ab_record) else None,
+                     "shipped": "complete",
                      "runtime": "exllamav3 with this architecture" if plan["mode"] == "text" else "exllamav3"},
                     f, indent=1)
     try:

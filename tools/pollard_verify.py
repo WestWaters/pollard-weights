@@ -20,12 +20,13 @@ Hard-won rules baked in:
   pollard-verify --model out-exl3 --source ./Qwen2.5-3B --end-to-end        # gate a build
   pollard-verify --model out-exl3 --source ./src --sanitizer               # kernels under compute-sanitizer
 
-Lanes (end-to-end fidelity vs the source, measured the same way for every lane: mean KLD + top-1):
+Lanes (end-to-end fidelity vs the source, measured the same way for every lane: mean KLD + top-1, on BOS-led
+2048-token chunks with the second half scored -- llama-perplexity -c 2048's protocol, so a card's numbers compare):
   gguf   llama-perplexity --kl-divergence against the f16/bf16 GGUF (--ref); base logits cached once
   mlx    mlx_lm: quantized vs source logits on the eval text (Apple Silicon)
   gptq   transformers: the GPTQ checkpoint vs the source (gptqmodel/optimum to load it)
   mx     transformers: the compressed-tensors checkpoint vs the source
-  exl3   per-tensor decode vs source + the assembled forward (the original lane)
+  exl3   exllamav3's own forward vs the source on --eval, per-tensor decode vs source, the assembled forward
   exlr8  transformers: the rung's reference decode (pollard-exlr8, bit-exact to its codes) vs the source
 
 PUBLISH GATE: --gate gates.yaml applies per-rung thresholds -- KLD max, top-1 min, task retention min
@@ -130,12 +131,19 @@ def verify_exl3(model_dir, source_dir, threshold, device, limit):
     return checked, failed
 
 
+def exl3_cache_tokens(length, headroom=64):
+    """Cache size for an `length`-token forward: exllamav3 asserts `max_num_tokens` is a multiple of 256 (its page
+    size), so length + headroom is rounded UP to the next page. 512 + 64 = 576 crashed every EXL3 rung's verify."""
+    need = max(1, int(length) + int(headroom))
+    return (need + 255) // 256 * 256
+
+
 def end_to_end(model_dir, source_dir, device, rows, length):
     """The assembled forward vs the fp16 source -- per-tensor correct is NOT sufficient."""
     import torch, torch.nn.functional as F
     from exllamav3 import Config, Model, Cache, Tokenizer
     cfg = Config.from_directory(model_dir); m = Model.from_config(cfg)
-    c = Cache(m, max_num_tokens=length + 64); m.load()
+    c = Cache(m, max_num_tokens=exl3_cache_tokens(length)); m.load()
     tok = Tokenizer.from_config(cfg)
     text = "The quick brown fox jumps over the lazy dog. " * 64
     ids = tok.encode(text)
@@ -316,9 +324,15 @@ def mlx_stream_wanted(source, model, mode="auto"):
 #: context. Before this the lane scored 256-token BOS-less chunks from position 0 and read LFM2.5-24B-A2B's 3-bit
 #: rung at KLD 1.05; on LFM2.5-8B-A1B the same rung read 0.94 that way and 0.53 this way.
 MLX_PROTOCOL = "bos-second-half"
+#: ...and so is every transformers lane (gptq / mx / exlr8, whole or streamed): one protocol for every lane, so the KLDs
+#: on a card compare. The HF lanes used to score 256-token BOS-less chunks from position 0 -- LFM2.5-24B-A2B's
+#: GPTQ-int4 rung read 0.336 that way next to GGUF rungs measured by llama-perplexity at -c 2048, second half.
+PROTOCOL = MLX_PROTOCOL
 #: exit code of a step held for disk / RAM (pollard release: resumable, the rung is kept), as pollard-mlx's
 EXIT_HELD = 3
 MLX_LENGTH = 2048
+#: tokens per chunk for every lane: llama-perplexity's -c 2048 (measure_gguf)
+PROTOCOL_LENGTH = MLX_LENGTH
 
 
 def _bos_id(tok):
@@ -470,26 +484,105 @@ def measure_mlx(model, source, eval_path, length=None, chunks=8, stream="auto", 
             "protocol": f"{MLX_PROTOCOL} (length {length}, {len(parts)} chunks)"}
 
 
-def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False,
+def _hf_tokens(tok, eval_path, length, chunks):
+    """(parts, starts) of the shared protocol from a transformers tokenizer: BOS-led chunks of `length` tokens, the
+    second half of each scored (where each one's scored part begins)."""
+    ids = list(tok(_eval_text(eval_path))["input_ids"])
+    return _protocol_chunks(ids, length, chunks, _bos_id(tok))
+
+
+def _scored_logits(m, ids, start):
+    """float32 numpy logits of positions start.. of one chunk: only the scored half leaves the model when it takes
+    `logits_to_keep` (transformers >= 4.50), else the full chunk's logits are sliced."""
+    import torch
+    keep = len(ids) - start
+    x = torch.tensor([list(ids)], device=getattr(m, "device", "cpu"))
+    with torch.no_grad():
+        try:
+            lg = m(x, logits_to_keep=keep).logits[0]
+        except TypeError:                                    # an older / custom forward
+            lg = m(x).logits[0]
+    if lg.shape[0] != keep:                                  # a forward that ignored logits_to_keep
+        lg = lg[start:]
+    return lg.float().cpu().numpy()
+
+
+def _ref_store(cache, offs, vocab, log=print):
+    """A float16 memmap for the source's scored logits, written as `<cache>.partial.npy` (renamed when complete): the
+    reference of 16 x 1024 scored positions at a 150k vocabulary is ~5 GB -- never held in RAM, checked for room."""
+    import numpy as np
+    import shutil
+    need = int(offs[-1]) * int(vocab) * 2
+    d = os.path.dirname(os.path.abspath(cache)) or "."
+    free = shutil.disk_usage(d).free
+    if free < need + 2e9:
+        import pollard_stream as S
+        raise S.OutOfMemoryBudget(f"disk: the reference logits need {need / 1e9:.2f} GB at {d} (+2 GB margin) and "
+                                  f"{free / 1e9:.2f} GB is free")
+    return np.lib.format.open_memmap(cache + ".partial.npy", mode="w+", dtype=np.float16,
+                                     shape=(int(offs[-1]), int(vocab)))
+
+
+def _protocol_result(kls, top, nll_q, nll_r, length, n_parts, **extra):
+    import numpy as np
+    kl, t1 = np.concatenate(kls), np.concatenate(top)
+    nq, nr = np.concatenate(nll_q), np.concatenate(nll_r)
+    return {"kld": float(kl.mean()), "top1": float(t1.mean() * 100.0), "kld_p99": float(np.percentile(kl, 99)),
+            "n": int(kl.size), "ppl": float(np.exp(nq.mean())) if nq.size else None,
+            "ref_ppl": float(np.exp(nr.mean())) if nr.size else None,
+            "protocol": f"{PROTOCOL} (length {length}, {n_parts} chunks)", **extra}
+
+
+def _hf_reference(load_source, parts, starts, cache, offs, free=None):
+    """The source's scored logits under the protocol, from the cache (fp16 memmap) or computed once into it: the
+    source is loaded by `load_source()`, run chunk by chunk, and freed before anything else loads."""
+    import numpy as np
+    if not os.path.exists(cache):
+        m, ref_mm = load_source(), None
+        try:
+            for b, (ids, st) in enumerate(zip(parts, starts)):
+                lg = _scored_logits(m, ids, st)
+                if ref_mm is None:
+                    ref_mm = _ref_store(cache, offs, lg.shape[-1])
+                ref_mm[offs[b]:offs[b + 1]] = lg.astype(np.float16)
+            ref_mm.flush()
+        except BaseException:
+            del ref_mm
+            try:
+                os.remove(cache + ".partial.npy")              # never a half-written reference
+            except OSError:
+                pass
+            raise
+        del ref_mm, m
+        if free:
+            free()
+        os.replace(cache + ".partial.npy", cache)
+    return np.load(cache, mmap_mode="r")
+
+
+def measure_hf(model, source, eval_path, device="cuda:0", length=None, chunks=8, trust_remote_code=False,
                loader=None):
-    """transformers: the GPTQ / compressed-tensors (MX) checkpoint vs the source, same chunks. The source's
-    logits are computed once, cached as fp16 in the workspace, and the source is freed before the
-    quantized model loads, so the two never sit in memory together."""
+    """transformers: the GPTQ / compressed-tensors (MX) / EXLR8 checkpoint vs the source, scored as llama-perplexity
+    scores the GGUF lane (PROTOCOL: BOS-led chunks of 2048, the second half of each scored) -- KLD, top-1, PPL. The
+    source's scored logits are computed once and cached (fp16 memmap, keyed on the protocol) and the source is freed
+    before the quantized model loads, so the two never sit in memory together; KL is taken chunk by chunk."""
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError:
         raise SystemExit("the gptq/mx lanes need torch + transformers (+ gptqmodel / compressed-tensors)") from None
     import numpy as np
+    length = length or PROTOCOL_LENGTH
     tok = AutoTokenizer.from_pretrained(source, trust_remote_code=trust_remote_code)
-    parts = _chunks(tok(_eval_text(eval_path))["input_ids"], length, chunks)
-    cache = _ref_cache(source, eval_path, length, chunks, "hf")
+    parts, starts = _hf_tokens(tok, eval_path, length, chunks)
+    cache = _ref_cache(source, eval_path, length, chunks, f"hf-{PROTOCOL}")
+    offs = np.cumsum([0] + [len(p) - st for p, st in zip(parts, starts)])
 
-    def logits(path, load=None):
+    def load_model(path, load=None):
         import pollard_mxfp6 as M6
         if load:
-            m = load(path)
-        elif M6.read_meta(path):
+            return load(path)
+        if M6.read_meta(path):
             # a pollard-mx MXFP6 / mix rung: the source architecture with every quantized linear replaced by the
             # rung's own bytes decoded exactly (weight-only, so this IS the math any runtime does with them)
             m = AutoModelForCausalLM.from_pretrained(source, torch_dtype="auto", device_map=device,
@@ -500,21 +593,69 @@ def measure_hf(model, source, eval_path, device="cuda:0", length=512, chunks=8, 
                 if key is None:
                     raise SystemExit(f"{k}: no such weight in the source model")
                 sd[key].copy_(torch.from_numpy(w).to(sd[key].dtype))
-        else:
-            m = AutoModelForCausalLM.from_pretrained(path, torch_dtype="auto", device_map=device,
-                                                     trust_remote_code=trust_remote_code).eval()
-        with torch.no_grad():
-            out = [m(torch.tensor([c], device=m.device)).logits[0].float().cpu().numpy() for c in parts]
-        del m
+            return m
+        return AutoModelForCausalLM.from_pretrained(path, torch_dtype="auto", device_map=device,
+                                                    trust_remote_code=trust_remote_code).eval()
+
+    def free():
+        import gc
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return np.concatenate(out)
-    if os.path.exists(cache):
-        ref = np.load(cache).astype(np.float32)
-    else:
-        ref = logits(source)
-        np.save(cache, ref.astype(np.float16))
-    return kld_top1(ref, logits(model, loader))
+
+    ref = _hf_reference(lambda: load_model(source), parts, starts, cache, offs, free)
+    m = load_model(model, loader)
+    kls, top, nll_q, nll_r = [], [], [], []
+    for b, (ids, st) in enumerate(zip(parts, starts)):
+        kl, t1, nq_, nr_ = _kl_chunk(ref[offs[b]:offs[b + 1]], _scored_logits(m, ids, st), ids, start=st)
+        kls.append(kl), top.append(t1), nll_q.append(nq_), nll_r.append(nr_)
+    del m
+    free()
+    return _protocol_result(kls, top, nll_q, nll_r, length, len(parts))
+
+
+def measure_exl3(model, source, eval_path, device="cuda:0", length=None, chunks=8, trust_remote_code=False):
+    """An EXL3 rung through exllamav3's own kernels vs the HF source, under the same PROTOCOL as every other lane
+    (BOS-led chunks of 2048, second half): the tokens come from the SOURCE's tokenizer, so the reference logits are
+    the very cache measure_hf uses. Before this the exl3 lane had no logit-level number at all -- only the
+    end-to-end next-token check -- so an EXL3 rung could not be compared on a card or gated on KLD."""
+    import numpy as np
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from exllamav3 import Config, Model, Cache
+    length = length or PROTOCOL_LENGTH
+    tok = AutoTokenizer.from_pretrained(source, trust_remote_code=trust_remote_code)
+    parts, starts = _hf_tokens(tok, eval_path, length, chunks)
+    cache = _ref_cache(source, eval_path, length, chunks, f"hf-{PROTOCOL}")
+    offs = np.cumsum([0] + [len(p) - st for p, st in zip(parts, starts)])
+
+    def free():
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    ref = _hf_reference(lambda: AutoModelForCausalLM.from_pretrained(
+        source, torch_dtype="auto", device_map=device, trust_remote_code=trust_remote_code).eval(),
+        parts, starts, cache, offs, free)
+    cfg = Config.from_directory(model)
+    m = Model.from_config(cfg)
+    kv = Cache(m, max_num_tokens=exl3_cache_tokens(max(len(p) for p in parts)))   # noqa: F841 -- kept referenced
+    m.load()
+    kls, top, nll_q, nll_r = [], [], [], []
+    with torch.no_grad():
+        for b, (ids, st) in enumerate(zip(parts, starts)):
+            lg = m.forward(torch.tensor([list(ids)], device=device))[0].float()
+            q = lg[st:] if lg.shape[0] == len(ids) else lg[-(len(ids) - st):]
+            kl, t1, nq_, nr_ = _kl_chunk(ref[offs[b]:offs[b + 1]], q.cpu().numpy(), ids, start=st)
+            kls.append(kl), top.append(t1), nll_q.append(nq_), nll_r.append(nr_)
+    try:
+        m.unload()
+    except Exception:                                        # noqa: BLE001
+        pass
+    del m, kv
+    free()
+    return _protocol_result(kls, top, nll_q, nll_r, length, len(parts), decoder="exllamav3")
 
 
 def _quant_method(d):
@@ -575,19 +716,23 @@ def stream_wanted(source, mode="auto", rung=None):
     return False, ""
 
 
-def measure_stream(model, source, eval_path, device="cpu", length=512, chunks=8, trust_remote_code="auto"):
+def measure_stream(model, source, eval_path, device="cpu", length=None, chunks=8, trust_remote_code="auto"):
     """The rung against its source, both streamed block by block (pollard_stream.stream_fidelity): any size, any
-    backbone the stream engine resolves, every Pollard rung format decoded from its bytes."""
+    backbone the stream engine resolves, every Pollard rung format decoded from its bytes -- scored under the same
+    PROTOCOL as every other lane (BOS-led chunks of 2048, second half)."""
     import pollard_stream as S
     dev = S.stream_device(device)
     from transformers import AutoTokenizer
+    length = length or PROTOCOL_LENGTH
     src = S.Source(source)
     tok = AutoTokenizer.from_pretrained(src.base_dir, trust_remote_code=trust_remote_code in (True, "on"))
-    parts = _chunks(tok(_eval_text(eval_path))["input_ids"], length, chunks)
-    return S.stream_fidelity(source, model, parts, dev, trust_remote_code)
+    parts, starts = _hf_tokens(tok, eval_path, length, chunks)
+    r = S.stream_fidelity(source, model, parts, dev, trust_remote_code, starts=starts)
+    r["protocol"] = f"{PROTOCOL} (length {length}, {len(parts)} chunks)"
+    return r
 
 
-def measure_exlr8(model, source, eval_path, device="cuda:0", length=512, chunks=8, trust_remote_code=False):
+def measure_exlr8(model, source, eval_path, device="cuda:0", length=None, chunks=8, trust_remote_code=False):
     """An EXLR8 rung: its weights decoded by the reference loader (bit-exact to the stored trellis codes) into the
     source architecture, then the same KLD / top-1 as the other transformers lanes."""
     import pollard_exlr8 as X
@@ -626,10 +771,9 @@ lanes:
   gguf:
     runtime: stock
     coherence: true
-  # exl3 has no logit-level KLD path in pollard-verify yet: it is gated on the assembled forward instead
+  # exl3: KLD / top-1 through exllamav3's own kernels on --eval (the shared protocol), plus the assembled forward
   exl3:
     e2e_acc_min: 0.3
-    skip: [kld_max, top1_min]
   # a drafter is judged on what it is for -- tokens per target pass against the rungs it ships with -- not on its own
   # logits; the per-bit-width and tool-call rows below are about TARGET rungs
   draft:
@@ -882,8 +1026,8 @@ def main():
     ap.add_argument("--eval", help="HELD-OUT text for the KLD/top-1 measurement (gguf/mlx/gptq/mx)")
     ap.add_argument("--chunks", type=int, default=16, help="eval chunks (gguf: llama-perplexity --chunks)")
     ap.add_argument("--length", type=int, default=None,
-                    help="tokens per chunk (gptq/mx: 256; mlx: 2048, scored like llama-perplexity -c 2048) / e2e "
-                         "length (exl3: 256)")
+                    help="tokens per chunk (mlx / gptq / mx / exlr8: 2048, BOS-led, second half scored -- like "
+                         "llama-perplexity -c 2048 on the gguf lane) / e2e length (exl3: 256)")
     ap.add_argument("--ngl", default="0", help="gguf: GPU layers for llama-perplexity (default 0 -- shared boxes)")
     ap.add_argument("--no-measure", dest="measure", action="store_false",
                     help="gate only on numbers already in --results (no model is run)")
@@ -907,7 +1051,9 @@ def main():
     ap.add_argument("--sanitizer", action="store_true",
                     help="re-run this verify under NVIDIA compute-sanitizer (memcheck+racecheck)")
     a = ap.parse_args()
-    mlx_length, a.length = a.length, a.length or 256       # the mlx lane's own default: MLX_LENGTH
+    # every measured lane defaults to PROTOCOL_LENGTH (2048, scored like llama-perplexity -c 2048); --length None is
+    # passed down as such. The exl3 end-to-end forward keeps its own 256.
+    mlx_length = a.length
     if a.print_gates:
         sys.stdout.write(DEFAULT_GATES)
         return
@@ -945,9 +1091,23 @@ def main():
                 print(f"   !! {len(failed)} tensors FAILED (e.g. {failed[0][0]} cos={failed[0][1]:.4f})")
         else:
             print("   (no --source; skipping per-tensor decode-vs-source. Pass --source to gate weights.)")
+        if a.eval:
+            if not a.source:
+                ap.error("--lane exl3 --eval measures against the source: pass --source")
+            print(f"-- fidelity vs {os.path.basename(str(a.source).rstrip('/'))} on {a.eval} (exllamav3) --")
+            import pollard_stream as S
+            try:
+                measured.update(measure_exl3(a.model, a.source, a.eval, a.device, a.length, a.chunks,
+                                             a.trust_remote_code == "on"))
+            except S.OutOfMemoryBudget as e:
+                print(f"HELD: {e}", flush=True)
+                sys.exit(EXIT_HELD)
+            print(f"   mean KLD {measured['kld']:.5f}   top-1 {measured.get('top1') or 0:.2f}%"
+                  + (f"   PPL {measured['ppl']:.4f}" if measured.get("ppl") else "")
+                  + f"   protocol: {measured.get('protocol')}")
         if a.end_to_end:
             print("-- end-to-end assembled forward --")
-            acc, ppl = end_to_end(a.model, a.source or a.model, a.device, 1, a.length)
+            acc, ppl = end_to_end(a.model, a.source or a.model, a.device, 1, a.length or 256)
             measured["e2e_acc"] = acc
             ok = acc >= a.e2e_min_acc
             print(f"   next_tok_acc={acc:.4f}  ppl={ppl:.2f}  [{'OK' if ok else 'FAIL'} vs min {a.e2e_min_acc}]")
@@ -970,13 +1130,20 @@ def main():
             except S.OutOfMemoryBudget as e:           # disk / RAM short: the rung stays on disk, the step is held
                 print(f"HELD: {e}", flush=True)
                 sys.exit(EXIT_HELD)
-        elif streamed:
-            print(f"   streamed: source and rung block by block ({why})")
-            measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc)
-        elif lane == "exlr8":
-            measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
         else:
-            measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
+            import pollard_stream as S
+            try:
+                if streamed:
+                    print(f"   streamed: source and rung block by block ({why})")
+                    measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc)
+                elif lane == "exlr8":
+                    measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
+                else:
+                    measured = measure_hf(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
+            except S.OutOfMemoryBudget as e:           # no disk for the reference logits: held, the rung is kept
+                print(f"HELD: {e}", flush=True)
+                sys.exit(EXIT_HELD)
+            print(f"   protocol: {measured.get('protocol')}")
         print(f"   mean KLD {measured['kld']:.5f}   top-1 {measured.get('top1') or 0:.2f}%"
               + (f"   PPL {measured['ppl']:.4f}" if measured.get("ppl") else ""))
     comp = complete_check(a.model, a.source, lane)

@@ -87,7 +87,8 @@ def test_every_lane_is_a_ladder_with_build_then_verify_per_rung(model):
     assert c["smooth_dir"] in by["gptq/int4/build"].cmd
     v = by["gptq/int4/verify"].cmd
     assert v[v.index("--source") + 1] == c["hf_dir"] and "--gate" in v
-    assert by["exl3/4.0bpw/verify"].cmd[-1] == "--end-to-end"
+    ev = by["exl3/4.0bpw/verify"].cmd
+    assert "--end-to-end" in ev and ev[ev.index("--eval") + 1] == c["heldout"]   # its KLD, through exllamav3
     gg = by["gguf/ladder"].cmd
     assert gg[:2] == ["pollard", "--hf"] and "--ladder" in gg and "--sensitivity" in gg, "the way we build"
     assert "--verified-only" in by["mlx/card"].cmd

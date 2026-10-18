@@ -142,11 +142,31 @@ def _norm_offset(bb, norm_key):
     return "1.0 + self.weight" in src or "1 + self.weight" in src or "(1.0 + self.weight" in src
 
 
+def pow2_scales(sc, clamp=(1e-2, 1e2)):
+    """Each SmoothQuant scale rounded to the nearest power of two (in log2), kept inside `clamp`.
+
+    Why: the fold is an identity in exact arithmetic only. Stored back in bf16, norm.weight / s and W[:, j] * s are
+    each rounded again -- on Qwen2.5-0.5B-Instruct the smoothed bf16 checkpoint ALONE (no quantization) read KLD
+    0.0011 / top-1 98.2% against its source (BOS-led 2048-token chunks, second half; wikitext-2 and the release
+    held-out alike, 2026-10-18), about what an int8 rung costs, and every lane built from it started there. A power
+    of two only moves the exponent, so the folded bf16 weights are exactly the source's (barring under/overflow,
+    which the clamp keeps far away): the smoothed model IS the model."""
+    import numpy as np
+    sc = np.asarray(sc, np.float64)
+    lo, hi = np.ceil(np.log2(clamp[0])), np.floor(np.log2(clamp[1]))
+    e = np.clip(np.round(np.log2(np.clip(sc, 1e-30, None))), lo, hi)
+    return np.exp2(e).astype(np.float32)
+
+
 def smooth_stream(model, out, calib=None, alpha=0.5, clamp=(1e-2, 1e2), rows=12, cols=512, device="cpu",
-                  trust_remote_code="auto", overlay=False, max_ram_gb=None, log=print, act_dtype=None):
+                  trust_remote_code="auto", overlay=False, max_ram_gb=None, log=print, act_dtype=None,
+                  scales="pow2"):
     """SmoothQuant, streamed one block at a time from disk. Writes either a full smoothed checkpoint (`out`) or,
     with overlay=True, a folder holding only the scales over the source (every streamed lane reads it as the
-    smoothed model; it costs megabytes instead of a second copy of the weights). Returns a summary dict."""
+    smoothed model; it costs megabytes instead of a second copy of the weights). Returns a summary dict.
+
+    scales="pow2" (default): every scale a power of two, so the fold is exact in the checkpoint's own bf16
+    (pow2_scales); "exact": the raw SmoothQuant ratio (the fold then rounds every smoothed weight once more)."""
     import numpy as np, torch
     import pollard_stream as S
     t0 = time.time()
@@ -178,6 +198,8 @@ def smooth_stream(model, out, calib=None, alpha=0.5, clamp=(1e-2, 1e2), rows=12,
             if a_max.shape != w_max.shape:
                 continue
             sc = np.clip(a_max ** alpha / w_max ** (1 - alpha), clamp[0], clamp[1]).astype(np.float32)
+            if scales == "pow2":
+                sc = pow2_scales(sc, clamp)
             off = _norm_offset(bb, nk)
             ops[nk] = ("div_offset" if off else "div", sc)
             for c in ck:
@@ -199,7 +221,7 @@ def smooth_stream(model, out, calib=None, alpha=0.5, clamp=(1e-2, 1e2), rows=12,
         bb.free_layer(i)
         eng.hidden = outs                     # the fold is an identity: the block's outputs are unchanged
         log(f"   block {i + 1}/{bb.n_layers}: {len(seams)} seam(s)")
-    summary = {"model": os.path.abspath(model), "alpha": alpha, "seams": folded,
+    summary = {"model": os.path.abspath(model), "alpha": alpha, "scales": scales, "seams": folded,
                "worst_outlier": {"layer": worst[0], "max_abs_x": round(worst[1], 2)}, "rows": len(data),
                "tokens": sum(len(r) for r in data), "backbone": bb.describe(), "memory_plan": plan,
                "peak_rss_gb": round(eng.peak_rss / 1e9, 2), "minutes": round((time.time() - t0) / 60, 2),
@@ -264,6 +286,9 @@ def main():
     ap.add_argument("--calib", help="calibration text file (else a bland built-in string; give real text)")
     ap.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant migration strength [0,1]")
     ap.add_argument("--clamp", type=float, nargs=2, default=(1e-2, 1e2), help="min/max per-channel scale")
+    ap.add_argument("--scales", default="pow2", choices=["pow2", "exact"],
+                    help="pow2 (default): power-of-two scales, so the fold is exact in bf16 -- the smoothed checkpoint "
+                         "computes what the source does; exact: the raw SmoothQuant ratio (rounds every folded weight)")
     ap.add_argument("--rows", type=int, default=12, help="calibration chunks")
     ap.add_argument("--cols", type=int, default=512, help="calibration chunk length (tokens)")
     ap.add_argument("--device", default="auto", help="auto (CUDA when present) | cpu | cuda[:N]")
@@ -300,7 +325,7 @@ def main():
               + ("overlay (scales only)" if overlay else "full smoothed checkpoint"))
     print(f"== pollard-hf-smooth :: {a.model}  alpha={a.alpha}  device={dev}")
     sm = smooth_stream(a.model, a.out, a.calib, a.alpha, tuple(a.clamp), a.rows, a.cols, dev, a.trust_remote_code,
-                       overlay, a.max_ram_gb)
+                       overlay, a.max_ram_gb, scales=a.scales)
     print(f"   folded {sm['seams']} seams; worst input-activation outlier: layer {sm['worst_outlier']['layer']}  "
           f"max|X|={sm['worst_outlier']['max_abs_x']:.1f}  (smoothed)")
     print(f"   peak RSS {sm['peak_rss_gb']} GB (plan {sm['memory_plan']['peak_gb']} GB), {sm['minutes']} min")
