@@ -104,6 +104,9 @@ lanes:
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
   mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
+  #   recipe_choice: auto (default) = the default rung is converted smoothed / raw x Calib 3.0 / exllamav3's own
+  #   calibration, each measured by KLD through exllamav3 on the held-out text; the winner is that rung and every
+  #   other rung builds the same way. pollard | raw-calib | smooth-default | plain pin one (no A/B).
   # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
   exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
   draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128,
@@ -775,7 +778,16 @@ def lane_steps(cfg, c, lane):
                           cmd=["pollard-exlr8", "--model", c["smooth_dir"], "--store", c["exlr8_store"], "--calib",
                                c["calib"], "--widths", widths, "--encode-only"] + hf_flags(c), out=c["exlr8_store"],
                           desc="encode every matrix once at each width (LDLQ + tail-biting Viterbi, E4M3 codebook)"))
-    for rung in lc.get("rungs") or []:
+    rungs = list(lc.get("rungs") or [])
+    ab_rung = None
+    if lane == "exl3" and rungs and str(lc.get("recipe_choice", "auto")) == "auto":
+        # the recipe A/B (pollard_exl3.run_ab) runs on ONE rung -- the default, else the first -- and its winner is
+        # the recipe every later rung builds with, so that rung goes first
+        ab_rung = lc.get("ab_bpw", lc.get("default"))
+        ab_rung = next((r for r in rungs if float(r) == float(ab_rung)), rungs[0]) if ab_rung is not None else rungs[0]
+        rungs = [ab_rung] + [r for r in rungs if r is not ab_rung]
+        c.setdefault("exl3_ab", os.path.join(c["mdir"], "reports", "exl3-recipe-ab.json"))
+    for rung in rungs:
         tag = rung_tag(lane, rung)
         out = ws.resolve_out(c["src"], lane, tag, create_parent=False)
         name = os.path.basename(out)
@@ -814,6 +826,11 @@ def lane_steps(cfg, c, lane):
         else:                                            # exl3
             cmd = ["pollard-exl3", "--model", c["smooth_dir"], "--bpw", str(float(rung)), "--calib-text", c["calib"],
                    "--out", out]
+            choice = str(lc.get("recipe_choice", "auto"))
+            if choice != "pollard":                      # smoothing / Calib 3.0 only where they measure better
+                cmd += ["--raw-model", c["hf_dir"], "--recipe-choice", choice]
+                if choice == "auto":
+                    cmd += ["--ab-record", c["exl3_ab"]] + (["--ab-eval", c["heldout"]] if rung is ab_rung else [])
             src = c["smooth_dir"]
         rid = f"{lane}/{tag}"
         st_build = Step(id=f"{rid}/build", lane=lane, rung=tag, kind="build", requires=REQUIRES[lane], cmd=cmd,
@@ -842,10 +859,11 @@ def lane_steps(cfg, c, lane):
             ver += ["--trust-remote-code", c.get("trc", "auto")]
             if c.get("ngl") == "0" and machine()["cuda"]:
                 ver += ["--device", "cpu"]
-        ver += ["--end-to-end"] if lane == "exl3" else ["--eval", c["heldout"]]
+        ver += (["--end-to-end"] if lane == "exl3" else []) + ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
                           cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None,
-                          held_codes=(EXIT_HELD,) if lane == "mlx" else ()))   # disk / RAM short: held, rung kept
+                          # disk / RAM short (MLX; the HF lanes' reference logits): held, rung kept
+                          held_codes=(EXIT_HELD,) if lane in ("mlx", "gptq", "mx", "exlr8") else ()))
         if c.get("free"):
             st = _publish_rung_step(c, lane, tag, out)
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag

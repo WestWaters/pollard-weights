@@ -42,7 +42,9 @@ DEFAULT_CONFIGS = ["f16/f16", "f16/q8_0", "q8_0/q8_0", "f16/q4_0", "q8_0/q4_0", 
 BYTES = {"f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
 SHARED_OK = ("dwm.exe", "explorer.exe", "ShellHost", "SearchHost", "StartMenuExperienceHost", "TextInputHost",
              "ShellExperienceHost", "CrossDeviceResume", "SystemSettings", "ApplicationFrameHost", "ctfmon",
-             "LockApp", "Widgets", "WindowsTerminal", "NVIDIA Overlay", "nvcontainer", "msedgewebview2", "DCv2")
+             "LockApp", "Widgets", "WindowsTerminal", "NVIDIA Overlay", "nvcontainer", "msedgewebview2", "DCv2",
+             "TabTip", "XboxPcApp", "XboxPcTray", "GameBar", "WidgetBoard", "SnippingTool", "ScreenClippingHost",
+             "PhoneExperienceHost", "mscopilot", "NVIDIA Share", "NVIDIA App")
 
 
 def nvsmi(query):

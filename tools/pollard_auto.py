@@ -776,14 +776,19 @@ def _imatrix_shape(gguf):
     "<arch>.decision.*" block) runs in embedding mode, and llama.cpp then forces n_batch = n_ubatch
     = 512 after imatrix has sized its sequences from the defaults -- it dies on
     GGML_ASSERT(params.n_ctx == n_seq * n_ctx) (exit 0xC0000409 on Windows) before the first chunk.
-    Asking for that shape up front is what it ends up with anyway. The perplexity it prints is then
-    meaningless (no LM head) -- the activations it collects are not."""
+    Asking for that shape up front is what it ends up with anyway.
+
+    --no-ppl too: the perplexity pass reads LM logits a decision head does not produce. On clef it printed a
+    meaningless number; on clef-omni (the head on the Qwen3-Omni MoE body) it read past them --
+    "get_logits_ith: invalid logits id 0, reason: no logits", then 0xC0000005 / SIGSEGV, no imatrix (box,
+    2026-10-17; reproduced on a tiny clef-omni with the patched b76b133 tree). The activations the imatrix
+    collects never needed the logits."""
     try:
         meta = read_gguf_meta(gguf)
     except Exception:
         return []
     if any(".decision." in str(k) for k in meta):
-        return ["-c", "512", "-b", "512", "-ub", "512"]
+        return ["-c", "512", "-b", "512", "-ub", "512", "--no-ppl"]
     return []
 
 

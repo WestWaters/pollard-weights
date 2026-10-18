@@ -26,10 +26,9 @@ lanes:
   gguf:
     runtime: stock
     coherence: true
-  # exl3 has no logit-level KLD path in pollard-verify yet: it is gated on the assembled forward instead
+  # exl3: KLD / top-1 through exllamav3's own kernels on --eval (the shared protocol), plus the assembled forward
   exl3:
     e2e_acc_min: 0.3
-    skip: [kld_max, top1_min]
   # a drafter is judged on what it is for -- tokens per target pass against the rungs it ships with -- not on its own
   # logits; the per-bit-width and tool-call rows below are about TARGET rungs
   draft:

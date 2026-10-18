@@ -754,7 +754,13 @@ SERVED_NAME = "pollard-toolcall"
 GPU_SHELL = ("dwm.exe", "explorer.exe", "shellhost", "searchhost", "startmenuexperiencehost", "textinputhost",
              "shellexperiencehost", "crossdeviceresume", "systemsettings", "applicationframehost", "ctfmon",
              "lockapp", "widgets", "windowsterminal", "nvidia overlay", "nvcontainer", "msedgewebview2", "dcv2",
-             "xorg", "gnome-shell", "xwayland", "kwin")
+             "xorg", "gnome-shell", "xwayland", "kwin",
+             # Windows 11 shell / overlay processes that hold a graphics context on an idle desktop: the touch keyboard
+             # host, the Xbox app and its tray, the Game Bar overlay, the widgets board, the snipping tool, Phone Link,
+             # Copilot, NVIDIA's share overlay. Seen on the box 2026-10-18 with the GPU free -> every EXL3 tool gate
+             # was recorded NOT MEASURED. A game is its own exe and still counts.
+             "tabtip", "xboxpcapp", "xboxpctray", "gamebar", "widgetboard", "snippingtool", "screenclippinghost",
+             "phoneexperiencehost", "mscopilot", "nvidia share", "nvidia app")
 
 
 class NotMeasured(Exception):

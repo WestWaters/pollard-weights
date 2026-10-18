@@ -1,0 +1,14 @@
+{
+ "name": "quantize-dec-blk",
+ "tree_slug": "llama.cpp",
+ "tree_path": "runtime/llama.cpp",
+ "remote": "https://github.com/ggml-org/llama.cpp",
+ "base_commit": "b76b133",
+ "base_describe": "",
+ "base_date": "2026-10-15",
+ "files": [
+  "src/llama-quant.cpp"
+ ],
+ "adds_strings": [],
+ "diff_bytes": 2647
+}

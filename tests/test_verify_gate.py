@@ -147,10 +147,13 @@ def test_shipped_gates_file_is_the_builtin_default():
         "recipes/gates.yaml drifted: regenerate with pollard-verify --print-gates > recipes/gates.yaml"
 
 
-def test_exl3_lane_is_gated_on_the_forward_not_on_a_kld_it_cannot_measure():
+def test_exl3_lane_is_gated_on_its_kld_and_the_forward():
+    """pollard-verify measures an EXL3 rung's KLD through exllamav3 now (measure_exl3, the shared protocol): the lane
+    takes the same per-bit-width KLD / top-1 thresholds as every other, plus the end-to-end forward check."""
     th = V.thresholds_for(V.load_gates(None), "M-Pollard-EXL3-4.0bpw", "exl3")
-    assert "kld_max" not in th and "top1_min" not in th and th["e2e_acc_min"] == 0.3
-    assert V.evaluate_gate({"e2e_acc": 0.6}, th)["pass"]
+    assert th["kld_max"] == 0.08 and th["top1_min"] == 90 and th["e2e_acc_min"] == 0.3
+    assert V.evaluate_gate({"e2e_acc": 0.6, "kld": 0.031, "top1": 91.9}, th)["pass"]
+    assert not V.evaluate_gate({"e2e_acc": 0.6}, th)["pass"], "an unmeasured KLD is not a verified rung"
 
 
 def test_tool_calls_not_measured_publish_by_default_and_fail_stays_available():

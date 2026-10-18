@@ -192,6 +192,15 @@ def _to_f32(dt, arr):
     raise ValueError(f"not a float tensor: {dt}")
 
 
+def _mx_scales(entries, keys, k_in):
+    """True when the module's `weight_scale` is an E8M0 MX scale: uint8, one byte per 32 of the `k_in` inputs."""
+    sk = keys.get("weight_scale")
+    if not sk or sk not in entries or not k_in:
+        return False
+    _, dt, shp, _, _ = entries[sk]
+    return dt == "U8" and len(shp) == 2 and k_in % 32 == 0 and shp[-1] == k_in // 32
+
+
 def weight_files(model_dir):
     """The checkpoint's weight shards: the index's files when there is one (so a side file such as clef-omni's
     joint_head.safetensors is NOT a model shard), else every *.safetensors."""
@@ -286,6 +295,10 @@ class Source:
             elif dt == "U8" and "weight_scale" in keys and ("weight_scale_2" in keys or algo.endswith("NVFP4")):
                 mods[mod] = {"algo": "nvfp4", "flavour": "modelopt", "keys": {"weight": name, **keys},
                              "a4": "input_scale" in keys, "spec": spec}
+            elif dt == "F8_E4M3" and _mx_scales(self.entries, keys, shape[-1] if shape else 0):
+                # compressed-tensors MXFP8: E4M3 elements, one E8M0 byte per 32 along the input dim
+                mods[mod] = {"algo": "mxfp8", "flavour": "compressed-tensors", "keys": {"weight": name, **keys},
+                             "spec": spec}
             elif dt == "F8_E4M3" and "weight_scale_inv" in keys:
                 mods[mod] = {"algo": "fp8-block", "keys": {"weight": name, **keys}, "spec": spec}
             elif dt == "F8_E4M3":
@@ -298,6 +311,15 @@ class Source:
                 keys = {s: f"{mod}.{s}" for s in AUX_SUFFIXES if f"{mod}.{s}" in self.entries}
                 mods[mod] = {"algo": "nvfp4", "flavour": "compressed-tensors", "keys": keys,
                              "a4": "input_global_scale" in keys}
+            elif name.endswith(".weight_packed") and name[:-len(".weight_packed")] not in mods:
+                # compressed-tensors MXFP4 (format mxfp4-pack-quantized, llm-compressor's MXFP4 / MXFP4A16): the same
+                # two-per-byte E2M1 packing as NVFP4, but one E8M0 scale byte per 32 inputs and NO global scale --
+                # w = fp4 * 2^(weight_scale - 127)
+                mod = name[:-len(".weight_packed")]
+                keys = {s: f"{mod}.{s}" for s in AUX_SUFFIXES if f"{mod}.{s}" in self.entries}
+                if dt == "U8" and len(shape) == 2 and _mx_scales(self.entries, keys, shape[1] * 2):
+                    mods[mod] = {"algo": "mxfp4", "flavour": "compressed-tensors", "keys": keys,
+                                 "a4": "input_global_scale" in keys}
         return mods
 
     def _logical(self):
@@ -317,7 +339,7 @@ class Source:
         if kind == "raw":
             return self.entries[ref][2]
         m = self.modules[ref]
-        if m["algo"] == "nvfp4":
+        if m["algo"] in ("nvfp4", "mxfp4"):
             p, dt, shp, off, n = self.entries[m["keys"].get("weight", m["keys"].get("weight_packed"))]
             return (shp[0], shp[1] * 2)
         if m["algo"].startswith("ggml:"):
@@ -429,6 +451,12 @@ class Source:
                 s2 = float(np.asarray(self._raw_f32(k["weight_scale_2"])).reshape(-1)[0]) if "weight_scale_2" in k else 1.0
                 g = 1.0 / s2 if s2 else 1.0
             return X.nvfp4_decode(packed, sc, g).astype(np.float32)
+        if algo in ("mxfp4", "mxfp8"):
+            import pollard_mxfp6 as M6
+            parts = {"weight_scale": np.asarray(self.read_raw(k["weight_scale"])[1], np.uint8)}
+            parts["weight_packed" if algo == "mxfp4" else "weight"] = self.read_raw(
+                k.get("weight_packed", k.get("weight")))[1]
+            return M6.decode_atom(parts, algo)
         if algo.startswith("ggml:"):
             from gguf import quants, GGMLQuantizationType as Q
             dt, raw = self.read_raw(k["weight"])
@@ -2064,10 +2092,15 @@ def _final_head(bb):
     return norm, head
 
 
-def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", log=print, max_ram_gb=None):
-    """{kld, top1, kld_p99, n}: the rung against its source over token `rows`, BOTH streamed block by block (one
-    block of each in memory), final norm + output projection applied per row -- the same KL(source || rung) and
-    top-1 agreement every lane is gated on, for a model of any size the machine can stream."""
+def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", log=print, max_ram_gb=None,
+                    starts=None, block=256):
+    """{kld, top1, kld_p99, n, ppl, ref_ppl}: the rung against its source over token `rows`, BOTH streamed block by
+    block (one block of each in memory), final norm + output projection applied per row -- the same KL(source ||
+    rung) and top-1 agreement every lane is gated on, for a model of any size the machine can stream.
+
+    `starts[i]`: the first scored position of row i (pollard_verify.PROTOCOL scores the second half of each
+    BOS-led chunk, as llama-perplexity does); None scores every position. The output projection runs `block`
+    positions at a time -- a 2048-token row's float64 logits at a 150k vocabulary are 2.5 GB whole."""
     import numpy as np, torch
     bb = Backbone(source, trust_remote_code, log=log)
     rd = RungReader(rung)
@@ -2107,26 +2140,40 @@ def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", 
                                                                                           "embeddings.weight")))
     w_q = rd.read_torch(hk, w_s.dtype).to(device)
     n_q = rd.read_torch(rev[norm_name], n_s.dtype).to(device) if norm is not None and norm_name in rev else n_s
-    kls, top = [], []
+    kls, top, nll_s, nll_q = [], [], [], []
     with torch.no_grad():
-        for hs, hq in zip(hidden_s, hidden_q):
-            lg = []
-            for h, w, nw in ((hs, w_s, n_s), (hq, w_q, n_q)):
-                x = h.to(device, bb.dtype)
-                if norm is not None:
-                    norm.weight.data = nw
-                    x = norm(x)
-                lg.append(torch.nn.functional.linear(x, w)[0].double())
-            a = torch.log_softmax(lg[0], -1)
-            b = torch.log_softmax(lg[1], -1)
-            kls.append((a.exp() * (a - b)).sum(-1).cpu().numpy())
-            top.append((a.argmax(-1) == b.argmax(-1)).cpu().numpy())
-            del lg, a, b
+        for r, (hs, hq) in enumerate(zip(hidden_s, hidden_q)):
+            ids = torch.as_tensor(list(rows[r]), dtype=torch.long)
+            st = int(starts[r]) if starts is not None else 0
+            n = hs.shape[1]
+            for a0 in range(st, n, max(1, int(block))):
+                a1 = min(n, a0 + int(block))
+                lg = []
+                for h, w, nw in ((hs, w_s, n_s), (hq, w_q, n_q)):
+                    x = h[:, a0:a1].to(device, bb.dtype)
+                    if norm is not None:
+                        norm.weight.data = nw
+                        x = norm(x)
+                    lg.append(torch.nn.functional.linear(x, w)[0].double())
+                a = torch.log_softmax(lg[0], -1)
+                b = torch.log_softmax(lg[1], -1)
+                kls.append((a.exp() * (a - b)).sum(-1).cpu().numpy())
+                top.append((a.argmax(-1) == b.argmax(-1)).cpu().numpy())
+                nxt = ids[a0 + 1:a1 + 1].to(a.device)              # position t predicts ids[t + 1]
+                m = len(nxt)
+                if m:
+                    nll_s.append((-a[torch.arange(m), nxt]).cpu().numpy())
+                    nll_q.append((-b[torch.arange(m), nxt]).cpu().numpy())
+                del lg, a, b
     if norm is not None:
         norm.weight.data = n_s
     kl = np.concatenate(kls)
+    ns = np.concatenate(nll_s) if nll_s else np.zeros(0)
+    nq = np.concatenate(nll_q) if nll_q else np.zeros(0)
     return {"kld": float(kl.mean()), "top1": float(np.concatenate(top).mean() * 100.0),
             "kld_p99": float(np.percentile(kl, 99)), "n": int(kl.size), "how": "streamed",
+            "ppl": float(np.exp(nq.mean())) if nq.size else None,
+            "ref_ppl": float(np.exp(ns.mean())) if ns.size else None,
             "peak_rss_gb": round(max(es.peak_rss, eq.peak_rss, peak_rss_bytes()) / 1e9, 2)}
 
 
