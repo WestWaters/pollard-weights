@@ -1698,6 +1698,19 @@ class RelayApi:
     def update_repo_settings(self, repo_id, private):
         self._api(f"str(api.update_repo_settings(repo_id={repo_id!r}, private={private!r}))")
 
+    def get_paths_info(self, repo_id, paths):
+        """HfApi.get_paths_info on the relay (what pollard_hubcheck reads back after an upload): path, size, LFS
+        sha256 and git blob id per file."""
+        from types import SimpleNamespace
+        rows = self._py("from huggingface_hub import HfApi\napi = HfApi()\nd = []\n"
+                        f"for f in api.get_paths_info({repo_id!r}, {list(paths)!r}):\n"
+                        "    if hasattr(f, 'size') and not hasattr(f, 'tree_id'):\n"
+                        "        lfs = getattr(f, 'lfs', None)\n"
+                        "        sha = (lfs.get('sha256') if isinstance(lfs, dict) else getattr(lfs, 'sha256', None)) if lfs else None\n"
+                        "        d.append([f.path, f.size, sha, getattr(f, 'blob_id', None)])\n"
+                        "print(json.dumps(d))\n") or []
+        return [SimpleNamespace(path=p, size=s, lfs=({"sha256": h} if h else None), blob_id=b) for p, s, h, b in rows]
+
     def _drop(self, job):
         self._py(f"import shutil\nshutil.rmtree({job!r}, ignore_errors=True)\nprint('null')\n")
 
