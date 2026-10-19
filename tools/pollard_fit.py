@@ -341,9 +341,6 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     ei = emb_ladder.index(emb_type) if emb_type in emb_ladder else 0
     while True:
         emb_gb = other * BPW[emb_type] / 8 / 1e9
-        if not items:                       # everything pinned: nothing left to allocate
-            res = ([], 0.0)
-            break
         res = _alloc_klaware(items, budget - emb_gb - pinned_gb, noise, ladder)
         if res is not None:
             break
