@@ -1103,32 +1103,31 @@ def canonical_gguf(c):
     names a build after the f16 it came from, which is not a name to publish."""
     import pollard_workspace as ws
     key = c["f16"]
-    man = ws.read_manifest(key)
-    changed = False
-    for b in man.get("builds", []):
-        if b.get("lane") != "gguf" or not b.get("tag"):
-            continue
-        want = f"{c['name']}-Pollard-{b['tag']}.gguf"
-        path = b.get("path", "")
-        if os.path.basename(path) == want or not os.path.exists(path):
-            continue
-        target = os.path.join(os.path.dirname(path), want)
-        os.replace(path, target)
-        b["path"], b["name"] = os.path.abspath(target), want
-        changed = True
-    if changed:
-        # a re-run's rung lands on the published name an earlier, freed / kept / replaced build of the same tag had:
-        # the newest entry for a path is the build that is there now, so older entries for it go (publish_rung would
-        # otherwise find the stale one first -- unverified -- and keep the fresh, verified file off the Hub)
-        seen, keepl = set(), []
-        for b in reversed(man.get("builds", [])):
-            p = os.path.normcase(os.path.abspath(str(b.get("path", ""))))
-            if b.get("lane") == "gguf" and p in seen:
+    with ws.manifest_transaction(key) as man:
+        changed = False
+        for b in man.get("builds", []):
+            if b.get("lane") != "gguf" or not b.get("tag"):
                 continue
-            seen.add(p)
-            keepl.append(b)
-        man["builds"] = list(reversed(keepl))
-        ws._write_manifest(key, man)
+            want = f"{c['name']}-Pollard-{b['tag']}.gguf"
+            path = b.get("path", "")
+            if os.path.basename(path) == want or not os.path.exists(path):
+                continue
+            target = os.path.join(os.path.dirname(path), want)
+            os.replace(path, target)
+            b["path"], b["name"] = os.path.abspath(target), want
+            changed = True
+        if changed:
+            # a re-run's rung lands on the published name an earlier, freed / kept / replaced build of the same tag had:
+            # the newest entry for a path is the build that is there now, so older entries for it go (publish_rung would
+            # otherwise find the stale one first -- unverified -- and keep the fresh, verified file off the Hub)
+            seen, keepl = set(), []
+            for b in reversed(man.get("builds", [])):
+                p = os.path.normcase(os.path.abspath(str(b.get("path", ""))))
+                if b.get("lane") == "gguf" and p in seen:
+                    continue
+                seen.add(p)
+                keepl.append(b)
+            man["builds"] = list(reversed(keepl))
 
 
 def default_build(builds, lane, want):
@@ -1374,17 +1373,14 @@ def remote_mismatches(api, repo, pairs):
     return H.mismatches(api, repo, pairs)
 
 
-def _keep(c, lane, key, man, b, why, out):
+def _keep(key, b, why, out):
     """A rung that is NOT freed: recorded in the MANIFEST (kept = why) and said out loud."""
+    import pollard_workspace as ws
     b["kept"] = why
     b.pop("freed", None)
-    ws_write(key, man)
+    fields = ("kept", "streamed_unverified", "runtime", "uploaded_as")
+    ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("freed",))
     out(f"      KEPT {b.get('path')} -- {why}")
-
-
-def ws_write(key, man):
-    import pollard_workspace as ws
-    ws._write_manifest(key, man)
 
 
 def publish_rung(step, c, cfg, run_upload, out=print):
@@ -1415,7 +1411,7 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     if b.get("verified") is not True:
         if streamed:
             b["streamed_unverified"] = sorted(e["path_in_repo"] for e in streamed.values())
-        _keep(c, lane, key, man, b, "not verified (measure / verify / gate failed or did not run) -- not published"
+        _keep(key, b, "not verified (measure / verify / gate failed or did not run) -- not published"
               + (f"; its {len(streamed)} streamed shard(s) stay in the PRIVATE repo, which will not go public "
                  "until they are verified or removed" if streamed else ""), out)
         return "kept: not verified"
@@ -1453,17 +1449,18 @@ def publish_rung(step, c, cfg, run_upload, out=print):
               for e in streamed.values()]
     bad = remote_mismatches(api, repo, pairs)
     if bad:
-        _keep(c, lane, key, man, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
+        _keep(key, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
         raise RuntimeError(f"{dest} is not intact in {repo} after the upload ({bad[0]}) -- keeping the local copy")
     b["uploaded"] = repo
     b.pop("kept", None)
     if streamed:
         b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
-    ws._write_manifest(key, man)
+    fields = ("uploaded", "uploaded_as", "runtime", "bytes")
+    ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",))
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if _free_local(c, b, out):
         b["freed"] = "uploaded + confirmed on the Hub"
-        ws._write_manifest(key, man)
+        ws.update_build(key, b["path"], {"freed": b["freed"]})
     return "done"
 
 
