@@ -17,6 +17,7 @@ python3.pkgs.buildPythonApplication {
       ../pyproject.toml
       ../README.md
       ../LICENSE
+      ../install.sh
       (lib.fileset.fileFilter (
         file:
         builtins.any file.hasExt [

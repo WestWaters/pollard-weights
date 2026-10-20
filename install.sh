@@ -21,23 +21,26 @@ echo "tools installed: pollard-calc, pollard-fit"
 # is the cross-vendor catch-all — it runs on AMD/Intel/NVIDIA off the graphics
 # driver alone, no compute toolkit — so any GPU has a path.
 GPU_FLAGS=""
-if [ -n "${POLLARD_GPU:-}" ]; then
-  GPU_FLAGS="$POLLARD_GPU"                    # override, e.g. POLLARD_GPU=-DGGML_VULKAN=ON
-elif [ "$(uname -s)" = "Darwin" ]; then
-  GPU_FLAGS="-DGGML_METAL=ON"                 # Apple Silicon
-elif command -v nvcc >/dev/null 2>&1; then
-  GPU_FLAGS="-DGGML_CUDA=ON"                  # NVIDIA: RTX, GB10 / DGX Spark
-elif command -v hipcc >/dev/null 2>&1 || command -v rocminfo >/dev/null 2>&1; then
-  GPU_FLAGS="-DGGML_HIP=ON"                   # AMD: Radeon / Instinct (ROCm)
-elif command -v icpx >/dev/null 2>&1; then
-  GPU_FLAGS="-DGGML_SYCL=ON"                  # Intel: Arc / Data Center GPU (oneAPI)
-elif command -v vulkaninfo >/dev/null 2>&1; then
-  GPU_FLAGS="-DGGML_VULKAN=ON"                # cross-vendor fallback (AMD/Intel/NVIDIA)
-else
-  echo "note: no GPU toolkit detected — building CPU-only. Have a GPU? Install its"
-  echo "      toolkit (CUDA / ROCm / oneAPI) or Vulkan drivers and re-run, or force it:"
-  echo "      POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh"
-fi
+configure_gpu() {
+  GPU_FLAGS=""
+  if [ -n "${POLLARD_GPU:-}" ]; then
+    GPU_FLAGS="$POLLARD_GPU"                    # override, e.g. POLLARD_GPU=-DGGML_VULKAN=ON
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    GPU_FLAGS="-DGGML_METAL=ON"                 # Apple Silicon
+  elif command -v nvcc >/dev/null 2>&1; then
+    GPU_FLAGS="-DGGML_CUDA=ON"                  # NVIDIA: RTX, GB10 / DGX Spark
+  elif command -v hipcc >/dev/null 2>&1 || command -v rocminfo >/dev/null 2>&1; then
+    GPU_FLAGS="-DGGML_HIP=ON"                   # AMD: Radeon / Instinct (ROCm)
+  elif command -v icpx >/dev/null 2>&1; then
+    GPU_FLAGS="-DGGML_SYCL=ON"                  # Intel: Arc / Data Center GPU (oneAPI)
+  elif command -v vulkaninfo >/dev/null 2>&1; then
+    GPU_FLAGS="-DGGML_VULKAN=ON"                # cross-vendor fallback (AMD/Intel/NVIDIA)
+  else
+    echo "note: no GPU toolkit detected — building CPU-only. Have a GPU? Install its"
+    echo "      toolkit (CUDA / ROCm / oneAPI) or Vulkan drivers and re-run, or force it:"
+    echo "      POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh"
+  fi
+}
 
 # 2. the runtime (llama.cpp — Pollard builds are normal GGUFs; this is the engine)
 if command -v llama-quantize >/dev/null 2>&1; then
@@ -52,6 +55,7 @@ else
   # their RAM). This is how a GGUF too big for one box runs across many — the
   # llama.cpp answer to vLLM's clustering, no vLLM required.
   #
+  configure_gpu
   cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release \
     -DGGML_RPC=ON $GPU_FLAGS
   # NOTE: the RPC server target is `ggml-rpc-server` in current llama.cpp
@@ -80,6 +84,7 @@ elif [ -x "$IK_DIR/build/bin/llama-quantize" ]; then
 else
   echo "building ik_llama.cpp (trellis engine for the flagship)…"
   [ -d "$IK_DIR" ] || git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp "$IK_DIR"
+  configure_gpu
   cmake -S "$IK_DIR" -B "$IK_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON $GPU_FLAGS
   cmake --build "$IK_DIR/build" -j \
     --target llama-quantize llama-cli llama-imatrix llama-perplexity
