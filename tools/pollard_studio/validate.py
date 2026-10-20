@@ -38,12 +38,8 @@ class Invalid(ValueError):
 def load_manifest(path: Path | None = None) -> dict:
     """{tool: {flag: spec}} from the parsed tools."""
     from . import runner
-    tools_dir = runner.REPO / "tools"
+    tools_dir = runner.tools_dir()
     data = None
-    # The REPO WINS. A snapshot on disk goes stale the moment a tool changes, and a validator
-    # working from yesterday's contract rejects a flag the tool now accepts -- which looks to the
-    # user like Pollard refusing a legitimate build. The file is only a fallback for an install
-    # that has no repo beside it.
     if path is None and tools_dir.is_dir():
         out = subprocess.run([sys.executable, str(HERE / "manifest.py"), str(tools_dir)],
                              capture_output=True, text=True, timeout=90)

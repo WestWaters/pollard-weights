@@ -361,7 +361,7 @@ def test_the_manifest_is_generated_from_the_repo_never_hand_written():
     """A hand-written flag list is a UI that lies the moment a tool changes."""
     src = (ROOT / "pollard_studio/app.py").read_text()
     fn = src[src.index("def load_manifest("):src.index("class Api")]
-    assert "runner.REPO" in fn and "manifest.py" in fn
+    assert "runner.tools_dir()" in fn and "manifest.py" in fn
     assert "subprocess" in fn, "the manifest should be parsed from the repo's own tools"
 
 

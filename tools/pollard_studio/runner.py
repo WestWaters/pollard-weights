@@ -36,12 +36,12 @@ def tools_dir() -> Path:
     env = os.environ.get("POLLARD_TOOLS")
     if env and (Path(env) / "pollard_bench.py").is_file():
         return Path(env)
+    repo = os.environ.get("POLLARD_REPO")
+    if repo and (Path(repo).expanduser() / "tools" / "pollard_bench.py").is_file():
+        return Path(repo).expanduser() / "tools"
     beside = Path(__file__).resolve().parent.parent
     if (beside / "pollard_bench.py").is_file():
         return beside
-    repo = os.environ.get("POLLARD_REPO")
-    if repo and (Path(repo) / "tools" / "pollard_bench.py").is_file():
-        return Path(repo) / "tools"
     return beside
 
 
