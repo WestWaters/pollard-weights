@@ -40,6 +40,10 @@ def load_manifest(path: Path | None = None) -> dict:
     from . import runner
     tools_dir = runner.tools_dir()
     data = None
+    # The TOOLS WIN. A snapshot on disk goes stale the moment a tool changes, and a validator
+    # working from yesterday's contract rejects a flag the tool now accepts -- which looks to the
+    # user like Pollard refusing a legitimate build. The file is only a fallback for when the tool
+    # sources cannot be parsed (none found, or manifest.py failed).
     if path is None and tools_dir.is_dir():
         out = subprocess.run([sys.executable, str(HERE / "manifest.py"), str(tools_dir)],
                              capture_output=True, text=True, timeout=90)
