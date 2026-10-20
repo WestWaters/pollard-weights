@@ -1910,19 +1910,33 @@ def run_cmd(cmd, ok_codes=(0,), env=None):
         raise RuntimeError(f"exit {r.returncode}")
 
 
-def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=False, have=None, out=print):
+class _ExecutionState:
+    def __init__(self):
+        self.failed_rungs, self.failed_lanes, self.unbuildable = set(), set(), set()
+        self.held_mem = set()
+        self.streamed = set()
+
+
+def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=False, have=None, out=print,
+            execution=None):
     """Print (dry-run) or run the plan, serially. Returns {step id: status}."""
     have = have or machine()
     state = load_state(c["state"])
-    statuses, failed_rungs, failed_lanes, unbuildable = {}, set(), set(), set()
-    held_mem = set()                                 # (lane, rung) held for RAM: kept on disk for a re-run
+    execution = execution or _ExecutionState()
+    statuses = {}
+    failed_rungs, failed_lanes, unbuildable = execution.failed_rungs, execution.failed_lanes, execution.unbuildable
+    held_mem = execution.held_mem                    # (lane, rung) held for RAM: kept on disk for a re-run
     kept = []                                        # (lane, rung, path) left on disk unpublished -- reported at the end
-    streamed = set()                                 # (lane, rung) built in streaming mode (shards already on the Hub)
+    streamed = execution.streamed                   # (lane, rung) built in streaming mode (shards already on the Hub)
     queue, n = list(steps), 0
     while queue:
         st = queue.pop(0)
         n += 1
         head = f"{n:3d}. [{st.lane}{'/' + st.rung if st.rung else ''}] {st.kind}"
+        if st.kind == "expand" and st.lane in failed_lanes:
+            out(f"{head}: SKIP (an earlier step of this lane failed)")
+            statuses[st.id] = "skipped: upstream failed"
+            continue
         if st.kind == "expand" and st.lane == "draft":
             import pollard_draft as D
             builds = D.draft_builds(c["src"])
@@ -2225,17 +2239,21 @@ class Admission:
 def rung_chains(steps):
     """[(lane, rung, [steps])] in plan order: a GGUF rung = its build + its expand; a directory-lane rung = build,
     complete gate, tool calls, verify, publish. Lane-level steps (card / upload / public) are not part of a chain."""
-    chains, idx = [], {}
+    chains, idx, last = [], {}, {}
     for st in steps:
         if st.kind in ("card", "upload", "finalize", "note", "hold") and not st.rung:
             continue
         # a lane-level build (the EXLR8 encode, the drafter's find / train / convert / expand) is its lane's own chain,
         # in plan order -- so it runs before that lane's rungs in the same slot
         key = (st.lane, st.rung or (st.id.split("rungs-", 1)[1] if "rungs-" in st.id else "_lane"))
+        if st.kind == "gate" and not st.rung and st.lane in (st.blocks or []):
+            # A whole-lane completion gate follows the build that produced its sidecars, before that rung expands.
+            key = last.get(st.lane, key)
         if key not in idx:
             idx[key] = len(chains)
             chains.append((key[0], key[1], []))
         chains[idx[key]][2].append(st)
+        last[st.lane] = key
     return chains
 
 
@@ -2248,7 +2266,8 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
     not fit. The lane cards / uploads and the public flip run last, serially. Per-slot timeline -> timeline."""
     import queue
     have = have or machine()
-    runner = runner or (lambda ss: execute(ss, c, cfg, True, run_upload, redo, False, have, out))
+    execution = _ExecutionState()
+    runner = runner or (lambda ss: execute(ss, c, cfg, True, run_upload, redo, False, have, out, execution))
     admission = admission or Admission(cfg, c, out=out)
     tl_path = timeline or os.path.join(c["mdir"], "release-timeline.log")
     os.makedirs(os.path.dirname(tl_path), exist_ok=True)
@@ -2299,7 +2318,11 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
                     statuses.update({s.id: "kept: upstream failed" for s in rest if s.kind == "publish"})
                 continue
             if rest:
-                mq.put((lane, rung, rest))
+                checked = _threading.Event() if any(s.kind == "gate" and lane in (s.blocks or []) for s in rest) else None
+                mq.put((lane, rung, rest, checked))
+                if checked:
+                    # Later builds in this lane depend on its complete-model gate. Other slots can carry on.
+                    checked.wait()
         mq.put(None)
 
     def measure_worker(n_feeders):
@@ -2309,9 +2332,13 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
             if item is None:
                 done_feeders += 1
                 continue
-            lane, rung, rest = item
+            lane, rung, rest, checked = item
             peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
-            run_job("measure", f"{lane}/{rung}", rest, peak)
+            try:
+                run_job("measure", f"{lane}/{rung}", rest, peak)
+            finally:
+                if checked:
+                    checked.set()
 
     feeders = [_threading.Thread(target=slot_worker, args=(k,), name=f"slot-{k}", daemon=True) for k in slots]
     meas = _threading.Thread(target=measure_worker, args=(len(feeders),), name="measure", daemon=True)
