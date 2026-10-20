@@ -169,7 +169,7 @@ def step_prune(c, keep, reap):
     tag = f"p{int(round(100 * (1 - keep)))}"
     out = c.p(f"{tag}-{c.a.src_type}.gguf")
     if not os.path.exists(out):
-        floors(c.w, 2.0)
+        floors(c.w, 1.5)
         run(c.tool("pollard_prune.py", "--gguf", c.src(), "--keep", str(keep), "--score", "reap",
                    "--scores", reap, "--out", out, "--keep-list", c.p(f"{tag}.keep.json")), c.p(f"{tag}.prune.log"))
     return tag, out
@@ -189,7 +189,7 @@ def step_sensitivity(c, model, imatrix, tag):
 def step_errmap(c, model, imatrix, tag):
     out = c.p(f"{tag}.errmap.json")
     if not os.path.exists(out):
-        floors(c.w, 3.0)
+        floors(c.w, 1.5)                       # one probe on disk at a time (<= the q8_0 probe)
         run(c.tool("pollard_moefit.py", "errmap", "--gguf", model, "--imatrix", imatrix, "--out", out,
                    "--llama-quantize", c.q, "--workdir", c.p(f"probes-{tag}"), *c.requant()), c.p(f"{tag}.errmap.log"))
         shutil.rmtree(c.p(f"probes-{tag}"), ignore_errors=True)
@@ -316,14 +316,45 @@ def step_arms(c):
 
 # ------------------------------------------------------------------------------------------------ table
 
+_CALL = re.compile(r'^\s*(?:<\|?tool_call\|?>)?\s*\[?\s*\{\s*"arguments"\s*:\s*(\{.*?\})\s*,\s*"name"\s*:\s*"([^"]+)"'
+                   r'|^\s*(?:<\|?tool_call\|?>)?\s*\[?\s*\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})')
+
+
+def _call(sample):
+    """(name, args text) of a call written the way the reference writes it, else None. A reply that echoes the tool
+    SCHEMA ({"name": ..., "description": ...}) is not a call."""
+    m = _CALL.search(sample or "")
+    if not m:
+        return None
+    return (m.group(2), m.group(1)) if m.group(2) else (m.group(3), m.group(4))
+
+
+def tool_agreement(c, tag):
+    """(%, n): of the probes where the REFERENCE writes a call, the share where the rung writes a call to the same
+    function with the same arguments. pollard-toolcall's served path can be blind here (llama-server's parser does
+    not read granite-3.1-1b's `<tool_call>[{...}]`, so parse rate is 0% for reference and rung alike and retention
+    only sees abstention); this reads the per-probe samples (first 160 chars) directly."""
+    try:
+        d = json.load(open(c.p(f"{tag}.toolcall.json")))
+    except Exception:
+        return None
+    ref = {r["id"]: _call(r.get("sample")) for r in (d.get("ref_rows") or [])}
+    pairs = [(ref[r["id"]], _call(r.get("sample"))) for r in d.get("rows") or [] if ref.get(r["id"])]
+    if not pairs:
+        return None
+    same = sum(1 for a, b in pairs if b is not None and a[0] == b[0] and a[1] == b[1])
+    return f"{100.0 * same / len(pairs):.0f}% of {len(pairs)}"
+
+
 def step_table(c):
     res = c.results()
     rows = [(k, v) for k, v in res.items() if not k.startswith("_") and v.get("mean_kld") is not None]
     rows.sort(key=lambda kv: (kv[1]["bytes"], kv[1]["mean_kld"]))
     base_ppl = next((v.get("ref_ppl") for _, v in rows if v.get("ref_ppl")), None)
     lines = [f"{c.a.src_type} reference PPL {base_ppl}", "",
-             "| rung | arm | GB | expert bpw | mean KLD | p99 KLD | top-1 % | PPL | tool retention | expert types |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "| rung | arm | GB | expert bpw | mean KLD | p99 KLD | top-1 % | PPL | tool retention | same call as ref "
+             "| expert types |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for k, v in rows:
         eb = (v.get("bpw_role") or {}).get("expert")
         ht = v.get("hist", {}).get("expert", {})
@@ -331,7 +362,7 @@ def step_table(c):
         tr = v.get("tool_retention")
         lines.append(f"| {k} | {v.get('arm')} | {v['gb']:.3f} | {eb if eb is not None else '-'} | "
                      f"{v['mean_kld']:.4f} | {v.get('p99_kld') or '-'} | {v.get('top1')} | {v.get('ppl')} | "
-                     f"{tr if tr is not None else v.get('tool_status', '-')} | {hs} |")
+                     f"{tr if tr is not None else v.get('tool_status', '-')} | {tool_agreement(c, k)} | {hs} |")
     txt = "\n".join(lines)
     print(txt)
     open(c.p("results.md"), "w").write(txt + "\n")
