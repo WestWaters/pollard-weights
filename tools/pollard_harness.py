@@ -30,7 +30,7 @@ codex (config.toml, appended tables only) and continue (config.yaml). Everything
 """
 from __future__ import annotations
 
-import argparse, json, os, re, shutil, subprocess, sys, time
+import argparse, glob, json, os, re, shutil, subprocess, sys, time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -313,7 +313,8 @@ def hf_gguf_files(repo, fetch=None):
 
 def resolve(target, fetch=None):
     """{path, name, tag, repo, url, source} for a .gguf path, a workspace rung (MODEL:TAG) or a published
-    rung (ORG/REPO:TAG). A local path wins; then the workspace MANIFEST; then the Hub."""
+    rung (ORG/REPO:TAG). Published rungs include files_in_repo (all shards, starting with shard one).
+    A local path wins; then the workspace MANIFEST; then the Hub."""
     t = os.path.expanduser(target)
     if not os.path.isfile(t) and os.sep not in t and "/" not in t and t.endswith(".gguf"):
         # a bare build name not in the cwd: the workspace knows where `pollard` put it
@@ -351,7 +352,24 @@ def resolve(target, fetch=None):
             raise SystemExit(f"pollard serve: {model} has no {tag} GGUF (has: "
                              + ", ".join(os.path.basename(f) for f in files[:12]) + ")")
         f = sorted(hit)[0]
+        selected = [f]
+        split = re.fullmatch(r"(.*)-(\d+)-of-(\d+)\.gguf", f)
+        if split:
+            prefix, index, total = split.groups()
+            count = int(total)
+            # Bound the filename's count before allocating its expected sibling list.
+            if not 1 <= int(index) <= count or count > len(files):
+                raise SystemExit(f"pollard serve: incomplete split GGUF {f!r} in {model}")
+            # Match this exact basename AND subdirectory. Other rungs or split counts
+            # cannot supply a missing sibling, even when they share the model prefix.
+            selected = [f"{prefix}-{i:0{len(index)}d}-of-{total}.gguf" for i in range(1, count + 1)]
+            missing = set(selected) - set(files)
+            if missing:
+                raise SystemExit(f"pollard serve: incomplete split GGUF {f!r} in {model}"
+                                 + f" (missing: {', '.join(sorted(missing))})")
+            f = selected[0]
         return {"path": None, "name": os.path.basename(f), "tag": tag, "repo": model, "file_in_repo": f,
+                "files_in_repo": selected,
                 "url": f"https://huggingface.co/{model}/resolve/main/{f}", "source": "hf"}
     raise SystemExit(f"pollard serve: no build tagged {tag!r} in the workspace MANIFEST for {model!r}")
 
@@ -773,9 +791,21 @@ def main(argv=None):
 
     path = info.get("path")
     if info["source"] == "hf" and not path:
-        from huggingface_hub import hf_hub_download
-        print(f"   downloading {info['file_in_repo']} from {info['repo']} ...")
-        path = hf_hub_download(info["repo"], info["file_in_repo"])
+        files = info.get("files_in_repo", [info["file_in_repo"]])
+        print(f"   downloading {', '.join(files)} from {info['repo']} ...")
+        if len(files) > 1:
+            from huggingface_hub import snapshot_download
+            # One snapshot keeps every shard at the same revision and in the same
+            # directory, where llama-server discovers the siblings of shard one.
+            snapshot = snapshot_download(info["repo"], allow_patterns=[glob.escape(f) for f in files])
+            missing = [f for f in files if not os.path.isfile(os.path.join(snapshot, f))]
+            if missing:
+                raise SystemExit("pollard serve: incomplete split GGUF download (missing: "
+                                 + ", ".join(missing) + ")")
+            path = os.path.join(snapshot, info["file_in_repo"])
+        else:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(info["repo"], info["file_in_repo"])
         argv_srv[argv_srv.index("-m") + 1] = path
     log = os.path.join(os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard"), "cache",
                        f"serve-{a.port}.log")
