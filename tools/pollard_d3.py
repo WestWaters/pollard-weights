@@ -511,7 +511,8 @@ class MlxRunner:
         import mlx.core as mx
         from mlx_lm.utils import load_model
         self.mx = mx
-        self.model, _ = load_model(Path(rung), strict=False)
+        with mlx_compat():
+            self.model, _ = load_model(Path(rung), strict=False)
         self.lm = _mlx_text_model(self.model)
         self.W = load_readout(src)
         self.T = float(decision_config(src).get("temperature", 1.0))
@@ -531,6 +532,100 @@ class MlxRunner:
 
     def close(self):
         pass
+
+
+def mlx_compat():
+    """Context manager: what mlx-lm / mlx-vlm's Qwen3.5 code needs to build a d3 body.
+
+      * names: a d3 body is stored as a bare `Qwen3_5Model` (`language_model.*`, `visual.*`); mlx-vlm's key mapping
+        knows the ForConditionalGeneration layout (`model.language_model.*`, `model.visual.*`) -- it takes both here
+      * layer types: both build every layer from `full_attention_interval` and drop `layer_types` from the config.
+        d3-edge is `llFllFllFFFF` (not every 4th), so its layers would be built as the wrong kind and its weights
+        refused ("parameters not in model"). Here `layer_types` is kept and decides each layer, as transformers,
+        vLLM and llama.cpp do
+    Patches are undone on exit; a model built inside keeps the right layers."""
+    import contextlib, copy, importlib
+
+    @contextlib.contextmanager
+    def patched():
+        saved = []
+
+        missing = object()
+
+        def swap(owner, attr, new):
+            saved.append((owner, attr, owner.__dict__.get(attr, missing) if isinstance(owner, type)
+                          else getattr(owner, attr)))
+            setattr(owner, attr, new)
+
+        def mod(name):
+            try:
+                return importlib.import_module(name)
+            except Exception:                                # noqa: BLE001 -- that package / family is absent
+                return None
+
+        for name in ("mlx_vlm.models.qwen3_5.qwen3_5", "mlx_vlm.models.qwen3_5_moe.qwen3_5_moe"):
+            m = mod(name)
+            if m is not None and hasattr(m, "sanitize_key"):
+                def bare(key, _orig=m.sanitize_key):
+                    if (key.startswith("language_model.") and not key.startswith("language_model.model.")) \
+                            or key.startswith("visual."):
+                        key = "model." + key
+                    return _orig(key)
+                swap(m, "sanitize_key", bare)
+        for mname, args_cls, layer_cls, text_cls in (
+                ("mlx_lm.models.qwen3_5", "TextModelArgs", "DecoderLayer", "Qwen3_5TextModel"),
+                ("mlx_vlm.models.qwen3_5.config", "TextConfig", None, None),
+                ("mlx_vlm.models.qwen3_5.language", None, "Qwen3_5DecoderLayer", "Qwen3_5Model")):
+            m = mod(mname)
+            if m is None:
+                continue
+            A = getattr(m, args_cls, None) if args_cls else None
+            if A is not None and hasattr(A, "from_dict"):
+                def from_dict(cls, params, _orig=A.from_dict.__func__):
+                    obj = _orig(cls, params)
+                    lt = params.get("layer_types") if isinstance(params, dict) else None
+                    if lt:
+                        obj.layer_types = list(lt)
+                    return obj
+                swap(A, "from_dict", classmethod(from_dict))
+            if hasattr(m, "_maybe_deserialize_config"):      # mlx-vlm builds its TextConfig without from_dict
+                def deser(config_cls, params, *a, _orig=m._maybe_deserialize_config, **k):
+                    obj = _orig(config_cls, params, *a, **k)
+                    lt = params.get("layer_types") if isinstance(params, dict) else None
+                    if lt and not isinstance(obj, dict):
+                        obj.layer_types = list(lt)
+                    return obj
+                swap(m, "_maybe_deserialize_config", deser)
+            L = getattr(m, layer_cls, None) if layer_cls else None
+            if L is not None:
+                def init(self, args, layer_idx, *a, _orig=L.__dict__["__init__"], **k):
+                    lt = getattr(args, "layer_types", None)
+                    if lt and layer_idx < len(lt):
+                        args = copy.copy(args)
+                        args.full_attention_interval = layer_idx + 1 if lt[layer_idx] == "full_attention" else 1 << 30
+                    return _orig(self, args, layer_idx, *a, **k)
+                swap(L, "__init__", init)
+            T = getattr(m, text_cls, None) if text_cls else None
+            if T is not None:
+                def tinit(self, *a, _orig=T.__dict__["__init__"], **k):
+                    _orig(self, *a, **k)
+                    layers = list(getattr(self, "layers", []) or [])
+                    lin = [i for i, l in enumerate(layers) if getattr(l, "is_linear", False)]
+                    full = [i for i, l in enumerate(layers) if not getattr(l, "is_linear", True)]
+                    if lin and hasattr(self, "ssm_idx"):
+                        self.ssm_idx = lin[0]
+                    if full and hasattr(self, "fa_idx"):
+                        self.fa_idx = full[0]
+                swap(T, "__init__", tinit)
+        try:
+            yield
+        finally:
+            for owner, attr, orig in reversed(saved):
+                if orig is missing:
+                    delattr(owner, attr)
+                else:
+                    setattr(owner, attr, orig)
+    return patched()
 
 
 def _mlx_text_model(model):
@@ -983,9 +1078,11 @@ def serve_lines(info_, repo=None, lanes=()):
            "generates text. Every rung here ships `readout.safetensors` and `decision_config.json` byte-exact; only "
            "the body is quantized.", ""]
     if not lanes or any(l in lanes for l in ("gptq", "mx")):
-        out += ["vLLM (nightly; `/v1/systemone` from vllm-project/vllm#61565):", "", "```sh",
-                f"vllm serve {src}            # the bf16 source",
-                f"vllm serve {repo} --revision main  # an HF-lane rung folder downloaded locally: vllm serve ./GPTQ/<rung>",
+        out += ["vLLM (nightly; vllm-project/vllm#61565 serves a bare `Qwen3_5Model` + `decision_config.json` as "
+                "`D3ForSequenceClassification`, the readout as its FP32 score head, on `/v1/systemone`):", "", "```sh",
+                f"vllm serve {src}                       # the bf16 source",
+                f"hf download {repo} --include \"GPTQ/<rung>/*\" --local-dir .",
+                "vllm serve ./GPTQ/<rung> --max-model-len 32768   # a rung folder (MX/<rung> the same way)",
                 "curl -s localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{",
                 '  "state": "I was charged twice for my order.",',
                 '  "questions": {"team": {"type": "choice", "instructions": "Which team?",',

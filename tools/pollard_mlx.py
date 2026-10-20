@@ -195,45 +195,15 @@ def mlx_engine(model_dir):
 
 
 def d3_names(model_dir):
-    """A d3 decision model stores its body as a bare `Qwen3_5Model` (`language_model.*`, `visual.*`), not the
-    ForConditionalGeneration layout mlx-vlm's Qwen3.5 maps (`model.language_model.*`, `model.visual.*`): for the
-    convert, its key mapping also takes the bare names. The readout and decision config ship byte-exact beside the
-    MLX model (pollard-complete --fill -> pollard-d3 ship); nothing else changes."""
-    import contextlib, importlib
+    """A d3 decision model (decision_config.json d3-code-readout-v1) builds through mlx-vlm with pollard-d3's MLX
+    compatibility in place (its bare `Qwen3_5Model` names, and `layer_types` honoured -- d3-edge is llFllFllFFFF). The
+    readout and decision config ship byte-exact beside the MLX model (pollard-complete --fill -> pollard-d3 ship)."""
+    import contextlib
     try:
         import pollard_d3 as D3
-        is_d3 = D3.decision_config(model_dir) is not None
     except ImportError:
-        is_d3 = False
-    if not is_d3:
         return contextlib.nullcontext()
-
-    @contextlib.contextmanager
-    def patched():
-        mods = []
-        for name in ("mlx_vlm.models.qwen3_5.qwen3_5", "mlx_vlm.models.qwen3_5_moe.qwen3_5_moe"):
-            try:
-                mods.append(importlib.import_module(name))
-            except Exception:                                   # noqa: BLE001 -- that family is not installed
-                continue
-        saved = [(m, m.sanitize_key) for m in mods if hasattr(m, "sanitize_key")]
-
-        def bare(orig):
-            def f(key):
-                if key.startswith("language_model.") and not key.startswith("language_model.model."):
-                    key = "model." + key
-                elif key.startswith("visual."):
-                    key = "model." + key
-                return orig(key)
-            return f
-        for m, orig in saved:
-            m.sanitize_key = bare(orig)
-        try:
-            yield
-        finally:
-            for m, orig in saved:
-                m.sanitize_key = orig
-    return patched()
+    return D3.mlx_compat() if D3.decision_config(model_dir) is not None else contextlib.nullcontext()
 
 
 def needs_mlx_vlm(model_dir):

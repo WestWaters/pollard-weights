@@ -136,6 +136,7 @@ PRESETS = {
     # non-causal body read at one position. EXL3 / EXLR8 plan a hold with the reason (lane_steps): no runtime serves a
     # d3 rung in those formats.
     "d3": {"measure": {"taskeval": None, "decision": True, "toolcall": False},
+           "calib": {"reasoning": "off"},             # the base template's <think> is never used: d3 never generates
            "d3": {"set": "typed-decisions", "limit": 0}},
     # MoE: vLLM's fused-MoE kernels want one scheme for all experts (--moe-protect-attn-only); 2/3-bit GPTQ
     # MoE kernels are poor, so the GPTQ ladder is 4 and 8. EXLR8 encodes every expert matrix as its own dense record
