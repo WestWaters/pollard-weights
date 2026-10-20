@@ -21,6 +21,10 @@ What counts as "carried", per lane:
   * gguf: vision / audio towers and the projector are in an mmproj-*.gguf that declares that encoder
     (clip.has_vision_encoder / clip.has_audio_encoder); anything a GGUF cannot hold (speech output, side weights)
     sits next to it as a source-precision safetensors sidecar. The processor files ride inside the mmproj.
+  * d3 decision models (decision_config.json `d3-code-readout-v1`), every lane: decision_config.json and
+    readout.safetensors byte-exact (sha256 = the source's) -- only the body is quantized -- and never the source's
+    MODEL_MANIFEST.json on a rung (its shard hashes would make the d3 runtime refuse the rung); --fill copies the
+    decision files and writes the rung's own manifest (pollard-d3 ship)
 
 Exit 0 = complete, 1 = incomplete (missing parts printed), 2 = usage error.
 """
@@ -210,10 +214,28 @@ def check(src, out, lane):
                 f"{name}: {len(keys) - len(lost)}/{len(keys)} tensors" + (f" (missing e.g. {lost[0]})" if lost else ""))
         for f in inv["processor_files"]:
             (carried if f in out_files else missing).append(f"file {f}")
+    d3c, d3m = _d3_check(src, out, lane)
     for f, keys in inv["side_weights"].items():
+        if d3c or d3m:
+            if f in D3_FILES:
+                continue                             # judged byte for byte below
         ok = f in out_files or all(k in out_keys for k in keys)
         (carried if ok else missing).append(f"side weights {f} ({len(keys)} tensors)")
+    carried += d3c
+    missing += d3m
     return {"ok": not missing, "missing": missing, "carried": carried, "lane": lane}
+
+
+#: a d3 decision model's readout + decision config: every lane ships them byte-exact (the body alone is quantized)
+D3_FILES = ("decision_config.json", "readout.safetensors")
+
+
+def _d3_check(src, out, lane):
+    try:
+        import pollard_d3 as D3
+    except ImportError:
+        return [], []
+    return D3.check_files(src, out, lane)
 
 
 def fill(src, out, lane):
@@ -253,6 +275,12 @@ def fill(src, out, lane):
         if f not in out_files:
             shutil.copy2(os.path.join(base, f), os.path.join(out, f))
             wrote.append(f)
+    try:
+        import pollard_d3 as D3
+        if D3.decision_config(src) is not None:          # byte-exact decision files + the rung's own manifest
+            wrote += [w for w in D3.ship(src, out, lane, log=lambda *_: None) if w not in wrote]
+    except ImportError:
+        pass
     return wrote
 
 

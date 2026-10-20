@@ -717,8 +717,10 @@ const ADV_SECTIONS = [
   { title: "DECISION MODELS", icon: "check",
     why: "Jev, OpenJev and d1-style models answer typed questions from the logits at position one and "
        + "never write prose. A rung is judged on agreement and option KL against f16 -- calibration is "
-       + "the product -- not on free-text coherence.",
-    tools: ["pollard_decision"] },
+       + "the product -- not on free-text coherence. d3 (vllm-sr/d3) reads a separate FP32 readout off the "
+       + "last token of a non-causal body instead: pollard_d3 gates each rung on that readout against bf16 "
+       + "through the rung's own runtime, and ships the readout byte-exact in every lane.",
+    tools: ["pollard_decision", "pollard_d3"] },
   { title: "DECODING", icon: "wave",
     why: "How a build is sampled is part of what it delivers. Composed decoding (arXiv 2609.34992) writes "
        + "every sampler as one objective on the simplex -- KL to the model, coverage, diversity -- and ships "
