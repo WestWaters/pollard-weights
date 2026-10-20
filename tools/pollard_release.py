@@ -727,7 +727,7 @@ def lane_steps(cfg, c, lane):
         return draft_steps(cfg, c, lc)
     if lane == "gguf":
         src = ["--gguf", c["f16"]] if c.get("given_f16") else ["--hf", c["hf_dir"], "--output", c["gguf_dir"]]
-        cmd = ["pollard"] + src + ["--calib", c["calib"],
+        cmd = ["pollard"] + src + ["--calib", c["calib"], "--heldout", c["heldout"],
                "--sensitivity", c["sens_raw"], "--ladder", "--run", "--no-card", "--force",
                "--no-toolcall",                          # release measures every rung itself (gguf/rungs)
                "--ngl", "auto" if c["ngl"] == "auto" else c["ngl"],
@@ -890,8 +890,21 @@ def gguf_ladder_labels(c):
             return [(lb, b / 1e9 * 1.02) for lb, b in pt.ladder_targets(ts, imatrix_ok=bool(c.get("imatrix")))]
     except Exception:                                              # noqa: BLE001 -- unreadable: the f16 ladder
         pass
-    from pollard_auto import LADDER
-    return [(label, frac * f16_gb * 1.05) for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]]
+    from pollard_auto import LADDER, MOE_BUDGET_LABEL, MOE_TAG
+    labels = [(label, frac * f16_gb * 1.05) for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]]
+    if _is_moe_gguf(c["f16"]):                     # the measured prune x bit-mix rung, at the 2-bit rung's bytes
+        labels.append((MOE_TAG, next(f for lb, _, f in LADDER if lb == MOE_BUDGET_LABEL) * f16_gb * 1.05))
+    return labels
+
+
+def _is_moe_gguf(path):
+    """Does this GGUF route experts (expert_count > 1)? False when unreadable."""
+    try:
+        from pollard_calc import read_gguf_meta
+        meta = read_gguf_meta(path)
+        return any(k.endswith(".expert_count") and int(v or 0) > 1 for k, v in meta.items())
+    except Exception:                                              # noqa: BLE001
+        return False
 
 
 def _draft_on(cfg):

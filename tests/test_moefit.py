@@ -501,3 +501,187 @@ def test_passthrough_keeps_qat_bytes_never_upgrades_and_only_moves_cold_tensors_
     assert smaller["types"]["blk.0.ffn_up_exps.weight"] == "iq2_xxs"        # the hot one keeps its QAT bytes
     assert smaller["types"]["blk.0.ssm_in.weight"] == "nvfp4"
     assert "iq3_s" not in {q for q in smaller["types"].values()}
+
+
+# ------------------------------------------------------------------------------------------------ measured 1-bit cost
+
+def _two_expert_em():
+    """weight-space error that flattens at the low end (iq1_s barely worse than iq2_xxs in e) -- the shape that made
+    the extrapolated law price 1-bit cheaply on granite"""
+    names = ["blk.0.ffn_up_exps.weight", "blk.1.ffn_up_exps.weight"]
+    rel = {"iq1_s": 0.18, "iq2_xxs": 0.12, "iq3_s": 0.03, "iq4_xs": 0.015, "q6_K": 0.002}
+    return names, _errmap({n: dict(rel) for n in names}, {n: M.ROLE_EXPERT for n in names})
+
+
+SENS = {"ffn": {"0": 0.1, "1": 0.1}, "attn": {}, "probe": "iq2_xxs"}
+
+
+def test_lowbit_cost_uses_the_measurement_and_scales_other_types_from_the_nearest_anchor():
+    t = {"rel": _rel(1.0), "numel": 1}
+    meas = {"iq1_s": 0.9, "iq2_xxs": 0.1}
+    assert M.lowbit_cost(meas, t, "iq1_s") == 0.9                    # measured: as measured
+    assert M.lowbit_cost(meas, t, "iq3_s") == pytest.approx(0.1 * 0.04 / 0.12)   # above: from the 2-bit anchor
+    # the extrapolated law would have priced iq1_s at 0.1 * 0.30 / 0.12 = 0.25 -- the measurement says 0.9
+    assert M.lowbit_cost(meas, t, "iq1_s") > 0.1 * 0.30 / 0.12
+
+
+def test_layer_granularity_splits_a_class_by_measured_error():
+    names = ["blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"]
+    em = _errmap({names[0]: _rel(1.0), names[1]: _rel(3.0)}, {n: M.ROLE_EXPERT for n in names})
+    lb = {"format": M.FORMAT_LOWBIT, "classes": {"0": {"tensors": names, "kl": {"iq1_s": 0.8}}}}
+    c = M.resolve_lowbit(lb, em["tensors"])
+    assert c[names[0]]["iq1_s"] == pytest.approx(0.2) and c[names[1]]["iq1_s"] == pytest.approx(0.6)
+    assert M.expert_class(names[1]) == "0.down" and M.expert_class(names[1], "layer") == "0"
+    assert M.expert_class("blk.0.attn_q.weight") is None
+
+
+def test_measured_1bit_cost_stops_the_knapsack_buying_1bit_that_does_not_pay():
+    names, em = _two_expert_em()
+    budget = M.fixed_bytes(em) + M.type_bytes("iq1_s", 256 * 1024) + M.type_bytes("iq3_s", 256 * 1024)
+    # extrapolated: 1-bit on one tensor is cheap enough to buy iq3_s on the other
+    p0 = M.plan(em, budget, SENS)
+    assert "iq1_s" in p0["types"].values()
+    # measured: iq1_s costs far more than the law said -> both at 2 bits instead
+    lb = {"classes": {f"{i}.up": {"tensors": [n], "kl": {"iq1_s": 2.0, "iq2_xxs": 0.1}} for i, n in enumerate(names)}}
+    p1 = M.plan(em, budget, SENS, lowbit=lb)
+    assert "iq1_s" not in p1["types"].values() and p1["estimate"] == "measured+lowbit"
+    # and where the measurement says 1-bit is nearly free on one tensor, it is bought there
+    lb["classes"]["1.up"]["kl"]["iq1_s"] = 0.11
+    p2 = M.plan(em, budget, SENS, lowbit=lb)
+    assert p2["types"][names[1]] == "iq1_s" and M.bpw_of(p2["types"][names[0]]) > M.bpw_of("iq2_xxs")
+    with pytest.raises(ValueError, match="sensitivity"):
+        M.plan(em, budget, None, lowbit=lb)
+
+
+# ------------------------------------------------------------------------------------------------ pruned candidates
+
+def _expert_em(E=4, rows=256, n_in=256):
+    numel = E * rows * n_in
+    t = {"role": M.ROLE_EXPERT, "layer": 0, "numel": numel, "shape": [E, rows, n_in],
+         "bytes": {q: M.type_bytes(q, numel) for q in ("iq1_s", "iq2_xxs")},
+         "rel": {"iq1_s": 0.3, "iq2_xxs": 0.1},
+         "experts": {"count": [10.0, 1.0, 50.0, 0.0], "energy": [1.0, 1.0, 1.0, 1.0],
+                     "err": {"iq1_s": [0.1, 0.9, 0.2, 0.5], "iq2_xxs": [0.05, 0.3, 0.06, 0.2]}}}
+    return {"format": M.FORMAT_ERRMAP, "types": ["iq1_s", "iq2_xxs"], "tensors": {"blk.0.ffn_up_exps.weight": t},
+            "fixed": {"blk.0.ffn_gate_inp.weight": {"role": M.ROLE_ROUTER, "numel": 256 * E, "src_bytes": 4 * 256 * E}},
+            "routing": {"0": {"counts": [10.0, 1.0, 50.0, 0.0], "share": [10 / 61, 1 / 61, 50 / 61, 0.0]}}}
+
+
+def test_prune_errmap_keeps_the_kept_experts_bytes_and_errors():
+    em = _expert_em()
+    p = M.prune_errmap(em, {0: [0, 2]})
+    t = p["tensors"]["blk.0.ffn_up_exps.weight"]
+    assert t["shape"][0] == 2 and t["numel"] == em["tensors"]["blk.0.ffn_up_exps.weight"]["numel"] // 2
+    assert t["bytes"]["iq1_s"] == M.type_bytes("iq1_s", t["numel"])
+    assert t["rel"]["iq1_s"] == pytest.approx((10 * 0.1 + 50 * 0.2) / 60)
+    assert p["fixed"]["blk.0.ffn_gate_inp.weight"]["numel"] == 512
+    assert p["routing"]["0"]["counts"] == [10.0, 50.0]
+    assert em["tensors"]["blk.0.ffn_up_exps.weight"]["shape"][0] == 4      # the full map is untouched
+    lb = M.prune_lowbit({"classes": {"0.up": {"tensors": ["blk.0.ffn_up_exps.weight"], "kl": {"iq1_s": 0.6}}}}, em, p)
+    assert lb["tensor_costs"]["blk.0.ffn_up_exps.weight"]["iq1_s"] == pytest.approx(0.6 * t["rel"]["iq1_s"] / 0.3)
+
+
+def test_keep_sets_follow_the_scores_drop_below_top_k_and_dedupe():
+    scores = {0: [5, 1, 9, 3, 7, 2, 8, 4], 1: [1, 2, 3, 4, 5, 6, 7, 8]}
+    ks = M.keep_sets(8, 2, (0, 0.1, 0.25, 0.5, 0.75, 0.9), scores)
+    assert sorted(ks) == [0.0, 0.1, 0.25, 0.5, 0.75]                   # 0.9 leaves 1 < top-2
+    assert ks[0.5] == (4, {0: [0, 2, 4, 6], 1: [4, 5, 6, 7]})
+    assert ks[0.1][0] == 7
+    assert len(M.keep_sets(8, 2, (0.1, 0.12), scores)) == 1             # both round to K = 7
+
+
+def test_slice_imatrix_keeps_the_kept_experts_rows(tmp_path):
+    gguf = pytest.importorskip("gguf")
+    p = _imatrix(tmp_path / "m.imatrix.gguf", {
+        "blk.0.ffn_up_exps.weight": (np.arange(4 * 256).reshape(4, 256), [30, 10, 0, 60]),
+        "blk.0.attn_q.weight": (np.ones((1, 256)), [100])})
+    out = M.slice_imatrix(p, {0: [0, 3]}, str(tmp_path / "s.imatrix.gguf"))
+    imx, kind = M.read_imatrix(out)
+    s, c = imx["blk.0.ffn_up_exps.weight"]
+    assert kind == "gguf" and s.shape == (2, 256) and list(c) == [30, 60] and s[1, 0] == 3 * 256
+    assert imx["blk.0.attn_q.weight"][0].shape == (1, 256)
+    r = gguf.GGUFReader(out)
+    assert bytes(r.fields["general.type"].parts[r.fields["general.type"].data[0]]).decode() == "imatrix"
+
+
+def test_auto_screens_every_fraction_measures_the_best_and_picks_the_lowest_measured(tmp_path, monkeypatch):
+    """the whole search with the binaries faked: pruning damage + predicted mix rank the candidates, the top ones
+    and a 1-bit plan's no-1-bit twin are 'built' and 'measured', a candidate whose tool calls drop is passed over."""
+    E, rows, n_in = 8, 256, 256
+    names = [f"blk.{L}.ffn_up_exps.weight" for L in range(2)]
+    numel = E * rows * n_in
+    rng = np.random.default_rng(1)
+    em = {"format": M.FORMAT_ERRMAP, "types": ["iq1_s", "iq2_xxs", "iq3_s", "iq4_xs"], "tensors": {}, "fixed": {}}
+    for n in names:
+        errs = {q: list(rng.uniform(0.5, 1.5, E) * b) for q, b in
+                (("iq1_s", 0.3), ("iq2_xxs", 0.12), ("iq3_s", 0.04), ("iq4_xs", 0.015))}
+        em["tensors"][n] = {"role": M.ROLE_EXPERT, "layer": M.layer_of(n), "numel": numel, "shape": [E, rows, n_in],
+                            "bytes": {q: M.type_bytes(q, numel) for q in em["types"]},
+                            "rel": {q: float(np.mean(v)) for q, v in errs.items()},
+                            "experts": {"count": list(rng.uniform(1, 10, E)), "energy": [1.0] * E, "err": errs}}
+    sens = {"ffn": {"0": 0.3, "1": 0.3}, "attn": {}, "probe": "iq2_xxs"}
+    lb = {"classes": {f"{L}.up": {"tensors": [names[L]], "kl": {"iq1_s": 0.6, "iq1_m": 0.45, "iq2_xxs": 0.3}}
+                      for L in range(2)}}
+    monkeypatch.setattr(M, "_gguf_experts", lambda p: (E, 2))
+    monkeypatch.setattr(M, "read_imatrix", lambda p: ({n: (np.ones((E, n_in)), np.arange(1, E + 1, dtype=float))
+                                                       for n in names}, "gguf"))
+    monkeypatch.setattr(M, "_quantized_source", lambda p: False)
+    monkeypatch.setattr(M, "_base_logits", lambda *a, **k: str(tmp_path / "base.kld"))
+    monkeypatch.setattr(M, "_prune_gguf", lambda src, K, kl, sc, out, log=print: open(out, "wb").write(b"GGUF" + b"\0" * 2048))
+    monkeypatch.setattr(M, "slice_imatrix", lambda imx, keep, out: open(out, "wb").write(b"GGUF" + b"\0" * 2048))
+    prune_kl = {}
+
+    def fake_kld(ppl, model, ev, base, ngl=99, chunks=None):
+        b = os.path.basename(model)
+        if b.endswith("-src.gguf"):                                    # the pruned model's own damage
+            p = int(b[1:3]) / 100
+            return {"mean_kld": prune_kl.setdefault(p, 0.4 * p * p)}
+        plan = json.load(open(model + ".plan.json"))
+        k = plan["predicted_kld"] + (0.05 if "-1bit" in b else 0.0)    # 1-bit measures worse than predicted
+        return {"mean_kld": round(k + (0.1 if b.startswith("cand-p") and "p00" not in b else 0), 6), "top1": 80.0,
+                "ppl": 5.0, "p99_kld": 1.0, "median_kld": 0.1}
+    monkeypatch.setattr(M, "_kld", fake_kld)
+    monkeypatch.setattr(M, "build", lambda src, im, plan, out, *a, **k: open(out, "wb").write(b"GGUF" + b"\0" * 2048))
+    tools = {}
+    monkeypatch.setattr(M, "_toolgate", lambda rung, ref, ngl, out, log=print: tools.setdefault(
+        os.path.basename(rung), {"tool_retention": 50.0 if "p25" in rung else 100.0, "tool_rate": 0.5}))
+    budget = M.fixed_bytes(em) + 2 * M.type_bytes("iq2_xxs", numel)
+    out = str(tmp_path / "win.gguf")
+    rep = M.auto("src.gguf", "imx.gguf", em, sens, lb, budget, prunes=(0, 0.25, 0.5), screen_eval="s.txt",
+                 judge_eval="j.txt", workdir=str(tmp_path / "w"), out=out, top=2, log=lambda *a: None)
+    rows = rep["candidates"]
+    assert {r["prune"] for r in rows} == {0.0, 0.25, 0.5}
+    measured = [r for r in rows if r.get("mean_kld") is not None]
+    assert 2 <= len(measured) <= 4
+    ok = [r for r in measured if (r.get("tool_retention") or 100) >= 90]
+    assert rep["winner"]["mean_kld"] == min(r["mean_kld"] for r in ok)
+    assert all(r["prune"] != 0.25 for r in rows if r.get("winner"))            # its tool calls dropped
+    assert os.path.exists(out) and rep["why"].startswith(f"{int(round(100 * rep['chosen_prune']))}% of routed")
+    # a 1-bit plan that was measured has its no-1-bit twin measured beside it
+    for r in measured:
+        if r["allow_1bit"] and r.get("n_1bit"):
+            assert any(x["prune"] == r["prune"] and not x["allow_1bit"] and x.get("mean_kld") is not None
+                       for x in measured)
+    tab = M.auto_table(rep)
+    assert "**" in tab and tab.count("\n") >= len([r for r in rows if r.get("feasible")])
+
+
+def test_card_states_the_chosen_prune_and_the_candidates():
+    import pollard_card as C
+    b = {"name": "M-Pollard-MOE.gguf", "moefit": {"chosen_prune": 0.25, "keep": 24, "experts": 32, "scores": "reap",
+                                                  "budget_gb": 0.36, "why": "25% of routed experts pruned ...",
+                                                  "table": "| prune |\n|---|\n| 25% |"}}
+    out = "\n".join(C.moe_allocation_section([b, {"name": "x.gguf"}]))
+    assert "25% of the routed experts pruned" in out and "keep 24/32" in out and "| 25% |" in out
+    assert "REAP" in out and C.moe_allocation_section([{"name": "x"}]) == []
+
+
+def test_release_ladder_adds_the_moe_rung_for_a_moe(monkeypatch, tmp_path):
+    import pollard_release as R
+    f = tmp_path / "m-f16.gguf"
+    f.write_bytes(b"GGUF" + b"\0" * 4096)
+    monkeypatch.setattr(R, "_is_moe_gguf", lambda p: True)
+    labels = dict(R.gguf_ladder_labels({"f16": str(f)}))
+    assert "MOE" in labels and labels["MOE"] == pytest.approx(labels["IQ2"])
+    monkeypatch.setattr(R, "_is_moe_gguf", lambda p: False)
+    assert "MOE" not in dict(R.gguf_ladder_labels({"f16": str(f)}))

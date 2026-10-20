@@ -891,6 +891,28 @@ def _rung_result(results, b):
     return (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {})
 
 
+def moe_allocation_section(builds):
+    """The measured MoE rung: how much was pruned and why -- every candidate pollard-moefit auto screened (prune
+    fraction x bit mix at the rung's bytes) with what it predicted and, for the ones built, what they MEASURED."""
+    out = []
+    for b in builds:
+        m = b.get("moefit")
+        if not m:
+            continue
+        pct = int(round(100 * float(m.get("chosen_prune") or 0)))
+        out += [f"## MoE allocation: `{b.get('name', '-')}`", "",
+                (f"**{pct}% of the routed experts pruned** (keep {m.get('keep')}/{m.get('experts')} per layer, "
+                 f"scored by {'REAP' if m.get('scores') == 'reap' else 'router traffic'})" if pct else
+                 f"**No experts pruned** (all {m.get('experts')} kept)")
+                + f", the remaining experts mixed per tensor at {m.get('budget_gb')} GB. Chosen by measurement, "
+                "not a fixed rule: every prune fraction was screened with its best bit mix at the same bytes, and "
+                "the best candidates were built and measured against the full model on held-out text (mean KLD, "
+                "top-1, PPL) with the tool-call gate.", "", f"Why: {m.get('why')}.", "", m.get("table") or "", "",
+                "_Screened KL = the pruned model's own measured KL + the allocator's predicted KL for its bit mix "
+                "(1-bit experts priced by their measured cost). Measured mean KLD is vs the full model._", ""]
+    return out
+
+
 def retention_section(builds, results):
     """"Retention vs f16": what each rung keeps of the f16 on real work, from pollard-taskeval (per-category
     task retention), its mt suite (chrF++ per language), pollard-toolcall (tool-call validity vs the f16's)
@@ -1438,6 +1460,7 @@ def main():
     if decision and dec_rows:
         out += decision_section(builds, results)
     out += retention_section(builds, results)
+    out += moe_allocation_section(builds)
     if one_repo and primary != "gguf":
         out += lane_folder_section(primary, builds, results, repo, facts.get("tools"))
     else:

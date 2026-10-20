@@ -20,6 +20,12 @@ full-expert build can reach: iq1_s everywhere is the floor).
 
     python3 moe_k1_arms.py --work ~/pollard_k1 --hf ~/pollard_k1/hf --step all
     python3 moe_k1_arms.py --work ~/pollard_k1 --step table          # the results table from results.json
+    python3 moe_k1_arms.py --work ~/pollard_k1 --step auto           # the AUTO-AWARE prune x mix at each budget
+
+The auto step (pollard-moefit auto) replaces the fixed p25 / p50 arms: prune fractions 0 / 10 / 25 / 40 / 50 % are
+screened at each budget with the measured low-bit costs (pollard-moefit lowbit on the allocation eval), the best three
+(+ the no-1-bit twin of any 1-bit plan) are built and judged on kld_eval with the tool gate, and the winner is reported
+per budget.
 
 Steps are idempotent (an output that exists is reused) and each checks the disk floor before writing."""
 from __future__ import annotations
@@ -314,6 +320,62 @@ def step_arms(c):
                      f"{name}, measured knapsack, 1-bit experts allowed @{bt}", "b" if prune is None else "d", prune)
 
 
+# ------------------------------------------------------------------------------------------------ auto
+
+def step_lowbit(c, model, imatrix, tag):
+    out = c.p(f"{tag}.lowbit.json")
+    if not (os.path.exists(out) and all(all(v.get("kl", {}).get(q) is not None for q in ("iq1_s", "iq1_m", "iq2_xxs"))
+                                        for v in json.load(open(out))["classes"].values())):
+        floors(c.w, 2.0)
+        run(c.tool("pollard_moefit.py", "lowbit", "--gguf", model, "--imatrix", imatrix, "--eval", c.p("sens_eval.txt"),
+                   "--out", out, "--llama-quantize", c.q, "--llama-perplexity", c.ppl, "--ngl", str(c.a.ngl),
+                   "--workdir", c.p("lowbit-work")), c.p(f"{tag}.lowbit.log"))
+    return out
+
+
+def step_auto(c):
+    src = c.src()
+    imx = step_imatrix(c, src, "full")
+    sens = step_sensitivity(c, src, imx, "full")
+    em = step_errmap(c, src, imx, "full")
+    lb = step_lowbit(c, src, imx, "full")
+    step_base(c)
+    bud = c.results().get("_budgets") or {}
+    if not bud:
+        raise SystemExit("no budgets recorded -- run --step arms first (or set _budgets)")
+    for bt in ("hi", "mid", "lo"):
+        B = bud[f"B_{bt}"]
+        key = f"auto-{bt}"
+        if c.results().get(key, {}).get("winner"):
+            continue
+        floors(c.w, 6.0)
+        rep_path = c.p(f"{key}.moefit.json")
+        run(c.tool("pollard_moefit.py", "auto", "--gguf", src, "--imatrix", imx, "--errmap", em, "--sensitivity", sens,
+                   "--lowbit", lb, "--reap", c.p("reap.json"), "--bytes", str(B), "--prunes", c.a.auto_prunes,
+                   "--screen-eval", c.p("sens_eval.txt"), "--eval", c.p("kld_eval.txt"), "--judge-chunks",
+                   str(c.a.kld_chunks), "--top", "3", "--embd", "q8_0", "--out", c.p(f"{key}.gguf"),
+                   "--report", rep_path, "--workdir", c.p("auto-work"), "--llama-quantize", c.q,
+                   "--llama-perplexity", c.ppl, "--ngl", str(c.a.ngl)), c.p(f"{key}.log"))
+        rep = json.load(open(rep_path))
+        c.save(key, {"budget": B, "winner": rep["winner"], "why": rep["why"], "candidates": rep["candidates"]})
+        if not c.a.keep_rungs and os.path.exists(c.p(f"{key}.gguf")):
+            os.remove(c.p(f"{key}.gguf"))
+        log(f"  {key}: {rep['why']}")
+
+
+def auto_tables(c):
+    import pollard_moefit as M
+    res = c.results()
+    out = []
+    for bt in ("hi", "mid", "lo"):
+        r = res.get(f"auto-{bt}")
+        if not r:
+            continue
+        rep = {"candidates": r["candidates"]}
+        out += [f"### budget {bt}: {r['budget'] / 1e9:.4f} GB -- winner: {r['why']}", "", M.auto_table(rep), ""]
+    return "\n".join(out)
+
+
 # ------------------------------------------------------------------------------------------------ table
 
 _CALL = re.compile(r'^\s*(?:<\|?tool_call\|?>)?\s*\[?\s*\{\s*"arguments"\s*:\s*(\{.*?\})\s*,\s*"name"\s*:\s*"([^"]+)"'
@@ -364,6 +426,9 @@ def step_table(c):
                      f"{v['mean_kld']:.4f} | {v.get('p99_kld') or '-'} | {v.get('top1')} | {v.get('ppl')} | "
                      f"{tr if tr is not None else v.get('tool_status', '-')} | {tool_agreement(c, k)} | {hs} |")
     txt = "\n".join(lines)
+    at = auto_tables(c)
+    if at:
+        txt += "\n\n## auto-aware prune x bit mix (pollard-moefit auto)\n\n" + at
     print(txt)
     open(c.p("results.md"), "w").write(txt + "\n")
 
@@ -387,7 +452,8 @@ def main():
     ap.add_argument("--no-sens", action="store_true", help="skip pollard-sensitivity (relative-error allocation)")
     ap.add_argument("--no-tool", action="store_true")
     ap.add_argument("--keep-rungs", action="store_true")
-    ap.add_argument("--step", default="all", choices=("all", "corpora", "convert", "arms", "table"))
+    ap.add_argument("--auto-prunes", default="0,0.1,0.25,0.4,0.5")
+    ap.add_argument("--step", default="all", choices=("all", "corpora", "convert", "arms", "auto", "table"))
     a = ap.parse_args()
     c = Ctx(a)
     if a.step in ("all", "corpora"):
@@ -403,7 +469,9 @@ def main():
                     log(f"freed {f} (re-download to rebuild)")
     if a.step in ("all", "arms"):
         step_arms(c)
-    if a.step in ("all", "table", "arms"):
+    if a.step in ("all", "auto"):
+        step_auto(c)
+    if a.step in ("all", "table", "arms", "auto"):
         step_table(c)
 
 

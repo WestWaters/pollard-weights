@@ -11,6 +11,24 @@ measured; this is Pollard's version of that allocator, for every lane that can s
     pollard-moefit plan    --errmap m.errmap.json --sensitivity m.sensitivity.json --gb 0.55 --out plan.json
     pollard-moefit build   --gguf m-f16.gguf --imatrix m.imatrix.gguf --plan plan.json --out m-Pollard-MoE.gguf
     pollard-moefit exl3-recipe --model ./M --routing routing.json --sensitivity s.json --bpw 1.8 --out recipe.yaml
+    pollard-moefit lowbit  --gguf m-f16.gguf --imatrix m.imatrix.gguf --eval sens.txt --out m.lowbit.json
+    pollard-moefit auto    --gguf m-f16.gguf --imatrix m.imatrix.gguf --errmap m.errmap.json --sensitivity s.json \
+                           --lowbit m.lowbit.json --gb 0.36 --screen-eval sens.txt --eval judge.txt --out m-MOE.gguf
+
+THE AUTO-AWARE PRUNE (auto) -- the default for a MoE release rung
+
+  No fixed prune fraction: every p in {0, 10, 25, 40, 50 %} (REAP scores pick which experts go) is screened at the
+  SAME byte budget -- the pruned model's own KL measured, the bit mix for what is left planned on the error map
+  restricted to the kept experts -- and the best 2-3 are built and MEASURED (KLD / top-1 / PPL on a held-out judge
+  eval, the tool gate). The lowest measured KLD whose tool calls hold wins; the report (and the card) carries every
+  candidate and why the winner won.
+
+THE 1-BIT COST (lowbit)
+
+  e(t, q) is a weight-space error; the KL a 1-bit tensor costs is not linear in it. lowbit MEASURES each expert
+  class (layer x gate/up/down) at iq1_s, iq1_m and the iq2_xxs anchor -- quantize that class alone, KL on held-out
+  text with the real routing -- and plan prices those types by the measurement (other types scale from the
+  nearest measured anchor). A 1-bit tensor is bought only where its measured cost per byte beats the alternatives.
 
 THE MEASUREMENT (errmap)
 
@@ -468,14 +486,24 @@ def fixed_bytes(em, head=DEFAULT_HEAD, embd=DEFAULT_EMBD):
 
 
 def plan(em, budget_bytes, sens=None, probe=None, floors=None, ceil=DEFAULT_CEIL, allow_1bit=True,
-         head=DEFAULT_HEAD, embd=DEFAULT_EMBD, types=None, max_cells=200_000_000):
+         head=DEFAULT_HEAD, embd=DEFAULT_EMBD, types=None, max_cells=200_000_000, lowbit=None):
     """the per-tensor type choice: exact multiple-choice knapsack on KL(t, q) = S_t * e(t, q) / e(t, probe) under
-    the whole file's bytes <= budget_bytes."""
+    the whole file's bytes <= budget_bytes.
+
+    lowbit (pollard-moefit lowbit, or {"tensor_costs": ...}): the routed-expert tensors' KL MEASURED at the low
+    types (iq1_s / iq1_m / iq2_xxs, one class crushed at a time) replaces the extrapolated law for those tensors:
+    a measured type costs what it measured, any other type is scaled from the nearest measured anchor at or above
+    it, KL(t, q) = KL(t, a) * e(t, q) / e(t, a) -- so a 1-bit choice is priced by its own measurement, never by a
+    straight line drawn from the 2-bit probe."""
     from pollard_exlr8 import knapsack
     tensors = em["tensors"]
     types = [q for q in (types or em["types"]) if q in QUANT_SIZES]
     probe = probe or (sens or {}).get("probe") or "iq2_xxs"
     S = tensor_sensitivity(tensors, sens)
+    if lowbit and not sens:
+        raise ValueError("measured low-bit costs are KL: they need the measured sensitivity profile (--sensitivity) "
+                         "so every tensor is priced in the same unit")
+    LB = resolve_lowbit(lowbit, tensors) if lowbit else {}
     fixed = fixed_bytes(em, head, embd)
     names = sorted(tensors, key=lambda n: (tensors[n]["layer"] if tensors[n]["layer"] is not None else -1, n))
     items = []
@@ -493,7 +521,8 @@ def plan(em, budget_bytes, sens=None, probe=None, floors=None, ceil=DEFAULT_CEIL
             b = int(t["bytes"][q] if q in t["bytes"] else type_bytes(q, t["numel"]))
             if passthrough and (b > t["src_bytes"] or q == t["src_type"]):
                 continue                                 # never "upgrade" a QAT tensor; its own type is below
-            opts.append((b, S[n] * float(e) / ref, q))
+            cost = lowbit_cost(LB[n], t, q) if n in LB else S[n] * float(e) / ref
+            opts.append((b, cost, q))
         if passthrough:                                  # the source's own bytes, copied verbatim: zero error
             opts.append((int(t["src_bytes"]), 0.0, t["src_type"]))
         if not opts:
@@ -504,7 +533,10 @@ def plan(em, budget_bytes, sens=None, probe=None, floors=None, ceil=DEFAULT_CEIL
         raise ValueError(f"budget {budget_bytes} B is below the fixed tensors' {fixed} B")
     res = knapsack(items, budget, max_cells=max_cells)
     chosen = dict(zip(names, res["choice"]))
-    return summarize(em, chosen, fixed, res, head, embd, sens is not None, probe)
+    out = summarize(em, chosen, fixed, res, head, embd, sens is not None, probe)
+    if LB:
+        out["estimate"] = "measured+lowbit"
+    return out
 
 
 def _interp_rel(rel, q):
@@ -718,6 +750,541 @@ def _mixed_within_layer(bits):
     return any(len(v) > 1 for v in seen.values())
 
 
+# ------------------------------------------------------------------------------------------------ measured low-bit cost
+
+FORMAT_LOWBIT = "pollard-moefit-lowbit"
+FORMAT_AUTO = "pollard-moefit-auto"
+#: the types whose cost is MEASURED per class (the 1-bit pair + the 2-bit anchor every higher type scales from)
+LOWBIT_TYPES = ("iq2_xxs", "iq1_m", "iq1_s")
+
+
+def expert_class(name, granularity="proj"):
+    """the class a routed-expert tensor is measured in: "<layer>.<proj>" (gate / up / down / gate_up) or "<layer>"."""
+    m = re.match(r"^blk\.(\d+)\.ffn_(gate|up|down|gate_up)_exps\.weight$", name)
+    if not m:
+        return None
+    return f"{m.group(1)}.{m.group(2)}" if granularity == "proj" else m.group(1)
+
+
+def resolve_lowbit(lb, tensors):
+    """{tensor: {type: KL}} from a lowbit measurement: a class of one tensor is that tensor's cost; a class of
+    several (granularity "layer") is split by each tensor's share of the class's measured output error at that
+    type, w_t(q) = numel_t * e(t, q)."""
+    if not lb:
+        return {}
+    if "tensor_costs" in lb:
+        return {n: dict(c) for n, c in lb["tensor_costs"].items() if n in tensors}
+    out = {}
+    for cls in (lb.get("classes") or {}).values():
+        names = [n for n in cls.get("tensors", []) if n in tensors]
+        for q, kl in (cls.get("kl") or {}).items():
+            if kl is None or not names:
+                continue
+            w = {n: tensors[n]["numel"] * float(tensors[n]["rel"].get(q) or _interp_rel(tensors[n]["rel"], q) or 0)
+                 for n in names}
+            tot = sum(w.values())
+            for n in names:
+                share = w[n] / tot if tot > 0 else 1.0 / len(names)
+                out.setdefault(n, {})[q] = max(0.0, float(kl)) * share
+    return out
+
+
+def lowbit_cost(meas, t, q):
+    """KL of tensor t at type q from its measured anchors: the measurement itself, else the nearest measured type at
+    or above q (the highest anchor when q is above them all) scaled by the measured output-error ratio."""
+    if q in meas:
+        return float(meas[q])
+    anchors = sorted(meas, key=bpw_of)
+    above = [a for a in anchors if bpw_of(a) >= bpw_of(q)]
+    a = above[0] if above else anchors[-1]
+    ea = float(t["rel"].get(a) or _interp_rel(t["rel"], a) or 0.0)
+    eq = float(t["rel"].get(q) or _interp_rel(t["rel"], q) or 0.0)
+    if ea <= 0:
+        return float(meas[a])
+    return float(meas[a]) * eq / ea
+
+
+def _kld(perplexity, model, eval_path, base, ngl=99, chunks=None):
+    """llama-perplexity --kl-divergence against stored base logits -> {mean_kld, median_kld, p99_kld, top1, ppl,
+    ref_ppl}; every value None when the run failed."""
+    cmd = [perplexity, "-m", model, "-f", eval_path, "--kl-divergence", "--kl-divergence-base", base,
+           "-ngl", str(ngl), "-c", "512"] + (["--chunks", str(chunks)] if chunks else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+
+    def g(pat):
+        m = re.search(pat, out, re.M)
+        return float(m.group(1)) if m else None
+    return {"mean_kld": g(r"^Mean\s+KLD:\s*(-?[0-9.]+)"), "median_kld": g(r"^Median\s+KLD:\s*(-?[0-9.]+)"),
+            "p99_kld": g(r"^99\.0%\s+KLD:\s*([0-9.]+)"), "top1": g(r"^Same top p:\s*([0-9.]+)"),
+            "ppl": g(r"^Mean PPL\(Q\)\s*:\s*([0-9.]+)"), "ref_ppl": g(r"^Mean PPL\(base\)\s*:\s*([0-9.]+)")}
+
+
+def _base_logits(perplexity, model, eval_path, out, ngl=99, chunks=None):
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        return out
+    cmd = [perplexity, "-m", model, "-f", eval_path, "--kl-divergence-base", out, "-ngl", str(ngl), "-c", "512"] + \
+        (["--chunks", str(chunks)] if chunks else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise SystemExit("could not write the base logits:\n" + "\n".join((r.stderr or r.stdout).strip().splitlines()[-8:]))
+    return out
+
+
+def _quantized_source(path):
+    import gguf
+    r = gguf.GGUFReader(path)
+    for t in r.tensors:
+        if role_of(t.name, len(t.shape)) == ROLE_EXPERT:
+            return gguf.GGMLQuantizationType(t.tensor_type).name.lower() not in ("f32", "f16", "bf16")
+    return False
+
+
+def _quantize(quantize, src, imatrix, out, lines, requant, threads=None):
+    tt = out + ".tensor-types.txt"
+    with open(tt, "w") as f:
+        f.write("".join(x + "\n" for x in lines))
+    cmd = [quantize] + (["--allow-requantize"] if requant else []) + ["--imatrix", imatrix] + \
+        (["--tensor-type-file", tt] if lines else []) + [src, out, "Q8_0"] + ([str(threads)] if threads else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    os.path.exists(tt) and os.remove(tt)
+    if r.returncode != 0 or not _gguf_ok(out):
+        return "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-6:])
+    return None
+
+
+def lowbit(gguf_path, imatrix, eval_path, out, types=LOWBIT_TYPES, granularity="proj", quantize="llama-quantize",
+           perplexity="llama-perplexity", ngl=99, workdir=None, threads=None, log=print, chunks=None):
+    """MEASURE each routed-expert class's KL at each low type: the class alone is quantized to q (everything else
+    as the reference build), llama-perplexity --kl-divergence on the held-out eval against the source's logits, minus
+    the reference build's own KL. One build + one forward pass per (class, type); resumable (the out file is
+    rewritten after every probe and a re-run skips what it holds).
+
+    This is the 1-bit cost the allocator uses instead of extrapolating the 2-bit probe's sensitivity down the
+    relative-error curve: on granite-3.1-1b-a400m that extrapolation priced iq1_s experts below what they cost, and
+    the knapsack bought 1-bit where 2-bit measured better."""
+    import gguf
+    src = gguf.GGUFReader(gguf_path)
+    classes = {}
+    for t in src.tensors:
+        c = expert_class(t.name, granularity)
+        if c is not None:
+            classes.setdefault(c, []).append(t.name)
+    if not classes:
+        raise SystemExit("no routed-expert tensors (ffn_*_exps) in this GGUF -- lowbit is for a MoE")
+    order = sorted(classes, key=lambda c: tuple(int(x) if x.isdigit() else x for x in c.split(".")))
+    requant = _quantized_source(gguf_path)
+    state = {}
+    if out and os.path.exists(out):
+        try:
+            state = json.load(open(out))
+        except ValueError:
+            state = {}
+    same = (state.get("format") == FORMAT_LOWBIT and state.get("source") == os.path.abspath(gguf_path)
+            and state.get("eval") == os.path.abspath(eval_path) and state.get("granularity") == granularity)
+    if not same:
+        state = {"format": FORMAT_LOWBIT, "source": os.path.abspath(gguf_path), "imatrix": os.path.abspath(imatrix),
+                 "eval": os.path.abspath(eval_path), "granularity": granularity, "types": list(types),
+                 "ref_kl": None, "classes": {c: {"tensors": classes[c], "kl": {}} for c in order}}
+    state["types"] = sorted(set(state.get("types", [])) | set(types), key=bpw_of)
+    work = workdir or tempfile.mkdtemp(prefix="pollard_lowbit_")
+    os.makedirs(work, exist_ok=True)
+    base = _base_logits(perplexity, gguf_path, eval_path, os.path.join(work, "lowbit-base.kld"), ngl, chunks)
+    probe = os.path.join(work, "lowbit-probe.gguf")
+
+    def save():
+        if out:
+            tmp = out + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=1)
+            os.replace(tmp, out)
+    if state.get("ref_kl") is None:
+        err = _quantize(quantize, gguf_path, imatrix, probe, [], requant, threads)
+        if err:
+            raise SystemExit(f"reference build failed:\n{err}")
+        state["ref_kl"] = _kld(perplexity, probe, eval_path, base, ngl, chunks)["mean_kld"] or 0.0
+        os.remove(probe)
+        save()
+    ref = float(state["ref_kl"])
+    n_total = len(order) * len(types)
+    done, t0 = 0, time.time()
+    log(f"  lowbit: {len(order)} classes x {list(types)}  reference build KL {ref:.5f}")
+    for c in order:
+        rec = state["classes"].setdefault(c, {"tensors": classes[c], "kl": {}})
+        for q in types:
+            done += 1
+            if rec["kl"].get(q) is not None:
+                continue
+            err = _quantize(quantize, gguf_path, imatrix, probe,
+                            [f"^{re.escape(n)}$={q}" for n in classes[c]], requant, threads)
+            if err:
+                log(f"    {c} {q}: build FAILED ({err.splitlines()[-1] if err else ''}) -- left unmeasured")
+                continue
+            k = _kld(perplexity, probe, eval_path, base, ngl, chunks)["mean_kld"]
+            os.remove(probe)
+            rec["kl"][q] = None if k is None else round(max(0.0, k - ref), 6)
+            save()
+        el = time.time() - t0
+        log(f"    {c:10} " + "  ".join(f"{q}={rec['kl'].get(q)}" for q in types)
+            + f"   [{done}/{n_total}  {el:5.0f}s]")
+    if workdir is None:
+        shutil.rmtree(work, ignore_errors=True)
+    save()
+    return state
+
+
+# ------------------------------------------------------------------------------------------------ pruned candidates
+
+def prune_errmap(em, keep):
+    """the error map of the model with only `keep` = {layer: [expert indices]} left, derived from the FULL model's
+    per-expert measurement: each routed-expert tensor keeps its kept experts' rows (bytes scale exactly -- one
+    expert is a whole number of blocks), its relative error is re-aggregated over the kept experts with their
+    traffic, the router shrinks with it. Nothing is re-measured: it is the screening estimate the auto search
+    ranks candidates with before it builds and measures the best of them."""
+    import copy
+    out = copy.deepcopy(em)
+    for n, t in out["tensors"].items():
+        if t["role"] != ROLE_EXPERT or t.get("layer") not in keep and str(t.get("layer")) not in keep:
+            continue
+        idx = list(keep.get(t["layer"], keep.get(str(t["layer"]))))
+        E = int(t["shape"][0])
+        k = len(idx)
+        f = k / E
+        t["shape"] = [k] + list(t["shape"][1:])
+        t["numel"] = int(t["numel"] * f)
+        t["bytes"] = {q: int(b * k // E) for q, b in t["bytes"].items()}
+        if "src_bytes" in t:
+            t["src_bytes"] = int(t["src_bytes"] * k // E)
+        ex = t.get("experts")
+        if ex:
+            cnt = np.asarray(ex["count"], dtype=np.float64)[idx]
+            en = np.asarray(ex["energy"], dtype=np.float64)[idx]
+            errs = {q: list(np.asarray(v, dtype=np.float64)[idx]) for q, v in ex["err"].items()}
+            t["experts"] = {"count": [float(x) for x in cnt], "energy": [float(x) for x in en],
+                            "err": {q: [float(x) for x in v] for q, v in errs.items()}}
+            for q, v in errs.items():
+                t["rel"][q] = aggregate(np.asarray(v) * en, en, cnt)
+    for n, f_ in out.get("fixed", {}).items():
+        L = layer_of(n)
+        if f_["role"] == ROLE_ROUTER and L is not None and (L in keep or str(L) in keep):
+            idx = keep.get(L, keep.get(str(L)))
+            E = int(em.get("n_experts") or 0) or _n_experts(em, L)
+            if E:
+                f_["numel"] = int(f_["numel"] * len(idx) // E)
+                f_["src_bytes"] = int(f_["src_bytes"] * len(idx) // E)
+    out["routing"] = {L: {"counts": [p["counts"][i] for i in keep.get(int(L), keep.get(str(L), range(len(p["counts"]))))],
+                          "share": None} for L, p in (em.get("routing") or {}).items()}
+    for p in out["routing"].values():
+        tot = sum(p["counts"]) or 1.0
+        p["share"] = [c / tot for c in p["counts"]]
+    out["pruned_from"] = em.get("source")
+    return out
+
+
+def _n_experts(em, L):
+    for t in em["tensors"].values():
+        if t["role"] == ROLE_EXPERT and t.get("layer") == L:
+            return int(t["shape"][0])
+    return 0
+
+
+def prune_lowbit(lb, em_full, em_pruned):
+    """the measured class costs carried onto a pruned candidate: each tensor's measured KL scaled by the ratio of
+    its kept experts' relative error to the full tensor's at that type (screening estimate; the build is judged by
+    its own measurement)."""
+    if not lb:
+        return None
+    full = resolve_lowbit(lb, em_full["tensors"])
+    out = {}
+    for n, costs in full.items():
+        tf, tp = em_full["tensors"][n], em_pruned["tensors"].get(n)
+        if tp is None:
+            continue
+        out[n] = {}
+        for q, kl in costs.items():
+            ef = float(tf["rel"].get(q) or 0.0)
+            ep = float(tp["rel"].get(q) or 0.0)
+            out[n][q] = kl * ep / ef if ef > 0 else kl
+    return {"tensor_costs": out}
+
+
+def slice_imatrix(imatrix, keep, out):
+    """a GGUF imatrix for the pruned model: every routed-expert entry keeps only the kept experts' rows (in_sum2 and
+    counts), so llama-quantize finds an entry of the right size for each pruned expert tensor; everything else, and
+    the datasets / chunk metadata, is copied."""
+    import gguf
+    from pollard_prune import _copy_field
+    r = gguf.GGUFReader(imatrix)
+    w = gguf.GGUFWriter(out, "imatrix")
+    for field in r.fields.values():
+        if field.name in ("general.architecture", "GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"):
+            continue
+        _copy_field(w, field)
+    for t in r.tensors:
+        arr = np.asarray(t.data)
+        base = re.sub(r"\.(in_sum2|counts)$", "", t.name)
+        m = re.match(r"^blk\.(\d+)\.ffn_(gate|up|down|gate_up)_exps\.weight$", base)
+        if m:
+            L = int(m.group(1))
+            idx = keep.get(L, keep.get(str(L)))
+            if idx is not None and arr.ndim >= 1 and arr.shape[0] > len(idx):
+                arr = np.take(arr, list(idx), axis=0)
+        w.add_tensor(t.name, np.ascontiguousarray(arr.astype(np.float32)))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return out
+
+
+def _gguf_experts(path):
+    import gguf
+    r = gguf.GGUFReader(path)
+    n_exp = n_used = None
+    for f in r.fields.values():
+        if f.name.endswith(".expert_count"):
+            n_exp = int(f.parts[f.data[0]][0])
+        elif f.name.endswith(".expert_used_count"):
+            n_used = int(f.parts[f.data[0]][0])
+    return n_exp, n_used
+
+
+def keep_sets(n_exp, n_used, prunes, scores):
+    """{fraction: (K, {layer: kept indices})} for each prune fraction, K = round((1 - p) * E) experts per layer, the
+    top-K by score in each layer; fractions that would leave fewer than the router's top-k (or repeat a K) dropped."""
+    out, seen = {}, set()
+    for p in sorted(set(float(x) for x in prunes)):
+        K = int(round((1.0 - p) * n_exp))
+        if K < max(1, n_used or 1) or K > n_exp or K in seen:
+            continue
+        seen.add(K)
+        keep = {int(L): sorted(int(i) for i in np.argsort(np.asarray(sc))[::-1][:K]) for L, sc in scores.items()}
+        out[round(p, 4)] = (K, keep)
+    return out
+
+
+def expert_scores(reap=None, imx=None):
+    """{layer: per-expert keep score}: REAP saliency from a pollard-reap file when given, else the router's token
+    counts on the calibration corpus (the imatrix's per-expert counts) -- frequency, the cheap REAP proxy."""
+    if reap:
+        d = json.load(open(reap)) if isinstance(reap, str) else reap
+        return {int(L): list(v["reap"]) for L, v in d["layers"].items()}, "reap"
+    prof = routing_profile(imx or {})
+    if not prof:
+        raise SystemExit("no expert scores: give --reap (pollard-reap) or an imatrix with per-expert counts")
+    return {int(L): p["counts"] for L, p in prof.items()}, "router-count"
+
+
+def _min_bytes(em, allow_1bit, floors=None, head=DEFAULT_HEAD, embd=DEFAULT_EMBD):
+    b = fixed_bytes(em, head, embd)
+    for t in em["tensors"].values():
+        al = [q for q in allowed_types(t["role"], em["types"], floors, DEFAULT_CEIL, allow_1bit) if q in t["rel"]]
+        b += min(t["bytes"].get(q, type_bytes(q, t["numel"])) for q in al) if al else t.get("src_bytes", 0)
+    return b
+
+
+def _prune_gguf(src, K, keep_list_path, scores_path, out, log=print):
+    """the pruned GGUF via pollard-prune (same writer the release uses)."""
+    cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pollard_prune.py"),
+           "--gguf", src, "--keep-experts", str(K), "--score", "reap", "--scores", scores_path, "--out", out,
+           "--keep-list", keep_list_path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not _gguf_ok(out):
+        raise SystemExit("pollard-prune failed:\n" + "\n".join((r.stderr or r.stdout).strip().splitlines()[-8:]))
+    return out
+
+
+def _toolgate(rung, ref, ngl, out_json, log=print):
+    """pollard-toolcall on the rung vs the reference (served llama-server, Pollard's reader on the content)."""
+    if not os.path.exists(out_json):
+        cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pollard_toolcall.py"),
+               "--gguf", rung, "--ref", ref, "--ngl", str(ngl), "--out", out_json]
+        subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        d = json.load(open(out_json))
+    except (OSError, ValueError):
+        return {"tool_status": "not-measured"}
+    sc, rs = d.get("score") or {}, d.get("ref_score") or {}
+    ret = d.get("retention")
+    return {"tool_status": d.get("status", "measured"), "tool_rate": sc.get("rate"), "tool_ref_rate": rs.get("rate"),
+            "tool_parse": sc.get("parse_rate"), "tool_ref_parse": rs.get("parse_rate"),
+            "tool_retention": round(100 * ret, 1) if ret is not None else None, "tool_n": sc.get("n"),
+            "tool_verdict": d.get("verdict")}
+
+
+def auto(src, imatrix, em, sens, lb, budget_bytes, prunes=(0.0, 0.10, 0.25, 0.40, 0.50), reap=None,
+         screen_eval=None, judge_eval=None, workdir=None, out=None, quantize="llama-quantize",
+         perplexity="llama-perplexity", ngl=99, top=3, toolcall=True, tool_ref=None, head=DEFAULT_HEAD,
+         embd=DEFAULT_EMBD, controls=True, min_tool_retention=90.0, judge_chunks=None, keep_candidates=False,
+         log=print):
+    """THE AUTO-AWARE MoE ALLOCATION: prune fraction x bit mix at ONE byte budget, chosen by measurement.
+
+      1. screen every prune fraction p (0 = no pruning): K = round((1-p) E) experts kept per layer by REAP score;
+         the pruned model is written and its OWN damage measured (KL vs the full model's logits on the screening
+         eval -- the allocation eval, not the judge's); the bit mix for its remaining experts is the exact
+         knapsack at the budget on the full model's error map restricted to the kept experts, with the measured
+         low-bit costs. Screening score = prune KL + the knapsack's predicted KL.
+      2. measure the `top` best for real: build at the budget, llama-perplexity --kl-divergence vs the FULL
+         model on the held-out judge eval (mean / p99 KLD, top-1, PPL) and the tool gate vs the full model. When a
+         measured plan uses 1-bit experts, its no-1-bit twin at the same bytes is measured beside it (`controls`).
+      3. the winner = lowest measured mean KLD among the candidates whose tool-call retention holds
+         (>= min_tool_retention, or not measurable); its file goes to `out`.
+
+    Returns the report (every candidate's screening + measured numbers, the winner and why)."""
+    from pollard_prune import reap_layers  # noqa: F401 -- same scorer the CLI prune uses
+    work = workdir or tempfile.mkdtemp(prefix="pollard_moeauto_")
+    os.makedirs(work, exist_ok=True)
+    screen_eval = screen_eval or judge_eval
+    judge_eval = judge_eval or screen_eval
+    if not screen_eval:
+        raise SystemExit("auto needs held-out text: --screen-eval (allocation) and --eval (judge)")
+    n_exp, n_used = _gguf_experts(src)
+    if not n_exp or n_exp < 2:
+        raise SystemExit("not a MoE: no expert_count in the GGUF")
+    imx, _ = read_imatrix(imatrix)
+    scores, score_kind = expert_scores(reap, imx)
+    scores_path = os.path.join(work, "expert-scores.json")
+    json.dump({"format": "pollard-reap", "score": score_kind,
+               "layers": {str(L): {"reap": v, "count": v, "ean": v} for L, v in scores.items()}},
+              open(scores_path, "w"))
+    requant = _quantized_source(src)
+    sbase = _base_logits(perplexity, src, screen_eval, os.path.join(work, "screen-base.kld"), ngl)
+    jbase = _base_logits(perplexity, src, judge_eval, os.path.join(work, "judge-base.kld"), ngl, judge_chunks)
+    sets = keep_sets(n_exp, n_used, prunes, scores)
+    log(f"== pollard-moefit auto :: {os.path.basename(src)}  {n_exp} experts (top-{n_used})  budget "
+        f"{budget_bytes / 1e9:.4f} GB  prune fractions {sorted(sets)}  scores {score_kind}")
+    cands, models = [], {}
+    for p, (K, keep) in sorted(sets.items()):
+        tag = f"p{int(round(100 * p)):02d}"
+        if p == 0:
+            model, im, emp, lbp, pkl = src, imatrix, em, lb, 0.0
+        else:
+            model = os.path.join(work, f"{tag}-src.gguf")
+            klp = os.path.join(work, f"{tag}.keep.json")
+            if not _gguf_ok(model):
+                _prune_gguf(src, K, klp, scores_path, model, log)
+            im = os.path.join(work, f"{tag}.imatrix.gguf")
+            if not _gguf_ok(im):
+                slice_imatrix(imatrix, keep, im)
+            emp = prune_errmap(em, keep)
+            lbp = prune_lowbit(lb, em, emp)
+            pkl = _kld(perplexity, model, screen_eval, sbase, ngl)["mean_kld"]
+        models[p] = (model, im, emp, lbp, K, tag)
+        for one in (True, False):
+            row = {"prune": p, "keep": K, "experts": n_exp, "tag": tag, "allow_1bit": one, "prune_kl": pkl}
+            if _min_bytes(emp, one, head=head, embd=embd) > budget_bytes:
+                row.update(feasible=False)
+                cands.append(row)
+                continue
+            try:
+                pl = plan(emp, budget_bytes, sens, head=head, embd=embd, allow_1bit=one, lowbit=lbp)
+            except ValueError as e:
+                row.update(feasible=False, why=str(e)[:120])
+                cands.append(row)
+                continue
+            n1 = sum(v for q, v in pl["hist"].get(ROLE_EXPERT, {}).items() if q in TYPES_1BIT)
+            row.update(feasible=True, predicted=pl["predicted_kld"], plan=pl, bytes=pl["bytes"],
+                       expert_bpw=pl["bpw_role"].get(ROLE_EXPERT), n_1bit=n1,
+                       score=(pkl or 0.0) + pl["predicted_kld"])
+            cands.append(row)
+        log(f"   {tag}  keep {K}/{n_exp}  prune KL {pkl if pkl is not None else '-'}  " + "  ".join(
+            f"{'1bit' if r['allow_1bit'] else 'no1bit'}: " + (f"pred {r['predicted']:.4f} score {r['score']:.4f}"
+                                                              f" ({r['n_1bit']} 1-bit)" if r.get("feasible") else "infeasible")
+            for r in cands if r["tag"] == tag))
+    # a no-1-bit row whose plan equals the 1-bit row's is the same build: keep one
+    feas = [r for r in cands if r.get("feasible")]
+    uniq = {}
+    for r in sorted(feas, key=lambda r: r["score"]):
+        key = (r["prune"], json.dumps(r["plan"]["types"], sort_keys=True))
+        uniq.setdefault(key, r)
+    ranked = sorted(uniq.values(), key=lambda r: r["score"])
+    for i, r in enumerate(ranked):
+        r["screen_rank"] = i + 1
+    chosen = ranked[:max(1, top)]
+    if controls:
+        for r in list(chosen):
+            if r["n_1bit"]:
+                twin = next((x for x in ranked if x["prune"] == r["prune"] and not x["allow_1bit"]), None)
+                if twin is not None and twin not in chosen:
+                    twin["control_for"] = r["screen_rank"]
+                    chosen.append(twin)
+    log(f"   measuring {len(chosen)} candidate(s) on the judge eval" + (" + the tool gate" if toolcall else ""))
+    for r in chosen:
+        model, im, _, _, K, tag = models[r["prune"]]
+        name = f"{tag}-{'1bit' if r['allow_1bit'] else 'no1bit'}"
+        path = os.path.join(work, f"cand-{name}-{int(budget_bytes)}.gguf")       # one work dir, many budgets
+        pj = path + ".plan.json"
+        json.dump(r["plan"], open(pj, "w"), indent=1)
+        if not _gguf_ok(path):
+            build(model, im, r["plan"], path, quantize, allow_requantize=requant)
+        r["file"] = path
+        r["bytes_built"] = os.path.getsize(path)
+        r.update({k: v for k, v in _kld(perplexity, path, judge_eval, jbase, ngl, judge_chunks).items()})
+        if toolcall:
+            r.update(_toolgate(path, tool_ref or src, ngl, path + ".toolcall.json", log))
+        log(f"   {name:12} {r['bytes_built'] / 1e9:.4f} GB  KLD {r.get('mean_kld')}  p99 {r.get('p99_kld')}  "
+            f"top-1 {r.get('top1')}  PPL {r.get('ppl')}" + (f"  tools {r.get('tool_retention')}% "
+                                                             f"(rate {r.get('tool_rate')})" if toolcall else ""))
+    measured = [r for r in chosen if r.get("mean_kld") is not None]
+
+    def tool_ok(r):
+        ret = r.get("tool_retention")
+        return ret is None or ret >= min_tool_retention
+    pool = [r for r in measured if tool_ok(r)] or measured
+    if not pool:
+        raise SystemExit("no candidate could be measured")
+    win = min(pool, key=lambda r: r["mean_kld"])
+    win["winner"] = True
+    others = sorted((r for r in measured if r is not win), key=lambda r: r["mean_kld"])
+    why = (f"{int(round(100 * win['prune']))}% of routed experts pruned (keep {win['keep']}/{n_exp} per layer), "
+           f"{'1-bit experts allowed' if win['allow_1bit'] else 'experts >= 2-bit'}: measured mean KLD "
+           f"{win['mean_kld']:.4f}")
+    if others:
+        o = others[0]
+        why += (f", next best {o['mean_kld']:.4f} at {int(round(100 * o['prune']))}% pruned"
+                f"{' (1-bit)' if o['allow_1bit'] and o.get('n_1bit') else ''}")
+    if win.get("tool_retention") is not None:
+        why += f"; tool-call retention {win['tool_retention']}%"
+    if out:
+        shutil.copyfile(win["file"], out)
+    rows = []
+    for r in sorted(cands, key=lambda r: (not r.get("feasible"), r.get("score") or 9e9)):
+        rows.append({k: v for k, v in r.items() if k not in ("plan",)} |
+                    ({"hist": r["plan"]["hist"].get(ROLE_EXPERT, {})} if r.get("plan") else {}))
+    rep = {"format": FORMAT_AUTO, "source": os.path.abspath(src), "budget_bytes": int(budget_bytes),
+           "budget_gb": round(budget_bytes / 1e9, 4), "experts": n_exp, "top_k": n_used, "scores": score_kind,
+           "screen_eval": os.path.abspath(screen_eval), "judge_eval": os.path.abspath(judge_eval),
+           "lowbit": bool(lb), "candidates": rows, "winner": {k: v for k, v in win.items() if k != "plan"},
+           "chosen_prune": win["prune"], "why": why, "out": os.path.abspath(out) if out else None}
+    rep["winner"]["hist"] = win["plan"]["hist"].get(ROLE_EXPERT, {})
+    if not keep_candidates:
+        for r in chosen:
+            if r.get("file") and os.path.exists(r["file"]) and (out or r is not win):
+                os.remove(r["file"])
+        if workdir is None:
+            shutil.rmtree(work, ignore_errors=True)
+    return rep
+
+
+def auto_table(rep):
+    """the report's candidate table (markdown), screening and measured side by side -- what the card shows."""
+    lines = ["| prune | experts kept | 1-bit | screened KL (prune + mix) | measured mean KLD | top-1 % | PPL | "
+             "tool retention | expert types |", "|---:|---:|---|---:|---:|---:|---:|---:|---|"]
+    for r in rep["candidates"]:
+        if not r.get("feasible"):
+            continue
+        h = " ".join(f"{q}:{n}" for q, n in sorted((r.get("hist") or {}).items(), key=lambda kv: bpw_of(kv[0])))
+        mk = f"**{r['mean_kld']:.4f}**" if r.get("winner") else (f"{r['mean_kld']:.4f}" if r.get("mean_kld")
+                                                                 is not None else "not built")
+        tr = r.get("tool_retention")
+        lines.append(f"| {int(round(100 * r['prune']))}% | {r['keep']}/{r['experts']} | "
+                     f"{'allowed' if r['allow_1bit'] else 'no'} ({r.get('n_1bit', 0)} tensors) | "
+                     f"{r['score']:.4f} | {mk} | {r.get('top1') if r.get('top1') is not None else '-'} | "
+                     f"{r.get('ppl') if r.get('ppl') is not None else '-'} | "
+                     f"{f'{tr}%' if tr is not None else '-'} | {h} |")
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------------------------------------ CLI
 
 def _budget(a, em):
@@ -778,6 +1345,54 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--tensor-types", help="also write the llama-quantize --tensor-type-file")
 
+    p.add_argument("--lowbit", help="pollard-moefit lowbit output: the experts' MEASURED KL at iq1_s / iq1_m / iq2_xxs")
+
+    lb = sub.add_parser("lowbit", help="MEASURE each expert class's KL at the 1-bit types (+ the 2-bit anchor)")
+    lb.add_argument("--gguf", required=True, help="source GGUF (f16/bf16, or the Q8_0 the errmap was taken from)")
+    lb.add_argument("--imatrix", required=True)
+    lb.add_argument("--eval", required=True, help="held-out text (the allocation eval: not the calibration, not "
+                                                  "the text the rungs are judged on)")
+    lb.add_argument("--out", required=True, help="cost file (resumable: a re-run skips what it holds)")
+    lb.add_argument("--types", default=",".join(LOWBIT_TYPES))
+    lb.add_argument("--granularity", choices=("proj", "layer"), default="proj",
+                    help="proj = one class per layer x gate/up/down (3 x layers probes per type); layer = the "
+                         "layer's experts together, split by measured error (for a big MoE)")
+    lb.add_argument("--llama-quantize", default="llama-quantize")
+    lb.add_argument("--llama-perplexity", default="llama-perplexity")
+    lb.add_argument("--ngl", default="99")
+    lb.add_argument("--workdir")
+    lb.add_argument("--threads", type=int)
+
+    au = sub.add_parser("auto", help="prune fraction x bit mix at one byte budget, chosen by measurement")
+    au.add_argument("--gguf", required=True, help="source GGUF (the full model; the KL reference)")
+    au.add_argument("--imatrix", required=True)
+    au.add_argument("--errmap", required=True)
+    au.add_argument("--sensitivity", required=True, help="pollard-sensitivity profile of the source")
+    au.add_argument("--lowbit", help="pollard-moefit lowbit costs (strongly recommended: 1-bit priced by measurement)")
+    au.add_argument("--reap", help="pollard-reap scores (else the imatrix's per-expert router counts)")
+    g2 = au.add_mutually_exclusive_group(required=True)
+    g2.add_argument("--gb", type=float)
+    g2.add_argument("--bytes", type=int)
+    g2.add_argument("--bpw", type=float)
+    au.add_argument("--prunes", default="0,0.1,0.25,0.4,0.5", help="fractions of routed experts to remove")
+    au.add_argument("--screen-eval", required=True, help="held-out text for the screening (allocation) KL")
+    au.add_argument("--eval", required=True, help="held-out text the measured candidates are judged on")
+    au.add_argument("--top", type=int, default=3, help="candidates built and measured for real")
+    au.add_argument("--judge-chunks", type=int, help="llama-perplexity --chunks for the judge eval")
+    au.add_argument("--no-controls", action="store_true", help="do not measure a 1-bit plan's no-1-bit twin")
+    au.add_argument("--no-toolcall", action="store_true")
+    au.add_argument("--tool-ref", help="tool-gate reference (default the source GGUF)")
+    au.add_argument("--min-tool-retention", type=float, default=90.0)
+    au.add_argument("--head", default=DEFAULT_HEAD)
+    au.add_argument("--embd", default=DEFAULT_EMBD)
+    au.add_argument("--out", required=True, help="the winning GGUF")
+    au.add_argument("--report", help="the report JSON (default <out>.moefit.json)")
+    au.add_argument("--workdir")
+    au.add_argument("--keep-candidates", action="store_true")
+    au.add_argument("--llama-quantize", default="llama-quantize")
+    au.add_argument("--llama-perplexity", default="llama-perplexity")
+    au.add_argument("--ngl", default="99")
+
     b = sub.add_parser("build", help="llama-quantize the plan")
     b.add_argument("--gguf", required=True)
     b.add_argument("--imatrix", required=True)
@@ -836,7 +1451,8 @@ def main(argv=None):
         else:
             types = [t.strip() for t in a.types.split(",")] if a.types else None
             res = plan(em, _budget(a, em), sens, floors=floors, ceil=a.ceil, allow_1bit=not a.no_1bit,
-                       head=a.head, embd=a.embd, types=types)
+                       head=a.head, embd=a.embd, types=types,
+                       lowbit=json.load(open(a.lowbit)) if a.lowbit else None)
         json.dump(res, open(a.out, "w"), indent=1)
         if a.tensor_types:
             write_tensor_types(res, a.tensor_types)
@@ -844,6 +1460,32 @@ def main(argv=None):
               f"predicted {res['predicted_kld']} ({res['estimate']})")
         for role, h in res["hist"].items():
             print(f"  {role:10} " + "  ".join(f"{q}:{n}" for q, n in sorted(h.items(), key=lambda kv: bpw_of(kv[0]))))
+        return 0
+
+    if a.cmd == "lowbit":
+        from pollard_calc import find_llama_bin
+        q = find_llama_bin(a.llama_quantize) or a.llama_quantize
+        ppl = find_llama_bin(a.llama_perplexity) or a.llama_perplexity
+        types = [t.strip() for t in a.types.split(",") if t.strip()]
+        print(f"== pollard-moefit lowbit :: {a.gguf}  types {types}  granularity {a.granularity}")
+        lowbit(a.gguf, a.imatrix, a.eval, a.out, types, a.granularity, q, ppl, a.ngl, a.workdir, a.threads)
+        print(f"wrote {a.out}")
+        return 0
+
+    if a.cmd == "auto":
+        from pollard_calc import find_llama_bin
+        q = find_llama_bin(a.llama_quantize) or a.llama_quantize
+        ppl = find_llama_bin(a.llama_perplexity) or a.llama_perplexity
+        em = json.load(open(a.errmap))
+        rep = auto(a.gguf, a.imatrix, em, json.load(open(a.sensitivity)),
+                   json.load(open(a.lowbit)) if a.lowbit else None, _budget(a, em),
+                   [float(x) for x in a.prunes.split(",") if x.strip()], a.reap, a.screen_eval, a.eval, a.workdir,
+                   a.out, q, ppl, a.ngl, a.top, not a.no_toolcall, a.tool_ref, a.head, a.embd, not a.no_controls,
+                   a.min_tool_retention, judge_chunks=a.judge_chunks, keep_candidates=a.keep_candidates)
+        rp = a.report or a.out + ".moefit.json"
+        json.dump(rep, open(rp, "w"), indent=1)
+        print(auto_table(rep))
+        print(f"\nwinner: {rep['why']}\nwrote {a.out} and {rp}")
         return 0
 
     if a.cmd == "build":
