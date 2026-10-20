@@ -2140,6 +2140,7 @@ def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", 
                                                                                           "embeddings.weight")))
     w_q = rd.read_torch(hk, w_s.dtype).to(device)
     n_q = rd.read_torch(rev[norm_name], n_s.dtype).to(device) if norm is not None and norm_name in rev else n_s
+    softcap = getattr(bb.text_config(), "final_logit_softcapping", None)
     kls, top, nll_s, nll_q = [], [], [], []
     with torch.no_grad():
         for r, (hs, hq) in enumerate(zip(hidden_s, hidden_q)):
@@ -2154,7 +2155,10 @@ def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", 
                     if norm is not None:
                         norm.weight.data = nw
                         x = norm(x)
-                    lg.append(torch.nn.functional.linear(x, w)[0].double())
+                    logits = torch.nn.functional.linear(x, w)[0]
+                    if softcap is not None:                     # Gemma2/3 apply this in their native LM forward
+                        logits = torch.tanh(logits / softcap) * softcap
+                    lg.append(logits.double())
                 a = torch.log_softmax(lg[0], -1)
                 b = torch.log_softmax(lg[1], -1)
                 kls.append((a.exp() * (a - b)).sum(-1).cpu().numpy())

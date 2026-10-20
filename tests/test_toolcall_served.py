@@ -287,3 +287,96 @@ def test_a_call_the_server_parser_dropped_is_unparsed_not_prose():
     row = TC.grade_reply(reply(content="", finish="tool_calls"), PROBE["s01"])
     assert row["failure"] == "unparsed"
     assert TC.grade_reply(reply(content="", finish="stop"), PROBE["s01"])["failure"] == "no-call"
+
+
+@pytest.mark.parametrize("candidate,reference", [
+    ("error", "error"), ("error", "zero"), ("good", "error"),
+    ("partial", "good"), ("good", "partial"), ("partial", None),
+])
+def test_server_errors_fail_the_gate_without_recording_a_measurement(
+        monkeypatch, tmp_path, capsys, candidate, reference):
+    """Exercise the actual CLI, URL transport, grading and persisted gate result."""
+    import io
+    import urllib.error
+    import pollard_verify as verify
+
+    counts = Counter()
+
+    def urlopen(req, **kwargs):
+        side = "reference" if req.full_url.startswith("http://reference/") else "candidate"
+        counts[side] += 1
+        behavior = reference if side == "reference" else candidate
+        if behavior == "error" or (behavior == "partial" and counts[side] == 1):
+            raise urllib.error.URLError("server unavailable")
+        if behavior == "zero":
+            out = reply([("unknown_tool", {})])
+        else:
+            body = json.loads(req.data)
+            p = next(p for p in TC.SUITE if p["prompt"] == body["messages"][-1]["content"])
+            out = reply(content="Sure.") if p["expect"] is None else reply([
+                (p["expect"]["name"], {k: _concrete(v) for k, v in p["expect"]["args"].items()})])
+        return io.BytesIO(json.dumps(out).encode())
+
+    monkeypatch.setattr(TC.urllib.request, "urlopen", urlopen)
+    res, out = tmp_path / "results.json", tmp_path / "rows.json"
+    # A failed rerun must also clear a previous passing measurement's numbers.
+    res.write_text(json.dumps({"served": {"toolcall": {
+        "pass": True, "status": "measured", "retention": 100, "rate": 1, "ref_rate": 1}}}))
+    args = ["--backend", "url", "--url", "http://candidate", "--limit", "1",
+            "--results", str(res), "--out", str(out)]
+    if reference is not None:
+        args += ["--ref-backend", "url", "--ref-url", "http://reference"]
+    with pytest.raises(SystemExit) as exc:
+        TC.main(args)
+    assert exc.value.code == 1
+    assert "\nPASS\n" not in capsys.readouterr().out
+    results = json.loads(res.read_text())
+    tc = results["served"]["toolcall"]
+    assert tc["pass"] is False and tc["status"] == "error"
+    assert "server-error" in tc["reason"]
+    assert tc.get("rate") is tc.get("ref_rate") is tc.get("retention") is None
+    metrics = verify.metrics_from_results(results, "served")
+    assert not verify.evaluate_gate(metrics, {"toolcall_pass": True})["pass"]
+    assert not verify.evaluate_gate(metrics, {"toolcall_retention_min": 90})["pass"]
+    assert any(r["failure"] == "server-error" for r in json.loads(out.read_text())["rows"] +
+               (json.loads(out.read_text())["ref_rows"] or []))
+
+
+def test_real_zero_capability_completions_still_pass_with_a_reference(monkeypatch, tmp_path):
+    import io
+    monkeypatch.setattr(TC.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(
+        json.dumps(reply([("unknown_tool", {})])).encode()))
+    res = tmp_path / "results.json"
+    with pytest.raises(SystemExit) as exc:
+        TC.main(["--backend", "url", "--url", "http://candidate", "--ref-backend", "url",
+                 "--ref-url", "http://reference", "--limit", "1", "--results", str(res)])
+    assert exc.value.code == 0
+    tc = json.loads(res.read_text())["served"]["toolcall"]
+    assert tc["pass"] is True and tc["status"] == "measured"
+    assert tc["rate"] == tc["ref_rate"] == 0
+
+
+@pytest.mark.parametrize("cached_error", [False, True])
+def test_reference_cache_recovers_after_server_errors(monkeypatch, tmp_path, cached_error):
+    cache = tmp_path / "reference.json"
+    monkeypatch.setattr(TC, "_ref_cache_path", lambda *a: str(cache))
+    error = TC.grade_reply({"error": "temporary outage"}, PROBE["s01"])
+    good = TC.grade_reply(reply([("get_weather", {"city": "Tokyo", "unit": "celsius"})]), PROBE["s01"])
+    runs = []
+    if cached_error:
+        cache.write_text(json.dumps({"rows": [error], "meta": {"backend": "gguf"}}))
+
+    def run(*args, **kwargs):
+        runs.append(1)
+        return ([good] if cached_error or len(runs) > 1 else [error]), {"backend": "gguf"}
+
+    monkeypatch.setattr(TC, "run_model", run)
+    first, _ = TC.run_ref_cached("reference.gguf", "0")
+    if cached_error:
+        assert first == [good] and len(runs) == 1
+    else:
+        assert first == [error] and not cache.exists()
+        assert TC.run_ref_cached("reference.gguf", "0")[0] == [good]
+    count = len(runs)
+    assert TC.run_ref_cached("reference.gguf", "0")[0] == [good]
+    assert len(runs) == count

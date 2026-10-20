@@ -1729,11 +1729,14 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
     if not refresh and os.path.isfile(path):
         try:
             d = json.load(open(path, encoding="utf-8"))
-            print(f"   reference: cached ({path})")
-            return d["rows"], d.get("meta", {})
+            if not any(r.get("failure") == "server-error" for r in d["rows"]):
+                print(f"   reference: cached ({path})")
+                return d["rows"], d.get("meta", {})
         except (ValueError, OSError, KeyError):
             pass
     rows, meta = run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend)
+    if any(r.get("failure") == "server-error" for r in rows):
+        return rows, meta                                      # an outage is not a reusable reference measurement
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         json.dump({"rows": rows, "meta": meta}, open(path, "w", encoding="utf-8"), indent=1)
@@ -1834,6 +1837,8 @@ def _same(rows, ref_rows):
 def verdict_for(s, rs=None, ret=None, min_rate=0.75, min_retention=90.0):
     """PASS/FAIL. With a reference the gate is retention (the rung against its own f16 -- a small model that was
     never good at tools is not failed for that); without one it is the absolute success rate."""
+    if any((v or {}).get("modes", {}).get("server-error") for v in (s, rs)):
+        return False                                           # server failures do not establish model capability
     if rs is not None and ret is not None:
         return 100.0 * ret >= min_retention
     if rs is not None and not rs["valid"]:
@@ -1920,13 +1925,19 @@ def main_full(a):
     print_board(rung, s, rows, a.verbose)
     ref_rows, ref_meta, ref_backend, ref_note = _resolve_ref(a, backend, kw)
     rs, ret = None, (None, None, None)
+    errors = []
+    if s["modes"].get("server-error"):
+        errors.append(f"candidate: {s['modes']['server-error']} server-error probes")
     if ref_rows is not None:
         rs = score_suite(ref_rows)
         ref_name = os.path.basename(str((a.ref_rows if ref_note and "measured elsewhere" in ref_note else None)
                                         or (a.ref_fallback if ref_note else None) or a.ref or a.ref_url).rstrip("/\\"))
         print_board(f"{ref_name}  (reference, {BACKEND_SERVER.get(ref_backend, ref_backend)})", rs, ref_rows,
                     a.verbose)
-        ret = retention_ci(rows, ref_rows)
+        if rs["modes"].get("server-error"):
+            errors.append(f"reference: {rs['modes']['server-error']} server-error probes")
+        if not errors:
+            ret = retention_ci(rows, ref_rows)
         if ret[0] is not None:
             print(f"\n  RETENTION {100 * ret[0]:.1f}%  (95% paired-bootstrap CI {100 * ret[1]:.1f}-{100 * ret[2]:.1f}%)"
                   f"   success {_pct(s['rate'])} vs {_pct(rs['rate'])}")
@@ -1934,10 +1945,12 @@ def main_full(a):
             if cross_backend(backend, ref_backend):
                 print(f"  (cross-backend: rung via {BACKEND_SERVER.get(backend, backend)}, reference via "
                       f"{BACKEND_SERVER.get(ref_backend, ref_backend)} -- part of any gap is the server, not the quant)")
-        else:
+        elif not errors:
             print("\n  (the reference passes no probe: nothing to retain -- retention is undefined)")
     elif ref_note:
         print(f"\n  no reference measured ({ref_note}): the gate is the absolute success rate")
+    if errors:
+        print(f"\n  ERROR: {'; '.join(errors)}; tool-call capability was not measured.")
     ok = verdict_for(s, rs, ret[0], a.min_rate, a.min_retention)
     if not ok and ret[0] is not None:
         _advice()
@@ -1969,6 +1982,12 @@ def main_full(a):
         if ret[0] is not None:
             tc.update({"retention": round(100 * ret[0], 2),
                        "retention_ci": [round(100 * ret[1], 2), round(100 * ret[2], 2)]})
+        if errors:
+            tc.update(status="error", reason="; ".join(errors))
+            # merge_results preserves old keys: explicitly clear any earlier successful measurement.
+            for key in ("rate", "rate_ci", "parse_rate", "function_acc", "args_valid", "exact", "abstention",
+                        "categories", "ref_rate", "ref_rate_ci", "drop", "agreement", "retention", "retention_ci"):
+                tc[key] = None
         ws.merge_results(a.results, rung, {"toolcall": tc})
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
