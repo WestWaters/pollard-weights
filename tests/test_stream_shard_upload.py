@@ -24,11 +24,25 @@ import pollard_workspace as ws  # noqa: E402
 
 
 class Hub:
-    """Bytes per (repo, path); get_paths_info answers size + LFS sha256 of what is stored."""
+    """Bytes per (repo, path) on main and per (repo, path) on each branch; get_paths_info answers size + LFS sha256 of
+    what a revision stores; create_commit copies files between revisions (CommitOperationCopy, server side)."""
     def __init__(self):
         self.blobs, self.private, self.log = {}, {}, []
+        self.branches = {}                                   # (repo, branch) -> {path: bytes}
+        self.commits, self.deleted = [], []
         self.fail_upload = False
         self.corrupt = False
+
+    def store(self, repo, revision=None):
+        if revision in (None, "main"):
+            return None
+        if (repo, revision) not in self.branches:
+            raise FileNotFoundError(f"404: no branch {revision} in {repo}")
+        return self.branches[(repo, revision)]
+
+    def get(self, repo, path, revision=None):
+        st = self.store(repo, revision)
+        return self.blobs.get((repo, path)) if st is None else st.get(path)
 
     def api(self):
         hub = self
@@ -37,12 +51,28 @@ class Hub:
             def create_repo(self, repo, repo_type="model", exist_ok=True, private=False):
                 hub.private.setdefault(repo, private)
 
-            def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
+            def create_branch(self, repo, branch, exist_ok=False):
+                if (repo, branch) in hub.branches and not exist_ok:
+                    raise RuntimeError("409: branch exists")
+                hub.branches.setdefault((repo, branch), {})
+
+            def delete_branch(self, repo, branch):
+                if (repo, branch) not in hub.branches:
+                    raise FileNotFoundError(f"404: no branch {branch}")
+                del hub.branches[(repo, branch)]
+                hub.deleted.append((repo, branch))
+
+            def upload_file(self, path_or_fileobj, path_in_repo, repo_id, revision=None):
                 if hub.fail_upload:
                     raise ConnectionError("upload interrupted")
                 data = open(path_or_fileobj, "rb").read()
-                hub.blobs[(repo_id, path_in_repo)] = data[:-3] if hub.corrupt else data
-                hub.log.append(path_in_repo)
+                data = data[:-3] if hub.corrupt else data
+                st = hub.store(repo_id, revision)
+                if st is None:
+                    hub.blobs[(repo_id, path_in_repo)] = data
+                else:
+                    st[path_in_repo] = data
+                hub.log.append(path_in_repo if st is None else f"{revision}:{path_in_repo}")
 
             def upload_folder(self, folder_path, repo_id, path_in_repo="", ignore_patterns=None):
                 import fnmatch
@@ -51,13 +81,29 @@ class Hub:
                         continue
                     self.upload_file(os.path.join(folder_path, f), f"{path_in_repo}/{f}", repo_id)
 
+            def create_commit(self, repo_id, operations, commit_message="", revision=None):
+                staged = {}
+                for op in operations:                        # atomic: every source must exist or nothing lands
+                    data = hub.get(repo_id, op.src_path_in_repo, op.src_revision)
+                    if data is None:
+                        raise FileNotFoundError(f"404: {op.src_path_in_repo}@{op.src_revision}")
+                    staged[op.path_in_repo] = data
+                for p, data in staged.items():
+                    hub.blobs[(repo_id, p)] = data
+                    hub.log.append(f"copy:{p}")
+                hub.commits.append((repo_id, commit_message, sorted(staged)))
+
             def list_repo_files(self, repo):
                 return sorted(p for (r, p) in hub.blobs if r == repo)
 
-            def get_paths_info(self, repo, paths):
-                return [types.SimpleNamespace(path=p, size=len(hub.blobs[(repo, p)]), blob_id=None,
-                                              lfs={"sha256": hashlib.sha256(hub.blobs[(repo, p)]).hexdigest()})
-                        for p in paths if (repo, p) in hub.blobs]
+            def get_paths_info(self, repo, paths, revision=None):
+                out = []
+                for p in paths:
+                    data = hub.get(repo, p, revision)
+                    if data is not None:
+                        out.append(types.SimpleNamespace(path=p, size=len(data), blob_id=None,
+                                                         lfs={"sha256": hashlib.sha256(data).hexdigest()}))
+                return out
 
             def update_repo_settings(self, repo_id, private=None):
                 hub.private[repo_id] = private
@@ -70,10 +116,15 @@ def hub(monkeypatch):
     monkeypatch.setattr(PS, "_hf_api", h.api)
     fake = types.ModuleType("huggingface_hub")
     fake.HfApi = h.api
+
+    class CommitOperationCopy:
+        def __init__(self, src_path_in_repo, path_in_repo, src_revision=None):
+            self.src_path_in_repo, self.path_in_repo, self.src_revision = src_path_in_repo, path_in_repo, src_revision
+    fake.CommitOperationCopy = CommitOperationCopy
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
 
-    def rng(repo, rp, start, n, retries=3):
-        return h.blobs[(repo, rp)][start:start + n]
+    def rng(repo, rp, start, n, retries=3, revision=None):
+        return h.get(repo, rp, revision)[start:start + n]
     monkeypatch.setattr(PS, "hub_range", rng)
     return h
 
@@ -180,6 +231,9 @@ def test_a_rung_bigger_than_the_disk_streams_instead_of_holding(model, inputs, h
             ran["build"] = True
         elif tool == "pollard-verify":
             assert PS.Source(out).read_raw("model.layers.0.mlp.weight")[1].shape == (10, 100), "verify reads it back"
+            assert not [p for (r, p) in hub.blobs if p.endswith(".safetensors")], \
+                "while it is unverified, main holds none of its shards (the staging branch does)"
+            assert hub.branches[(repo, "pollard-staging-GPTQ-int8")], "verify reads from the staging branch"
             ws.record_gate(out, {"pass": True})
         elif tool == "pollard-toolcall":
             raise AssertionError("a streamed rung is not on disk for the tool-call probe")
@@ -187,6 +241,7 @@ def test_a_rung_bigger_than_the_disk_streams_instead_of_holding(model, inputs, h
             o = cmd[cmd.index("--out") + 1]
             os.makedirs(os.path.dirname(o), exist_ok=True)
             open(o, "w").write("card")
+    repo = "PollardWeights/Tiny-1B-Pollard"
     monkeypatch.setattr(R, "run_cmd", fake)
     monkeypatch.setattr(R, "disk_free_gb", lambda p: 10.0)    # > shard + margin, < the rung estimate? force it:
     for s in steps:
@@ -202,12 +257,17 @@ def test_a_rung_bigger_than_the_disk_streams_instead_of_holding(model, inputs, h
     tc = next(v["toolcall"] for v in res.values() if isinstance(v, dict) and "toolcall" in v)
     assert tc["status"] == "not-measured" and "streamed" in tc["reason"]
     assert st["gptq/int8/publish"] == "done"
-    repo = "PollardWeights/Tiny-1B-Pollard"
     files = [p for (r, p) in hub.blobs if r == repo]
     assert "GPTQ/int8/config.json" in files and "GPTQ/int8/model.safetensors.index.json" in files
-    assert hub.log.index("GPTQ/int8/model.safetensors.index.json") > max(
-        hub.log.index(p) for p in hub.log if p.startswith("GPTQ/int8/") and not p.endswith("index.json")), \
-        "the index is uploaded LAST"
+    assert {f"GPTQ/int8/model-0000{i}.safetensors" for i in (1, 2, 3)} <= set(files), "the shards reached main"
+    assert len(hub.commits) == 1 and len(hub.commits[0][2]) == 3, "ONE server-side copy commit, no re-upload"
+    assert not any(x.startswith("GPTQ/int8/model-") for x in hub.log), "no shard was ever uploaded to main"
+    assert (repo, "pollard-staging-GPTQ-int8") not in hub.branches and hub.deleted == [
+        (repo, "pollard-staging-GPTQ-int8")], "the staging branch is deleted once main holds the rung"
+    main = [x[len("copy:"):] if x.startswith("copy:") else x for x in hub.log if ":" not in x or x.startswith("copy:")]
+    assert main.index("GPTQ/int8/model.safetensors.index.json") > max(
+        main.index(p) for p in main if p.startswith("GPTQ/int8/") and not p.endswith("index.json")), \
+        "the index reaches main LAST (after every shard is copied)"
     assert "GPTQ/int8/pollard-streamed.json" not in files
     assert not os.path.exists(out), "the rest of the rung freed once everything is confirmed"
 
@@ -239,3 +299,80 @@ def test_the_complete_gate_sees_a_streamed_rungs_tensors(tmp_path, hub, monkeypa
     _write(out)
     keys = PC._out_tensors(str(out))
     assert "model.layers.0.mlp.weight" in keys and "model.layers.4.mlp.weight" in keys
+
+
+def test_streamed_shards_go_to_the_staging_branch_and_read_back_from_it(tmp_path, hub, monkeypatch):
+    out = tmp_path / "rung"
+    monkeypatch.setenv(PS.SHARD_UPLOAD_ENV, json.dumps({"out": str(out), "repo": "O/M", "path_in_repo": "MX/nvfp4",
+                                                        "revision": PS.staging_branch("MX/nvfp4")}))
+    arrs = _write(out)
+    assert PS.staging_branch("MX/nvfp4") == "pollard-staging-MX-nvfp4"
+    assert hub.blobs == {}, "main (which may be PUBLIC) never receives an unverified shard"
+    assert sorted(hub.branches[("O/M", "pollard-staging-MX-nvfp4")]) == [f"MX/nvfp4/model-0000{i}.safetensors"
+                                                                        for i in (1, 2, 3)]
+    reg = PS.read_streamed(str(out))
+    assert {e["revision"] for e in reg.values()} == {"pollard-staging-MX-nvfp4"}
+    src = PS.Source(str(out))                                 # verify: range reads from the staging branch
+    for k, a in arrs.items():
+        assert np.array_equal(src.read_raw(k)[1], a)
+    PS.promote_staging(hub.api(), reg, log=lambda *_: None)
+    assert sorted(p for (_, p) in hub.blobs) == sorted(e["path_in_repo"] for e in reg.values())
+    assert ("O/M", "pollard-staging-MX-nvfp4") not in hub.branches
+
+
+def test_a_promotion_that_does_not_land_intact_keeps_the_branch(tmp_path, hub, monkeypatch):
+    out = tmp_path / "rung"
+    monkeypatch.setenv(PS.SHARD_UPLOAD_ENV, json.dumps({"out": str(out), "repo": "O/M", "path_in_repo": "GPTQ/int4",
+                                                        "revision": "pollard-staging-GPTQ-int4"}))
+    _write(out)
+    reg = PS.read_streamed(str(out))
+    first = sorted(reg)[0]
+    reg[first] = dict(reg[first], sha256="0" * 64)            # main would hold other bytes than were uploaded
+    with pytest.raises(RuntimeError, match="branch is kept"):
+        PS.promote_staging(hub.api(), reg, log=lambda *_: None)
+    assert ("O/M", "pollard-staging-GPTQ-int4") in hub.branches, "nothing lost: the verified bytes stay on the branch"
+    with pytest.raises(ValueError, match="not a Pollard staging branch"):
+        PS.discard_staging(hub.api(), "O/M", "main")
+
+
+def test_a_staged_rung_that_fails_its_gate_deletes_its_branch_and_never_touches_main(model, inputs, hub, monkeypatch):
+    cfg = _gptq_plan(inputs)
+    c = R._ctx(dict(cfg, _free_after_upload=True), model)
+    repo = "PollardWeights/Tiny-1B-Pollard"
+    out = os.path.join(ws.model_dir(c["smooth_dir"], create=True), "Tiny-1B-Pollard-GPTQ-int8")
+    monkeypatch.setenv(PS.SHARD_UPLOAD_ENV, json.dumps({"out": out, "repo": repo, "path_in_repo": "GPTQ/int8",
+                                                        "revision": "pollard-staging-GPTQ-int8"}))
+    _write(out)
+    monkeypatch.delenv(PS.SHARD_UPLOAD_ENV)
+    hub.blobs[(repo, "README.md")] = b"card"
+    hub.private[repo] = False                                 # already PUBLIC (an earlier lane went out)
+    before = dict(hub.blobs)
+    ws.record_build(c["smooth_dir"], "gptq", out, tag="int8")
+    ws.record_gate(out, {"pass": False})
+    st = R._publish_rung_step(c, "gptq", "int8", out)
+    assert R.publish_rung(st, c, cfg, True, out=lambda *_: None) == "kept: not verified"
+    assert hub.blobs == before, "main untouched"
+    assert (repo, "pollard-staging-GPTQ-int8") not in hub.branches, "the failed rung's branch is gone"
+    assert PS.read_streamed(out) == {}, "and so is its registry"
+    assert not ws.find_build(out)[1].get("streamed_unverified"), "nothing stranded: the repo is not blocked"
+
+
+def test_a_staged_rung_whose_verify_was_held_keeps_its_branch(model, inputs, hub, monkeypatch):
+    cfg = _gptq_plan(inputs)
+    c = R._ctx(dict(cfg, _free_after_upload=True), model)
+    repo = "PollardWeights/Tiny-1B-Pollard"
+    out = os.path.join(ws.model_dir(c["smooth_dir"], create=True), "Tiny-1B-Pollard-GPTQ-int8")
+    monkeypatch.setenv(PS.SHARD_UPLOAD_ENV, json.dumps({"out": out, "repo": repo, "path_in_repo": "GPTQ/int8",
+                                                        "revision": "pollard-staging-GPTQ-int8"}))
+    _write(out)
+    monkeypatch.delenv(PS.SHARD_UPLOAD_ENV)
+    ws.record_build(c["smooth_dir"], "gptq", out, tag="int8")   # no gate verdict: held / not run
+    st = R._publish_rung_step(c, "gptq", "int8", out)
+    said = []
+    assert R.publish_rung(st, c, cfg, True, out=said.append) == "kept: not verified"
+    assert hub.branches[(repo, "pollard-staging-GPTQ-int8")], "resumable: the shards stay on their branch"
+    assert any("staging branch" in x for x in said)
+    assert not any(k[1].endswith(".safetensors") for k in hub.blobs), "and main still has none of them"
+    # a build that FAILED part-way: its staging branch is deleted when the publish step is skipped
+    assert R.drop_failed_stream(st, {"gptq/int8/build": "failed"}, out=lambda *_: None)
+    assert (repo, "pollard-staging-GPTQ-int8") not in hub.branches

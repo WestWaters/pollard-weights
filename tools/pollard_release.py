@@ -859,6 +859,8 @@ def lane_steps(cfg, c, lane):
             ver += ["--trust-remote-code", c.get("trc", "auto")]
             if c.get("ngl") == "0" and machine()["cuda"]:
                 ver += ["--device", "cpu"]
+            if c.get("max_ram_gb"):                      # the streamed verify plans both passes under the plan's cap
+                ver += ["--max-ram-gb", str(c["max_ram_gb"])]
         ver += (["--end-to-end"] if lane == "exl3" else []) + ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
                           cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None,
@@ -1409,11 +1411,20 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     import pollard_stream as PS
     streamed = PS.read_streamed(b["path"]) if lane != "gguf" and os.path.isdir(b.get("path", "")) else {}
     if b.get("verified") is not True:
+        if streamed and b.get("verified") is False and PS.staged_revisions(streamed):
+            # the gate measured it and it FAILED: its staging branch goes, main never held a byte of it
+            discard_streamed(b["path"], out)
+            _keep(key, b, "failed its gate -- not published; its streamed shards were on a staging branch, now "
+                  "deleted (main never held them)", out)
+            return "kept: not verified"
         if streamed:
             b["streamed_unverified"] = sorted(e["path_in_repo"] for e in streamed.values())
+        staged = bool(PS.staged_revisions(streamed))
         _keep(key, b, "not verified (measure / verify / gate failed or did not run) -- not published"
-              + (f"; its {len(streamed)} streamed shard(s) stay in the PRIVATE repo, which will not go public "
-                 "until they are verified or removed" if streamed else ""), out)
+              + (f"; its {len(streamed)} streamed shard(s) stay on "
+                 + ("their staging branch (not main) until the rung is verified" if staged else
+                    "the PRIVATE repo, which will not go public until they are verified or removed")
+                 if streamed else ""), out)
         return "kept: not verified"
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
@@ -1434,8 +1445,11 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     else:
         dest = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
         if not b.get("uploaded") and streamed:
-            # the shards are already there (streamed + confirmed one by one); the rest, then the index LAST -- a
-            # loader sees the rung only once every shard it maps is in place
+            # the shards are already there (streamed + confirmed one by one) -- on the rung's staging branch: copied
+            # onto main now that it is verified (server side, nothing re-sent), the branch deleted; then the rest,
+            # then the index LAST -- a loader sees the rung only once every shard it maps is in place
+            if PS.staged_revisions(streamed):
+                PS.promote_staging(PS._hf_api(), streamed, log=out)
             api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo,
                               ignore_patterns=["model.safetensors.index.json", PS.STREAMED, "*.tmp"])
             if os.path.isfile(os.path.join(b["path"], "model.safetensors.index.json")):
@@ -1462,6 +1476,41 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         b["freed"] = "uploaded + confirmed on the Hub"
         ws.update_build(key, b["path"], {"freed": b["freed"]})
     return "done"
+
+
+def discard_streamed(path, out=print):
+    """A streamed rung that will never ship (its build or its gate failed): every staging branch its shards sit on is
+    deleted and the registry with it -- main never held them. Shards streamed onto main by an older Pollard (no
+    branch) are left alone: they keep the repo private (go_public) until someone removes them."""
+    import pollard_stream as PS
+    streamed = PS.read_streamed(path) if os.path.isdir(str(path)) else {}
+    revs = PS.staged_revisions(streamed)
+    if not revs:
+        return False
+    api = PS._hf_api()
+    for repo, rev in revs:
+        PS.discard_staging(api, repo, rev, log=lambda m: out("   " + m.strip()))
+    if all(e.get("revision") for e in streamed.values()):
+        try:
+            os.remove(os.path.join(path, PS.STREAMED))
+        except OSError:
+            pass
+    return True
+
+
+def drop_failed_stream(st, statuses, out=print):
+    """The publish step of a rung that will not ship: when its BUILD failed or its gate FAILED (not merely held or not
+    run -- that rung is resumable), the staging branch its streamed shards sit on is deleted. Never raises."""
+    if not st.out or st.lane == "gguf":
+        return False
+    import pollard_workspace as ws
+    try:
+        b = ws.find_build(st.out)[1] or {}
+        if str(statuses.get(f"{st.lane}/{st.rung}/build", "")) == "failed" or b.get("verified") is False:
+            return discard_streamed(st.out, out)
+    except Exception as e:                                       # noqa: BLE001
+        out(f"      could not delete the staging branch of {st.out}: {e} -- delete it on the Hub by hand")
+    return False
 
 
 def _free_vram_mib():
@@ -2005,6 +2054,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             out(f"{head}: KEPT locally, not published (an earlier step of this rung failed) -- {st.out}")
             statuses[st.id] = "kept: upstream failed"
             kept.append((st.lane, st.rung, st.out))
+            if run:
+                drop_failed_stream(st, statuses, out)
             continue
         if st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
             out(f"{head}: SKIP (an earlier step of this {'rung' if st.rung else 'lane'} failed) -- {what}")
@@ -2018,11 +2069,14 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             if free < need + margin and st.stream_to and run_upload and free >= STREAM_SHARD_GB + margin:
                 import pollard_stream as PS
                 repo, sub = st.stream_to
+                # always onto the rung's own staging branch, never main: the repo may already be public (an earlier
+                # lane went out), and an unverified shard must not be on the branch people download
+                rev = PS.staging_branch(sub)
                 stream_env = dict(os.environ, **{PS.SHARD_UPLOAD_ENV: json.dumps(
-                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub})})
+                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub, "revision": rev})})
                 streamed.add((st.lane, st.rung))
                 out(f"{head}: ~{need:.1f} GB > {free:.1f} GB free -- STREAMING: each shard written -> uploaded to "
-                    f"{repo}/{sub}/ -> confirmed -> freed before the next (the repo stays private)")
+                    f"{repo}@{rev}/{sub}/ -> confirmed -> freed before the next (main gets it only once verified)")
             elif free < need + margin:
                 msg = f"held: disk (needs ~{need:.1f} GB + {margin:g} margin, {free:.1f} GB free)"
                 out(f"{head}: {msg} -- {what}")
@@ -2313,6 +2367,9 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
                 with tl_lock:
                     statuses.update({s.id: "skipped: upstream failed" for s in rest if s.kind != "publish"})
                     statuses.update({s.id: "kept: upstream failed" for s in rest if s.kind == "publish"})
+                for s in rest:
+                    if s.kind == "publish":
+                        drop_failed_stream(s, statuses, out)
                 continue
             if rest:
                 checked = _threading.Event() if any(s.kind == "gate" and lane in (s.blocks or []) for s in rest) else None
