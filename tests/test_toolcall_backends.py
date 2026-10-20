@@ -341,6 +341,25 @@ def test_retention_section_says_not_measured():
     assert "| `r` | not measured |" in md
 
 
+@pytest.mark.parametrize("reason", ["", "candidate: 1 server-error probes | unavailable"])
+def test_card_distinguishes_toolcall_errors_from_model_capability(reason):
+    tc = {"status": "error", "pass": False, "rate": None, "reason": reason, "backend": "vllm"}
+    expected = "error (candidate: 1 server-error probes / unavailable)" if reason else "error"
+    assert C.tool_ready_cell(tc) == expected
+    md = "\n".join(C.retention_section([{"name": "r", "bytes": 1}], {"r": {"toolcall": tc}}))
+    assert "| `r` | error |" in md
+
+
+def test_tool_ready_note_excludes_failed_measurements():
+    builds = [{"name": "ok"}, {"name": "error"}]
+    results = {"ok": {"toolcall": {"backend": "mlx", "rate": 1.0}},
+               "error": {"toolcall": {"backend": "vllm", "status": "error", "pass": False}}}
+    note = C.tool_ready_note(builds, results)
+    assert "`mlx_lm.server`" in note and C.TOOL_SERVERS["vllm"] not in note
+    note = C.tool_ready_note(builds[1:], results)
+    assert "no completed measurement" in note and "served with" not in note
+
+
 # ------------------------------------------------------------------ release: every lane's rungs gated
 
 def _ctx(tmp_path):
