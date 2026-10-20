@@ -615,6 +615,11 @@ TOOL_FAMILIES = {
                     fmt='<|open|>call tool="NAME" index="1"<|sep|><|open|>argument key="KEY" ...<|sep|>VALUE<|close|>argument'),
     "granite": dict(vllm="granite", vllm_ok=True, shape="json",
                     fmt='<|tool_call|>[{"name": NAME, "arguments": {...}}]'),
+    # Granite 3.0-3.2 instruct: the same template text (it never renders tool_calls back), but the model writes the
+    # call as PLAIN `<tool_call>` + a JSON list (granite-3.1-1b-a400m, measured) -- llama-server's autoparser reads
+    # neither, vLLM's granite parser reads both spellings
+    "granite_tc": dict(vllm="granite", vllm_ok=True, shape="json",
+                       fmt='<tool_call>[{"arguments": {...}, "name": NAME}]'),
     "functiongemma": dict(vllm="functiongemma", vllm_ok=True, shape="kv",
                           fmt="<start_function_call>call:NAME{key:<escape>value<escape>}<end_function_call>"),
     "gemma4": dict(vllm="gemma4", vllm_ok=False, shape="kv",
@@ -787,6 +792,7 @@ def _classify_call_text(seg, name=_TC_NAME):
         (lambda: "functools[" in seg, "firefunction"),
         (lambda: "<arg_key>" in seg, "glm"),
         (lambda: "<tool_calls>" in seg, "tool_calls"),
+        (lambda: bool(re.search(r"<tool_call>\s*\[\s*\{", seg)) and "</tool_call>" not in seg, "granite_tc"),
         (lambda: "<tool_call>" in seg and '"name"' in seg, "hermes"),
         (lambda: bool(re.search(r"\[\s*%s\(" % n, seg)), "pythonic"),
         (lambda: '"parameters"' in seg and '"name"' in seg, "llama3_json"),
@@ -897,7 +903,7 @@ def toolcall_info(model=None, tpl=None, archs=None, conf=None) -> dict:
     info = {"family": "none", "supports_tools": False, "supports_tool_calls": False, "source": None,
             "vllm_parser": None, "vllm_parser_confirmed": None, "vllm_flags": None,
             "llama_cpp": None, "tool_list": {"placement": None, "container": None},
-            "call_format": None, "shape": None, "example": None, "why": why}
+            "call_format": None, "shape": None, "example": None, "reader": None, "why": why}
     if not tpl:
         why.append("no chat template -> no tool calling")
         return info
@@ -946,7 +952,21 @@ def toolcall_info(model=None, tpl=None, archs=None, conf=None) -> dict:
         fam = "none"
         why.append("template renders no tool list" if not info["supports_tools"] else
                    "template lists tools but writes no call syntax of its own")
+    if fam == "granite" and any(re.search(r"granite[-_ ]3\.[0-2]\b", n or "", re.I)
+                                for n in _safe(_model_names, model, conf or {}) or []):
+        fam = "granite_tc"
+        why.append("Granite 3.0-3.2 writes the call as a plain `<tool_call>[...]` (not the template's <|tool_call|>)")
     info["family"] = fam
+    info["reader"] = None
+    if tpl:
+        for mutable in (False, True):
+            try:
+                rd = _safe(derive_reader, ChatTemplate(tpl, _special_tokens(model, conf or {}), mutable=mutable))
+            except Exception:                                    # noqa: BLE001 -- no jinja2 / bad syntax
+                rd = None
+            if rd:
+                info["reader"] = rd
+                break
     if fam != "none":
         meta = TOOL_FAMILIES.get(fam, TOOL_FAMILIES["unknown"])
         ex, lead = info["example"] or "", re.split(r"NAME|\{", meta["fmt"])[0].strip()
@@ -1013,6 +1033,7 @@ def format_tool_call(family, name, arguments):
         "llama3_json": json.dumps({"name": name, "parameters": args}, ensure_ascii=False),
         "xlam": f"[{obj}]",
         "granite": f"<|tool_call|>[{obj}]",
+        "granite_tc": f"<tool_call>[{obj}]",
         "deepseek_v3": f"<\uff5ctool\u2581calls\u2581begin\uff5c><\uff5ctool\u2581call\u2581begin\uff5c>function<\uff5ctool\u2581sep\uff5c>{name}\n```json\n{js}\n```"
                        "<\uff5ctool\u2581call\u2581end\uff5c><\uff5ctool\u2581calls\u2581end\uff5c>",
         "deepseek_v31": f"<\uff5ctool\u2581calls\u2581begin\uff5c><\uff5ctool\u2581call\u2581begin\uff5c>{name}<\uff5ctool\u2581sep\uff5c>{js}<\uff5ctool\u2581call\u2581end\uff5c>"
@@ -1400,6 +1421,18 @@ def _p_solar(t, sc):
         if _ok_json(a)]
 
 
+def _p_granite(t, sc):
+    """Granite: `<|tool_call|>` (3.3) or a plain `<tool_call>` (3.0-3.2) followed by a JSON list of calls -- vLLM's
+    granite parser accepts both spellings, and so does this reader."""
+    m = re.search(r"<\|tool_call\|>|<tool_call>", t)
+    if not m:
+        return []
+    rest = t[m.end():]
+    if "</tool_call>" in rest and m.group(0) == "<tool_call>" and not rest.lstrip().startswith("["):
+        return []                                                    # a Hermes block, not Granite's list
+    return _calls_in_json(rest.split("</tool_call>", 1)[0] if "</tool_call>" in rest else rest)
+
+
 def _p_cohere_cmdr(t, sc):
     m = re.search(r"Action:\s*```(?:json)?\s*(.*?)```", t, re.S)
     return _calls_in_json(m.group(1)) if m else []
@@ -1415,7 +1448,8 @@ CALL_READERS = {
     "deepseek_v32": _p_dsml,
     "lfm2": _p_pythonic_wrapped, "pythonic": _p_pythonic,
     "mistral": _p_mistral, "llama3_json": _p_llama3_json, "xlam": _p_xlam,
-    "granite": _p_after("<|tool_call|>"),
+    "granite": lambda t, sc: _p_granite(t, sc),
+    "granite_tc": lambda t, sc: _p_granite(t, sc),
     "harmony": _p_harmony,
     "deepseek_v3": _p_deepseek_v3, "deepseek_v31": _p_deepseek_v31,
     "kimi_k2": _p_kimi_k2,
@@ -1443,27 +1477,329 @@ def tool_schemas(tools):
     return out
 
 
-def parse_tool_calls(text, family, tools=None):
+def parse_tool_calls(text, family, tools=None, reader=None):
     """(calls, content, attempted) from a model's raw answer (thinking already removed).
 
     calls     [{"name": str, "arguments": dict | str}] in the order written -- what a server returns in tool_calls
     content   the text with the calls taken out (prose around them)
     attempted True when the answer carries call markers at all (parsed or not)
 
-    Raises KeyError for a family with no reader here (the caller reports it, never guesses)."""
-    reader = CALL_READERS[family]
+    reader    a derive_reader spec (toolcall_info's "reader"): the model's OWN template's call syntax, read off a
+              rendering of a known call. Used when the family has no reader here, and whenever the family's reader
+              finds no call in text that carries the template's markers.
+
+    Raises KeyError for a family with no reader here and no template reader (the caller reports it, never guesses)."""
+    calls, content, attempted, _ = read_tool_calls(text, family, tools, reader)
+    return calls, content, attempted
+
+
+def read_tool_calls(text, family, tools=None, reader=None):
+    """parse_tool_calls + which reader read the calls: "family:<name>", "template" or None."""
+    fam_reader = CALL_READERS.get(family)
+    if fam_reader is None and not reader:
+        raise KeyError(family)
     t = text or ""
-    calls = []
-    try:
-        calls = [{"name": n, "arguments": a} for n, a in reader(t, tool_schemas(tools)) if n]
-    except Exception:                                                # noqa: BLE001 -- unreadable = no call
-        calls = []
-    attempted = call_shaped(t) or bool(calls)
+    calls, how = [], None
+    if fam_reader is not None:
+        try:
+            calls = [{"name": n, "arguments": a} for n, a in fam_reader(t, tool_schemas(tools)) if n]
+        except Exception:                                            # noqa: BLE001 -- unreadable = no call
+            calls = []
+        how = f"family:{family}" if calls else None
+    if not calls and reader:
+        try:
+            calls = [{"name": n, "arguments": a} for n, a in parse_with_reader(t, reader, tools) if n]
+        except Exception:                                            # noqa: BLE001
+            calls = []
+        how = "template" if calls else None
+    attempted = call_shaped(t) or bool(calls) or bool(reader and _reader_marker_in(t, reader))
     content = t
     if calls:
         first = CALL_MARKERS.search(t)
-        content = t[:first.start()].strip() if first else ""
-    return calls, content, attempted
+        mk = _reader_marker_in(t, reader) if reader else None
+        starts = [x for x in ((first.start() if first else None), mk) if x is not None]
+        content = t[:min(starts)].strip() if starts else ""
+    return calls, content, attempted, how
+
+
+def _reader_marker_in(text, spec):
+    """where the template reader's opening marker first appears in text, or None."""
+    op = (spec or {}).get("open") if (spec or {}).get("shape") in ("json", "pythonic") else (spec or {}).get("call_open")
+    if not op or not op.strip():
+        return None
+    m = re.search(_flex(op.strip()), text or "")
+    return m.start() if m else None
+
+
+# ----------------------------------------------------------------- the template-derived reader (any model)
+#
+# The family readers above cover the syntaxes Pollard knows by name. A model whose template writes calls in a syntax
+# with no name here -- or a known family whose reader finds nothing -- is still readable: its OWN template is asked to
+# render a known call (one call, then two in one turn) and the wrapper, the separators and the shape of the call are
+# read off that rendering. The model's output is then parsed with exactly those markers. One reader, derived from the
+# template, used on every path (served replies whose server parser did not read the call, in-process generations).
+
+_RD_NAME, _RD_NAME2 = "pzq_lookup", "pzq_other"
+_RD_A1, _RD_B1, _RD_A2, _RD_B2 = "PZQCITY", "PZQUNIT", "PZQTOWN", "PZQMODE"
+_RD_TOOLS = [{"type": "function", "function": {
+    "name": n, "description": f"Look up {_TC_DESC}.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "the city"},
+                                                     "unit": {"type": "string", "description": "the unit"}},
+                   "required": ["city"]}}} for n in (_RD_NAME, _RD_NAME2)]
+
+
+def _rd_messages(calls, as_string):
+    tc = [{"id": f"pzqcall0{i + 1}", "type": "function",
+           "function": {"name": n, "arguments": json.dumps(a) if as_string else a}} for i, (n, a) in enumerate(calls)]
+    msgs = [{"role": "user", "content": _TC_USER}, {"role": "assistant", "content": "", "tool_calls": tc}]
+    msgs += [{"role": "tool", "tool_call_id": c["id"], "name": c["function"]["name"], "content": _TC_RES} for c in tc]
+    return msgs + [{"role": "assistant", "content": "PZQFINAL"}]
+
+
+def _rd_call_text(ct, calls):
+    """The assistant's call turn as the template writes it (generation prompt cut off, thinking stub dropped, cut at
+    the end of the last call), or None when the template does not render these calls."""
+    last = list(calls[-1][1].values())[-1]
+    for as_string in (False, True):
+        full = _safe(ct.render, _rd_messages(calls, as_string), tools=_RD_TOOLS)
+        if not full or _TC_USER not in full or calls[-1][0] not in full:
+            continue
+        gen = _safe(ct.render, [{"role": "user", "content": _TC_USER}], add_generation_prompt=True,
+                    tools=_RD_TOOLS) or ""
+        ui = full.index(_TC_USER) + len(_TC_USER)
+        call = full[len(gen):] if gen and full.startswith(gen) else full[ui:]
+        cut = call.find(_TC_RES)
+        call = call[:cut] if cut >= 0 else call
+        end = call.rfind(last)
+        if end < 0:
+            continue
+        end += len(last)
+        tail = call[end:]
+        stops = [tail.find(t) for t in _TURN_ENDS if t in tail]
+        stop = min(stops) if stops else len(tail)
+        ends = [m.end() for m in re.finditer(_CALL_CLOSERS, tail[:stop])]
+        call = call[:end + (max(ends) if ends else 0)]
+        call = re.sub(r"^\s*(<think>\s*</think>|</think>|<\|START_THINKING\|><\|END_THINKING\|>)\s*", "", call)
+        return call.strip()
+    return None
+
+
+def _lcs_suffix(a, b):
+    n = 0
+    while n < min(len(a), len(b)) and a[len(a) - 1 - n] == b[len(b) - 1 - n]:
+        n += 1
+    return a[len(a) - n:] if n else ""
+
+
+def _opener(lit):
+    """A per-call opener read as the common tail of two renderings starts where a marker starts: closing brackets
+    left over from whatever preceded it (`>` of an end tag) are dropped, so `><<act:` reads as `<<act:`."""
+    t = lit.lstrip()
+    s = t.lstrip(">]}) \t\r\n")
+    return s if s else t
+
+
+def _flex(lit):
+    """A literal marker as a regex: whitespace runs flexible, digits any number (call indices), the rest exact."""
+    out, i = [], 0
+    while i < len(lit):
+        c = lit[i]
+        if c.isspace():
+            j = i
+            while j < len(lit) and lit[j].isspace():
+                j += 1
+            out.append(r"\s*")
+            i = j
+        elif c.isdigit():
+            j = i
+            while j < len(lit) and lit[j].isdigit():
+                j += 1
+            out.append(r"\d+")
+            i = j
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def _json_spans(s):
+    """[(start, end, value)] of every JSON object / array in s, left to right."""
+    dec, out, i = json.JSONDecoder(), [], 0
+    while i < len(s):
+        if s[i] in "{[":
+            try:
+                val, end = dec.raw_decode(s, i)
+                out.append((i, end, val))
+                i = end
+                continue
+            except ValueError:
+                pass
+        i += 1
+    return out
+
+
+def _is_args(v, want):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return False
+    return isinstance(v, dict) and v == want
+
+
+def derive_reader(ct):
+    """The call syntax read off the template's own rendering of a known call -- a spec parse_with_reader reads model
+    output with -- or None when the template renders no call. Shapes:
+      json      the call is a JSON object (or list of them) carrying the name: {"open", "close"}
+      name+json the name sits in markup, the arguments are a JSON object: {"call_open", "mid"}
+      tagged    one markup element per argument: {"call_open", "name_tail", "kv_open", "kv_mid", "val_close",
+                "call_close"}
+      pythonic  [name(key="value")]: {"open"}"""
+    a1 = {"city": _RD_A1, "unit": _RD_B1}
+    a2 = {"city": _RD_A2, "unit": _RD_B2}
+    one = _rd_call_text(ct, [(_RD_NAME, a1)])
+    if not one or _RD_NAME not in one:
+        return None
+    two = _rd_call_text(ct, [(_RD_NAME, a1), (_RD_NAME2, a2)])
+    if two and _RD_NAME2 not in two:
+        two = None
+    n0 = one.index(_RD_NAME)
+    spans = _json_spans(one)
+    # json: a JSON value whose object(s) carry the name
+    for s0, s1, v in spans:
+        objs = v if isinstance(v, list) else [v]
+        if any((_call_from_obj(o) or (None,))[0] == _RD_NAME for o in objs):
+            return {"shape": "json", "open": one[:s0].strip(), "close": one[s1:].strip(), "list": isinstance(v, list),
+                    "example": one}
+    # name+json: the arguments are a JSON object after the name
+    for s0, s1, v in spans:
+        if s0 > n0 and (_is_args(v, a1) or (isinstance(v, dict) and v.get("city") == _RD_A1)):
+            pre, mid = one[:n0], one[n0 + len(_RD_NAME):s0]
+            call_open = pre
+            if two:
+                t_n2 = two.index(_RD_NAME2)
+                first = next((e for b, e, w in _json_spans(two) if b < t_n2 and (_is_args(w, a1) or
+                              (isinstance(w, dict) and w.get("city") == _RD_A1))), None)
+                if first is not None:
+                    call_open = _lcs_suffix(pre, two[first:t_n2]) or pre
+            return {"shape": "name+json", "call_open": _opener(call_open), "mid": mid, "example": one}
+    # pythonic: name( ... key="value" ... )
+    m = re.search(r"\[?\s*" + re.escape(_RD_NAME) + r"\s*\(", one)
+    if m and re.search(r"city\s*=", one[m.end():]):
+        return {"shape": "pythonic", "open": one[:m.start()].strip(), "example": one}
+    # tagged: key / value markup per argument. The name nearest the first argument is the call's own (a header
+    # may repeat it); the value closer is what the last value and the middle values share (a separator follows
+    # only between them); a closer that repeats the key (`<city>v</city>`) is kept as a key back-reference.
+    v1 = one.find(_RD_A1)
+    k1 = one.rfind("city", 0, v1) if v1 >= 0 else -1
+    n0 = one.rfind(_RD_NAME, 0, k1) if k1 >= 0 else -1
+    k2 = one.find("unit", v1 + len(_RD_A1)) if v1 >= 0 else -1
+    v2 = one.find(_RD_B1, k2 + 4) if k2 >= 0 else -1
+    if min(n0, k1, v1, k2, v2) < 0:
+        return None
+    K = "\x00KEY\x00"
+    lead, between = one[n0 + len(_RD_NAME):k1], one[v1 + len(_RD_A1):k2]
+    kv_open = _lcs_suffix(lead, between)
+    name_tail = lead[:len(lead) - len(kv_open)]
+    kv_mid = one[k1 + 4:v1]
+    mid_t = between[:len(between) - len(kv_open)].replace("city", K)
+    post_t = one[v2 + len(_RD_B1):].replace("unit", K, 1)
+    n = 0
+    while n < min(len(mid_t), len(post_t)) and mid_t[n] == post_t[n]:
+        n += 1
+    val_close, sep, call_close = mid_t[:n], mid_t[n:], post_t[n:]
+    pre = one[:n0]
+    call_open = pre
+    if two:
+        t_n2 = two.rfind(_RD_NAME2, 0, two.find(_RD_A2))
+        e1 = two.rfind(_RD_B1, 0, t_n2)
+        if t_n2 >= 0 and e1 >= 0:
+            call_open = _lcs_suffix(pre, two[e1 + len(_RD_B1):t_n2]) or pre
+    return {"shape": "tagged", "call_open": _opener(call_open), "name_tail": name_tail, "kv_open": kv_open,
+            "kv_mid": kv_mid, "val_close": val_close, "sep": sep, "call_close": call_close.strip().replace(K, "unit"),
+            "example": one}
+
+
+_RD_NAME_RE = r"([A-Za-z_][\w.\-:/]*)"
+
+
+def parse_with_reader(text, spec, tools=None):
+    """[(name, args)] read from raw model text with a derive_reader spec -- only text carrying the template's own
+    markers counts (a bare JSON reply is a call only when the template's call is a bare JSON value too)."""
+    t = text or ""
+    sc = tool_schemas(tools)
+    shape = (spec or {}).get("shape")
+    if shape == "json":
+        op = spec.get("open") or ""
+        if op:
+            m = re.search(_flex(op), t)
+            if not m:
+                return []
+            region = t[m.end():]
+        else:
+            region = re.sub(r"^```(?:json)?\s*", "", t.strip())
+            if region[:1] not in "[{":
+                return []
+        return _calls_in_json(region)
+    if shape == "name+json":
+        out = []
+        co = (spec.get("call_open") or "").strip()
+        pat = (_flex(co) if co else r"^\s*") + _RD_NAME_RE + _flex(spec.get("mid") or "")
+        for m in re.finditer(pat, t):                         # no opener: the reply must START with the call
+            rest = t[m.end():]
+            lead = len(rest) - len(rest.lstrip())
+            if rest[lead:lead + 1] != "{":
+                continue
+            try:
+                v, _ = json.JSONDecoder().raw_decode(rest, lead)
+            except ValueError:
+                continue
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except ValueError:
+                    pass
+            out.append((m.group(1), v))
+        return out
+    if shape == "pythonic":
+        op = spec.get("open") or ""
+        if op:
+            m = re.search(_flex(op), t)
+            if not m:
+                return []
+            t = t[m.end():]
+        s = t.lstrip()
+        if s.startswith("["):
+            body = _balanced_list(s, 0)
+            return _pythonic(body) if body else []
+        m = re.search(r"[A-Za-z_][\w.]*\s*\(", s)
+        if not m or m.start() > 0:
+            return []
+        body = _balanced_list(s, 0)
+        return _pythonic(body) if body else []
+    if shape == "tagged":
+        out = []
+        co, nt = spec.get("call_open") or "", spec.get("name_tail") or ""
+        ko, km, vc, sp, cc = (spec.get(k) or "" for k in ("kv_open", "kv_mid", "val_close", "sep", "call_close"))
+        if not (co.strip() or nt.strip()):
+            return []                                           # no markup to anchor on: never guess
+        name_re = r"([^\s<>\"'=]+?)" if nt.strip() else _RD_NAME_RE
+        heads = list(re.finditer(_flex(co) + name_re + _flex(nt), t))
+        K = "\x00KEY\x00"
+        vc_re = "(?P=key)".join(_flex(x) for x in vc.split(K)) if vc.strip() else \
+            (r"(?=" + _flex(sp + ko) + r"|$)" if (sp + ko).strip() else r"$")
+        kv_re = _flex(ko) + r"(?P<key>[\w.\-]+)" + _flex(km) + r"(?P<val>.*?)" + vc_re
+        for i, m in enumerate(heads):
+            stop = heads[i + 1].start() if i + 1 < len(heads) else len(t)
+            seg = t[m.end():stop]
+            em = re.search(_flex(cc), seg) if cc.strip() else None
+            body = seg[:em.start()] if em else seg
+            name = m.group(1).strip()
+            props = (sc or {}).get(name) or {}
+            pairs = [(x.group("key"), x.group("val")) for x in re.finditer(kv_re, body, re.S)]
+            out.append((name, {k: _coerce(_strip1(v), props.get(k)) for k, v in pairs}))
+        return out
+    return []
 
 
 _DECISION_TAGS =("decision-model", "calibrated-probabilities", "system-one")
