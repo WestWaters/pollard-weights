@@ -339,6 +339,11 @@ def test_lane_of_reads_the_rung_format(tmp_path):
     m.mkdir()
     (m / "config.json").write_text(json.dumps({"quantization": {"group_size": 64, "bits": 4}}))
     assert D3.lane_of(m) == "mlx"
+    raw = tmp_path / "mlx-bf16"
+    raw.mkdir()
+    (raw / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    _st(raw / "model.safetensors", {"language_model.model.norm.weight": np.zeros((H,), np.float32)})
+    assert D3.lane_of(raw) == "mlx", "an unquantized MLX conversion is still the MLX runtime's"
     g = tmp_path / "gptq"
     g.mkdir()
     (g / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "gptq"}}))
@@ -428,3 +433,23 @@ def test_card_shows_the_d3_board_with_runtime_ece_and_the_index_delta():
     txt = "\n".join(lines)
     assert "vllm serve vllm-sr/d3-edge" in txt and "/v1/systemone" in txt
     assert "--embeddings --pooling last" in txt and "pollard-d3 serve" in txt
+
+
+def test_mlx_compat_is_harmless_without_mlx_and_restores_what_it_patched():
+    with D3.mlx_compat():
+        pass
+    try:
+        from mlx_lm.models import qwen3_5 as Q
+    except Exception:                                   # noqa: BLE001 -- not an Apple / mlx box
+        return
+    cfg = {"model_type": "qwen3_5", "text_config": {
+        "model_type": "qwen3_5_text", "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32, "rms_norm_eps": 1e-6, "vocab_size": 128,
+        "linear_num_value_heads": 2, "linear_num_key_heads": 2, "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4, "full_attention_interval": 4,
+        "tie_word_embeddings": True, "rope_parameters": {"rope_theta": 1e6, "partial_rotary_factor": 0.25},
+        "layer_types": ["linear_attention", "full_attention", "full_attention", "full_attention"]}}
+    kinds = lambda m: "".join("l" if l.is_linear else "F" for l in m.language_model.model.layers)
+    with D3.mlx_compat():
+        assert kinds(Q.Model(Q.ModelArgs.from_dict(cfg))) == "lFFF", "layer_types decides each layer"
+    assert kinds(Q.Model(Q.ModelArgs.from_dict(cfg))) == "lllF", "patches undone on exit"

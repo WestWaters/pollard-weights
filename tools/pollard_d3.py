@@ -447,7 +447,7 @@ def load_rung_weights(backbone, rung, log=print):
             if key is None:
                 missing.append(name)
                 continue
-            arr = torch.from_numpy(rd.read(key)).reshape(p.shape).to(p.dtype)
+            arr = torch.from_numpy(rd.read(key)).reshape(p.shape).to(device=p.device, dtype=p.dtype)
             if not torch.equal(arr, p.data):
                 changed += 1
             p.data.copy_(arr)
@@ -720,6 +720,18 @@ def lane_of(rung):
         return "mlx"
     if os.path.isfile(os.path.join(p, "pollard-mlx.json")):
         return "mlx"
+    # an unquantized MLX conversion has no `quantization` block: its tensor names say it (mlx-vlm's layout)
+    for f in sorted(os.listdir(p)) if os.path.isdir(p) else ():
+        if f.startswith("model") and f.endswith(".safetensors"):
+            try:
+                with open(os.path.join(p, f), "rb") as fh:
+                    n = struct.unpack("<Q", fh.read(8))[0]
+                    keys = json.loads(fh.read(n))
+            except (OSError, ValueError, struct.error):
+                break
+            if any(k.startswith(("language_model.model.", "vision_tower.")) for k in keys):
+                return "mlx"
+            break
     return "hf"
 
 

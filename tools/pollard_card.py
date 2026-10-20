@@ -1497,7 +1497,11 @@ def main():
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
                 "one the f16 would have picked (llama-perplexity's `Same top p` for GGUF, the same logit "
                 "comparison in pollard-verify for the other lanes). Higher is closer to the original model._"]
-    if has_v:
+    if has_v and d3_boards(results):
+        out += ["", "_Verified = the rung passed `pollard-d3 gate`: through its own runtime it picks the same option as "
+                "bf16 on at least 90% of the typed decisions with a mean option KL of at most 0.05, and it ships the "
+                "readout and decision config byte-exact (pollard-complete). A rung that failed is not published._"]
+    elif has_v:
         out += ["", "_Verified = the rung passed `pollard-verify --gate`: its KLD / top-1 against the source and "
                 "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
                 "and met. A rung that failed is not published._"]
@@ -1653,7 +1657,13 @@ def main():
 
     # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
     # prints from, so the card and the CLI cannot drift apart
-    if "gguf" in lanes and builds:
+    if "gguf" in lanes and builds and d3_boards(results):
+        out += ["## Use it in your harness", "",
+                "A d3 rung has no chat endpoint. `pollard-d3 serve --rung <rung>.gguf --source . --port 8080` puts "
+                "`/v1/systemone` in front of llama-server (the readout applied to the last token's hidden state), so "
+                "anything that calls `/v1/systemone` -- Oh My Pi's `api: typesafe` judge role, the decision-index "
+                "`http` engine -- uses it unchanged.", ""]
+    elif "gguf" in lanes and builds:
         import pollard_harness as PH
         rt_ex = runtimes.get(ex.get("path"))
         stock_rungs = [b for b in builds if runtimes.get(b.get("path")) == "stock"]

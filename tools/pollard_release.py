@@ -1035,6 +1035,14 @@ def base_model_id(cfg, c):
                 return str(nop)
         except (OSError, ValueError, AttributeError):
             pass
+    for d in (c.get("hf_dir"), c.get("src")):            # a d3 package names its own repo in MODEL_MANIFEST.json
+        try:
+            import pollard_d3 as D3
+            rid = (D3.info(str(d)) or {}).get("repo_id")
+            if _is_hf_id(rid):
+                return str(rid)
+        except Exception:                                    # noqa: BLE001
+            pass
     for d in (c.get("hf_dir"), c.get("src")):
         base = os.path.basename(str(d or "").rstrip("/\\"))
         if base.count("__") == 1 and _is_hf_id(base.replace("__", "/")):
