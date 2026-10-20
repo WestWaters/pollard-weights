@@ -81,6 +81,10 @@ pollard-taskeval = "pollard_taskeval:main"
 pollard-health = "pollard_health:main"
 pollard-pack = "pollard_pack:main"
 pollard-prune = "pollard_prune:main"
+# per-expert-tensor MoE allocation incl. 1-bit experts (GGUF errmap + exact knapsack; EXL3 K1 recipes)
+pollard-moefit = "pollard_moefit:main"
+# REAP expert saliency (router weight x expert output norm) for pollard-prune --score reap
+pollard-reap = "pollard_reap:main"
 pollard-forge = "pollard_forge:main"
 # fine-tune (LoRA/QLoRA on mlx / TRL / Unsloth) + base-vs-tuned eval + ship (also `pollard tune`)
 pollard-tune = "pollard_tune:main"
@@ -162,7 +166,9 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "p
     "pollard_failmode", "pollard_routecheck", "pollard_toolcall", "pollard_trellis", "pollard_draft",
     "pollard_draft_train",
     # the setup checker and the one device helper every tool resolves --device through
-    "pollard_setup", "pollard_device"]
+    "pollard_setup", "pollard_device",
+    # MoE: per-expert allocation (1-bit experts) and REAP saliency for expert pruning
+    "pollard_moefit", "pollard_reap"]
 
 # the window's own HTML/CSS/JS and the bear it puts in the dock
 [tool.setuptools.package-data]

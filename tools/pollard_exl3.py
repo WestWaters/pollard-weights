@@ -423,13 +423,29 @@ def _ties(keys, tie=EXL3_TIE):
     return groups
 
 
+#: below K2 the K2->K1 octave of EXL3's trellis runs steeper than the in-range law (sc_optimize --alpha_low note:
+#: effective exponent ~2.35 vs ~2.0 measured on qwen3.8-27b). exllamav3 encodes and decodes K = 1..8
+#: (quant/bits_k.cuh, exl3_kernel_map.cu), so K1 is a real width -- this keeps the estimate honest down there.
+EXL3_ALPHA_LOW = 2.35
+
+
+def kld_law(S, K, probe_bits=4, alpha=2.0, alpha_low=EXL3_ALPHA_LOW):
+    """sc_optimize's error law kld(t, K) = S_t * 4^(p - K), with the steeper exponent below K2."""
+    if K >= 2 or alpha_low is None:
+        return S * 2.0 ** (alpha * (probe_bits - K))
+    return S * 2.0 ** (alpha * (probe_bits - 2)) * 2.0 ** (alpha_low * (2 - K))
+
+
 def pollard_recipe(budgeted, sens, target_bpw, head_bits=6, min_bits=2, max_bits=8, tie=EXL3_TIE,
-                   probe_bits=None, alpha=2.0):
+                   probe_bits=None, alpha=2.0, alpha_low=EXL3_ALPHA_LOW):
     """EXL3 recipe dict from Pollard's sensitivity profile at `target_bpw` (same accounting as convert --bits:
-    mean bits over the budgeted tensors)."""
+    mean bits over the budgeted tensors). min_bits=1 puts the K1 trellis on the table (a MoE's cold experts --
+    per-expert traffic is pollard-moefit exl3-recipe's job)."""
     import heapq, math, re as _re
     if not budgeted:
         raise ValueError("no budgeted tensors")
+    if not (1 <= min_bits <= max_bits <= 8):
+        raise ValueError(f"bit range [{min_bits}, {max_bits}] outside EXL3's K = 1..8")
     if not (min_bits <= target_bpw <= max_bits):
         raise ValueError(f"target {target_bpw} bpw outside [{min_bits}, {max_bits}]")
     numel = dict(budgeted)
@@ -453,7 +469,7 @@ def pollard_recipe(budgeted, sens, target_bpw, head_bits=6, min_bits=2, max_bits
     budget = target_bpw * total
     bits = {i: min_bits for i in range(len(groups))}
     used = min_bits * total
-    kl = lambda gi, K: sum(S[k] * 2.0 ** (alpha * (probe_bits - K)) for k in groups[gi])
+    kl = lambda gi, K: sum(kld_law(S[k], K, probe_bits, alpha, alpha_low) for k in groups[gi])
     heap = []
     for gi in range(len(groups)):
         cost = sum(numel[k] for k in groups[gi])
@@ -673,7 +689,10 @@ def main():
     ap.add_argument("--sensitivity", help="Pollard sensitivity.json (pollard-probe/-sensitivity) for --recipe pollard")
     ap.add_argument("--exl3-recipe", help="an sc_optimize recipe.yaml for --recipe exl3")
     ap.add_argument("--recipe-out", help="where --recipe pollard writes its YAML (default <out>.pollard-recipe.yaml)")
-    ap.add_argument("--min-bits", type=int, default=2, help="--recipe pollard: lowest per-tensor bitrate")
+    ap.add_argument("--min-bits", type=int, default=2,
+                    help="--recipe pollard: lowest per-tensor bitrate (1 = the K1 trellis; exllamav3 encodes and "
+                         "decodes K = 1..8). For a MoE use pollard-moefit exl3-recipe: per-expert traffic decides "
+                         "which experts take K1")
     ap.add_argument("--max-bits", type=int, default=8, help="--recipe pollard: highest per-tensor bitrate")
     ap.add_argument("--tie", default=EXL3_TIE, help="--recipe pollard: fused groups sharing one bitrate "
                     "(EXL3's default; '' = independent)")

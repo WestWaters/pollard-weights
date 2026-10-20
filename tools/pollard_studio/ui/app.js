@@ -739,9 +739,10 @@ const ADV_SECTIONS = [
   { title: "MIXTURE OF EXPERTS", icon: "cpu",
     why: "A MoE has no fixed computation graph. Capture which experts your workload uses, drop "
        + "the cold ones whole rather than crushing every one, and check quantization did not "
-       + "change the selection.",
-    tools: ["pollard_route", "pollard_experts", "pollard_prune", "pollard_routecheck",
-            "pollard_run"] },
+       + "change the selection. moefit measures every expert tensor at every width (1-bit included) "
+       + "and picks the mix at your byte budget; reap scores which experts to prune.",
+    tools: ["pollard_route", "pollard_experts", "pollard_moefit", "pollard_reap", "pollard_prune",
+            "pollard_routecheck", "pollard_run"] },
   { title: "LOOKUP TABLES ON THE SSD", icon: "layers",
     why: "N-gram and per-layer embedding tables (Qwen3.8-Flash-Next's 51B table, Gemma 4) are only ever "
        + "READ a few rows at a time, so llama.cpp can serve them straight from the file. fit --disk keeps "
