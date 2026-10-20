@@ -345,6 +345,17 @@ class HfApi:
                 yield os.path.relpath(os.path.join(r, f), base).replace(os.sep, "/"), os.path.join(r, f)
     def list_repo_files(self, repo):
         return sorted(p for p, _ in self._files(repo))
+    def get_paths_info(self, repo, paths):
+        files = dict(self._files(repo))
+        out = []
+        for p in paths:
+            if p in files:
+                full = files[p]
+                sha = hashlib.sha256(open(full, "rb").read()).hexdigest()
+                if os.environ.get("FAKEHUB_CORRUPT") and p.endswith(".safetensors"):
+                    sha = "0" * 64
+                out.append(_F(p, os.path.getsize(full), sha if p.endswith(".safetensors") else None))
+        return out
     def list_repo_tree(self, repo, recursive=True):
         for p, full in self._files(repo):
             sha = hashlib.sha256(open(full, "rb").read()).hexdigest()
@@ -392,6 +403,26 @@ def test_upload_relay_stages_uploads_checks_and_cleans_up(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="must keep 40 GB free"):
         tight.upload_folder(str(rung), "MLX/4bit", "Org/M-Pollard")
     assert isinstance(R.hf_api({"upload_via": url}), R.RelayApi)
+
+
+def test_upload_relay_answers_the_post_upload_hub_check(tmp_path, monkeypatch):
+    """pollard_hubcheck reads files back with get_paths_info; over the relay that call runs on the box."""
+    R = _release(tmp_path, monkeypatch)
+    import pollard_hubcheck as H
+    (tmp_path / "fakehub.py").write_text(FAKEHUB)
+    hub, staging = tmp_path / "hub", tmp_path / "staging"
+    rung = tmp_path / "LFM-MLX-3bit"
+    rung.mkdir()
+    (rung / "config.json").write_text("{}")
+    (rung / "model.safetensors").write_bytes(b"\x02" * 4096)
+    api = R.RelayApi(f"ssh://jwate@box{staging}?python=py", runner=_FakeRelay(tmp_path, hub), out=lambda *a: None)
+    api.create_repo("Org/M-Pollard", private=True)
+    api.upload_folder(str(rung), "MLX/3bit", "Org/M-Pollard")
+    info = {f.path: f for f in api.get_paths_info("Org/M-Pollard", ["MLX/3bit/model.safetensors", "MLX/3bit/config.json"])}
+    assert info["MLX/3bit/model.safetensors"].size == 4096
+    assert info["MLX/3bit/model.safetensors"].lfs["sha256"] == H.sha256_file(str(rung / "model.safetensors"))
+    pairs = [("MLX/3bit/model.safetensors", str(rung / "model.safetensors"))]
+    assert not H.mismatches(api, "Org/M-Pollard", pairs), "a correct upload passes the Hub check over the relay"
 
 
 def test_toolcall_reference_rows_measured_elsewhere_are_labelled(tmp_path):
