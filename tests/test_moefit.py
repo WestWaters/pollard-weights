@@ -685,3 +685,30 @@ def test_release_ladder_adds_the_moe_rung_for_a_moe(monkeypatch, tmp_path):
     assert "MOE" in labels and labels["MOE"] == pytest.approx(labels["IQ2"])
     monkeypatch.setattr(R, "_is_moe_gguf", lambda p: False)
     assert "MOE" not in dict(R.gguf_ladder_labels({"f16": str(f)}))
+
+
+def test_the_moe_ladder_plans_the_measured_rung(tmp_path, monkeypatch):
+    """pollard --ladder on a MoE: the MOE rung's steps, in order, each input built once (plan mode, nothing runs)."""
+    import types as _t
+    import pollard_auto as A
+    f16 = tmp_path / "m-f16.gguf"
+    f16.write_bytes(b"GGUF" + b"\0" * 4096)
+    calib = tmp_path / "release-calib.txt"
+    calib.write_text("x\n" * 10)
+    (tmp_path / "release-calib.heldout.txt").write_text("held\n" * 10)
+    ran = []
+    monkeypatch.setattr(A, "_run", lambda cmd, do_run, cwd=None: ran.append([str(c) for c in cmd]) or True)
+    monkeypatch.setattr(A, "find_llama_bin", lambda n: f"/bin/{n}")
+    monkeypatch.setattr(A, "_fit_ngl", lambda g, n: 99)
+    monkeypatch.setattr(A, "_moe_budget_gb", lambda a, f16_gb: 0.36)
+    a = _t.SimpleNamespace(gguf=str(f16), calib=str(calib), heldout=None, bin=None, ngl="auto", run=False,
+                           imatrix=str(tmp_path / "m.imatrix"), sensitivity=None, moe_gb=None)
+    out = A._moe_rung(a)
+    assert out.endswith("m-f16-MOE.gguf")
+    heads = [c[1] if c[0] == "pollard-moefit" else os.path.basename(c[0]) for c in ran]
+    assert heads == ["llama-imatrix", "errmap", "pollard-sensitivity", "lowbit", "auto"]
+    au = ran[-1]
+    assert au[au.index("--gb") + 1].startswith("0.36") and "--lowbit" in au and "--no-toolcall" not in au
+    assert au[au.index("--screen-eval") + 1] != au[au.index("--eval") + 1]
+    assert ran[0][ran[0].index("-o") + 1].endswith(".moe.imatrix.gguf")       # GGUF: per-expert counts
+    assert A._heldout_for(a).endswith("release-calib.heldout.txt")
