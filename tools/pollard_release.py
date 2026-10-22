@@ -1541,7 +1541,7 @@ def _keep(key, b, why, out):
     import pollard_workspace as ws
     b["kept"] = why
     b.pop("freed", None)
-    fields = ("kept", "streamed_unverified", "runtime", "uploaded_as")
+    fields = ("kept", "streamed_unverified", "runtime", "runtime_arch", "uploaded_as")
     ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("freed",))
     out(f"      KEPT {b.get('path')} -- {why}")
 
@@ -1596,7 +1596,9 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         name = b.get("name") or os.path.basename(b["path"])
         try:                                     # pollard-ggufcheck before it leaves: the card states the runtime
             import pollard_ggufcompat as gc
-            b["runtime"] = gc.runtime_of(b["path"])[0]
+            b["runtime"], _why = gc.runtime_of(b["path"])
+            if b["runtime"] == "pollard":      # the card names the patch even after the rung is freed
+                b["runtime_arch"] = _why.get("architecture")
             out(f"      ggufcheck: {name} -> {b['runtime']}")
         except Exception as e:                                   # noqa: BLE001
             out(f"      ggufcheck: could not read {name} ({e}) -- the card will not state its runtime")
@@ -1630,7 +1632,7 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     b.pop("kept", None)
     if streamed:
         b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
-    fields = ("uploaded", "uploaded_as", "runtime", "bytes")
+    fields = ("uploaded", "uploaded_as", "runtime", "runtime_arch", "bytes")
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if not ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",)):
         # the upload is confirmed but the MANIFEST no longer has this build to say so: freeing the file now would

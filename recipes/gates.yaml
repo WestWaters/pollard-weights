@@ -13,7 +13,9 @@
 #                    "tool calls: not measured (<reason>)"; fail holds it back
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   decision_option_kl_max  mean option-distribution KL to the f16 (nats) pollard-decision --results
-#   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
+#   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck). An architecture only
+#                    Pollard's own runtime patch implements (`pollard`, e.g. clef-omni) passes when this release
+#                    built/verified it with Pollard's runtime; the card says "Needs llama.cpp with Pollard's patch"
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
 #   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
 #   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure

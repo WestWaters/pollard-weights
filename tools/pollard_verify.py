@@ -764,7 +764,9 @@ DEFAULT_GATES = """\
 #                    "tool calls: not measured (<reason>)"; fail holds it back
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
 #   decision_option_kl_max  mean option-distribution KL to the f16 (nats) pollard-decision --results
-#   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
+#   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck). An architecture only
+#                    Pollard's own runtime patch implements (`pollard`, e.g. clef-omni) passes when this release
+#                    built/verified it with Pollard's runtime; the card says "Needs llama.cpp with Pollard's patch"
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
 #   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
 #   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
@@ -984,6 +986,17 @@ def evaluate_gate(metrics, th, missing="fail"):
                 row("runtime", None, want, missing == "skip", "not checked (not a GGUF, or unreadable)")
             else:
                 ok = v in _RUNTIME_OK.get(want, {want})
+                if v == "pollard" and want in _RUNTIME_OK:
+                    # an architecture only Pollard's own runtime patch implements (runtime-patches/, upstream PR
+                    # pending): passes when THIS release built / verified the rung with that runtime -- the card then
+                    # says "Needs llama.cpp with Pollard's <arch> patch", never "stock". Without that evidence the
+                    # card and the runtime could disagree, so it fails like any other mismatch.
+                    ok = metrics.get("runtime_engine") == "pollard"
+                    row("runtime", v, want, ok,
+                        "needs llama.cpp with Pollard's runtime patch; built/verified with it here -- the card says so"
+                        if ok else "the architecture needs Pollard's runtime patch and this rung was not built or "
+                        "verified with Pollard's runtime (pollard-runtime --update)")
+                    continue
                 row("runtime", v, want, ok, "" if ok else
                     f"a rung published as {want} needs '{v}' -- the card and the runtime would disagree")
     if metrics.get("complete") is not None:            # never a text-only rung, whatever the thresholds say
@@ -1026,6 +1039,8 @@ def metrics_from_results(results, rung):
         m["decision_option_kl"] = float(d["option_kl"])
     if r.get("coherence"):
         m["coherence"] = r["coherence"]
+    if r.get("runtime_engine"):                # a `pollard`-architecture rung built / verified with Pollard's runtime
+        m["runtime_engine"] = r["runtime_engine"]
     dr = r.get("draft") or {}
     if dr.get("tau") is not None:
         m["draft_tau"] = float(dr["tau"])
@@ -1059,6 +1074,23 @@ def gguf_runtime(path):
         return gc.runtime_of(path)[0]
     except Exception as e:                                   # noqa: BLE001
         print(f"   (runtime check unavailable: {e})", file=sys.stderr)
+        return None
+
+
+def pollard_runtime_engine(path, measured=None):
+    """'pollard' when this machine built / verified a `pollard`-architecture rung WITH Pollard's runtime: the
+    measurement here loaded the file (a llama.cpp that opens an architecture only our patch implements is, by
+    construction, Pollard's), or the engine tree the one resolver (pollard_calc.find_llama_bin, via
+    pollard_ggufcompat.pollard_engine_tree) runs this architecture with carries it. None otherwise -- the runtime
+    gate then fails rather than letting the card guess."""
+    measured = measured or {}
+    if any(measured.get(k) is not None for k in ("kld", "ppl", "decision_agreement", "decision_option_kl")):
+        return "pollard"
+    try:
+        import pollard_ggufcompat as gc
+        arch = gc.read_header(path)[0]
+        return "pollard" if gc.pollard_engine_tree(arch) else None
+    except Exception:                                        # noqa: BLE001
         return None
 
 
@@ -1235,6 +1267,14 @@ def main():
             fails += 1
     if lane == "gguf" and a.gate is not None and str(a.model).endswith(".gguf"):
         measured["runtime"] = gguf_runtime(a.model)
+        if measured["runtime"] == "pollard":
+            prior = {}
+            if a.results and os.path.exists(a.results):
+                try:
+                    prior = metrics_from_results(json.load(open(a.results, encoding="utf-8")), rung)
+                except (OSError, ValueError):
+                    prior = {}
+            measured["runtime_engine"] = pollard_runtime_engine(a.model, {**prior, **measured})
     if a.coherence and lane == "gguf":
         from pollard_bench import coherence_gate
         from pollard_calc import find_llama_bin
@@ -1247,6 +1287,8 @@ def main():
     if a.results and measured:
         import pollard_workspace as ws
         keep = {k: measured[k] for k in ("kld", "top1", "ppl", "coherence") if measured.get(k) is not None}
+        if measured.get("runtime") == "pollard":       # the card reads this: "Needs llama.cpp with Pollard's patch"
+            keep.update({k: measured[k] for k in ("runtime", "runtime_engine") if measured.get(k)})
         if keep:
             try:
                 ws.merge_results(a.results, rung, keep)

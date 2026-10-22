@@ -18,6 +18,7 @@ python3.pkgs.buildPythonApplication {
       ../README.md
       ../LICENSE
       ../install.sh
+      ../runtime-patches
       (lib.fileset.fileFilter (
         file:
         builtins.any file.hasExt [
