@@ -255,3 +255,71 @@ def test_parallel_free_completion_gate_runs_before_expanded_rungs_or_later_build
         assert st["gguf/complete"] == "done"
         assert ran.index("complete") < ran.index("gguf-verify") < ran.index("gguf-publish")
         assert ran.index("complete") < ran.index("later-build")
+
+
+def test_a_measure_worker_crash_wakes_the_waiting_slot_and_stops_the_release(tmp_path):
+    """A non-SystemExit error in the measure worker must not leave a slot blocked on its lane's gate forever."""
+    steps = [S(id="gguf/ladder-Q6_K", lane="gguf", rung="Q6_K", kind="build"),
+             S(id="gguf/complete", lane="gguf", kind="gate", blocks=["gguf"]),
+             S(id="gguf/rungs-Q6_K", lane="gguf", kind="expand"),
+             S(id="gguf/ladder-IQ4_XS", lane="gguf", rung="IQ4_XS", kind="build"),
+             S(id="gguf/rungs-IQ4_XS", lane="gguf", kind="expand"),
+             S(id="gguf/card", lane="gguf", kind="card"), S(id="release/public", lane="release", kind="finalize")]
+    ran = []
+
+    def runner(ss):
+        ran.extend(s.id for s in ss)
+        if any(s.kind == "gate" for s in ss):
+            raise RuntimeError("bug in the measure path")
+        return {s.id: "done" for s in ss}
+
+    box = {}
+
+    def go():
+        try:
+            R.execute_parallel(steps, {"mdir": str(tmp_path), "ngl": "0"}, {}, True, out=lambda *_: None,
+                               runner=runner, admission=Open(), timeline=str(tmp_path / "tl.log"))
+        except BaseException as e:                  # noqa: BLE001
+            box["err"] = e
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(15)
+    assert not t.is_alive(), "the slot waiting on the gate hung"
+    assert isinstance(box.get("err"), RuntimeError) and "measure worker stopped" in str(box["err"])
+    assert "gguf/ladder-IQ4_XS" not in ran, "no later build of the lane without its gate"
+    assert "gguf/card" not in ran and "release/public" not in ran, "nothing final on top of ungated rungs"
+
+
+def test_a_gate_queued_after_the_measure_worker_died_does_not_hang(tmp_path):
+    """The worker dies on ANOTHER lane's job first; a slot that queues its gate afterwards must not wait forever."""
+    steps = [S(id="gptq/int4/build", lane="gptq", rung="int4", kind="build"),
+             S(id="gptq/int4/verify", lane="gptq", rung="int4", kind="verify"),
+             S(id="gguf/ladder-Q6_K", lane="gguf", rung="Q6_K", kind="build"),
+             S(id="gguf/complete", lane="gguf", kind="gate", blocks=["gguf"]),
+             S(id="gguf/rungs-Q6_K", lane="gguf", kind="expand"),
+             S(id="gguf/ladder-IQ4_XS", lane="gguf", rung="IQ4_XS", kind="build"),
+             S(id="gguf/card", lane="gguf", kind="card")]
+    ran = []
+
+    def runner(ss):
+        ran.extend(s.id for s in ss)
+        if any(s.id == "gguf/ladder-Q6_K" for s in ss):
+            time.sleep(0.3)                          # the GPU lane's measure job crashes first
+        if any(s.kind == "verify" for s in ss):
+            raise RuntimeError("bug in the measure path")
+        return {s.id: "done" for s in ss}
+
+    box = {}
+
+    def go():
+        try:
+            box["st"] = R.execute_parallel(steps, {"mdir": str(tmp_path), "ngl": "0"}, {}, True, out=lambda *_: None,
+                                           runner=runner, admission=Open(), timeline=str(tmp_path / "tl.log"))
+        except BaseException as e:                  # noqa: BLE001
+            box["err"] = e
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(15)
+    assert not t.is_alive(), "the slot waiting on the gate hung"
+    assert isinstance(box.get("err"), RuntimeError)
+    assert "gguf/complete" not in ran and "gguf/ladder-IQ4_XS" not in ran and "gguf/card" not in ran

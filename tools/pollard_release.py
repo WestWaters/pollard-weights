@@ -1456,8 +1456,12 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     if streamed:
         b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
     fields = ("uploaded", "uploaded_as", "runtime", "bytes")
-    ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",))
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
+    if not ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",)):
+        # the upload is confirmed but the MANIFEST no longer has this build to say so: freeing the file now would
+        # leave nothing on this machine recording where the rung went -- keep it
+        out(f"      KEPT {b.get('path')} -- uploaded, but its MANIFEST entry is gone, so the upload is not recorded")
+        return "kept: upload not recorded"
     if _free_local(c, b, out):
         b["freed"] = "uploaded + confirmed on the Hub"
         ws.update_build(key, b["path"], {"freed": b["freed"]})
@@ -2301,8 +2305,21 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
             statuses.update(got)
         return got
 
+    pending = set()                                   # gate Events a slot is waiting on (under tl_lock)
+    measure_down = _threading.Event()                 # set when the measure worker exits, for any reason
+    measure_crash = []
+
+    def skip_unmeasured(ss, why):
+        with tl_lock:
+            statuses.update({s.id: why for s in ss if s.id not in statuses})
+
     def slot_worker(slot):
-        for lane, rung, ss in slots[slot]:
+        for i, (lane, rung, ss) in enumerate(slots[slot]):
+            if measure_down.is_set():
+                # nothing queued from here on would ever be measured: say so instead of building rungs nobody gates
+                for _, _, left in slots[slot][i:]:
+                    skip_unmeasured(left, "skipped: the measure worker stopped")
+                break
             builds = [s for s in ss if s.kind == "build"]
             rest = [s for s in ss if s.kind != "build"]
             ok = True
@@ -2316,26 +2333,56 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
                 continue
             if rest:
                 checked = _threading.Event() if any(s.kind == "gate" and lane in (s.blocks or []) for s in rest) else None
-                mq.put((lane, rung, rest, checked))
                 if checked:
-                    # Later builds in this lane depend on its complete-model gate. Other slots can carry on.
-                    checked.wait()
+                    with tl_lock:
+                        pending.add(checked)
+                mq.put((lane, rung, rest, checked))
+                if measure_down.is_set():                  # put after the worker drained the queue: never measured
+                    skip_unmeasured(rest, "skipped: the measure worker stopped")
+                if checked:
+                    # Later builds in this lane depend on its complete-model gate. Other slots can carry on. A measure
+                    # worker that died never sets it: notice that rather than wait forever.
+                    while not checked.wait(1.0) and not measure_down.is_set():
+                        pass
+                    with tl_lock:
+                        pending.discard(checked)
         mq.put(None)
 
     def measure_worker(n_feeders):
         done_feeders = 0
-        while done_feeders < n_feeders:
-            item = mq.get()
-            if item is None:
-                done_feeders += 1
-                continue
-            lane, rung, rest, checked = item
-            peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
-            try:
-                run_job("measure", f"{lane}/{rung}", rest, peak)
-            finally:
-                if checked:
-                    checked.set()
+        try:
+            while done_feeders < n_feeders:
+                item = mq.get()
+                if item is None:
+                    done_feeders += 1
+                    continue
+                lane, rung, rest, checked = item
+                try:
+                    peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
+                    run_job("measure", f"{lane}/{rung}", rest, peak)
+                except BaseException:
+                    skip_unmeasured(rest, "failed: the measure worker stopped")
+                    raise
+                finally:
+                    if checked:
+                        checked.set()
+        except BaseException as e:                     # noqa: BLE001 -- reported after the join, never swallowed
+            measure_crash.append(e)
+        finally:
+            # every slot waiting on a gate wakes up; whatever is still queued will not be measured
+            measure_down.set()
+            with tl_lock:
+                for ev in list(pending):
+                    ev.set()
+            while True:
+                try:
+                    item = mq.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    skip_unmeasured(item[2], "skipped: the measure worker stopped")
+                    if item[3]:
+                        item[3].set()
 
     feeders = [_threading.Thread(target=slot_worker, args=(k,), name=f"slot-{k}", daemon=True) for k in slots]
     meas = _threading.Thread(target=measure_worker, args=(len(feeders),), name="measure", daemon=True)
@@ -2343,6 +2390,10 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
         t.start()
     for t in feeders + [meas]:
         t.join()
+    if measure_crash:
+        # no card, upload or public flip on top of rungs that were never gated
+        skip_unmeasured(final, "skipped: the measure worker stopped")
+        raise RuntimeError(f"the measure worker stopped: {measure_crash[0]!r}") from measure_crash[0]
     statuses.update(runner(final))
     return statuses
 

@@ -234,3 +234,52 @@ def test_mark_verified_uses_discovered_manifest_when_local_source_was_removed(tm
     assert build["verified"] is True
     assert build["ppl"] == 4.5
     assert ws.list_models() == ["local-source"]
+
+
+def test_publish_keeps_the_file_when_its_manifest_entry_vanished_during_upload(model, inputs, hub, monkeypatch):
+    """A confirmed upload that cannot be recorded (the entry was removed meanwhile) must not free the local copy."""
+    cfg = plan(inputs)
+    c, _, _ = R.plan_steps(cfg, model, {"gguf"})
+    key = c["f16"]
+    rung = Path(ws.model_dir(key, create=True)) / "Tiny-1B-Pollard-Q6_K.gguf"
+    rung.write_bytes(b"GGUF" * 10)
+    ws.record_build(key, "gguf", str(rung), tag="Q6_K")
+    ws.record_gate(str(rung), {"pass": True})
+
+    def confirm(api, repo, pairs):
+        with ws.manifest_transaction(key) as man:     # another writer drops the entry while the upload runs
+            man["builds"] = [b for b in man["builds"] if b["path"] != str(rung)]
+        return []
+
+    monkeypatch.setattr(R, "remote_mismatches", confirm)
+    step = R._publish_rung_step(c, "gguf", "Q6_K", str(rung))
+    assert R.publish_rung(step, c, cfg, True, out=lambda *_: None) == "kept: upload not recorded"
+    assert rung.exists()
+
+
+def test_update_build_patches_every_entry_for_the_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))
+    path = str(tmp_path / "dup.gguf")
+    ws.record_build("Org/Model", "gguf", path)
+    with ws.manifest_transaction("Org/Model") as man:  # a hand-merged MANIFEST with the same path twice
+        man["builds"].append(dict(man["builds"][0], kept="old"))
+    assert ws.update_build("Org/Model", path, {"verified": True}, remove=("kept",))
+    builds = ws.read_manifest("Org/Model")["builds"]
+    assert len(builds) == 2 and all(b["verified"] is True and "kept" not in b for b in builds)
+    before = Path(ws._manifest_path("Org/Model")).read_text()
+    assert not ws.update_build("Org/Model", str(tmp_path / "other.gguf"), {"verified": False})
+    assert Path(ws._manifest_path("Org/Model")).read_text() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_atomic_json_respects_the_umask_not_mkstemp_0600(tmp_path, monkeypatch):
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(ws, "_UMASK", 0o022)
+    out = tmp_path / "results.json"
+    ws.write_json_atomic(str(out), {"a": 1})
+    assert out.stat().st_mode & 0o777 == 0o644
+    ws.record_build("Org/Model", "gguf", str(tmp_path / "b.gguf"))
+    assert Path(ws._manifest_path("Org/Model")).stat().st_mode & 0o777 == 0o644
+    monkeypatch.setattr(ws, "_UMASK", 0o077)
+    ws.write_json_atomic(str(out), {"a": 2})
+    assert out.stat().st_mode & 0o777 == 0o600
