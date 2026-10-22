@@ -1143,11 +1143,35 @@ def vllm_load_problem(model_dir):
     return None
 
 
+#: vLLM's Humming kernels (vllm-project/humming, in vLLM since 0.32.0) serve a MIXED checkpoint layer by layer when it
+#: loads through its own quant method plus `--linear-backend humming`. `--quantization humming` is not that: it reads
+#: only the first compressed-tensors config group that targets Linear, or Quark's global_quant_config -- one scheme
+#: for every layer of a per-layer mix.
+HUMMING_FLAG = "--linear-backend humming"
+HUMMING_MIN_VLLM = "0.32.0"
+HUMMING_COMMENT = f"# mixed precision: Humming kernels per layer, vLLM >= {HUMMING_MIN_VLLM}"
+HUMMING_NOTE = (f"Mixed-precision rungs serve with `{HUMMING_FLAG}` (vLLM >= {HUMMING_MIN_VLLM}): the checkpoint loads "
+                "through its own quantization config, every layer at its own scheme, on vLLM's Humming kernels. Not "
+                "`--quantization humming`, which reads only the first compressed-tensors config group (or Quark's "
+                "global config) and would give every layer one scheme.")
+
+
+def humming_serve(path, flags=""):
+    """The vLLM line for a mixed-precision rung (see HUMMING_FLAG)."""
+    return f"vllm serve {path}{flags} {HUMMING_FLAG}   {HUMMING_COMMENT}"
+
+
+def meta_is_mixed(meta):
+    """A pollard-mx rung whose linears are MXFP6 or a per-layer mix (pollard_mx.json)."""
+    fmt = str((meta or {}).get("format") or "").lower()
+    return fmt == "mix" or fmt.startswith("mxfp6")
+
+
 def serve_lines(meta, path):
     out = []
     for rt, status, how in (tuple(x) for x in meta.get("runtimes", [])):
         if rt == "vLLM" and status == "yes":
-            out.append(f"vllm serve {path}")
+            out.append(humming_serve(path) if meta_is_mixed(meta) else f"vllm serve {path}")
         elif rt == "Graft" and status == "yes":
             out.append(f"graft repack {path} && graft serve -m <the .graft.gguf it writes>")
     return out

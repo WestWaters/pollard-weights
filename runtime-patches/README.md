@@ -38,6 +38,17 @@ against, the files it touches, and any architecture-like strings it adds.
 | `llama.cpp-clef-omni` | ggml-org/llama.cpp | `b76b133` 2026-10-15 | `clef-omni` architecture: Cloudflare's decision head on the Qwen3-Omni MoE body (head shared with `clef`), converter, `/v1/systemone`. Applies after the two Omni patches. Parity vs Cloudflare's reference: text 1.6e-5, image 1.4e-4, audio 4.5e-5..9.4e-5. Rebased 2026-10-15 onto master (after `vllm-decision2` and the no-cache KV padding, #30416): same tensors from the converter, and `/v1/systemone` answers equal to the 1623d8c build within 2.6e-9 (CPU) on a tiny random clef-omni. Upstream PR pending. |
 | `llama.cpp-quantize-dec-blk` | ggml-org/llama.cpp | `b76b133` 2026-10-15 | `llama-quantize` on an MoE model reads every FFN tensor's layer from its name and knew only `blk.N.`, so clef-omni died on `Failed to determine layer for tensor dec.blk.0.ffn_down.weight` -- no Q8_0 imatrix host, no ftype rung that left a `dec.blk` tensor to the preset. The decision head's `dec.blk.N` is now its own stack (block count from the tensor names). One file (`src/llama-quant.cpp`), applies after `clef-omni`; also applies to the box's newer staged tree. Checked on a tiny clef-omni (b76b133 + the Omni patches, CPU): Q4_K_M / Q2_K / IQ4_XS / IQ2_XXS all build where every one failed before. |
 
+## Which engine runs a model
+
+Every llama.cpp step (rung builds, imatrix, quantize, pollard-decision, pollard-verify) finds its binary through
+one resolver, `pollard_calc.find_llama_bin`, steered by the model's architecture (`POLLARD_ARCH`, which the release,
+`pollard`, `pollard-decision` and `pollard-verify` set from the GGUF). A manifest's `archs` list names architectures
+that need the patch beyond loading at all: `llama.cpp-quantize-dec-blk` lists `clef-omni`. For such an architecture
+the engine trees (`engines.json` plus any `runtime/<name>.lock.json` that `pollard-runtime --update` built, e.g. a
+staged `llama.cpp.bolt`) are ranked by how many of those patches their source carries (by content, as below), so a
+clef-omni ladder quantizes, imatrixes and serves from the tree that has the dec.blk fix even when the live
+`runtime/llama.cpp` loads clef-omni without it. Architectures with no `archs` entry resolve exactly as before.
+
 ## Verification is by content, not by `git apply`
 
 A patch is confirmed applied by checking its added lines against the tree's own diff. Reverse-applying
