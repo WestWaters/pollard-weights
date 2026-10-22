@@ -197,16 +197,20 @@ def load_plan(path=None, preset=None):
 
 
 def auto_preset(cfg, src, preset=None, plan=None):
-    """A d3 decision model picks the d3 preset itself when neither the command line nor the plan names one."""
+    """A d3 decision model picks the d3 preset itself when neither the command line nor the plan names one, and a
+    decision-HEAD model (clef / clef-omni: joint_head_config.json) the decision preset."""
     if preset or cfg.get("preset") != "text" or not src or not os.path.isdir(str(src)):
         return cfg
     if plan and _yaml(open(plan, encoding="utf-8").read()).get("preset"):
         return cfg
     import pollard_d3 as D3
-    if D3.decision_config(src) is None:
-        return cfg
-    print(f"   {src}: a d3 decision model ({D3.FORMAT_ID}) -> preset d3")
-    return load_plan(plan, "d3")
+    if D3.decision_config(src) is not None:
+        print(f"   {src}: a d3 decision model ({D3.FORMAT_ID}) -> preset d3")
+        return load_plan(plan, "d3")
+    if os.path.isfile(os.path.join(str(src), "joint_head_config.json")):
+        print(f"   {src}: a decision-head model (joint_head_config.json) -> preset decision")
+        return load_plan(plan, "decision")
+    return cfg
 
 
 def repo_name(org, model, lane=None):
@@ -306,7 +310,34 @@ def _ctx(cfg, src):
         ctx["d3"] = False
     if cfg.get("measure_ref"):                           # the served measurements' reference (see measure_ref)
         ctx["measure_ref"] = os.path.abspath(str(cfg["measure_ref"]))
+    ctx["decision_only"] = decision_only_reason(ctx)
     return ctx
+
+
+def decision_only_reason(c):
+    """Why this model is DECISION-ONLY (its graph ends in a decision head: no per-token logits), or None. Read off the
+    HF folder (clef's joint_head_config.json, a d3 package), else the f16 GGUF when it exists. Such a model's GGUF
+    rungs are gated on the decision board (pollard-decision vs the reference) and pollard-verify records KLD / PPL as
+    not applicable -- llama-perplexity has no logits to read."""
+    import pollard_decision as PD
+    for p in (c.get("hf_dir"), c.get("f16")):
+        why = PD.decision_only(p) if p else None
+        if why:
+            return why
+    return None
+
+
+def engine_arch(c):
+    """POLLARD_ARCH for this run, from the f16 GGUF as soon as it exists: every binary lookup in this process and in
+    every step it starts (rung builds, imatrix, quantize, pollard-decision, pollard-verify) then resolves through
+    pollard_calc.find_llama_bin to the engine tree that carries what the architecture needs (engines.json + the
+    patches' `archs`), not the stock tree by default."""
+    from pollard_calc import model_arch, set_model_arch
+    f16 = c.get("f16")
+    if f16 and os.path.isfile(str(f16)) and not c.get("_arch_set"):
+        if set_model_arch(f16):
+            c["_arch_set"] = True
+    return model_arch()
 
 
 def results_path(c, lane):
@@ -602,7 +633,7 @@ def gguf_rung_steps(cfg, c, builds):
             if c.get("free"):
                 steps.append(_publish_rung_step(c, "gguf", tag, path))
             continue
-        if m.get("decision"):
+        if m.get("decision") or c.get("decision_only"):     # decision-only: the board IS the fidelity number
             steps.append(Step(id=f"{rid}/decision", lane="gguf", rung=tag, kind="measure", requires="any",
                               cmd=["pollard-decision", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
                               ok_codes=(0, 1)))
@@ -2114,6 +2145,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
     while queue:
         st = queue.pop(0)
         n += 1
+        if run:
+            engine_arch(c)
         head = f"{n:3d}. [{st.lane}{'/' + st.rung if st.rung else ''}] {st.kind}"
         if st.kind == "expand" and st.lane in failed_lanes:
             out(f"{head}: SKIP (an earlier step of this lane failed)")

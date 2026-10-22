@@ -117,6 +117,37 @@ def engine_archs(vendored=VENDORED_ARCH_SRC):
     return got or None
 
 
+def pollard_engine_tree(arch):
+    """The managed engine tree Pollard's pipeline runs `arch` with, when that tree's source implements `arch`; else None.
+
+    ONE notion of the engine: the tree is the one pollard_calc.find_llama_bin (the resolver every rung build, imatrix,
+    quantize, decision and verify step uses, ranked by the patches the architecture needs) picks for `arch`. When no
+    managed binary is built here (CI, a fresh checkout), the managed trees (pollard_calc.engine_trees: engines.json
+    plus runtime/<name>.lock.json) are read by source in the resolver's order."""
+    if not arch:
+        return None
+    try:
+        import pollard_calc as pc
+    except Exception:                                        # noqa: BLE001 -- an installed tool without the calc
+        return None
+    trees = pc.engine_trees(REPO_ROOT)
+    order = []
+    for name in ("llama-server", "llama-perplexity", "llama-cli", "llama-quantize"):
+        try:
+            b = pc.find_llama_bin(name, arch=arch)
+        except Exception:                                    # noqa: BLE001
+            b = None
+        t = pc._engine_of(b, trees) if b else None
+        if t:
+            order.append(t)
+            break
+    order += [d for _n, d in trees if d not in order]
+    for t in order:
+        if arch in (engine_archs(os.path.join(t, "src", "llama-arch.cpp")) or ()):
+            return t
+    return None
+
+
 def stock_archs(vendored=VENDORED_ARCH_SRC):
     """The architecture names STOCK llama.cpp knows, as far as this machine can tell.
 

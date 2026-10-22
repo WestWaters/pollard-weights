@@ -10,5 +10,8 @@
   "src/llama-quant.cpp"
  ],
  "adds_strings": [],
- "diff_bytes": 2647
+ "diff_bytes": 2647,
+ "archs": [
+  "clef-omni"
+ ]
 }

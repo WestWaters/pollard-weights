@@ -53,6 +53,17 @@ A `pollard` rung passes the `runtime: stock` gate only when the release built/ve
 patch (runtime-patches/<patch>; upstream PR pending)" with `pollard-runtime --update` and the pinned-base build.
 When the upstream PR exists, record it in the manifest as `"upstream": {"pr": "<url>"}` (or `{"merged": "<tag>"}`).
 
+## Which engine runs a model
+
+Every llama.cpp step (rung builds, imatrix, quantize, pollard-decision, pollard-verify) finds its binary through
+one resolver, `pollard_calc.find_llama_bin`, steered by the model's architecture (`POLLARD_ARCH`, which the release,
+`pollard`, `pollard-decision` and `pollard-verify` set from the GGUF). A manifest's `archs` list names architectures
+that need the patch beyond loading at all: `llama.cpp-quantize-dec-blk` lists `clef-omni`. For such an architecture
+the engine trees (`engines.json` plus any `runtime/<name>.lock.json` that `pollard-runtime --update` built, e.g. a
+staged `llama.cpp.bolt`) are ranked by how many of those patches their source carries (by content, as below), so a
+clef-omni ladder quantizes, imatrixes and serves from the tree that has the dec.blk fix even when the live
+`runtime/llama.cpp` loads clef-omni without it. Architectures with no `archs` entry resolve exactly as before.
+
 ## Verification is by content, not by `git apply`
 
 A patch is confirmed applied by checking its added lines against the tree's own diff. Reverse-applying

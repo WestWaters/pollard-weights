@@ -45,13 +45,47 @@ LANE_WORD = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang"
 RUBIN_VLLM_IMAGE = "vllm/vllm-openai:cu134-nightly"
 
 
-def vllm_serve_block(repo, lanes):
+def checkpoint_is_mixed(path):
+    """Does this GPTQ / MX rung folder hold a MIXED-precision checkpoint -- layers at different schemes? A GPTQ
+    `dynamic` map that changes bits, a Quark per-module `layer_quant_config`, more than one compressed-tensors config
+    group, or a pollard-mx MXFP6 / mix rung. Those serve on vLLM with `--linear-backend humming` (pollard_mxfp6)."""
+    import pollard_mxfp6 as M6
+    p = str(path or "")
+    if not p or not os.path.isdir(p):
+        return False
+    if M6.meta_is_mixed(M6.read_meta(p)):
+        return True
+    if gptq_is_mixed(p):
+        return True
+    try:
+        with open(os.path.join(p, "config.json"), encoding="utf-8") as f:
+            q = json.load(f).get("quantization_config") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    if q.get("quant_method") == "quark" and q.get("layer_quant_config"):
+        return True
+    return q.get("quant_method") == "compressed-tensors" and (
+        len(q.get("config_groups") or {}) > 1 or q.get("format") == "mixed-precision")
+
+
+def vllm_line(path, rung_dir=None, flags=""):
+    """`vllm serve <path>`, with the Humming flag when the rung at `rung_dir` is a mixed-precision checkpoint."""
+    import pollard_mxfp6 as M6
+    return M6.humming_serve(path, flags) if checkpoint_is_mixed(rung_dir) else f"vllm serve {path}{flags}"
+
+
+def vllm_serve_block(repo, lanes, builds=None):
     """The vLLM run lines for the gptq / mx lanes. The mx lane adds Vera Rubin: the nightly CUDA 13.4
     image and the flags that select its paths. Commands only -- no throughput claim, because no number
-    on a card may be one we did not measure, and Pollard has not run on Rubin."""
+    on a card may be one we did not measure, and Pollard has not run on Rubin. `builds`: the gptq / mx rungs; any
+    mixed-precision one puts `--linear-backend humming` on the line."""
     if "gptq" not in lanes and "mx" not in lanes:
         return []
-    out = ["```bash", f"vllm serve {repo}", "```", ""]
+    import pollard_mxfp6 as M6
+    mixed = any(checkpoint_is_mixed(b.get("path")) for b in builds or [] if isinstance(b, dict))
+    out = ["```bash", M6.humming_serve(repo) if mixed else f"vllm serve {repo}", "```", ""]
+    if mixed:
+        out += [M6.HUMMING_NOTE, ""]
     if "mx" in lanes:
         out += ["On Vera Rubin, use vLLM's CUDA 13.4 nightly image (Rubin support is upstream-nightly):", "",
                 "```bash",
@@ -538,7 +572,7 @@ def tool_ready_note(builds, results):
             "capability measurement._")
 
 
-def tool_serve_lines(tools, lanes, repo, example_file):
+def tool_serve_lines(tools, lanes, repo, example_file, builds=None):
     """One serve line per lane, each with the flags that make THAT server parse this model's tool calls."""
     lc = tools.get("llama_cpp") or {}
     out = []
@@ -557,7 +591,10 @@ def tool_serve_lines(tools, lanes, repo, example_file):
         target = repo if vllm_lanes else "<the original weights>"
         what = " (" + " / ".join({"gptq": "GPTQ", "mx": "NVFP4 / MXFP4 / MXFP6 / FP8"}[l] for l in vllm_lanes) + ")" \
             if vllm_lanes else ""
-        out.append(f"- **vLLM**{what}: `vllm serve {target} {tools['vllm_flags']}`{note}")
+        mixed = vllm_lanes and any(checkpoint_is_mixed(b.get("path")) for b in builds or [] if isinstance(b, dict))
+        hum = " --linear-backend humming" if mixed else ""
+        out.append(f"- **vLLM**{what}: `vllm serve {target} {tools['vllm_flags']}{hum}`{note}"
+                   + (" (mixed-precision rungs: vLLM >= 0.32.0)" if mixed else ""))
     else:
         out.append("- **vLLM**: no `--tool-call-parser` reads this syntax; parse the calls client-side.")
     if "exlr8" in lanes:
@@ -571,7 +608,7 @@ def tool_serve_lines(tools, lanes, repo, example_file):
     return out
 
 
-def tool_serving_section(tools, lanes, repo, example_file):
+def tool_serving_section(tools, lanes, repo, example_file, builds=None):
     """'Tool calling': the call syntax the chat template uses and, per lane, the server flags that parse it -- the
     setting users get wrong most often. From pollard-modelkind's toolcall_info; nothing when the template writes no
     tool calls."""
@@ -586,7 +623,7 @@ def tool_serving_section(tools, lanes, repo, example_file):
         out += ["```", ex, "```", ""]
     out.append("Serve with:")
     out.append("")
-    out += tool_serve_lines(tools, lanes, repo, example_file)
+    out += tool_serve_lines(tools, lanes, repo, example_file, builds)
     if not tools.get("supports_tools"):
         out.append("- The template does not render a tool list, so describe the tools in the system prompt.")
     out.append("")
@@ -618,14 +655,16 @@ def rungs_section(builds, lane, repo):
            "exlr8": "pollard-exlr8 --decode ./{d} --out ./{d}-bf16 && vllm serve ./{d}-bf16"}.get(lane, "")
     rows = [f"| `{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} |"
             for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
-    pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+    pick_b = min(builds, key=lambda x: x.get("bytes") or 0)
+    pick = rung_subfolder(pick_b, lane)
     if lane == "mx":
         return mx_rungs_section(builds, repo, pick)
+    line = vllm_line(f"./{pick}", pick_b.get("path")) if lane == "gptq" else run.format(d=pick)
     return ["## Rungs in this repo", "",
             "Each rung is a complete checkpoint in its own folder; the repo root holds the default rung, so "
             "pointing a runtime at the repo id loads that one.", "",
             "| folder | size | avg bits |", "|---|---:|---:|", *rows, "",
-            "```bash", f'hf download {repo} --include "{pick}/*" --local-dir .', run.format(d=pick), "```", ""]
+            "```bash", f'hf download {repo} --include "{pick}/*" --local-dir .', line, "```", ""]
 
 
 #: ONE repo per model (owner, 2026-10-16): GGUF rungs + mmproj at the root, every other lane in its own folder
@@ -640,14 +679,15 @@ def lane_dir(repo):
     return "./" + str(repo).split("/")[-1]
 
 
-def lane_serve(lane, path, tools=None):
-    """The serve command for one directory-lane rung at a local `path`, with the tool-call flags that server needs."""
+def lane_serve(lane, path, tools=None, rung_dir=None):
+    """The serve command for one directory-lane rung at a local `path`, with the tool-call flags that server needs.
+    `rung_dir`: the rung's local build folder -- a mixed-precision GPTQ / MX checkpoint gets `--linear-backend humming`."""
     tools = tools if isinstance(tools, dict) else {}
     vflags = f" {tools['vllm_flags']}" if tools.get("vllm_parser") and tools.get("vllm_flags") else ""
     if lane == "mlx":
         return [f"mlx_lm.server --model {path}"]
     if lane in ("gptq", "mx"):
-        return [f"vllm serve {path}{vflags}"]
+        return [vllm_line(path, rung_dir, vflags)]
     if lane == "exl3":
         return [f"# TabbyAPI: python main.py --model-dir {os.path.dirname(path) or '.'} "
                 f"--model-name {os.path.basename(path)}"]
@@ -735,15 +775,19 @@ def lane_folder_section(lane, builds, results, repo, tools=None):
                     f"{_fmt_num(r.get('ppl'))} | {_fmt_num(r.get('kld'))} | "
                     f"{(f'{float(top1):.2f}%' if top1 else '--')} | {tool_ready_cell(r.get('toolcall'))} |"
                     f"{verified_cell(b, results)}")
-    pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+    pick_b = min(builds, key=lambda x: x.get("bytes") or 0)
+    pick = rung_subfolder(pick_b, lane)
     here = lane_dir(repo)
     path = f"{here}/{F}/{pick}"
     out = [f"## {LANE_TITLE.get(lane, lane.upper())} -- `{F}/`", "",
            f"Each rung is a complete checkpoint in its own folder under `{F}/`. Download only the one you want:", "",
            "| folder | size | avg bits | PPL | Mean KLD | Top-1 agree | Tool-ready | verified |",
            "|---|---:|---:|---:|---:|---:|---|---|", *rows, "",
-           "```bash", f'hf download {repo} --include "{F}/{pick}/*" --local-dir {here}', *lane_serve(lane, path, tools),
-           "```", ""]
+           "```bash", f'hf download {repo} --include "{F}/{pick}/*" --local-dir {here}',
+           *lane_serve(lane, path, tools, pick_b.get("path")), "```", ""]
+    if lane in ("gptq", "mx") and any(checkpoint_is_mixed(b.get("path")) for b in builds):
+        import pollard_mxfp6 as M6
+        out += [M6.HUMMING_NOTE, ""]
     out += provenance_lines(lane, builds)
     if lane == "gptq" and any(gptq_is_mixed(b.get("path", "")) for b in builds):
         out += ["Mixed-precision rungs store each layer at the bits its sensitivity earned (a per-layer `dynamic` map in "
@@ -781,7 +825,7 @@ def mx_rungs_section(builds, repo, pick):
                 serve.append(line)
         else:
             fmt, lay, loads = str(b.get("tag") or d).upper(), "compressed-tensors", "vLLM"
-            serve.append(f"vllm serve ./{d}")
+            serve.append(vllm_line(f"./{d}", b.get("path")))
         rows.append(f"| `{d}/` | {fmt} | {lay} | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} | {loads} |")
     notes = []
     for b in builds:
@@ -963,7 +1007,18 @@ def decision_section(builds, results):
             + (" _ECE = expected calibration error against the gold labels (10 bins, top label; lower = its "
                "confidence means what it says)._" if has_ece else "")
             + (f" _Flips = decisions whose answer differs from the {ref}'s._" if has_flips else ""),
-            ""]
+            ""] + decision_only_lines(results, ref)
+
+
+def decision_only_lines(results, ref="f16"):
+    """A decision-ONLY model (no per-token logits: clef / clef-omni): the card says KLD / PPL are not applicable, as
+    pollard-verify recorded them, and that the board above is what each rung was gated on."""
+    why = next((str(r.get("kld_reason") or "") for r in (results or {}).values()
+                if isinstance(r, dict) and r.get("kld_status") == "not-applicable"), None)
+    if why is None:
+        return []
+    return [f"_Mean KLD / PPL: {why or 'not applicable: decision-only model'}. Each rung's publish gate is this "
+            f"board: agreement and option KL vs the {ref}._", ""]
 
 
 RETENTION_CATS = ["Knowledge & Reasoning", "Math", "Coding", "Instruction Following", "Vision", "Other"]
@@ -1700,11 +1755,13 @@ def main():
                         "cannot run these files.", ""]
     if "mlx" in lanes:
         out += ["```bash", f'mlx_lm.generate --model {repo} --prompt "Hello"', "```", ""]
-    out += vllm_serve_block(repo, lanes)
+    vllm_builds = (list(builds) if primary in ("gptq", "mx") else []) + [
+        x for l_, bb_, _ in also if l_ in ("gptq", "mx") for x in bb_]
+    out += vllm_serve_block(repo, lanes, vllm_builds)
     if "exlr8" in lanes:
         out += exlr8_section(builds, repo, cfg)
     if not decision:
-        out += tool_serving_section(facts.get("tools"), lanes, repo, exn)
+        out += tool_serving_section(facts.get("tools"), lanes, repo, exn, vllm_builds)
     # ---- Speculative decoding: the matched drafter (pollard-draft), measured against these quantized rungs
     if a.draft_results and os.path.exists(a.draft_results) and a.draft_repo:
         import pollard_draft as PD

@@ -37,6 +37,11 @@ threshold with no number to check FAILS unless the file says `missing: skip` -- 
 a verified one. The verdict is stamped on the build in the MANIFEST and in results.json, so pollard-card
 shows "verified" and pollard release refuses to upload a rung that did not pass.
 
+DECISION-ONLY models (the graph ends in a decision head, no per-token logits: clef / clef-omni, a d3 readout GGUF)
+have no KLD / PPL: the gguf lane records them "not applicable: decision-only model" instead of running
+llama-perplexity, and gates the rung on its decision board (pollard-decision --ref --results: agreement + option KL,
+`kinds.decision_only` in gates.yaml, built-in per-bit-band defaults when the file has none).
+
   pollard-verify --lane gguf --model M-Q6_K.gguf --ref M-f16.gguf --eval heldout.txt \
                  --gate gates.yaml --rung Q6_K --results results.json
   pollard-verify --lane mlx --model ./M-Pollard-MLX-4bit --source ./M --eval heldout.txt --gate gates.yaml
@@ -758,6 +763,7 @@ DEFAULT_GATES = """\
 #                    this machine, GPU not free, too big). skip (the default) PUBLISHES it and the card says
 #                    "tool calls: not measured (<reason>)"; fail holds it back
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
+#   decision_option_kl_max  mean option-distribution KL to the f16 (nats) pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck). An architecture only
 #                    Pollard's own runtime patch implements (`pollard`, e.g. clef-omni) passes when this release
 #                    built/verified it with Pollard's runtime; the card says "Needs llama.cpp with Pollard's patch"
@@ -818,6 +824,33 @@ kinds:
         toolcall_retention_min: 85
       - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
         toolcall_retention_min: 75
+  # decision_only = the graph ends in a decision head and has NO per-token logits (clef / clef-omni, a d3 readout
+  # GGUF): llama-perplexity KLD / PPL cannot exist ("not applicable"), so the rung is gated on its decision board --
+  # agreement with the reference's decisions and the option-distribution KL (pollard-decision --ref --results).
+  # Applied by pollard-verify itself when it finds such a model, whatever gates file is in use.
+  decision_only:
+    skip: [kld_max, top1_min]
+    decision_agreement_min: 85
+    decision_option_kl_max: 0.15
+    rungs:
+      - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
+        decision_agreement_min: 98
+        decision_option_kl_max: 0.01
+      - match: ["Q6_K*", "*6bit*", "*-6.0bpw", "*MXFP6*", "MIX-6*bpw"]
+        decision_agreement_min: 97
+        decision_option_kl_max: 0.02
+      - match: ["Q5_K*", "*5bit*", "*-5.0bpw", "MIX-5*bpw"]
+        decision_agreement_min: 95
+        decision_option_kl_max: 0.03
+      - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw", "MIX-4*bpw"]
+        decision_agreement_min: 92
+        decision_option_kl_max: 0.05
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
+        decision_agreement_min: 88
+        decision_option_kl_max: 0.10
+      - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
+        decision_agreement_min: 80
+        decision_option_kl_max: 0.20
 """
 
 
@@ -845,14 +878,35 @@ def thresholds_for(gates, rung, lane=None, kinds=()):
     th = dict(gates.get("default") or {})
     th.update((gates.get("lanes") or {}).get(lane or "", {}) or {})
     _apply_rungs(th, gates.get("rungs"), rung)
+    kind_skip = []
     for kind in kinds or ():
         sec = (gates.get("kinds") or {}).get(kind) or {}
-        th.update({k: v for k, v in sec.items() if k != "rungs"})
+        th.update({k: v for k, v in sec.items() if k not in ("rungs", "skip")})
         _apply_rungs(th, sec.get("rungs"), rung)
+        kind_skip += list(sec.get("skip") or [])
+    for k in kind_skip:                         # a kind that has no such number (decision_only: no KLD / top-1)
+        th.pop(k, None)
     # a lane can opt out of a check it has no way to measure (exl3: no logit-level KLD path yet)
     for k in ((gates.get("lanes") or {}).get(lane or "", {}) or {}).get("skip") or []:
         th.pop(k, None)
     th.pop("skip", None)
+    return th
+
+
+DECISION_ONLY_NA = ("kld_max", "top1_min")
+
+
+def decision_only_thresholds(th, gates, rung):
+    """A decision-only rung's thresholds: KLD / top-1 removed (not applicable -- no per-token logits), and the
+    decision board's thresholds present. A gates file without a `kinds.decision_only` section gets the built-in
+    ones for the rung's bit band, so a custom file can never gate a decision model on a number that cannot exist."""
+    th = {k: v for k, v in th.items() if k not in DECISION_ONLY_NA}
+    if not any(k.startswith("decision_") for k in th):
+        builtin = load_gates(None)
+        sec = (builtin.get("kinds") or {}).get("decision_only") or {}
+        add = {k: v for k, v in sec.items() if k not in ("rungs", "skip")}
+        _apply_rungs(add, sec.get("rungs"), rung)
+        th.update(add)
     return th
 
 
@@ -863,6 +917,7 @@ _CHECKS = {
     "retention_min": ("retention", ">=", "task retention %"),
     "mt_retention_min": ("mt_retention", ">=", "translation retention %"),
     "decision_agreement_min": ("decision_agreement", ">=", "decision agreement %"),
+    "decision_option_kl_max": ("decision_option_kl", "<=", "decision option KL"),
     "toolcall_retention_min": ("toolcall_retention", ">=", "tool-call retention %"),
     "e2e_acc_min": ("e2e_acc", ">=", "end-to-end next-token agreement"),
     "draft_tau_min": ("draft_tau", ">=", "drafter tokens per target pass"),
@@ -980,6 +1035,8 @@ def metrics_from_results(results, rung):
     d = r.get("decision") or {}
     if d.get("agreement") is not None:
         m["decision_agreement"] = 100.0 * float(d["agreement"])
+    if d.get("option_kl") is not None:
+        m["decision_option_kl"] = float(d["option_kl"])
     if r.get("coherence"):
         m["coherence"] = r["coherence"]
     if r.get("runtime_engine"):                # a `pollard`-architecture rung built / verified with Pollard's runtime
@@ -1023,15 +1080,16 @@ def gguf_runtime(path):
 def pollard_runtime_engine(path, measured=None):
     """'pollard' when this machine built / verified a `pollard`-architecture rung WITH Pollard's runtime: the
     measurement here loaded the file (a llama.cpp that opens an architecture only our patch implements is, by
-    construction, Pollard's), or the engine tree Pollard builds (runtime/llama.cpp beside this checkout) carries the
-    architecture. None otherwise -- the runtime gate then fails rather than letting the card guess."""
+    construction, Pollard's), or the engine tree the one resolver (pollard_calc.find_llama_bin, via
+    pollard_ggufcompat.pollard_engine_tree) runs this architecture with carries it. None otherwise -- the runtime
+    gate then fails rather than letting the card guess."""
     measured = measured or {}
-    if any(measured.get(k) is not None for k in ("kld", "ppl", "decision_agreement")):
+    if any(measured.get(k) is not None for k in ("kld", "ppl", "decision_agreement", "decision_option_kl")):
         return "pollard"
     try:
         import pollard_ggufcompat as gc
         arch = gc.read_header(path)[0]
-        return "pollard" if arch in (gc.engine_archs() or ()) else None
+        return "pollard" if gc.pollard_engine_tree(arch) else None
     except Exception:                                        # noqa: BLE001
         return None
 
@@ -1114,6 +1172,25 @@ def main():
 
     print(f"== pollard-verify :: {a.model}  (lane={lane}) ==")
     fails, measured = 0, {}
+    dec_only = None
+    if lane == "gguf":
+        from pollard_calc import set_model_arch
+        set_model_arch(a.model)            # llama-perplexity / llama-cli from the engine this architecture needs
+        from pollard_decision import decision_only, NOT_APPLICABLE
+        dec_only = decision_only(a.model)
+    if dec_only and a.measure:
+        # nothing for llama-perplexity to read: KLD / PPL do not exist for this model. The rung's fidelity is the
+        # decision board pollard-decision wrote into --results (agreement + option KL vs the reference)
+        print(f"-- KLD / PPL: {NOT_APPLICABLE} ({dec_only}); fidelity = the decision board in --results --")
+        a.measure = False
+        if a.results:
+            import pollard_workspace as ws
+            try:
+                ws.merge_results(a.results, rung, {"kld_status": "not-applicable",
+                                                   "kld_reason": f"{NOT_APPLICABLE} ({dec_only})"})
+            except OSError as e:
+                print(f"HELD: {e}", flush=True)
+                sys.exit(EXIT_HELD)
 
     if a.measure and lane == "exl3":
         _add_cuda_dll_dirs()
@@ -1228,7 +1305,11 @@ def main():
         if gates.get("kinds") and "agentic" not in kinds and (
                 metrics.get("toolcall_status") or metrics.get("toolcall_retention") is not None):
             kinds.append("agentic")            # pollard-toolcall measured it: its template writes tool calls
+        if dec_only and "decision_only" not in kinds:
+            kinds.append("decision_only")
         th = thresholds_for(gates, rung, lane, kinds)
+        if dec_only:
+            th = decision_only_thresholds(th, gates, rung)
         gate_res = evaluate_gate(metrics, th, gates.get("missing", "fail"))
         gate_res.update({"rung": rung, "lane": lane, "gates": os.path.basename(a.gate) if a.gate else "built-in",
                          "thresholds": th, "kinds": kinds})
