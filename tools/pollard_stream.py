@@ -378,7 +378,9 @@ class Source:
         npdt = np.dtype(ST_NP[dt])
         if p in getattr(self, "_remote", {}):
             ent = self._remote[p]
-            arr = np.frombuffer(hub_range(ent["repo"], ent["path_in_repo"], off, n), dtype=npdt)
+            rd = (ent["repo"], ent["path_in_repo"], off, n)
+            data = hub_range(*rd, revision=ent["revision"]) if ent.get("revision") else hub_range(*rd)
+            arr = np.frombuffer(data, dtype=npdt)
             return dt, arr.reshape(shape)
         arr = np.fromfile(p, dtype=npdt, count=n // npdt.itemsize if npdt.itemsize else 0, offset=off)
         return dt, arr.reshape(shape)
@@ -1096,10 +1098,14 @@ def _to(v, device, dtype=None, cache=None):
 class Engine:
     """Calibration activations through the backbone, one block at a time."""
 
-    def __init__(self, bb: Backbone, device="cpu", dtype=None, act_dtype=None, log=print):
+    def __init__(self, bb: Backbone, device="cpu", dtype=None, act_dtype=None, log=print, cast_blocks=False):
         import torch
         self.bb, self.device, self.log = bb, device, log
         self.dtype = dtype or bb.dtype
+        # transformers' loader casts every tensor to the dtype of the (meta) parameter it lands in -- the backbone is
+        # built in float32, so a bf16 plan would still hold float32 blocks. cast_blocks: each block's meta parameters
+        # take the plan's dtype first (free: they are meta), so the block is loaded AS bf16
+        self.cast_blocks = cast_blocks
         self.act_dtype = act_dtype or torch.bfloat16
         self.hidden, self.kwargs, self.ret_tuple = [], [], False
         self.peak_rss = 0
@@ -1190,6 +1196,13 @@ class Engine:
         need = sum(_prod(bb.src.shape(k)) for k in bb.layer_keys[i]) * _elsize(self.dtype) / 1e9
         if guard_gb is not False:
             free_ram_guard(need + (guard_gb or 0.0), what=f"layer {i}")
+        if self.cast_blocks:
+            import torch
+            for mod in bb.layers[i].modules():
+                for n, p in list(mod._parameters.items()):
+                    if p is not None and p.is_meta and p.is_floating_point() and p.dtype != self.dtype:
+                        mod._parameters[n] = torch.nn.Parameter(torch.empty_like(p, device="meta", dtype=self.dtype),
+                                                                requires_grad=False)
         bb.load(bb.layer_keys[i], self.device, self.dtype, tensors=tensors)
         bb.check_loaded(i)
         self.note_rss()
@@ -1647,13 +1660,23 @@ def collect_input_amax(model, calib=None, nsamples=128, seqlen=2048, device="cpu
 # ----------------------------------------------------------------------------------------------- writing
 
 
-#: pollard release sets this for ONE build of a rung bigger than the free disk: json {"out", "repo", "path_in_repo"}.
-#: Every safetensors shard written into exactly `out` is uploaded to <repo>/<path_in_repo>/, confirmed there (size +
-#: sha256), recorded in pollard-streamed.json (with its header, so the rung can still be READ -- verify streams it back
-#: with range requests) and deleted before the next shard is written. Any other directory (the smoothed source, a
-#: text copy) is written normally.
+#: pollard release sets this for ONE build of a rung bigger than the free disk: json {"out", "repo", "path_in_repo",
+#: "revision"}. Every safetensors shard written into exactly `out` is uploaded to <repo>/<path_in_repo>/ on the branch
+#: `revision` (the rung's STAGING branch, pollard-staging-<rung>: never the repo's main branch, which may already be
+#: public), confirmed there (size + sha256), recorded in pollard-streamed.json (with its header, so the rung can still
+#: be READ -- verify streams it back from that branch with range requests) and deleted before the next shard is
+#: written. Only a rung that passes its gate is copied onto main (promote_staging: a server-side copy, no bytes
+#: re-sent) and its branch deleted; a rung that fails has its branch deleted and main never saw it. Any other directory
+#: (the smoothed source, a text copy) is written normally.
 SHARD_UPLOAD_ENV = "POLLARD_SHARD_UPLOAD"
 STREAMED = "pollard-streamed.json"
+STAGING_PREFIX = "pollard-staging-"
+
+
+def staging_branch(path_in_repo):
+    """The staging branch of the rung streamed to `path_in_repo` (GPTQ/int8 -> pollard-staging-GPTQ-int8)."""
+    tail = re.sub(r"[^A-Za-z0-9._-]+", "-", str(path_in_repo or "")).strip("-.") or "rung"
+    return STAGING_PREFIX + tail
 
 
 def shard_upload_spec(out):
@@ -1708,22 +1731,72 @@ def stream_shard(out, path, spec, api=None, log=print):
     size, sha = os.path.getsize(path), H.sha256_file(path)
     hdr, base = st_header(path)
     api = api or _hf_api()
+    rev = spec.get("revision")
     api.create_repo(spec["repo"], repo_type="model", exist_ok=True, private=True)   # public only once complete
-    api.upload_file(path_or_fileobj=path, path_in_repo=rp, repo_id=spec["repo"])
-    bad = H.mismatches(api, spec["repo"], [(rp, path)])
+    if rev:                                     # the rung's staging branch: main (maybe public) never sees it unverified
+        api.create_branch(spec["repo"], branch=rev, exist_ok=True)
+        api.upload_file(path_or_fileobj=path, path_in_repo=rp, repo_id=spec["repo"], revision=rev)
+    else:
+        api.upload_file(path_or_fileobj=path, path_in_repo=rp, repo_id=spec["repo"])
+    bad = H.mismatches(api, spec["repo"], [(rp, path)], revision=rev)
     if bad:
         raise RuntimeError(f"shard {fn} is not intact on {spec['repo']} ({bad[0]}) -- kept at {path}, build stopped")
-    _record_streamed(out, fn, {"repo": spec["repo"], "path_in_repo": rp, "size": size, "sha256": sha,
-                               "git_sha1": H.git_blob_sha1(path), "header": hdr, "data_start": base})
+    ent = {"repo": spec["repo"], "path_in_repo": rp, "size": size, "sha256": sha,
+           "git_sha1": H.git_blob_sha1(path), "header": hdr, "data_start": base}
+    if rev:
+        ent["revision"] = rev
+    _record_streamed(out, fn, ent)
     os.remove(path)
-    log(f"   shard {fn} ({size / 1e9:.2f} GB) -> {spec['repo']}/{rp}: confirmed on the Hub, freed locally")
+    log(f"   shard {fn} ({size / 1e9:.2f} GB) -> {spec['repo']}/{rp}" + (f" @ {rev}" if rev else "")
+        + ": confirmed on the Hub, freed locally")
 
 
-def hub_range(repo, path_in_repo, start, n, retries=3):
-    """`n` bytes of a file on the Hub from `start` (an HTTP range request; the token comes from the usual place)."""
+def staged_revisions(entries):
+    """{(repo, staging branch)} the streamed entries ({file: entry}) still sit on."""
+    return sorted({(e["repo"], e["revision"]) for e in entries.values() if e.get("revision")})
+
+
+def promote_staging(api, entries, log=print):
+    """A verified streamed rung onto main: every shard copied from its staging branch onto the default branch in ONE
+    commit (CommitOperationCopy -- the Hub copies an LFS / Xet file by its content id server side, so nothing is
+    re-uploaded and the shards' local copies are not needed), confirmed on main (size + sha256 recorded at upload),
+    then the staging branch deleted. Raises with main unchanged (the commit is atomic) when the copy cannot be made,
+    and with the branch kept when main does not hold every shard intact afterwards."""
+    import pollard_hubcheck as H
+    from huggingface_hub import CommitOperationCopy
+    staged = [e for e in entries.values() if e.get("revision")]
+    for repo, rev in staged_revisions(entries):
+        mine = [e for e in staged if e["repo"] == repo and e["revision"] == rev]
+        ops = [CommitOperationCopy(src_path_in_repo=e["path_in_repo"], path_in_repo=e["path_in_repo"], src_revision=rev)
+               for e in mine]
+        api.create_commit(repo_id=repo, operations=ops, commit_message=f"{len(ops)} verified shard(s) from {rev}")
+        bad = H.mismatches(api, repo, [(e["path_in_repo"], {"size": e["size"], "sha256": e["sha256"],
+                                                             "git_sha1": e.get("git_sha1")}) for e in mine])
+        if bad:
+            raise RuntimeError(f"{repo}: the shards copied from {rev} are not intact on main ({bad[0]}) -- the branch is "
+                               "kept")
+        discard_staging(api, repo, rev, log=log)
+        log(f"   {len(ops)} shard(s) {repo}@{rev} -> main (copied on the Hub, confirmed), branch deleted")
+
+
+def discard_staging(api, repo, rev, log=print):
+    """Delete a staging branch (a rung that failed its gate, or one already copied to main). Never main itself."""
+    if not rev or not str(rev).startswith(STAGING_PREFIX):
+        raise ValueError(f"{rev!r} is not a Pollard staging branch -- refusing to delete it")
+    try:
+        api.delete_branch(repo, branch=rev)
+    except Exception as e:                                        # noqa: BLE001 -- already gone is fine
+        if "404" not in str(e) and "not found" not in str(e).lower():
+            raise
+    log(f"   staging branch {repo}@{rev} deleted")
+
+
+def hub_range(repo, path_in_repo, start, n, retries=3, revision=None):
+    """`n` bytes of a file on the Hub from `start` (an HTTP range request; the token comes from the usual place), on
+    the branch `revision` (a streamed rung's staging branch) or the default one."""
     from huggingface_hub import hf_hub_url
     from huggingface_hub.utils import build_hf_headers, get_session
-    url = hf_hub_url(repo, path_in_repo)
+    url = hf_hub_url(repo, path_in_repo, revision=revision) if revision else hf_hub_url(repo, path_in_repo)
     last = None
     for _ in range(retries):
         try:
@@ -1939,9 +2012,16 @@ class RungReader:
 
     def read_torch(self, key, dtype=None):
         import numpy as np, torch
+        if self.kind != "exlr8" and key in self.src.logical and not self._quantized(key):
+            return self.src.read_torch(key, dtype)          # stored plainly: as stored, no float32 detour
         a = self.read(key)
         t = torch.from_numpy(np.ascontiguousarray(a))
         return t.to(dtype) if dtype is not None and t.is_floating_point() else t
+
+    def _quantized(self, key):
+        mod = key[:-len(".weight")] if key.endswith(".weight") else None
+        return bool(mod and ((self.gptq and f"{mod}.qweight" in self.src.entries)
+                             or (self.mx and mod in (self.mx.get("modules") or {}))))
 
     def read(self, key):
         import numpy as np
@@ -2092,85 +2172,206 @@ def _final_head(bb):
     return norm, head
 
 
+class _LazyRung:
+    """The rung's tensors of one block, read (decoded) one at a time AS the loader asks for them and converted to the
+    block's dtype straight away: never the whole block decoded to float32 beside its loaded copy."""
+
+    def __init__(self, rd, keys, dtype):
+        self.rd, self.keys, self.dtype = rd, set(keys), dtype
+
+    def __contains__(self, k):
+        return k in self.keys
+
+    def __getitem__(self, k):
+        return self.rd.read_torch(k, self.dtype)
+
+
+def verify_memory(bb, nrows, seqlen, budget_gb, device="cpu", block=256, log=print):
+    """The streamed verify's peak RAM (GB) by component, for BOTH passes -- they run one after the other (the source
+    to its final hidden states, cached on disk; then the rung), so the peak is ONE pass: the biggest block while it
+    loads (the checkpoint tensors + the module's copy -- an MoE's experts are fused on load), the block inputs AND
+    outputs of every eval row (float32), the per-row call tensors (rotary tables, a materialised mask), the
+    embeddings, the source's output projection kept for the rung pass, one block of logits, torch itself. fp32 blocks
+    when that fits `budget_gb`, else bf16; nothing fits -> OutOfMemoryBudget with the numbers (the eval rows are the
+    protocol's and are never cut). On CUDA the block lives in VRAM: RAM holds only its staging copy."""
+    shapes = layer_shapes(bb)
+    i_max = max(range(len(shapes)), key=lambda i: shapes[i][0]) if shapes else -1
+    biggest = shapes[i_max][0] if shapes else 0
+    tc = bb.text_config()
+    hid = bb.hidden_size() or 1
+    vocab = int(getattr(tc, "vocab_size", 0) or 0)
+    if not vocab:
+        emb = [k for k in bb.outer_keys if bb.kmap.get(k) and bb.kmap[k][0].endswith(("embed_tokens.weight",
+                                                                                   "embeddings.weight"))]
+        vocab = int(bb.src.shape(emb[0])[0]) if emb else 0
+    heads = max(1, int(getattr(tc, "num_attention_heads", 1) or 1))
+    head_dim = int(getattr(tc, "head_dim", 0) or hid // heads)
+    acts = nrows * seqlen * hid * 4 * 2 / 1e9                     # block inputs + outputs, float32
+    kw = nrows * (2 * seqlen * head_dim * 4 + seqlen * seqlen * 4) / 1e9
+    outer_n = sum(_prod(bb.src.shape(k)) for k in bb.outer_keys)
+    logits = min(block, seqlen) * vocab * 8 * 4 / 1e9             # 2 sides x (logits + log-softmax), float64
+    overhead = 0.8                                                # python + torch + transformers
+    cuda = str(device).startswith("cuda")
+    plan = None
+    for cb in (4, 2):
+        layer = biggest * cb / 1e9
+        load = layer * (1.0 if cuda else 2.0)
+        outer = outer_n * cb / 1e9
+        head = vocab * hid * cb / 1e9                             # the source's projection, kept for the rung pass
+        total = load + acts + kw + outer + head + logits + overhead
+        plan = {"layer": i_max, "layer_weights_gb": round(layer, 2), "load_gb": round(load, 2),
+                "activations_gb": round(acts + kw, 2), "outer_gb": round(outer + head, 2),
+                "logits_gb": round(logits, 2), "overhead_gb": overhead, "peak_gb": round(total, 2),
+                "vram_gb": round(layer * 2 + seqlen * hid * cb * 8 / 1e9, 2) if cuda else 0.0,
+                "compute_bytes": cb, "rows": nrows, "seqlen": seqlen, "budget_gb": round(budget_gb, 2),
+                "device": str(device)}
+        if total <= budget_gb:
+            if cb == 2:
+                log(f"   memory: bf16 blocks to fit {budget_gb:.1f} GB (peak ~{total:.1f} GB: block {i_max} "
+                    f"{layer:.2f} GB, activations {acts + kw:.2f} GB)")
+            return plan
+    raise OutOfMemoryBudget(
+        f"the streamed verify needs ~{plan['peak_gb']:.1f} GB of RAM at its smallest (bf16 blocks: block "
+        f"{plan['layer']} = {plan['layer_weights_gb']} GB loading as {plan['load_gb']} GB, {plan['activations_gb']} GB "
+        f"of activations for {nrows} x {seqlen} eval tokens, {plan['outer_gb']} GB embeddings + output projection) "
+        f"and the budget is {budget_gb:.1f} GB -- raise --max-ram-gb or run it on CUDA (--device cuda)")
+
+
+def _state_store(nrows_scored, hid):
+    """A float32 memmap for the source's final hidden states (scored positions only) in the workspace cache, and its
+    path: the source pass writes it, the rung pass reads it -- the two passes never sit in memory together."""
+    import numpy as np
+    import shutil
+    import tempfile
+    try:
+        import pollard_workspace as ws
+        d = ws.cache_dir(create=True)
+    except Exception:                                                     # noqa: BLE001
+        d = tempfile.gettempdir()
+    need = int(nrows_scored) * int(hid) * 4
+    free = shutil.disk_usage(d).free
+    if free < need + 1e9:
+        raise OutOfMemoryBudget(f"disk: the source's final hidden states need {need / 1e9:.2f} GB at {d} (+1 GB "
+                                f"margin) and {free / 1e9:.2f} GB is free")
+    fd, path = tempfile.mkstemp(prefix="verify-state-", suffix=".f32", dir=d)
+    os.close(fd)
+    return np.memmap(path, dtype=np.float32, mode="w+", shape=(max(1, int(nrows_scored)), int(hid))), path
+
+
 def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", log=print, max_ram_gb=None,
                     starts=None, block=256):
-    """{kld, top1, kld_p99, n, ppl, ref_ppl}: the rung against its source over token `rows`, BOTH streamed block by
-    block (one block of each in memory), final norm + output projection applied per row -- the same KL(source ||
-    rung) and top-1 agreement every lane is gated on, for a model of any size the machine can stream.
+    """{kld, top1, kld_p99, n, ppl, ref_ppl}: the rung against its source over token `rows`, each streamed block by
+    block, final norm + output projection applied per row -- the same KL(source || rung) and top-1 agreement every
+    lane is gated on, for a model of any size the machine can stream.
+
+    Two passes, ONE in memory at a time (verify_memory plans the peak against `max_ram_gb` / free RAM): the SOURCE,
+    block by block (each block's weights freed as soon as every row went through it), to its final hidden states --
+    written to a disk memmap, scored positions only -- then the RUNG the same way, its tensors decoded one at a time
+    into the block's dtype. The logits are formed per row from the cached source states with the source's own norm +
+    projection: the math of the side-by-side pass, without two engines' activations and two decoded blocks resident.
 
     `starts[i]`: the first scored position of row i (pollard_verify.PROTOCOL scores the second half of each
     BOS-led chunk, as llama-perplexity does); None scores every position. The output projection runs `block`
     positions at a time -- a 2048-token row's float64 logits at a 150k vocabulary are 2.5 GB whole."""
+    import gc
     import numpy as np, torch
     bb = Backbone(source, trust_remote_code, log=log)
     rd = RungReader(rung)
-    plan = fit_memory(bb, len(rows), max(len(r) for r in rows), ram_budget(max_ram_gb) / 1.5, log=log,
-                      hessian=False)
+    plan = verify_memory(bb, len(rows), max(len(r) for r in rows), ram_budget(max_ram_gb), device=device,
+                         block=block, log=log)
     bb.dtype = plan_dtype(plan)
     head_keys = [k for k in bb.other_keys + bb.outer_keys
                  if bb.kmap.get(k) and bb.kmap[k][0].endswith(("lm_head.weight", "output.weight"))]
     tied = not head_keys
-    es = Engine(bb, device=device, act_dtype=torch.float32, log=log).record(rows)
-    hidden_s = es.hidden
-    eq = Engine(bb, device=device, act_dtype=torch.float32, log=log).record(
-        rows, outer_tensors={k: rd.read_torch(k) for k in bb.outer_keys})
-    hidden_q = eq.hidden
-    for i in range(bb.n_layers):
-        es.hidden = hidden_s
-        es.load_layer(i)
-        hidden_s = es.run_layer(i)
-        eq.hidden = hidden_q
-        eq.load_layer(i, tensors={k: rd.read_torch(k) for k in bb.layer_keys[i]})
-        hidden_q = eq.run_layer(i)
-        bb.free_layer(i)
-    norm, head = _final_head(bb)
-    # both output projections side by side (source + rung), logits one row at a time: never the [rows x vocab]
-    # logits of a whole eval set in memory
-    keys = bb.outer_keys + head_keys
-    bb.load(keys, device)
-    if tied and hasattr(bb.root, "tie_weights"):
-        bb.root.tie_weights()
-    names = {n: p for n, p in bb.root.named_parameters()}
-    head_name = next((n for n, p in names.items() if p is head.weight), None)
-    norm_name = next((n for n, p in names.items() if norm is not None and p is norm.weight), None)
-    rev = {t: k for k, (t, _) in bb.kmap.items()}
-    w_s = head.weight.detach().clone()
-    n_s = norm.weight.detach().clone() if norm is not None else None
-    hk = rev.get(head_name) or next(k for k in bb.outer_keys if bb.kmap[k][0].endswith(("embed_tokens.weight",
-                                                                                          "embeddings.weight")))
-    w_q = rd.read_torch(hk, w_s.dtype).to(device)
-    n_q = rd.read_torch(rev[norm_name], n_s.dtype).to(device) if norm is not None and norm_name in rev else n_s
-    softcap = getattr(bb.text_config(), "final_logit_softcapping", None)
-    kls, top, nll_s, nll_q = [], [], [], []
-    with torch.no_grad():
-        for r, (hs, hq) in enumerate(zip(hidden_s, hidden_q)):
-            ids = torch.as_tensor(list(rows[r]), dtype=torch.long)
-            st = int(starts[r]) if starts is not None else 0
-            n = hs.shape[1]
-            for a0 in range(st, n, max(1, int(block))):
-                a1 = min(n, a0 + int(block))
-                lg = []
-                for h, w, nw in ((hs, w_s, n_s), (hq, w_q, n_q)):
-                    x = h[:, a0:a1].to(device, bb.dtype)
-                    if norm is not None:
-                        norm.weight.data = nw
-                        x = norm(x)
-                    logits = torch.nn.functional.linear(x, w)[0]
-                    if softcap is not None:                     # Gemma2/3 apply this in their native LM forward
-                        logits = torch.tanh(logits / softcap) * softcap
-                    lg.append(logits.double())
-                a = torch.log_softmax(lg[0], -1)
-                b = torch.log_softmax(lg[1], -1)
-                kls.append((a.exp() * (a - b)).sum(-1).cpu().numpy())
-                top.append((a.argmax(-1) == b.argmax(-1)).cpu().numpy())
-                nxt = ids[a0 + 1:a1 + 1].to(a.device)              # position t predicts ids[t + 1]
-                m = len(nxt)
-                if m:
-                    nll_s.append((-a[torch.arange(m), nxt]).cpu().numpy())
-                    nll_q.append((-b[torch.arange(m), nxt]).cpu().numpy())
-                del lg, a, b
-    if norm is not None:
-        norm.weight.data = n_s
+    st_of = [int(starts[r]) if starts is not None else 0 for r in range(len(rows))]
+    offs = np.cumsum([0] + [max(0, len(r) - st) for r, st in zip(rows, st_of)])
+    hid = bb.hidden_size()
+    peak = 0
+
+    def blocks(eng, tensors_for=None):
+        h = eng.hidden
+        for i in range(bb.n_layers):
+            eng.hidden = h
+            eng.load_layer(i, tensors=tensors_for(i) if tensors_for else None)
+            h = eng.run_layer(i)
+            eng.hidden = None                          # this block's inputs go now, its weights next
+            bb.free_layer(i)
+        return h
+
+    # -- pass 1: the source, to its final hidden states on disk
+    mm, mm_path = None, None
+    try:
+        es = Engine(bb, device=device, act_dtype=torch.float32, log=log, cast_blocks=True).record(rows)
+        hs_final = blocks(es)
+        del es.kwargs
+        peak = max(peak, es.peak_rss)
+        mm, mm_path = _state_store(offs[-1], hid or hs_final[0].shape[-1])
+        for r, h in enumerate(hs_final):
+            mm[offs[r]:offs[r + 1]] = h[0, st_of[r]:].numpy()
+        mm.flush()
+        del hs_final, es
+        gc.collect()
+        norm, head = _final_head(bb)
+        bb.load(bb.outer_keys + head_keys, device)
+        if tied and hasattr(bb.root, "tie_weights"):
+            bb.root.tie_weights()
+        names = {n: p for n, p in bb.root.named_parameters()}
+        head_name = next((n for n, p in names.items() if p is head.weight), None)
+        norm_name = next((n for n, p in names.items() if norm is not None and p is norm.weight), None)
+        rev = {t: k for k, (t, _) in bb.kmap.items()}
+        w_s = head.weight.detach().clone()
+        n_s = norm.weight.detach().clone() if norm is not None else None
+        hk = rev.get(head_name) or next(k for k in bb.outer_keys if bb.kmap[k][0].endswith(("embed_tokens.weight",
+                                                                                              "embeddings.weight")))
+        # -- pass 2: the rung (its own embeddings / norms / every block), the source states read back per row
+        eq = Engine(bb, device=device, act_dtype=torch.float32, log=log, cast_blocks=True).record(
+            rows, outer_tensors=_LazyRung(rd, bb.outer_keys, bb.dtype))
+        hidden_q = blocks(eq, lambda i: _LazyRung(rd, bb.layer_keys[i], bb.dtype))
+        del eq.kwargs
+        peak = max(peak, eq.peak_rss)
+        w_q = rd.read_torch(hk, w_s.dtype).to(device)
+        n_q = rd.read_torch(rev[norm_name], n_s.dtype).to(device) if norm is not None and norm_name in rev else n_s
+        softcap = getattr(bb.text_config(), "final_logit_softcapping", None)
+        kls, top, nll_s, nll_q = [], [], [], []
+        with torch.no_grad():
+            for r, hq in enumerate(hidden_q):
+                ids = torch.as_tensor(list(rows[r]), dtype=torch.long)
+                st = st_of[r]
+                hs = torch.from_numpy(np.array(mm[offs[r]:offs[r + 1]]))[None]     # positions st.. of row r
+                n = hq.shape[1]
+                for a0 in range(st, n, max(1, int(block))):
+                    a1 = min(n, a0 + int(block))
+                    lg = []
+                    for x, w, nw in ((hs[:, a0 - st:a1 - st], w_s, n_s), (hq[:, a0:a1], w_q, n_q)):
+                        x = x.to(device, bb.dtype)
+                        if norm is not None:
+                            norm.weight.data = nw
+                            x = norm(x)
+                        logits = torch.nn.functional.linear(x.to(w.dtype), w)[0]
+                        if softcap is not None:                 # Gemma2/3 apply this in their native LM forward
+                            logits = torch.tanh(logits / softcap) * softcap
+                        lg.append(logits.double())
+                    a = torch.log_softmax(lg[0], -1)
+                    b = torch.log_softmax(lg[1], -1)
+                    kls.append((a.exp() * (a - b)).sum(-1).cpu().numpy())
+                    top.append((a.argmax(-1) == b.argmax(-1)).cpu().numpy())
+                    nxt = ids[a0 + 1:a1 + 1].to(a.device)          # position t predicts ids[t + 1]
+                    m = len(nxt)
+                    if m:
+                        nll_s.append((-a[torch.arange(m), nxt]).cpu().numpy())
+                        nll_q.append((-b[torch.arange(m), nxt]).cpu().numpy())
+                    del lg, a, b
+                hidden_q[r] = None                               # this row is scored: its states go
+        if norm is not None:
+            norm.weight.data = n_s
+    finally:
+        if mm is not None:
+            del mm
+        if mm_path:
+            try:
+                os.remove(mm_path)
+            except OSError:
+                pass
     kl = np.concatenate(kls)
     ns = np.concatenate(nll_s) if nll_s else np.zeros(0)
     nq = np.concatenate(nll_q) if nll_q else np.zeros(0)
@@ -2178,7 +2379,8 @@ def stream_fidelity(source, rung, rows, device="cpu", trust_remote_code="auto", 
             "kld_p99": float(np.percentile(kl, 99)), "n": int(kl.size), "how": "streamed",
             "ppl": float(np.exp(nq.mean())) if nq.size else None,
             "ref_ppl": float(np.exp(ns.mean())) if ns.size else None,
-            "peak_rss_gb": round(max(es.peak_rss, eq.peak_rss, peak_rss_bytes()) / 1e9, 2)}
+            "peak_rss_gb": round(max(peak, peak_rss_bytes()) / 1e9, 2),
+            "memory_plan": plan}
 
 
 # ----------------------------------------------------------------------------------------------- text extraction

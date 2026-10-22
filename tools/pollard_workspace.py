@@ -230,16 +230,19 @@ def _write_manifest(model: str, man: dict):
 
 
 def update_build(model: str, build_path: str, patch: dict, remove=()) -> bool:
-    """Apply just this writer's fields to the latest build entry, preserving other writers' fields."""
+    """Apply just this writer's fields (and drop `remove`) on EVERY build entry recorded for `build_path`, under the
+    manifest lock, preserving the fields other writers own. True when at least one entry matched; False -- and the
+    MANIFEST unchanged -- when none did."""
     build_path = os.path.abspath(build_path.rstrip("/\\"))
+    found = False
     with manifest_transaction(model) as man:
         for b in man.get("builds", []):
             if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
                 b.update(patch)
                 for key in remove:
                     b.pop(key, None)
-                return True
-    return False
+                found = True
+    return found
 
 
 def record_calibration(model: str, corpus: str, sources: dict):
@@ -309,6 +312,17 @@ def calib_samples(path: str) -> list:
         return [ln.strip() for ln in f if ln.strip()]
 
 
+def _process_umask() -> int:
+    """This process's umask, read once at import (os.umask can only be read by setting it, which is not safe to do
+    while other threads create files)."""
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+_UMASK = _process_umask()
+
+
 def write_json_atomic(path: str, obj, indent=2) -> None:
     """Write `obj` as JSON to `path` through a unique temp file + fsync + rename: a full disk (ENOSPC) or a crash mid-write
     leaves the previous file exactly as it was, and the half-written temp file is removed. Raises OSError (same errno)
@@ -321,6 +335,9 @@ def write_json_atomic(path: str, obj, indent=2) -> None:
             json.dump(obj, f, indent=indent)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp creates the temp file 0600; the file it becomes is an ordinary one (0644 under the usual umask),
+        # as readable as a plain open() would have made it
+        os.chmod(tmp, 0o666 & ~_UMASK)
         os.replace(tmp, path)
     except BaseException as e:
         try:

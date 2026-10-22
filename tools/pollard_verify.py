@@ -716,7 +716,8 @@ def stream_wanted(source, mode="auto", rung=None):
     return False, ""
 
 
-def measure_stream(model, source, eval_path, device="cpu", length=None, chunks=8, trust_remote_code="auto"):
+def measure_stream(model, source, eval_path, device="cpu", length=None, chunks=8, trust_remote_code="auto",
+                   max_ram_gb=None):
     """The rung against its source, both streamed block by block (pollard_stream.stream_fidelity): any size, any
     backbone the stream engine resolves, every Pollard rung format decoded from its bytes -- scored under the same
     PROTOCOL as every other lane (BOS-led chunks of 2048, second half)."""
@@ -727,7 +728,7 @@ def measure_stream(model, source, eval_path, device="cpu", length=None, chunks=8
     src = S.Source(source)
     tok = AutoTokenizer.from_pretrained(src.base_dir, trust_remote_code=trust_remote_code in (True, "on"))
     parts, starts = _hf_tokens(tok, eval_path, length, chunks)
-    r = S.stream_fidelity(source, model, parts, dev, trust_remote_code, starts=starts)
+    r = S.stream_fidelity(source, model, parts, dev, trust_remote_code, starts=starts, max_ram_gb=max_ram_gb)
     r["protocol"] = f"{PROTOCOL} (length {length}, {len(parts)} chunks)"
     return r
 
@@ -1042,6 +1043,9 @@ def main():
     ap.add_argument("--end-to-end", action="store_true", help="exl3: also check the assembled forward")
     ap.add_argument("--e2e-min-acc", type=float, default=0.30, help="exl3: min end-to-end next-tok agreement")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--max-ram-gb", type=float, default=None,
+                    help="gptq/mx/exlr8 streamed: cap the verify's RAM (default: 85%% of what is free); the source "
+                         "and the rung pass run one after the other, planned together under this")
     ap.add_argument("--trust-remote-code", nargs="?", const="on", default="auto", choices=["auto", "on", "off"],
                     help="run the source's own code where no native transformers class covers it (never silent)")
     ap.add_argument("--stream", default="auto", choices=["auto", "on", "off"],
@@ -1135,7 +1139,8 @@ def main():
             try:
                 if streamed:
                     print(f"   streamed: source and rung block by block ({why})")
-                    measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc)
+                    measured = measure_stream(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc,
+                                              max_ram_gb=a.max_ram_gb)
                 elif lane == "exlr8":
                     measured = measure_exlr8(a.model, a.source, a.eval, a.device, a.length, a.chunks, trc == "on")
                 else:
