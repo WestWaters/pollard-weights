@@ -454,6 +454,75 @@ def pregate_checks(meta: dict, cfg: dict | None = None) -> list[str]:
     return warns
 
 
+#: architectures whose graph ends in a decision head: the output is the head's option scores, never per-token LM
+#: logits (src/models/clef-omni.cpp sets only t_embd -> the head). llama-perplexity has nothing to read on these --
+#: on clef-omni llama-imatrix's ppl pass died "get_logits_ith: invalid logits id 0, reason: no logits" (2026-10-17).
+DECISION_HEAD_ARCHS = ("clef", "clef-omni")
+NOT_APPLICABLE = "not applicable: decision-only model"
+
+
+def decision_only_meta(meta: dict) -> str | None:
+    """Why a GGUF (its metadata) is a DECISION-ONLY model -- no per-token logits, so KLD / PPL cannot exist and its
+    fidelity is the decision board -- or None. A letter-readout decision model (Jev / OpenJev: a stock body read at
+    position one) is NOT decision-only: it has logits and is measured on them as well."""
+    meta = meta or {}
+    arch = str(meta.get("general.architecture", "") or "")
+    if arch in DECISION_HEAD_ARCHS:
+        return f"`{arch}` ends in a decision head (no per-token logits)"
+    if any(".decision." in str(k) for k in meta):
+        return "the GGUF carries a decision head (`.decision.*` keys; no per-token logits)"
+    if any(str(t).startswith("dec.blk.") for t in (meta.get("_tensor_params") or {})):
+        return "the GGUF carries a decision-head stack (`dec.blk.N`; no per-token logits)"
+    try:
+        import pollard_d3 as D3
+        if D3.gguf_is_d3(meta):
+            return f"{D3.FORMAT_ID}: a non-causal body read by a separate readout (no next-token logits)"
+    except ImportError:
+        pass
+    return None
+
+
+def decision_only(model: str) -> str | None:
+    """decision_only_meta for a GGUF file; for an HF folder: clef's joint_head_config.json, or a d3 package
+    (decision_config.json). None for everything else, and for anything unreadable."""
+    model = str(model or "")
+    if os.path.isdir(model):
+        if os.path.isfile(os.path.join(model, "joint_head_config.json")):
+            return "joint_head_config.json: a decision head on the body (no per-token logits)"
+        try:
+            import pollard_d3 as D3
+            if D3.decision_config(model) is not None:
+                return f"{D3.FORMAT_ID}: a non-causal body read by a separate readout (no next-token logits)"
+        except ImportError:
+            pass
+        return None
+    if not model.endswith(".gguf") or not os.path.isfile(model):
+        return None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from pollard_calc import read_gguf_meta
+        return decision_only_meta(read_gguf_meta(model))
+    except (Exception, SystemExit):                                # noqa: BLE001 -- unreadable: not decided here
+        return None
+
+
+def resolve_ngl(gguf: str, ngl) -> str:
+    """`--ngl auto` -> the layers that fit THIS file in free VRAM (pollard_llamaserve, the release's own logic); a
+    number as given. The build and the reference are served one after the other, so each gets its own fit."""
+    try:
+        import pollard_llamaserve as LS
+        return str(LS.resolve_ngl(gguf, ngl))
+    except Exception:                                              # noqa: BLE001 -- never crash on the GPU probe
+        return "0" if str(ngl).strip().lower() == "auto" else str(ngl)
+
+
+def _ngl_arg(v: str) -> str:
+    s = str(v).strip().lower()
+    if s == "auto" or s.lstrip("-").isdigit():
+        return s
+    raise argparse.ArgumentTypeError(f"--ngl takes a number of GPU layers or `auto`, not {v!r}")
+
+
 def pregate(model: str, source: str | None = None) -> list[str]:
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -464,7 +533,7 @@ def pregate(model: str, source: str | None = None) -> list[str]:
     return pregate_checks(meta, _source_config(model, source))
 
 
-def gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
+def gate(model: str, ngl, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
          limit: int = 0, source: str | None = None) -> dict:
     """Pre-gate metadata checks, then the board (see _gate). Warnings ride along in the result."""
     warns = pregate(model, source)
@@ -474,23 +543,29 @@ def gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: st
     return res
 
 
-def _gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
+def _gate(model: str, ngl, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
           limit: int = 0) -> dict:
     """Serve the build (and the reference), run the set on both, return the board + verdict in the
     same shape pollard-bench prints ("verdict", "rows", "reason").
 
     qset "typed-decisions" replays the 2000-decision benchmark through /v1/systemone (native decision
     models only). The 20 built-in questions are easy enough that every clef rung scored 100%; on 2000
-    decisions agreement and option KL separate the rungs."""
+    decisions agreement and option KL separate the rungs.
+
+    `ngl` may be `auto`: each file is fitted to free VRAM when it is served (resolve_ngl)."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from pollard_bench import _served, _post
+
+    def fit(path):
+        return resolve_ngl(path, ngl)
+
     if qset == "typed-decisions":
         data = load_typed()
         if limit:                                       # a smoke run; a board is only comparable at the full 400
             data = dict(data, rows=data["rows"][:limit])
         # clef evaluates a whole prompt in one batch: let it be as large as the context
         extra = ("-b", str(ctx), "-ub", str(ctx))
-        with _served(model, ngl, ctx, extra=extra) as base:
+        with _served(model, fit(model), ctx, extra=extra) as base:
             if base is None or not native(base):
                 return {"verdict": "NO_SERVER" if base is None else "UNSUPPORTED", "config": None,
                         "rows": [{"prompt": "(not run)", "loop": None, "sample": "",
@@ -499,7 +574,7 @@ def _gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: s
             rows = run_typed(base, _post, data["rows"])
         ref_rows = None
         if ref:
-            with _served(ref, ngl, ctx, extra=extra) as rbase:
+            with _served(ref, fit(ref), ctx, extra=extra) as rbase:
                 if rbase is not None:
                     ref_rows = run_typed(rbase, _post, data["rows"])
         board = score_typed(rows, ref_rows)
@@ -507,14 +582,14 @@ def _gate(model: str, ngl: int, ctx: int = 4096, ref: str | None = None, qset: s
         v, why = verdict(board)
         return {"verdict": v, "config": "decision", "reason": why, "board": board,
                 "rows": _typed_rows_out(rows, ref_rows), "sampling": ["--temp", "0"]}
-    with _served(model, ngl, ctx) as base:
+    with _served(model, fit(model), ctx) as base:
         if base is None:
             return {"verdict": "NO_SERVER", "config": None, "rows": [{"prompt": "(not run)", "loop": None,
                     "reason": "llama-server would not start", "sample": ""}]}
         rows = run(base, _post)
     ref_rows = None
     if ref:
-        with _served(ref, ngl, ctx) as rbase:
+        with _served(ref, fit(ref), ctx) as rbase:
             if rbase is not None:
                 ref_rows = run(rbase, _post)
     board = score_rows(rows, ref_rows)
@@ -553,7 +628,8 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--ref", help="reference GGUF (f16 / Q8_0) for agreement + option KL")
-    ap.add_argument("--ngl", type=int, default=0)
+    ap.add_argument("--ngl", type=_ngl_arg, default="0",
+                    help="GPU layers for llama-server, or `auto` = what fits free VRAM, per file (default 0)")
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--set", dest="qset", default="builtin", choices=["builtin", "typed-decisions"],
@@ -566,6 +642,8 @@ def main() -> None:
                                       "--results: the Decision fidelity table and the retention table)")
     ap.add_argument("--rung", help="the rung's name/tag in --results (default: the GGUF file name)")
     a = ap.parse_args()
+    from pollard_calc import set_model_arch
+    set_model_arch(a.gguf)                 # llama-server from the engine that carries this architecture's patches
     res = gate(a.gguf, a.ngl, a.ctx, a.ref, a.qset, a.limit, a.source)
     if a.results and res.get("board"):
         import pollard_workspace as ws

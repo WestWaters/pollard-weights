@@ -1421,6 +1421,8 @@ def _dispatch(a):
             print("\n   plan only -- re-run with --run to execute (convert + build).")
             return
 
+    from pollard_calc import set_model_arch
+    set_model_arch(a.gguf)               # every llama.cpp step below (and in its children): the engine this arch needs
     arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
     is_moe = (arch.get("n_experts") or 0) > 0 or "moe" in str(arch.get("kind", "")).lower()
     if a.force_dense: is_moe = False

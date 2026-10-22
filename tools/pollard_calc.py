@@ -121,24 +121,163 @@ def binary_supports_arch(bin_path, arch):
     return not found_readable                                # unreadable -> don't block
 
 
+def _repo_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def engine_trees(repo=None):
+    """Every managed engine tree Pollard keeps under runtime/: the engines in runtime-patches/engines.json, then any
+    engine pollard-runtime --update built under another name (runtime/<name>.lock.json -- e.g. a staged
+    `llama.cpp.bolt` carrying patches the live tree does not have yet). [(name, dir)], llama.cpp first; the
+    .next / .prev / .rolled siblings of an update are never engines."""
+    repo = repo or _repo_root()
+    names = ["llama.cpp"]
+    try:
+        with open(os.path.join(repo, "runtime-patches", "engines.json"), encoding="utf-8") as f:
+            names += [k for k in json.load(f) if not k.startswith("_")]
+    except (OSError, ValueError):
+        pass
+    try:
+        names += sorted(f[:-len(".lock.json")] for f in os.listdir(os.path.join(repo, "runtime"))
+                        if f.endswith(".lock.json"))
+    except OSError:
+        pass
+    out, seen = [], set()
+    for n in names:
+        if n in seen or re.search(r"\.(next|prev|rolled)$", n):
+            continue
+        seen.add(n)
+        out.append((n, os.path.join(repo, "runtime", n)))
+    return out
+
+
+def _tree_bin(tree, name):
+    """`name` built in an engine tree (build/bin/Release on MSVC, build/bin elsewhere), or None."""
+    exts = ("", ".exe") if sys.platform == "win32" else ("",)
+    for d in (os.path.join(tree, "build", "bin", "Release"), os.path.join(tree, "build", "bin")):
+        for ext in exts:
+            p = os.path.join(d, name + ext)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _patch_manifests(repo=None):
+    """runtime-patches/*.json with the path of each .patch beside it."""
+    import glob
+    out = []
+    for mp in sorted(glob.glob(os.path.join(repo or _repo_root(), "runtime-patches", "*.json"))):
+        if os.path.basename(mp) == "engines.json":
+            continue
+        try:
+            with open(mp, encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(m, dict):
+            m["_patch"] = mp[:-5] + ".patch"
+            out.append(m)
+    return out
+
+
+def required_patches(arch, repo=None):
+    """The captured runtime patches a model of `arch` needs beyond the architecture itself: a manifest's `archs`
+    list names them (llama.cpp-quantize-dec-blk: clef-omni -- llama-quantize knew only `blk.N.` and died on the
+    decision head's `dec.blk.0.ffn_down.weight`). A patch that only REGISTERS an architecture is not listed here:
+    whether a build loads the architecture at all is binary_supports_arch's question."""
+    if not arch:
+        return []
+    return [m for m in _patch_manifests(repo) if arch in (m.get("archs") or [])]
+
+
+_PATCH_IN_TREE = {}
+
+
+def tree_has_patch(tree, m, need=0.9):
+    """Does the engine tree's SOURCE carry this patch? By content, like pollard-runtime --verify: the patch's added
+    lines are (nearly) all in the files it touches -- line-ending and context agnostic, and no git, so a tree another
+    account owns ("dubious ownership" on the box) answers the same as one this account owns."""
+    key = (os.path.abspath(tree), m.get("_patch"))
+    if key in _PATCH_IN_TREE:
+        return _PATCH_IN_TREE[key]
+    ok = False
+    try:
+        with open(m["_patch"], encoding="utf-8", errors="replace") as f:
+            diff = f.read()
+        added = {ln[1:].strip() for ln in diff.splitlines()
+                 if ln.startswith("+") and not ln.startswith("+++") and len(ln[1:].strip()) >= 4}
+        files = m.get("files") or sorted(set(re.findall(r"^\+\+\+ b/(\S+)", diff, re.M)))
+        have = set()
+        for rel in files:
+            try:
+                with open(os.path.join(tree, *rel.split("/")), encoding="utf-8", errors="replace") as f:
+                    have.update(ln.strip() for ln in f)
+            except OSError:
+                pass
+        ok = bool(added) and len(added & have) >= need * len(added)
+    except (OSError, KeyError, TypeError):
+        ok = False
+    _PATCH_IN_TREE[key] = ok
+    return ok
+
+
+def model_arch():
+    """The architecture the current pipeline works on (POLLARD_ARCH, set by set_model_arch), or None."""
+    return (os.environ.get("POLLARD_ARCH") or "").strip() or None
+
+
+def set_model_arch(gguf_or_arch):
+    """Tell every later binary lookup -- in this process and every subprocess it starts -- which architecture the
+    work is for, so find_llama_bin picks the engine that can do it. A GGUF path is read for its
+    general.architecture; an unreadable or missing file changes nothing. Returns the arch set (or None)."""
+    arch = None
+    if gguf_or_arch and str(gguf_or_arch).lower().endswith(".gguf"):
+        if os.path.isfile(str(gguf_or_arch)):
+            try:
+                arch = str(read_gguf_meta(str(gguf_or_arch)).get("general.architecture") or "") or None
+            except (Exception, SystemExit):                     # noqa: BLE001 -- not a readable GGUF
+                arch = None
+    elif gguf_or_arch:
+        arch = str(gguf_or_arch)
+    if arch:
+        os.environ["POLLARD_ARCH"] = arch
+    return arch
+
+
+def _engine_of(path, trees):
+    ap = os.path.abspath(path)
+    for _, d in trees:
+        if ap.startswith(os.path.abspath(d) + os.sep):
+            return d
+    return None
+
+
 def find_llama_bin(name, arch=None):
-    """Resolve a llama.cpp binary (llama-perplexity, llama-cli, llama-quantize...):
-    honor an explicit path, else the runtime build install.sh created (PREFERRED --
-    Pollard keeps it current), else PATH, else common spots. Returns the path or None.
+    """Resolve a llama.cpp binary (llama-perplexity, llama-cli, llama-quantize...) -- the ONE resolver every
+    pipeline step uses: honor an explicit path, else the runtime build install.sh created (PREFERRED --
+    Pollard keeps it current), else PATH, else common spots, else the other managed engine trees. Returns the
+    path or None.
 
     Pass `arch` (the model's general.architecture) to pick a binary that actually
     SUPPORTS that architecture: a stale llama.cpp on PATH -- e.g. a distro/homebrew
     build a few weeks behind -- silently shadows the fresh runtime build and then dies
     on 'unknown model architecture: bailingmoe3'. With `arch` we skip incapable
     binaries; if some exist but none support the arch we return None so the caller can
-    say 'update your runtime' instead of 'not found'."""
+    say 'update your runtime' instead of 'not found'.
+
+    Without `arch`, POLLARD_ARCH (set_model_arch: the release / pollard / pollard-decision / pollard-verify set it
+    from the model's GGUF) is used the same way, except that an incapable result falls back to the first binary
+    found, as before. Either way, when the architecture needs runtime patches beyond loading it
+    (required_patches: a manifest's `archs`), the engine tree whose source carries the most of them wins -- clef-omni
+    goes to the tree with the dec.blk quantize patch (a staged runtime/llama.cpp.bolt) for EVERY step, not only to
+    the live runtime/llama.cpp, which loads clef-omni but cannot quantize its decision head."""
     import shutil
     if not name:
         return None
     if os.path.sep in name or name.startswith("~"):        # explicit path given -- honored as-is
         p = os.path.expanduser(name)
         return p if os.path.exists(p) else None
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = _repo_root()
     home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
     candidates = [
         os.path.join(repo, "runtime", "llama.cpp", "build", "bin", name),  # ours FIRST -- kept current
@@ -153,13 +292,29 @@ def find_llama_bin(name, arch=None):
     # build box resolves NOTHING and the caller is told to update a runtime it already has.
     if sys.platform == "win32":
         candidates = [c + ext for c in candidates if c for ext in ("", ".exe")]
-    existing = [c for c in candidates if c and os.path.exists(c)]
+    existing = list(dict.fromkeys(c for c in candidates if c and os.path.exists(c)))
+    implicit = not arch
+    arch = arch or model_arch()
+    trees = engine_trees(repo)
+    need = required_patches(arch, repo) if arch else []
+    # the other managed engines (engines.json + runtime/<name>.lock.json) count only when this architecture needs a
+    # patch -- otherwise the order above is the whole answer, exactly as before
+    extra = [p for n, d in trees[1:] if need for p in [_tree_bin(d, name)] if p and p not in existing]
+    existing += extra
     if not existing:
         return None
-    if arch:
-        capable = [c for c in existing if binary_supports_arch(c, arch)]
-        return capable[0] if capable else None             # exist-but-too-old -> None (caller explains)
-    return existing[0]
+    if not arch:
+        return existing[0]
+    capable = [c for c in existing if binary_supports_arch(c, arch)]
+    if need and capable:
+        def carried(c):
+            tree = _engine_of(c, trees)
+            return sum(tree_has_patch(tree, m) for m in need) if tree else 0
+        best = max(carried(c) for c in capable)
+        capable = [c for c in capable if carried(c) == best]
+    if capable:
+        return capable[0]
+    return existing[0] if implicit else None               # exist-but-too-old -> None (caller explains)
 
 
 def _shard_paths(path):
