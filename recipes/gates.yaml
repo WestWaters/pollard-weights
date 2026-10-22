@@ -76,9 +76,11 @@ kinds:
   # decision_only = the graph ends in a decision head and has NO per-token logits (clef / clef-omni, a d3 readout
   # GGUF): llama-perplexity KLD / PPL cannot exist ("not applicable"), so the rung is gated on its decision board --
   # agreement with the reference's decisions and the option-distribution KL (pollard-decision --ref --results).
-  # Applied by pollard-verify itself when it finds such a model, whatever gates file is in use.
+  # Applied by pollard-verify itself when it finds such a model, whatever gates file is in use. Such a graph never
+  # generates text either, so tool-call numbers cannot exist: a template with tools (pollard-modelkind: agentic)
+  # must not hold the rung to a tool-call retention it has no way to measure.
   decision_only:
-    skip: [kld_max, top1_min]
+    skip: [kld_max, top1_min, toolcall_retention_min, toolcall_pass]
     decision_agreement_min: 85
     decision_option_kl_max: 0.15
     rungs:
