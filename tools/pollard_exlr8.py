@@ -569,11 +569,40 @@ def _layer_of(key):
     return int(m.group(1)) if m else None
 
 
-def tensor_sensitivity(tensors, sens):
+_EXPERT_KEY = re.compile(r"^(.*)\.(?:experts|local_experts)\.(\d+)\.(.+)$")
+
+
+def routing_weights(tensors):
+    """{tensor: r_t}: a routed expert's traffic relative to its layer's mean expert -- E x tokens_x / sum(tokens)
+    over the experts of the same projection (the store's `hessian_tokens`: tokens the router sent to that expert on
+    the calibration corpus). 1.0 for every non-expert tensor, and for a projection whose experts all report 0."""
+    groups = {}
+    for k, v in tensors.items():
+        m = _EXPERT_KEY.match(k)
+        if m:
+            groups.setdefault((m.group(1), m.group(3)), []).append(k)
+    r = {k: 1.0 for k in tensors}
+    for keys in groups.values():
+        tok = [float(tensors[k].get("hessian_tokens") or 0) for k in keys]
+        tot = sum(tok)
+        if tot > 0:
+            for k, t in zip(keys, tok):
+                r[k] = len(keys) * t / tot
+    return r
+
+
+def tensor_sensitivity(tensors, sens, routing=False):
     """{tensor: S_t}: Pollard's measured group KL (pollard-probe: attn / ffn per layer) split across the group's
     tensors by size -- the same split pollard-exl3's recipe bridge uses. No profile: S_t = numel share (the
-    allocation then minimises the summed relative output error)."""
+    allocation then minimises the summed relative output error).
+
+    routing=True (a MoE's per-expert allocation, the K1 lane): the split is by size x traffic (routing_weights), so a
+    layer's experts together keep the layer's measured S, a hot expert carries more of it and a cold one ~none --
+    the cold expert's K1 then costs what its traffic costs."""
     numel = {k: v["numel"] for k, v in tensors.items()}
+    if routing:
+        rw = routing_weights(tensors)
+        numel = {k: n * rw[k] for k, n in numel.items()}
     if not sens:
         tot = float(sum(numel.values())) or 1.0
         return {k: n / tot for k, n in numel.items()}
@@ -593,7 +622,7 @@ def tensor_sensitivity(tensors, sens):
     return out
 
 
-def plan_rung(store_meta, bpw, sens=None, widths=None, min_width=None, max_width=None):
+def plan_rung(store_meta, bpw, sens=None, widths=None, min_width=None, max_width=None, routing=False):
     """The rung's width per tensor: exact knapsack on KL(t, K) = S_t * e(t, K) / e_rtn(t) under
     sum(trellis bytes) <= bpw * numel / 8. Returns {widths, bpw, bytes, predicted_kld, granularity, exact}."""
     tensors = store_meta["tensors"]
@@ -604,7 +633,7 @@ def plan_rung(store_meta, bpw, sens=None, widths=None, min_width=None, max_width
         avail = [k for k in avail if k <= int(max_width)]
     if not avail:
         raise ValueError("no width left to choose from")
-    S = tensor_sensitivity(tensors, sens)
+    S = tensor_sensitivity(tensors, sens, routing)
     names = sorted(tensors)
     total = sum(tensors[n]["numel"] for n in names)
     if not (min(avail) <= bpw + 1e-9 and bpw <= max(avail) + 1e-9):
@@ -1325,6 +1354,11 @@ def main(argv=None):
     ap.add_argument("--ladder", help="comma list of bpw: every rung from the one encode (e.g. 2.5,3,3.25,4,5,6)")
     ap.add_argument("--widths", default=",".join(map(str, DEFAULT_WIDTHS)), help="trellis widths K to encode")
     ap.add_argument("--min-width", type=int, help="no tensor below this width in any rung")
+    ap.add_argument("--routing", action="store_true",
+                    help="MoE: weight each routed expert's share of its layer's sensitivity by the tokens the router "
+                         "sent it (the store's per-expert Hessian token counts) -- per-expert allocation, so cold "
+                         "experts can take K1 (encode with --widths 1,2,3,4,...). GR8's kernels serve K2-K4; K1 and "
+                         "K5/K6 decode with the reference loader")
     ap.add_argument("--calib", help="calibration corpus (pollard-calib output; its .samples.jsonl twin is used)")
     ap.add_argument("--sensitivity", help="pollard-probe sensitivity.json (attn/ffn per layer) -- the measured "
                     "allocation; without it the knapsack minimises summed relative output error")
@@ -1376,7 +1410,7 @@ def main(argv=None):
         if done:
             meta = read_store(store)
             for b in ladder:
-                p = plan_rung(meta, b, sens, widths, a.min_width)
+                p = plan_rung(meta, b, sens, widths, a.min_width, routing=a.routing)
                 print(f"   {bpw_tag(b):>8}: {p['bpw']:.3f} bpw  {p['bytes'] / 1e6:.1f} MB trellis  "
                       f"predicted KL {p['predicted_kld']:.4g}")
         return 0
@@ -1392,7 +1426,7 @@ def main(argv=None):
         return 0
     meta = read_store(store)
     for b in ladder:
-        p = plan_rung(meta, b, sens, widths, a.min_width)
+        p = plan_rung(meta, b, sens, widths, a.min_width, routing=a.routing)
         if a.ladder:
             out = os.path.join(a.out, f"{os.path.basename(str(a.model).rstrip('/'))}-Pollard-EXLR8-{bpw_tag(b)}") \
                 if a.out else _rung_out(a.model, b)

@@ -595,7 +595,7 @@ def grade_reply(reply, probe):
     exp = probe.get("expect")
     row = {"id": probe["id"], "category": probe["category"], "expected": exp is not None, "called": bool(calls),
            "parsed": bool(calls), "name_ok": False, "args_valid": False, "exact": False, "ok": False,
-           "failure": None, "detail": "", "finish": finish,
+           "failure": None, "detail": "", "finish": finish, "read_by": (reply or {}).get("read_by") if calls else None,
            "sample": (json.dumps(calls[0].get("function", {}))[:160] if calls else text.replace("\n", " ")[:160])}
     if reply is None or "error" in (reply or {}):
         err = (reply or {}).get("error") if reply else "no reply"
@@ -1181,9 +1181,50 @@ def reader_family(kind):
     fam = ((kind or {}).get("tools") or {}).get("family") or "none"
     if fam in CALL_READERS:
         return fam, fam
+    if ((kind or {}).get("tools") or {}).get("reader"):
+        return fam, "template"                               # the model's own template says how its calls look
     if fam == "none":
         return fam, "json"
-    raise NotMeasured(f"no in-process reader for the '{fam}' call syntax here (serve it with --backend url)")
+    raise NotMeasured(f"no in-process reader for the '{fam}' call syntax here, and the template renders no call "
+                      "to derive one from (serve it with --backend url)")
+
+
+#: bumped whenever the call readers change what they accept: a cached reference graded by an older reader is re-run
+READER_VERSION = "2026-10-20.template-reader"
+
+
+def pollard_read(reply, family, reader=None, tools=None):
+    """A SERVED reply whose server parser returned no tool_calls, read again by Pollard's reader -- the family's, then
+    the one derived from the model's own template -- so every lane's gate reads a model's calls the same way, whatever
+    the server's parser knows. The reply gets `read_by`: "server" (the server parsed it), "family:<f>" / "template"
+    (Pollard read the content), or nothing (no call)."""
+    from pollard_modelkind import CALL_READERS, read_tool_calls
+    if not reply or "error" in reply:
+        return reply
+    ch = (reply.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    if msg.get("tool_calls"):
+        reply["read_by"] = "server"
+        return reply
+    if family not in CALL_READERS and not reader:
+        return reply
+    content = msg.get("content") or ""
+    think, answer, unclosed = _split_think(content)
+    if unclosed:
+        return reply
+    text = answer if think else content
+    calls, rest, _, how = read_tool_calls(text, family if family in CALL_READERS else None, tools, reader)
+    if not calls:
+        return reply
+    msg["tool_calls"] = [{"id": f"call_{i}", "type": "function",
+                          "function": {"name": c["name"],
+                                       "arguments": c["arguments"] if isinstance(c["arguments"], str)
+                                       else json.dumps(c["arguments"], ensure_ascii=False)}}
+                         for i, c in enumerate(calls)]
+    msg["content"] = ((think and f"<think>{think}</think>") or "") + rest
+    ch["finish_reason"] = "tool_calls"
+    reply["read_by"] = how
+    return reply
 
 
 def exlr8_decoded_gb(rung):
@@ -1542,25 +1583,26 @@ def inprocess_engine(backend, model, device="cuda", threads=None, ctx=8192, load
         eng.close()
 
 
-def reply_from_text(raw, family, tools=None, finish="stop", reasoning=None, prefill=""):
+def reply_from_text(raw, family, tools=None, finish="stop", reasoning=None, prefill="", reader=None):
     """An in-process generation as the /v1/chat/completions reply a server would have returned: thinking split off
     (reasoning_content), calls read by the family's reader (tool_calls, arguments as a JSON string), the prose left as
     content -- so grade_reply grades it exactly like a served reply. `prefill` = the reasoning opener the prompt
     already ended with (the model's text then starts mid-thought)."""
-    from pollard_modelkind import CALL_READERS, call_shaped, parse_tool_calls, split_reasoning
+    from pollard_modelkind import CALL_READERS, call_shaped, read_tool_calls, split_reasoning
     text = (prefill or "") + (raw or "")
-    rf = family if family in CALL_READERS else "json"
+    rf = family if family in CALL_READERS else (None if reader else "json")
+    how = None
     if rf == "harmony":                                          # analysis channel = thinking; calls ride commentary
         think = " ".join(re.findall(r"<\|channel\|>\s*analysis\s*<\|message\|>(.*?)(?:<\|end\|>|$)", text, re.S))
         body = re.sub(r"<\|channel\|>\s*analysis\s*<\|message\|>.*?(?:<\|end\|>|$)", "", text, flags=re.S)
         fin = re.search(r"<\|channel\|>\s*final\s*<\|message\|>(.*?)(?:<\|return\|>|<\|end\|>|$)", body, re.S)
-        calls, _, attempted = parse_tool_calls(body, rf, tools)
+        calls, _, attempted, how = read_tool_calls(body, rf, tools, reader)
         answer = fin.group(1).strip() if fin else ("" if calls or think else body.strip())
         unclosed = bool(think) and not fin and not calls and "<|channel|>" not in body
     else:
         think, answer, unclosed = split_reasoning(text, reasoning)
-        calls, content, attempted = ([], answer, call_shaped(answer)) if unclosed else \
-            parse_tool_calls(answer, rf, tools)
+        calls, content, attempted, how = ([], answer, call_shaped(answer), None) if unclosed else \
+            read_tool_calls(answer, rf, tools, reader)
         answer = content if calls else answer
     msg = {"role": "assistant", "content": text if unclosed else answer}
     if think and not unclosed:
@@ -1571,8 +1613,10 @@ def reply_from_text(raw, family, tools=None, finish="stop", reasoning=None, pref
                                            "arguments": c["arguments"] if isinstance(c["arguments"], str)
                                            else json.dumps(c["arguments"], ensure_ascii=False)}}
                              for i, c in enumerate(calls)]
-    return {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else finish}],
-            "raw": raw}
+    out = {"choices": [{"message": msg, "finish_reason": "tool_calls" if calls else finish}], "raw": raw}
+    if how:
+        out["read_by"] = how
+    return out
 
 
 def _prefill_for(prompt, reasoning):
@@ -1583,7 +1627,7 @@ def _prefill_for(prompt, reasoning):
 
 
 def run_suite_inprocess(engine, probes=None, max_tokens=384, template_kwargs=None, progress=None, family=None,
-                        reasoning=None):
+                        reasoning=None, reader=None):
     """The suite through an in-process engine: the SAME request a served backend gets (request_for), rendered by the
     model's template, decoded greedily, read back by the family's reader, graded by grade_reply."""
     rows = []
@@ -1592,7 +1636,8 @@ def run_suite_inprocess(engine, probes=None, max_tokens=384, template_kwargs=Non
         try:
             prompt = engine.render(body["messages"], body["tools"], template_kwargs)
             raw, finish = engine.generate(prompt, max_tokens)
-            reply = reply_from_text(raw, family, body["tools"], finish, reasoning, _prefill_for(prompt, reasoning))
+            reply = reply_from_text(raw, family, body["tools"], finish, reasoning, _prefill_for(prompt, reasoning),
+                                    reader)
         except NotMeasured:
             raise
         except Exception as e:                                   # noqa: BLE001 -- one probe, recorded
@@ -1657,10 +1702,12 @@ def request_for(probe, max_tokens, template_kwargs=None, extra=None):
     return body
 
 
-def run_suite(base, probes=None, max_tokens=384, template_kwargs=None, progress=None, extra=None):
+def run_suite(base, probes=None, max_tokens=384, template_kwargs=None, progress=None, extra=None, family=None,
+              reader=None):
     rows = []
     for i, p in enumerate(probes or SUITE):
-        reply = _post(base, request_for(p, max_tokens, template_kwargs, extra))
+        body = request_for(p, max_tokens, template_kwargs, extra)
+        reply = pollard_read(_post(base, body), family, reader, body["tools"])
         rows.append(grade_reply(reply, p))
         if progress:
             progress(i + 1, len(probes or SUITE), rows[-1])
@@ -1668,7 +1715,7 @@ def run_suite(base, probes=None, max_tokens=384, template_kwargs=None, progress=
 
 
 def suite_hash(probes=None, extra=""):
-    blob = json.dumps([probes or SUITE, TOOLBOX, SYSTEM, extra], sort_keys=True)
+    blob = json.dumps([probes or SUITE, TOOLBOX, SYSTEM, extra, READER_VERSION], sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -1737,6 +1784,7 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
         tog = ((kind.get("reasoning") or {}).get("toggle") or {})
         tkw = dict(tog.get("off") or {}) or None
     fam = (kind.get("tools") or {}).get("family")
+    treader = (kind.get("tools") or {}).get("reader")
     if not quiet:
         if note:
             print(f"   ({note})", flush=True)
@@ -1764,11 +1812,25 @@ def run_model(model, ngl, threads=None, server=None, max_tokens=0, no_think=Fals
             meta["loader"] = extra["loader"]
         with inprocess_engine(backend, model, extra.get("device", "cuda"), threads,
                               **({"loader": extra["loader"]} if extra.get("loader") else {})) as eng:
-            rows = run_suite_inprocess(eng, probes, budget, tkw, prog, rkey, kind.get("reasoning"))
+            rows = run_suite_inprocess(eng, probes, budget, tkw, prog, rkey if rkey != "template" else fam,
+                                       kind.get("reasoning"), treader)
+        meta["read_by"] = _read_by(rows)
         return rows, meta
     with backend_server(backend, model, ngl, threads, server, url, kind) as base:
-        rows = run_suite(base, probes, budget, tkw, prog, extra)
+        rows = run_suite(base, probes, budget, tkw, prog, extra, fam, treader)
+    meta["read_by"] = _read_by(rows)
+    if treader:
+        meta["template_reader"] = treader.get("shape")
     return rows, meta
+
+
+def _read_by(rows):
+    """{reader: probes whose call it read} -- how many calls the server parsed and how many Pollard read."""
+    out = {}
+    for r in rows:
+        if r.get("read_by"):
+            out[r["read_by"]] = out.get(r["read_by"], 0) + 1
+    return out
 
 
 def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=False, probes=None, refresh=False,

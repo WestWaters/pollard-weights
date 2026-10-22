@@ -485,6 +485,146 @@ def _automap_mix(a, is_moe, ik_dir=None):
     return out
 
 
+#: the measured MoE rung: its tag in the MANIFEST / file name, and the ladder label its budget comes from
+MOE_TAG, MOE_BUDGET_LABEL = "MOE", "IQ2"
+
+
+def _heldout_for(a):
+    """The held-out text beside the calibration corpus (pollard-calib --held-out), or None."""
+    if getattr(a, "heldout", None):
+        return a.heldout
+    here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+    calib = a.calib or os.path.join(here, "pollard_calib.txt")
+    for c in (re.sub(r"\.txt$", "", calib) + ".heldout.txt", calib + ".heldout"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _split_heldout(held, here, stem):
+    """Two disjoint halves of the held-out text: the allocation's screening eval and the judge the measured
+    candidates are graded on (neither is the calibration the imatrix saw)."""
+    a_, b_ = os.path.join(here, f"{stem}.moe-screen.txt"), os.path.join(here, f"{stem}.moe-judge.txt")
+    if not (os.path.exists(a_) and os.path.exists(b_)):
+        lines = open(held, encoding="utf-8", errors="ignore").read().split("\n")
+        half = len(lines) // 2
+        open(a_, "w", encoding="utf-8").write("\n".join(lines[:half])[:16000])
+        open(b_, "w", encoding="utf-8").write("\n".join(lines[half:])[:60000])
+    return a_, b_
+
+
+def _moe_budget_gb(a, f16_gb):
+    """The MoE rung's byte budget: --moe-gb, else the ladder's 2-bit rung size (so the card compares the two at
+    equal bytes), else that label's fraction of the f16."""
+    if getattr(a, "moe_gb", None):
+        return float(a.moe_gb)
+    try:
+        picks = pick_ladder(ladder_points(a.gguf, a.imatrix, a.sensitivity), f16_gb, False)
+        if MOE_BUDGET_LABEL in picks:
+            return float(picks[MOE_BUDGET_LABEL][2])
+    except Exception:                                                    # noqa: BLE001
+        pass
+    return next(frac for lb, _, frac in LADDER if lb == MOE_BUDGET_LABEL) * f16_gb
+
+
+def _moe_rung(a):
+    """THE MEASURED MoE RUNG -- the default for a MoE ladder: pollard-moefit auto at the 2-bit rung's bytes.
+
+    No fixed prune fraction: 0 / 10 / 25 / 40 / 50 % of routed experts (REAP scores where the HF weights are here,
+    else the router's own token counts) are each screened with the bit mix for what is left, the best few BUILT and
+    MEASURED (KLD / top-1 / PPL on held-out text, the tool gate), and the winner ships as <M>-MOE.gguf with the
+    candidate table in the MANIFEST (the card prints it). 1-bit experts are priced by their MEASURED cost
+    (pollard-moefit lowbit), not extrapolated. Inputs: a GGUF imatrix (per-expert counts), the error map, the GGUF
+    sensitivity profile (iq2_xxs probe), the low-bit costs -- each built once and reused."""
+    here = os.path.dirname(os.path.abspath(a.gguf)) or "."
+    stem = os.path.splitext(os.path.basename(a.gguf))[0]
+    binq = (_bin_in(a.bin, "llama-quantize") if a.bin else find_llama_bin("llama-quantize")) or "llama-quantize"
+    binp = (_bin_in(a.bin, "llama-perplexity") if a.bin else find_llama_bin("llama-perplexity")) or "llama-perplexity"
+    bini = (_bin_in(a.bin, "llama-imatrix") if a.bin else find_llama_bin("llama-imatrix")) or "llama-imatrix"
+    held = _heldout_for(a)
+    calib = a.calib or os.path.join(here, "pollard_calib.txt")
+    if not held:
+        print("   3) (no held-out text beside the calibration -- the measured MoE rung needs one; pollard-calib "
+              "--held-out writes it)")
+        return None
+    ngl = str(_fit_ngl(a.gguf, a.ngl))
+    imx = os.path.join(here, f"{stem}.moe.imatrix.gguf")      # GGUF format: per-expert token counts
+    em = os.path.join(here, f"{stem}.moe.errmap.json")
+    sens = os.path.join(here, f"{stem}.moe.sensitivity.json")
+    lb = os.path.join(here, f"{stem}.moe.lowbit.json")
+    out = _rung_out(a.gguf, MOE_TAG)
+    rep = out + ".moefit.json"
+    f16_gb = os.path.getsize(a.gguf) / 1e9 if os.path.exists(a.gguf) else 0.0
+    gb = _moe_budget_gb(a, f16_gb)
+    print(f"   3) the measured MoE rung (pollard-moefit auto: prune 0-50 % x bit mix at {gb:.2f} GB, the best "
+          "candidates built + measured, the winner ships):")
+    screen = judge = None
+    if a.run:
+        screen, judge = _split_heldout(held, here, stem)
+    else:
+        screen, judge = (os.path.join(here, f"{stem}.moe-screen.txt"), os.path.join(here, f"{stem}.moe-judge.txt"))
+    steps = []
+    if not os.path.exists(imx):
+        steps.append([bini, "-m", a.gguf, "-f", calib, "-o", imx, "-ngl", ngl, "-c", "512", "--chunks", "128"])
+    if not os.path.exists(em):
+        steps.append(["pollard-moefit", "errmap", "--gguf", a.gguf, "--imatrix", imx, "--out", em,
+                      "--llama-quantize", binq, "--workdir", os.path.join(here, f"{stem}.moe-probes")])
+    if not os.path.exists(sens):
+        steps.append(["pollard-sensitivity", "--gguf", a.gguf, "--imatrix", imx, "--eval", screen, "--out", sens,
+                      "--llama-quantize", binq, "--llama-perplexity", binp, "--ngl", ngl]
+                     + (["--allow-slow"] if getattr(a, "allow_slow", False) else []))
+    big = (analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf)).get("total") or 0) > 8e9 if a.run else False
+    steps.append(["pollard-moefit", "lowbit", "--gguf", a.gguf, "--imatrix", imx, "--eval", screen, "--out", lb,
+                  "--granularity", "layer" if big else "proj", "--llama-quantize", binq, "--llama-perplexity", binp,
+                  "--ngl", ngl, "--workdir", os.path.join(here, f"{stem}.moe-lowbit")])
+    reap = None
+    hf_dir = getattr(a, "_hf_dir", None)
+    if hf_dir and os.path.isfile(os.path.join(hf_dir, "config.json")):
+        reap = os.path.join(here, f"{stem}.reap.json")
+        if not os.path.exists(reap):
+            steps.append(["pollard-reap", "--model", hf_dir, "--calib", calib, "--out", reap, "--rows", "64",
+                          "--seqlen", "512", "--stream"])
+    au = ["pollard-moefit", "auto", "--gguf", a.gguf, "--imatrix", imx, "--errmap", em, "--sensitivity", sens,
+          "--lowbit", lb, "--gb", f"{gb:.6f}", "--screen-eval", screen, "--eval", judge, "--out", out,
+          "--report", rep, "--llama-quantize", binq, "--llama-perplexity", binp, "--ngl", ngl,
+          "--workdir", os.path.join(here, f"{stem}.moe-auto")]
+    if reap:
+        au += ["--reap", reap]
+    # the candidates' tool gate is part of the CHOICE, so it runs even when the release measures rungs itself
+    steps.append(au)
+    for cmd in steps:
+        try:
+            _run(cmd, a.run, cwd=here)
+        except SystemExit as e:
+            if cmd[0] != "pollard-reap":
+                raise
+            print(f"      (pollard-reap failed: {e} -- the router's token counts score the experts instead)")
+            del au[au.index("--reap"):au.index("--reap") + 2]
+    if a.run:
+        return _record_moe(a, out, rep)
+    return out
+
+
+def _record_moe(a, out, rep_path):
+    """The MoE rung in the MANIFEST with its report (chosen prune %, why, every candidate) for the card."""
+    if not os.path.isfile(out):
+        print(f"   (warning: the MoE rung is not at {out} -- not recorded)")
+        return None
+    try:
+        import pollard_workspace as ws
+        from pollard_moefit import auto_table
+        rep = json.load(open(rep_path))
+        arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
+        bpw = round(os.path.getsize(out) * 8.0 / arch["total"], 2) if arch.get("total") else None
+        summary = {"chosen_prune": rep["chosen_prune"], "why": rep["why"], "budget_gb": rep["budget_gb"],
+                   "experts": rep["experts"], "keep": rep["winner"]["keep"], "scores": rep["scores"],
+                   "table": auto_table(rep), "report": os.path.abspath(rep_path)}
+        return ws.record_build(a.gguf, "gguf", out, tag=MOE_TAG, bpw=bpw, extra={"moefit": summary})
+    except Exception as e:                                               # noqa: BLE001
+        print(f"   (warning: could not record the MoE rung in the workspace manifest: {e})")
+        return None
+
+
 def flagship_mix_path(gguf, here=None):
     """Where pollard-automap writes the mix: <stem>-mix.gguf next to the f16, where <stem> is the file name with
     `-f16.gguf` / `.f16.gguf` / `.gguf` cut off (pollard_automap's own rule). The recorder used the plain stem, so
@@ -1132,8 +1272,13 @@ def main():
                          "--ram build: budgets are found by pollard-fit's own planner, the 2-bit rung is the "
                          "IQ*_KT flagship where ik_llama can build it and a stock IQ2 type where it cannot")
     ap.add_argument("--rung", action="append", metavar="LABEL",
-                    help="with --ladder: build only this rung (Q6_K / IQ4_XS / IQ3_S / IQ2 / flagship); repeatable "
-                         "or a comma list. Default: every rung + the flagship")
+                    help="with --ladder: build only this rung (Q6_K / IQ4_XS / IQ3_S / IQ2 / flagship / MOE); "
+                         "repeatable or a comma list. Default: every rung + the flagship (+ MOE for a MoE)")
+    ap.add_argument("--heldout", help="held-out text beside --calib (pollard-calib --held-out); the measured MoE rung "
+                                      "screens and judges on it")
+    ap.add_argument("--moe-gb", type=float, help="byte budget of the measured MoE rung (default: the 2-bit rung's)")
+    ap.add_argument("--no-moe-rung", dest="moe_rung", action="store_false",
+                    help="MoE: skip the measured prune x bit-mix rung (pollard-moefit auto)")
     ap.add_argument("--allow-slow", action="store_true",
                     help="let the passthrough sensitivity sweep run on a big model (it is one quantize + KL pass "
                          "per layer; pollard-sensitivity refuses multi-hour sweeps without this)")
@@ -1334,6 +1479,8 @@ def _dispatch(a):
     else:
         print(f"   2) (--no-auto-imatrix set and no --imatrix: stock K-quant ladder only. Drop the "
               f"flag for the {flagship} flagship -- the winning build, auto-calibrated.)")
+    if is_moe and a.ladder and a.imatrix and getattr(a, "moe_rung", True) and (want is None or MOE_TAG in want):
+        _moe_rung(a)
     if a.run:
         _toolcall_gate(a, since=getattr(a, "_t0", 0.0))
     if a.run and getattr(a, "card", True):

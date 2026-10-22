@@ -15,6 +15,9 @@ Scoring (which experts to KEEP, per layer):
   imatrix             -- summed importance-matrix activation per expert (REAP-correct: keeps the
                         experts the calib actually routed to). Needs --imatrix.
   router              -- L2 norm of the router (ffn_gate_inp) row per expert. Cheap proxy.
+  reap                -- REAP saliency (pollard-reap): mean router weight x expert output norm over the tokens
+                        routed to the expert on the calibration corpus. Needs --scores <pollard-reap json>.
+                        `--score count|ean` read the same file's token counts / summed output norms.
 
 Keeps a FIXED count K per layer (GGUF stores one expert_count); which experts differ per layer.
 K must be >= the model's active-expert count (top-k), or routing breaks. Writes a new GGUF with
@@ -60,7 +63,7 @@ def imatrix_activation(path):
 _LAYER = re.compile(r"blk\.(\d+)\.")
 _EXPERT_W = re.compile(r"blk\.\d+\.ffn_(gate|up|down)_exps\.weight$")
 _ROUTER = re.compile(r"blk\.\d+\.ffn_gate_inp\.weight$")
-_EXP_BIAS = re.compile(r"blk\.\d+\.(ffn_gate_inp|exp_probs)_b(ias)?\.weight$|exp_probs_b\.weight$")
+_EXP_BIAS = re.compile(r"blk\.\d+\.(exp_probs_b(\.bias|\.weight)?|ffn_gate_inp\.bias|ffn_(gate|up|down)_exps\.bias)$")
 
 
 def _expert_axis(arr, n_exp):
@@ -126,8 +129,12 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--keep", type=float, help="fraction of experts to KEEP per layer (0<f<=1)")
     g.add_argument("--keep-experts", type=int, help="absolute experts to KEEP per layer")
-    ap.add_argument("--score", choices=["magnitude", "imatrix", "router"], default="magnitude")
+    ap.add_argument("--score", choices=["magnitude", "imatrix", "router", "reap", "count", "ean"],
+                    default="magnitude")
     ap.add_argument("--imatrix", help="imatrix (for --score imatrix)")
+    ap.add_argument("--scores", help="pollard-reap JSON (for --score reap|count|ean)")
+    ap.add_argument("--keep-list", help="write the kept expert indices per layer here (JSON), e.g. to slice an "
+                                        "imatrix or map a routing profile onto the pruned model")
     ap.add_argument("--dry-run", action="store_true", help="report the plan; write nothing")
     a = ap.parse_args()
     if not a.dry_run and not a.out:
@@ -157,13 +164,23 @@ def main():
     imx = imatrix_activation(a.imatrix) if a.score == "imatrix" and a.imatrix else {}
     if a.score == "imatrix" and not imx:
         sys.exit("--score imatrix needs a readable --imatrix.")
-    layers = score_experts(reader, n_exp, a.score, imx)
+    if a.score in ("reap", "count", "ean"):
+        if not a.scores:
+            sys.exit(f"--score {a.score} needs --scores <pollard-reap json> (run pollard-reap first).")
+        layers = reap_layers(a.scores, n_exp, a.score)
+    else:
+        layers = score_experts(reader, n_exp, a.score, imx)
     if not layers:
         sys.exit("found no expert tensors to score -- is this the right GGUF?")
     keep = keep_indices(layers, n_exp, keep_k)
     dropped = n_exp - keep_k
     print(f"  {len(layers)} MoE layers scored; dropping {dropped}/{n_exp} experts each "
           f"(~{100*dropped/n_exp:.0f}% fewer expert params).")
+    if a.keep_list:
+        import json
+        json.dump({"source": os.path.abspath(a.gguf), "score": a.score, "n_experts": n_exp, "keep": keep_k,
+                   "layers": {str(L): [int(x) for x in idx] for L, idx in sorted(keep.items())}},
+                  open(a.keep_list, "w"), indent=1)
     if a.dry_run:
         print("  dry-run: no file written. Re-run without --dry-run to emit the pruned GGUF.")
         return
@@ -177,15 +194,15 @@ def main():
         if field.name in ("general.architecture", "GGUF.version",
                            "GGUF.tensor_count", "GGUF.kv_count"):
             continue
-        if field.name.endswith("expert_count"):
-            writer.add_uint32(field.name, keep_k)
+        if field.name.endswith(".expert_count"):
+            writer.add_key_value(field.name, keep_k, field.types[0])
             continue
         _copy_field(writer, field)
 
     for t in reader.tensors:
         arr = np.asarray(t.data)
         m = _LAYER.search(t.name)
-        if m and (_EXPERT_W.search(t.name) or _ROUTER.search(t.name)):
+        if m and (_EXPERT_W.search(t.name) or _ROUTER.search(t.name) or _EXP_BIAS.search(t.name)):
             layer = int(m.group(1))
             ax = _expert_axis(arr, n_exp)
             if ax is not None and layer in keep:
@@ -203,18 +220,43 @@ def main():
 
 
 def _copy_field(writer, field):
-    """Re-emit a GGUFReader field into the writer, preserving its type."""
+    """Re-emit a GGUFReader field into the writer with its EXACT value type (bool stays bool, int32 stays int32,
+    typed arrays keep their element type) -- llama.cpp checks key types on load."""
     import gguf as _g
-    val = field.contents() if hasattr(field, "contents") else None
     t = field.types[0] if field.types else None
-    if t == _g.GGUFValueType.STRING:
-        writer.add_string(field.name, str(val))
-    elif t == _g.GGUFValueType.ARRAY:
-        writer.add_array(field.name, list(val) if val is not None else [])
-    elif t in (_g.GGUFValueType.FLOAT32, _g.GGUFValueType.FLOAT64):
-        writer.add_float32(field.name, float(val))
-    elif t is not None:
-        writer.add_uint32(field.name, int(val))
+    if t is None:
+        return
+    val = field.contents() if hasattr(field, "contents") else _legacy_contents(field, _g)
+    if t == _g.GGUFValueType.ARRAY:
+        sub = field.types[1] if len(field.types) > 1 else None
+        writer.add_key_value(field.name, list(val), t, sub_type=sub)
+    else:
+        writer.add_key_value(field.name, val, t)
+
+
+def _legacy_contents(field, _g):
+    """field value on a gguf-py without ReaderField.contents()."""
+    def one(i, typ):
+        part = field.parts[i]
+        return bytes(part).decode("utf-8") if typ == _g.GGUFValueType.STRING else part[0].item()
+    if field.types[0] == _g.GGUFValueType.ARRAY:
+        return [one(i, field.types[-1]) for i in field.data]
+    return one(field.data[0], field.types[0])
+
+
+def reap_layers(path, n_exp, key="reap"):
+    """{layer: np.array scores} from a pollard-reap JSON (reap | count | ean)."""
+    import json
+    d = json.load(open(path))
+    if d.get("format") != "pollard-reap":
+        sys.exit(f"{path} is not a pollard-reap file")
+    out = {}
+    for L, v in d["layers"].items():
+        sc = np.asarray(v[key], dtype=np.float64)
+        if sc.size != n_exp:
+            sys.exit(f"{path}: layer {L} has {sc.size} experts, the GGUF has {n_exp} -- scores of another model?")
+        out[int(L)] = sc
+    return out
 
 
 if __name__ == "__main__":

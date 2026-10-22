@@ -1,0 +1,565 @@
+{
+ "model": "ibm-granite/granite-3.1-1b-a400m-instruct (32 experts, top-8, 24 layers, Apache-2.0)",
+ "reference": "Q8_0 GGUF of the full model (disk could not hold the f16); KLD on 16x512 held-out tokens (pollard-calib agent profile held-out, disjoint from calibration and from the sensitivity eval)",
+ "runtime": "llama.cpp df03399b (Pollard runtime), Metal",
+ "allocation": "pollard-moefit errmap + exact knapsack on pollard-sensitivity --passthrough profile (probe iq2_xxs); REAP from 64x512 calibration rows",
+ "budgets": {
+  "B_hi": 436673728,
+  "B_mid": 361176256,
+  "B_lo": 265231552
+ },
+ "rungs": {
+  "uniform-iq2_xxs": {
+   "label": "full, experts uniform iq2_xxs",
+   "arm": "ref",
+   "prune": null,
+   "bytes": 410101920,
+   "bpw_role": {
+    "expert": 2.0625,
+    "attn": 4.25
+   },
+   "hist": {
+    "expert": {
+     "iq2_xxs": 72
+    },
+    "attn": {
+     "iq4_xs": 96
+    }
+   },
+   "predicted": 0.090007,
+   "ppl": 6.179926,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.686729,
+   "median_kld": 0.180904,
+   "p99_kld": 6.048727,
+   "top1": 75.147,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "uniform-iq2_s": {
+   "label": "full, experts uniform iq2_s",
+   "arm": "ref",
+   "prune": null,
+   "bytes": 485599392,
+   "bpw_role": {
+    "expert": 2.5625,
+    "attn": 4.25
+   },
+   "hist": {
+    "expert": {
+     "iq2_s": 72
+    },
+    "attn": {
+     "iq4_xs": 96
+    }
+   },
+   "predicted": 0.050648,
+   "ppl": 5.42453,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.500034,
+   "median_kld": 0.087729,
+   "p99_kld": 5.884006,
+   "top1": 80.147,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "uniform-iq1_m": {
+   "label": "full, experts uniform iq1_m",
+   "arm": "ref",
+   "prune": null,
+   "bytes": 362916000,
+   "bpw_role": {
+    "expert": 1.75,
+    "attn": 4.25
+   },
+   "hist": {
+    "expert": {
+     "iq1_m": 72
+    },
+    "attn": {
+     "iq4_xs": 96
+    }
+   },
+   "predicted": 0.149237,
+   "ppl": 11.594332,
+   "ref_ppl": 4.620807,
+   "mean_kld": 1.485131,
+   "median_kld": 0.748839,
+   "p99_kld": 8.374848,
+   "top1": 61.373,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "uniform-iq3_xxs": {
+   "label": "full, experts uniform iq3_xxs",
+   "arm": "ref",
+   "prune": null,
+   "bytes": 561096864,
+   "bpw_role": {
+    "expert": 3.0625,
+    "attn": 4.25
+   },
+   "hist": {
+    "expert": {
+     "iq3_xxs": 72
+    },
+    "attn": {
+     "iq4_xs": 96
+    }
+   },
+   "predicted": 0.024405,
+   "ppl": 4.9929,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.268815,
+   "median_kld": 0.029608,
+   "p99_kld": 3.828133,
+   "top1": 85.833,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "full-no1bit-hi": {
+   "label": "full, measured knapsack, experts >= iq2_xxs @hi",
+   "arm": "a",
+   "prune": null,
+   "bytes": 438397088,
+   "bpw_role": {
+    "attn": 4.4705,
+    "expert": 2.2361
+   },
+   "hist": {
+    "attn": {
+     "q6_K": 3,
+     "q5_K": 13,
+     "iq4_xs": 80
+    },
+    "expert": {
+     "iq2_s": 9,
+     "iq2_xs": 16,
+     "iq3_xxs": 4,
+     "iq2_xxs": 43
+    }
+   },
+   "predicted": 0.541035,
+   "ppl": 5.335345,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.518315,
+   "median_kld": 0.118861,
+   "p99_kld": 4.455776,
+   "top1": 77.647,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "full-1bit-hi": {
+   "label": "full, measured knapsack, 1-bit experts allowed @hi",
+   "arm": "b",
+   "prune": null,
+   "bytes": 438397088,
+   "bpw_role": {
+    "attn": 4.4705,
+    "expert": 2.2361
+   },
+   "hist": {
+    "attn": {
+     "q6_K": 3,
+     "q5_K": 13,
+     "iq4_xs": 80
+    },
+    "expert": {
+     "iq2_s": 9,
+     "iq2_xs": 16,
+     "iq3_xxs": 4,
+     "iq2_xxs": 43
+    }
+   },
+   "predicted": 0.541035,
+   "ppl": 5.335345,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.518315,
+   "median_kld": 0.118861,
+   "p99_kld": 4.455776,
+   "top1": 77.647,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p50-no1bit-hi": {
+   "label": "p50, measured knapsack, experts >= iq2_xxs @hi",
+   "arm": "c",
+   "prune": "p50",
+   "bytes": 438413472,
+   "bpw_role": {
+    "attn": 6.2431,
+    "expert": 4.2717
+   },
+   "hist": {
+    "attn": {
+     "q8_0": 9,
+     "q6_K": 41,
+     "q5_K": 46
+    },
+    "expert": {
+     "q6_K": 1,
+     "q5_K": 11,
+     "iq4_xs": 44,
+     "iq3_s": 12,
+     "iq3_xxs": 4
+    }
+   },
+   "predicted": 0.143385,
+   "ppl": 16.843656,
+   "ref_ppl": 4.620807,
+   "mean_kld": 1.909164,
+   "median_kld": 1.100559,
+   "p99_kld": 9.249826,
+   "top1": 54.632,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p50-1bit-hi": {
+   "label": "p50, measured knapsack, 1-bit experts allowed @hi",
+   "arm": "d",
+   "prune": "p50",
+   "bytes": 438413472,
+   "bpw_role": {
+    "attn": 6.2431,
+    "expert": 4.2717
+   },
+   "hist": {
+    "attn": {
+     "q8_0": 9,
+     "q6_K": 41,
+     "q5_K": 46
+    },
+    "expert": {
+     "q6_K": 1,
+     "q5_K": 11,
+     "iq4_xs": 44,
+     "iq3_s": 12,
+     "iq3_xxs": 4
+    }
+   },
+   "predicted": 0.143385,
+   "ppl": 16.843656,
+   "ref_ppl": 4.620807,
+   "mean_kld": 1.909164,
+   "median_kld": 1.100559,
+   "p99_kld": 9.249826,
+   "top1": 54.632,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p25-no1bit-hi": {
+   "label": "p25, measured knapsack, experts >= iq2_xxs @hi",
+   "arm": "c",
+   "prune": "p25",
+   "bytes": 438372512,
+   "bpw_role": {
+    "attn": 5.2665,
+    "expert": 2.9219
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 70,
+     "q6_K": 4,
+     "iq4_xs": 22
+    },
+    "expert": {
+     "iq3_s": 9,
+     "iq3_xxs": 44,
+     "iq2_s": 9,
+     "iq2_xs": 4,
+     "iq2_xxs": 6
+    }
+   },
+   "predicted": 0.469817,
+   "ppl": 6.310326,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.753156,
+   "median_kld": 0.202065,
+   "p99_kld": 6.803507,
+   "top1": 72.941,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p25-1bit-hi": {
+   "label": "p25, measured knapsack, 1-bit experts allowed @hi",
+   "arm": "d",
+   "prune": "p25",
+   "bytes": 438372512,
+   "bpw_role": {
+    "attn": 5.2665,
+    "expert": 2.9219
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 70,
+     "q6_K": 4,
+     "iq4_xs": 22
+    },
+    "expert": {
+     "iq3_s": 9,
+     "iq3_xxs": 44,
+     "iq2_s": 9,
+     "iq2_xs": 4,
+     "iq2_xxs": 6
+    }
+   },
+   "predicted": 0.469817,
+   "ppl": 6.310326,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.753156,
+   "median_kld": 0.202065,
+   "p99_kld": 6.803507,
+   "top1": 72.941,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "full-1bit-mid": {
+   "label": "full, measured knapsack, 1-bit experts allowed @mid",
+   "arm": "b",
+   "prune": null,
+   "bytes": 362883232,
+   "bpw_role": {
+    "attn": 4.3021,
+    "expert": 1.7465
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 4,
+     "iq4_xs": 92
+    },
+    "expert": {
+     "iq2_xxs": 25,
+     "iq1_m": 4,
+     "iq1_s": 43
+    }
+   },
+   "predicted": 1.032383,
+   "ppl": 8.886153,
+   "ref_ppl": 4.620807,
+   "mean_kld": 1.14097,
+   "median_kld": 0.529066,
+   "p99_kld": 7.289021,
+   "top1": 65.76,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p50-no1bit-mid": {
+   "label": "p50, measured knapsack, experts >= iq2_xxs @mid",
+   "arm": "c",
+   "prune": "p50",
+   "bytes": 362907808,
+   "bpw_role": {
+    "attn": 5.3464,
+    "expert": 3.3837
+   },
+   "hist": {
+    "attn": {
+     "q6_K": 12,
+     "q5_K": 62,
+     "iq4_xs": 22
+    },
+    "expert": {
+     "q5_K": 3,
+     "iq4_xs": 13,
+     "iq3_s": 23,
+     "iq3_xxs": 21,
+     "iq2_s": 6,
+     "iq2_xs": 3,
+     "iq2_xxs": 3
+    }
+   },
+   "predicted": 0.449818,
+   "ppl": 22.057786,
+   "ref_ppl": 4.620807,
+   "mean_kld": 2.195257,
+   "median_kld": 1.491071,
+   "p99_kld": 9.728262,
+   "top1": 51.348,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p50-1bit-mid": {
+   "label": "p50, measured knapsack, 1-bit experts allowed @mid",
+   "arm": "d",
+   "prune": "p50",
+   "bytes": 362907808,
+   "bpw_role": {
+    "attn": 5.3464,
+    "expert": 3.3837
+   },
+   "hist": {
+    "attn": {
+     "q6_K": 12,
+     "q5_K": 62,
+     "iq4_xs": 22
+    },
+    "expert": {
+     "q5_K": 3,
+     "iq4_xs": 13,
+     "iq3_s": 23,
+     "iq3_xxs": 21,
+     "iq2_s": 6,
+     "iq2_xs": 3,
+     "iq2_xxs": 3
+    }
+   },
+   "predicted": 0.449818,
+   "ppl": 22.057786,
+   "ref_ppl": 4.620807,
+   "mean_kld": 2.195257,
+   "median_kld": 1.491071,
+   "p99_kld": 9.728262,
+   "top1": 51.348,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p25-no1bit-mid": {
+   "label": "p25, measured knapsack, experts >= iq2_xxs @mid",
+   "arm": "c",
+   "prune": "p25",
+   "bytes": 362916000,
+   "bpw_role": {
+    "attn": 4.4583,
+    "expert": 2.3229
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 17,
+     "iq4_xs": 79
+    },
+    "expert": {
+     "iq3_xxs": 9,
+     "iq2_s": 12,
+     "iq2_xs": 15,
+     "iq2_xxs": 36
+    }
+   },
+   "predicted": 1.077975,
+   "ppl": 7.06988,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.906704,
+   "median_kld": 0.344281,
+   "p99_kld": 5.851319,
+   "top1": 69.485,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p25-1bit-mid": {
+   "label": "p25, measured knapsack, 1-bit experts allowed @mid",
+   "arm": "d",
+   "prune": "p25",
+   "bytes": 362916000,
+   "bpw_role": {
+    "attn": 4.5625,
+    "expert": 2.3142
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 27,
+     "iq4_xs": 69
+    },
+    "expert": {
+     "iq3_xxs": 10,
+     "iq2_s": 18,
+     "iq2_xs": 11,
+     "iq2_xxs": 25,
+     "iq1_s": 6,
+     "iq1_m": 2
+    }
+   },
+   "predicted": 1.068496,
+   "ppl": 7.588166,
+   "ref_ppl": 4.620807,
+   "mean_kld": 0.976563,
+   "median_kld": 0.391497,
+   "p99_kld": 6.410557,
+   "top1": 68.088,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p50-no1bit-lo": {
+   "label": "p50, measured knapsack, experts >= iq2_xxs @lo",
+   "arm": "c",
+   "prune": "p50",
+   "bytes": 266971296,
+   "bpw_role": {
+    "attn": 4.3194,
+    "expert": 2.2413
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 6,
+     "iq4_xs": 90
+    },
+    "expert": {
+     "iq3_s": 3,
+     "iq3_xxs": 8,
+     "iq2_s": 1,
+     "iq2_xxs": 59,
+     "iq2_xs": 1
+    }
+   },
+   "predicted": 2.279886,
+   "ppl": 41.678272,
+   "ref_ppl": 4.620807,
+   "mean_kld": 2.773476,
+   "median_kld": 2.161831,
+   "p99_kld": 10.625293,
+   "top1": 43.48,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  },
+  "p50-1bit-lo": {
+   "label": "p50, measured knapsack, 1-bit experts allowed @lo",
+   "arm": "d",
+   "prune": "p50",
+   "bytes": 266971296,
+   "bpw_role": {
+    "attn": 4.3889,
+    "expert": 2.2326
+   },
+   "hist": {
+    "attn": {
+     "q5_K": 11,
+     "iq4_xs": 85
+    },
+    "expert": {
+     "iq4_xs": 3,
+     "iq3_s": 3,
+     "iq3_xxs": 7,
+     "iq2_s": 5,
+     "iq2_xxs": 22,
+     "iq2_xs": 9,
+     "iq1_m": 7,
+     "iq1_s": 16
+    }
+   },
+   "predicted": 2.082229,
+   "ppl": 49.889689,
+   "ref_ppl": 4.620807,
+   "mean_kld": 3.002066,
+   "median_kld": 2.412447,
+   "p99_kld": 10.720802,
+   "top1": 41.225,
+   "tool_rate": 0.25,
+   "tool_ref_rate": 0.25,
+   "tool_retention": 100.0
+  }
+ }
+}

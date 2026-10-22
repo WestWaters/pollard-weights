@@ -5,7 +5,7 @@ import subprocess
 
 COMMANDS = ("pollard", "pollard-calc", "pollard-fit", "pollard-experts",
             "pollard-runtime", "pollard-serve-eval", "pollard-ggufcheck", "pollard-node",
-            "pollard-ngram", "pollard-forge", "pollard-thinklean", "pollard-kvbench")
+            "pollard-ngram", "pollard-forge", "pollard-thinklean", "pollard-kvbench", "pollard-moefit")
 
 for command in COMMANDS:
     result = subprocess.run([command, "--help"], capture_output=True, text=True, timeout=30)
