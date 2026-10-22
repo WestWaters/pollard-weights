@@ -12,6 +12,7 @@
 #                    this machine, GPU not free, too big). skip (the default) PUBLISHES it and the card says
 #                    "tool calls: not measured (<reason>)"; fail holds it back
 #   decision_agreement_min  same decision as the f16, percent            pollard-decision --results
+#   decision_option_kl_max  mean option-distribution KL to the f16 (nats) pollard-decision --results
 #   runtime          stock | ik_llama | any  (GGUF: from the tensor types, pollard-ggufcheck)
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
 #   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
@@ -70,3 +71,30 @@ kinds:
         toolcall_retention_min: 85
       - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
         toolcall_retention_min: 75
+  # decision_only = the graph ends in a decision head and has NO per-token logits (clef / clef-omni, a d3 readout
+  # GGUF): llama-perplexity KLD / PPL cannot exist ("not applicable"), so the rung is gated on its decision board --
+  # agreement with the reference's decisions and the option-distribution KL (pollard-decision --ref --results).
+  # Applied by pollard-verify itself when it finds such a model, whatever gates file is in use.
+  decision_only:
+    skip: [kld_max, top1_min]
+    decision_agreement_min: 85
+    decision_option_kl_max: 0.15
+    rungs:
+      - match: ["Q8_0", "*8bit*", "*int8*", "*FP8*", "*-8.0bpw"]
+        decision_agreement_min: 98
+        decision_option_kl_max: 0.01
+      - match: ["Q6_K*", "*6bit*", "*-6.0bpw", "*MXFP6*", "MIX-6*bpw"]
+        decision_agreement_min: 97
+        decision_option_kl_max: 0.02
+      - match: ["Q5_K*", "*5bit*", "*-5.0bpw", "MIX-5*bpw"]
+        decision_agreement_min: 95
+        decision_option_kl_max: 0.03
+      - match: ["Q4_K*", "IQ4_*", "*4bit*", "*int4*", "*NVFP4*", "*MXFP4*", "*-4.0bpw", "MIX-4*bpw"]
+        decision_agreement_min: 92
+        decision_option_kl_max: 0.05
+      - match: ["Q3_K*", "IQ3_*", "*3bit*", "*int3*", "*-3.0bpw", "*-3.25bpw", "*-3.5bpw"]
+        decision_agreement_min: 88
+        decision_option_kl_max: 0.10
+      - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw", "*_KT*", "PollardMix*"]
+        decision_agreement_min: 80
+        decision_option_kl_max: 0.20
