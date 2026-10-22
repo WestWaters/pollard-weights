@@ -314,9 +314,10 @@ class _FakeRelay:
         self.cmds.append(cmd)
         if cmd[0] == "scp":
             import shutil
-            src, dst = cmd[-2], cmd[-1].split(":", 1)[1]
-            shutil.copytree(src, os.path.join(dst, os.path.basename(src))) if os.path.isdir(src) else \
-                shutil.copy(src, dst)
+            dst = cmd[-1].split(":", 1)[1]
+            for src in cmd[cmd.index("-q") + 1:-1]:
+                shutil.copytree(src, os.path.join(dst, os.path.basename(src))) if os.path.isdir(src) else \
+                    shutil.copy(src, dst)
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
         code = input.replace("from huggingface_hub import HfApi", "from fakehub import HfApi")
         code = code.replace("shutil.disk_usage(", f"(lambda p: type('U', (), {{'free': {self.free * 1e9}}}))(")
@@ -362,8 +363,9 @@ class HfApi:
             if os.environ.get("FAKEHUB_CORRUPT") and p.endswith(".safetensors"):
                 sha = "0" * 64
             yield _F(p, os.path.getsize(full), sha if p.endswith(".safetensors") else None)
-    def upload_folder(self, folder_path, path_in_repo, repo_id):
-        shutil.copytree(folder_path, os.path.join(ROOT, repo_id, path_in_repo), dirs_exist_ok=True)
+    def upload_folder(self, folder_path, path_in_repo, repo_id, ignore_patterns=None):
+        shutil.copytree(folder_path, os.path.join(ROOT, repo_id, path_in_repo), dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(*(ignore_patterns or [])))
         return "ok"
     def upload_file(self, path_or_fileobj, path_in_repo, repo_id):
         dst = os.path.join(ROOT, repo_id, path_in_repo)
@@ -378,17 +380,20 @@ class HfApi:
 def test_upload_relay_stages_uploads_checks_and_cleans_up(tmp_path, monkeypatch):
     R = _release(tmp_path, monkeypatch)
     (tmp_path / "fakehub.py").write_text(FAKEHUB)
-    hub, staging = tmp_path / "hub", tmp_path / "staging"
+    hub, home = tmp_path / "hub", tmp_path / "boxhome"
+    staging = home / "staging"
     rung = tmp_path / "LFM-MLX-4bit"
     rung.mkdir()
     (rung / "config.json").write_text("{}")
     (rung / "model.safetensors").write_bytes(b"\x01" * 4096)
     fake = _FakeRelay(tmp_path, hub)
-    url = f"ssh://jwate@box:2222{staging}?python=py&key=~/.ssh/k&min_free_gb=40"
+    url = f"ssh://jwate@box:2222?python=py&key=~/.ssh/k&min_free_gb=40&home={home}"
     api = R.RelayApi(url, runner=fake, out=lambda *a: None)
-    assert (api.host, api.port, api.staging, api.min_free) == ("jwate@box", "2222", str(staging), 40.0)
-    win = R.RelayApi("ssh://jwate@10.0.0.107/C:/pollard/mlx-staging?python=C:/pollard/venv312/Scripts/python.exe")
-    assert win.staging == "C:/pollard/mlx-staging" and win.port == "22"
+    assert (api.host, api.port, api.staging, api.min_free) == ("jwate@box", "2222", f"{home}/staging", 40.0)
+    win = R.RelayApi("ssh://jwate@10.0.0.107/C:/pollard/mlx-staging?python=C:/pollard/venv312/Scripts/python.exe"
+                     "&home=C:/Users/jwate/pollard")
+    assert win.url_path == "C:/pollard/mlx-staging" and win.port == "22"
+    assert win.staging == "C:/Users/jwate/pollard/staging", "staging is the relay's workspace, not the URL path"
     api.create_repo("Org/M-Pollard", private=True)
     api.upload_folder(str(rung), "MLX/4bit", "Org/M-Pollard")
     assert sorted(api.list_repo_files("Org/M-Pollard")) == ["MLX/4bit/config.json", "MLX/4bit/model.safetensors"]
@@ -401,7 +406,7 @@ def test_upload_relay_stages_uploads_checks_and_cleans_up(tmp_path, monkeypatch)
     monkeypatch.delenv("FAKEHUB_CORRUPT")
     tight = R.RelayApi(url, runner=_FakeRelay(tmp_path, hub, free_gb=40.0), out=lambda *a: None)
     with pytest.raises(RuntimeError, match="must keep 40 GB free"):
-        tight.upload_folder(str(rung), "MLX/4bit", "Org/M-Pollard")
+        tight.upload_folder(str(rung), "MLX/8bit", "Org/M-Pollard")
     assert isinstance(R.hf_api({"upload_via": url}), R.RelayApi)
 
 
@@ -410,12 +415,12 @@ def test_upload_relay_answers_the_post_upload_hub_check(tmp_path, monkeypatch):
     R = _release(tmp_path, monkeypatch)
     import pollard_hubcheck as H
     (tmp_path / "fakehub.py").write_text(FAKEHUB)
-    hub, staging = tmp_path / "hub", tmp_path / "staging"
+    hub, staging = tmp_path / "hub", tmp_path / "boxhome"
     rung = tmp_path / "LFM-MLX-3bit"
     rung.mkdir()
     (rung / "config.json").write_text("{}")
     (rung / "model.safetensors").write_bytes(b"\x02" * 4096)
-    api = R.RelayApi(f"ssh://jwate@box{staging}?python=py", runner=_FakeRelay(tmp_path, hub), out=lambda *a: None)
+    api = R.RelayApi(f"ssh://jwate@box?python=py&home={staging}", runner=_FakeRelay(tmp_path, hub), out=lambda *a: None)
     api.create_repo("Org/M-Pollard", private=True)
     api.upload_folder(str(rung), "MLX/3bit", "Org/M-Pollard")
     info = {f.path: f for f in api.get_paths_info("Org/M-Pollard", ["MLX/3bit/model.safetensors", "MLX/3bit/config.json"])}

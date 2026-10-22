@@ -436,8 +436,8 @@ def avg_bits(n_layers, hot_frac, protect_down, scheme="NVFP4", protect_scheme="F
 
 
 def _snapshot(model_id):
-    from huggingface_hub import snapshot_download
-    return snapshot_download(model_id, allow_patterns=["*.safetensors", "*.json"])
+    return ws.fetch_source(                       # one findable copy in the workspace downloads/, not ~/.cache
+        model_id, allow_patterns=["*.safetensors", "*.json"])
 
 
 def mx6_main(a):

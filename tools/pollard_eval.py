@@ -153,7 +153,8 @@ def main():
     if not a.trajectory and not a.eval:
         sys.exit("ERROR: pass --eval <held-out.txt>, or --trajectory --prompts <prompts.txt>.")
 
-    tmp = tempfile.mkdtemp(prefix="pollard_eval_")
+    import pollard_workspace as ws
+    tmp = tempfile.mkdtemp(prefix="pollard_eval_", dir=ws.cache_dir(create=True))   # base logits: GBs, in the workspace
     corpus = a.eval
     if a.trajectory:
         corpus = os.path.join(tmp, "trajectories.txt")

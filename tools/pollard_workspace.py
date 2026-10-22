@@ -15,7 +15,10 @@ Layout (default ~/pollard, override with $POLLARD_HOME):
         calibration/                          imatrix, cal data, sensitivity.json
         reports/                              pollard-verify / scorecard / ppl outputs
         MANIFEST.json                         every build here: lane, bpw, ppl, verified, size, date
-    cache/                                    _work dirs (safe to delete)
+    cache/                                    _work dirs: probe GGUFs, base logits (safe to delete)
+    staging/                                  copies waiting to be uploaded FROM this machine (the --upload-via
+      <Org>__<Repo>/<LANE>__<rung>/           relay): one fixed folder per rung, resumed by a rerun, deleted once
+                                              the Hub holds it (size + sha256); `pollard-ls --clean-staging`
 
 Tools call `resolve_out(model, lane, tag, explicit)` -- if the user passed --out it's respected; otherwise
 the build lands in the workspace automatically. After a build, call `record_build(...)` to log it to the
@@ -126,6 +129,235 @@ def clean_downloads() -> int:
     if os.path.isdir(d):
         shutil.rmtree(d, ignore_errors=True)
     return n
+
+
+# ------------------------------------------------------------------------------------------------ staging
+# A copy of a built rung waiting to be uploaded from THIS machine (the --upload-via relay copies a rung from the
+# builder here, uploads it with this machine's HF login, checks it on the Hub, then deletes the copy). One fixed
+# folder per rung -- $POLLARD_HOME/staging/<repo slug>/<path in repo>/ -- so a transfer that dies part way is
+# resumed by the next run (files already here at the right size + sha256 are not sent again), and a folder left
+# behind is always findable, sized by pollard-ls and reclaimed by `pollard-ls --clean-staging`.
+
+#: written into every staging folder: which repo / path it is for and the size + sha256 of every file, so a sweep
+#: can tell a copy whose upload is already confirmed on the Hub (safe to delete) from one still waiting
+STAGING_MARK = ".pollard-staging.json"
+#: where the relay staged before it used the workspace (a random folder per transfer, never reclaimed). Swept for
+#: empty folders and copies already on the Hub; nothing else outside the workspace is ever deleted.
+LEGACY_STAGING = "C:/pollard/mlx-staging"
+#: a staging folder not confirmed on the Hub and older than this is reported (never deleted) by a sweep
+STAGING_REPORT_DAYS = 7
+
+
+def staging_root(home: str | None = None) -> str:
+    return os.path.join(home or pollard_home(), "staging")
+
+
+def staging_key(path_in_repo: str) -> str:
+    """'MLX/4bit' -> 'MLX__4bit' (one flat folder per upload: a file uploaded INTO a rung folder never lands
+    inside that rung's staging copy); '' -> '_root'."""
+    p = str(path_in_repo or "").strip("/\\").replace("\\", "/")
+    return p.replace("/", "__") if p else "_root"
+
+
+def staging_dir(repo_id: str, path_in_repo: str, home: str | None = None) -> str:
+    return os.path.join(staging_root(home), model_slug(repo_id) if "/" in repo_id else repo_id,
+                        staging_key(path_in_repo))
+
+
+def scan_staging(root, depth=2):
+    """Every staging folder `depth` levels under `root` (2 = <repo slug>/<key>, 1 = the legacy <uuid>): path, bytes,
+    {relative file: size} (the marker excluded), newest mtime, the marker (or None). Self-contained (stdlib only,
+    imports inside; json + os are imported where the relay runs it) -- the relay ships this function's source to
+    the machine it uploads from and runs it there."""
+    out = []
+    if not os.path.isdir(root):
+        return out
+    level = [root]
+    for _ in range(depth):
+        level = [os.path.join(d, n) for d in level for n in sorted(os.listdir(d)) if os.path.isdir(os.path.join(d, n))]
+    for d in level:
+        files, mark, newest = {}, None, os.path.getmtime(d)
+        for r, _, fs in os.walk(d):
+            for f in fs:
+                p = os.path.join(r, f)
+                rel = os.path.relpath(p, d).replace(os.sep, "/")
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                newest = max(newest, st.st_mtime)
+                if rel == ".pollard-staging.json":
+                    try:
+                        with open(p, encoding="utf-8") as fh:
+                            mark = json.load(fh)
+                    except (OSError, ValueError):
+                        mark = None
+                    continue
+                files[rel] = st.st_size
+        out.append({"path": d.replace(os.sep, "/"), "bytes": sum(files.values()), "files": files, "mtime": newest,
+                    "mark": mark, "has_mark": os.path.isfile(os.path.join(d, ".pollard-staging.json"))})
+    return out
+
+
+def remove_within(root, path):
+    """Delete `path` (a folder strictly inside `root`) and then every folder between it and `root` left empty.
+    Refuses anything else. True when removed. Self-contained -- shipped to the relay machine like scan_staging."""
+    import shutil
+    r = os.path.normcase(os.path.realpath(root))
+    p = os.path.normcase(os.path.realpath(path))
+    if p == r or not p.startswith(r.rstrip(os.sep) + os.sep):
+        raise ValueError(f"refusing to delete {path}: not inside {root}")
+    shutil.rmtree(path)
+    d = os.path.dirname(os.path.realpath(path))
+    while os.path.normcase(d) != r and os.path.normcase(d).startswith(r) and os.path.isdir(d) and not os.listdir(d):
+        os.rmdir(d)
+        d = os.path.dirname(d)
+    return True
+
+
+def sha256_files(base, rels):
+    """{rel: sha256} of files under `base`. Self-contained -- shipped to the relay machine."""
+    import hashlib
+    out = {}
+    for rel in rels:
+        h = hashlib.sha256()
+        try:
+            with open(os.path.join(base, rel), "rb") as f:
+                for blk in iter(lambda: f.read(1 << 24), b""):
+                    h.update(blk)
+        except OSError:
+            continue
+        out[rel] = h.hexdigest()
+    return out
+
+
+def hub_holds(listing, files):
+    """Does a Hub listing {path in repo: [size, lfs sha256 or None]} hold every file of `files`
+    {path in repo: [size, sha256]} intact (same size, and the same sha256 wherever the Hub reports one)?"""
+    if not files or listing is None:
+        return False
+    for rp, (size, sha) in files.items():
+        got = listing.get(rp)
+        if not got or int(got[0]) != int(size) or (got[1] and sha and got[1] != sha):
+            return False
+    return True
+
+
+def _legacy_on_hub(entry, listing, shas_of):
+    """A legacy staging folder (no marker: <uuid>/<rung folder or file>) is on the Hub when every file in it matches a
+    Hub file of the same name and size -- and the same sha256 wherever the Hub reports one (hashed only when the
+    names and sizes already line up)."""
+    if not entry["files"] or not listing:
+        return False
+    by = {}
+    for rp, (size, sha) in listing.items():
+        by.setdefault((rp.rsplit("/", 1)[-1], int(size)), []).append(sha)
+    cand = {rel: by.get((rel.rsplit("/", 1)[-1], int(sz))) for rel, sz in entry["files"].items()}
+    if not all(cand.values()):
+        return False
+    need = [rel for rel, s in cand.items() if any(s)]
+    got = shas_of(entry, need) if need else {}
+    return all(not any(s) or got.get(rel) in s for rel, s in cand.items())
+
+
+def plan_sweep(entries, listing_of, shas_of, repos=(), now=None, report_days=STAGING_REPORT_DAYS, legacy=False):
+    """[(entry, action, why)] for staging folders: action 'remove' (empty, or every file already confirmed on the Hub
+    by size + sha256), 'report' (not on the Hub and older than `report_days` -- kept, said out loud) or 'keep' (a
+    recent partial copy: the next upload resumes it). `listing_of(repo)` -> Hub listing or None (unreadable: keep);
+    `shas_of(entry, rels)` -> {rel: sha256} of files in the folder. Nothing that is not proven uploaded is removed."""
+    now = time.time() if now is None else now
+    plan = []
+    for e in entries:
+        if not e["files"] and not e.get("has_mark"):
+            plan.append((e, "remove", "empty"))
+            continue
+        mark = e.get("mark") or {}
+        on_hub = None
+        if mark.get("repo_id") and mark.get("files"):
+            listing = listing_of(mark["repo_id"])
+            if listing is not None and hub_holds(listing, mark["files"]):
+                on_hub = mark["repo_id"]
+        elif legacy or not e.get("has_mark"):
+            for repo in repos:
+                listing = listing_of(repo)
+                if listing and _legacy_on_hub(e, listing, shas_of):
+                    on_hub = repo
+                    break
+        if on_hub:
+            plan.append((e, "remove", f"already on the Hub ({on_hub}, size + sha256 confirmed)"))
+        elif now - e["mtime"] > report_days * 86400:
+            plan.append((e, "report", f"not confirmed on the Hub, untouched for {(now - e['mtime']) / 86400:.0f} days "
+                                      f"({human(e['bytes'])}) -- kept; `pollard-ls --clean-staging --force` removes it"))
+        else:
+            plan.append((e, "keep", f"partial copy ({human(e['bytes'])}) -- the next upload of it resumes here"))
+    return plan
+
+
+def staging_usage(home: str | None = None) -> list:
+    """scan_staging of this machine's workspace staging area (pollard-ls)."""
+    return scan_staging(staging_root(home))
+
+
+def _hub_listing(api, repo):
+    try:
+        d = {}
+        for f in api.list_repo_tree(repo, recursive=True):
+            if hasattr(f, "size") and not hasattr(f, "tree_id"):
+                lfs = getattr(f, "lfs", None)
+                sha = (lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)) if lfs else None
+                d[f.path] = [f.size, sha]
+        return d
+    except Exception:                                                     # noqa: BLE001
+        return None
+
+
+def sweep_staging(api=None, repos=(), force=False, home=None, legacy_root=None, report_days=STAGING_REPORT_DAYS,
+                  log=print, now=None):
+    """Sweep THIS machine's staging area (and the legacy relay folder, when it exists here): remove empty folders and
+    copies already confirmed on the Hub, report anything else older than `report_days`, keep recent partial copies.
+    `force` also removes the copies that are not confirmed (a staging copy is only ever a copy: the rung itself
+    stays on the machine that built it until its upload is confirmed). Returns (bytes freed, plan)."""
+    cache = {}
+
+    def listing_of(repo):
+        if repo not in cache:
+            cache[repo] = _hub_listing(api, repo) if api is not None else None
+        return cache[repo]
+
+    def shas_of(e, rels):
+        return sha256_files(e["path"], rels)
+
+    freed, done = 0, []
+    roots = [(staging_root(home), 2, False)]
+    lr = legacy_root if legacy_root is not None else LEGACY_STAGING
+    if lr and os.path.isdir(lr):
+        roots.append((lr, 1, True))
+    for root, depth, legacy in roots:
+        plan = plan_sweep(scan_staging(root, depth), listing_of, shas_of, repos, now, report_days, legacy)
+        for e, act, why in plan:
+            if act == "remove" or (force and not legacy):
+                remove_within(root, e["path"])
+                freed += e["bytes"]
+                log(f"   staging: removed {e['path']} -- {why if act == 'remove' else 'forced (--force)'}")
+                act = "remove"
+            elif act == "report":
+                log(f"   staging: KEPT {e['path']} -- {why}")
+            done.append((e, act, why))
+        _prune_empty(root, legacy, log)
+    return freed, done
+
+
+def _prune_empty(root, legacy, log=print):
+    """Empty <repo slug> folders under the staging root go; the legacy root itself goes once it is empty."""
+    if not os.path.isdir(root):
+        return
+    for n in os.listdir(root):
+        p = os.path.join(root, n)
+        if os.path.isdir(p) and not os.listdir(p):
+            os.rmdir(p)
+    if legacy and not os.listdir(root):
+        os.rmdir(root)
+        log(f"   staging: removed the empty legacy folder {root}")
 
 
 def charts_dir(model: str | None = None, create: bool = False) -> str:

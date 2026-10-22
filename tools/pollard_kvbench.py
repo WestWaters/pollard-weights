@@ -30,7 +30,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -169,7 +168,8 @@ def main(argv=None):
     ap.add_argument("--no-speed", action="store_true")
     ap.add_argument("--no-quality", action="store_true")
     ap.add_argument("--out", help="results JSON (default kvbench-<model>-<date>.json)")
-    ap.add_argument("--workdir", default=tempfile.gettempdir(), help="where base logits go (several GB at 32K)")
+    ap.add_argument("--workdir", default=None,
+                    help="where base logits go (several GB at 32K; default: the workspace cache/)")
     ap.add_argument("--force", action="store_true", help="run even though another program holds the GPU")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
@@ -213,6 +213,9 @@ def main(argv=None):
     res = {"model": os.path.basename(a.model), "arch": meta["arch"], "model_gb": round(model_gb, 2), "fa_all_quants": fa_all,
            "when": _dt.datetime.now().isoformat(timespec="seconds"), "rows": []}
     out = a.out or f"kvbench-{os.path.splitext(os.path.basename(a.model))[0]}-{_dt.date.today():%Y%m%d}.json"
+    if not a.workdir:
+        import pollard_workspace as ws
+        a.workdir = ws.cache_dir(create=True)
     for c in ctxs:
         base = os.path.join(a.workdir, f"kvbase-{c}.kld")
         have_base = False
