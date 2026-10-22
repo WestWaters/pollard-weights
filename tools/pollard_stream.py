@@ -1916,11 +1916,15 @@ def _st_write(path, tensors, metadata=None):
 def copy_side_files(src_dir, out, skip_weights=True):
     import shutil
     shards = {os.path.basename(p) for p in weight_files(src_dir)} if skip_weights else set()
+    # a d3 package's MODEL_MANIFEST.json lists the SOURCE's shard hashes: on a rung the d3 runtime would refuse to load
+    # it. The decision files (readout.safetensors, decision_config.json) are copied as stored like every side file;
+    # the rung's own manifest is written by pollard-d3 ship / pollard-complete --fill once its shards exist.
+    d3 = os.path.isfile(os.path.join(src_dir, "decision_config.json"))
     for f in os.listdir(src_dir):
         p = os.path.join(src_dir, f)
         if not os.path.isfile(p) or f in shards or f == "model.safetensors.index.json" or f.endswith(".tmp"):
             continue
-        if f.startswith(".") or f in ("README.md",):
+        if f.startswith(".") or f in ("README.md",) or (d3 and f == "MODEL_MANIFEST.json"):
             continue
         shutil.copy2(p, os.path.join(out, f))
 

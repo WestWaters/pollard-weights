@@ -1,0 +1,46 @@
+# pollard release plan -- every lane, each a ladder of rungs. `pollard release --hf <model> --plan this.yaml`
+# prints the plan; add --run to build, --upload to publish (and set upload: true below).
+org: PollardWeights            # the HF account the lane repos go to
+base_model: null               # the HF repo id the card names as base_model (null = the --hf id / its config)
+preset: d3                     # text | vlm | decision | d3 | moe -- fills anything not set here (a d3
+                               # decision model -- decision_config.json d3-code-readout-v1 -- picks d3 itself)
+ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
+upload: false                  # publishing needs this AND --upload on the command line
+gates: null                    # gates.yaml for pollard-verify --gate (null = the built-in defaults)
+trust_remote_code: false       # true = consent to run the checkpoint's own .py files (only used where no native class fits)
+hf_weights: null               # the checkpoint the HF lanes read (dir or repo id) when the --hf folder holds no weights
+max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
+remote_source: null            # ssh://user@host/<dir>?python=..&key=..: the MLX lane reads the source through a sparse
+                               # local mirror at --hf (tensors fetched as read, cached within the free disk)
+calib:
+  profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
+  per_domain: 300
+  self_generate: null          # an OpenAI-compatible URL serving the f16, for target-generated calibration
+  reasoning: auto              # auto | on | off | toggle -- thinking traces in the model's own delimiters
+  reasoning_share: null        # null = 0.35 of the corpus when the model reasons
+measure:                       # extra numbers for the card + gate (GGUF rungs; served by llama-server)
+  taskeval: {suite: quick, limit: 200}   # OPT-IN (--taskeval, or later --taskeval-only): ~1 h per rung of lm-eval,
+                                         # so the release path does not run it; retention vs f16 per task
+  mt: null                     # {limit: 100} -> chrF++ per language (translation models)
+  toolcall: false              # a d3 model never generates: no tool calls
+  decision: true               # pollard-d3 gate per rung: readout KL / agreement / ECE vs bf16
+d3:                            # the pollard-d3 gate every rung passes (verify step)
+  set: typed-decisions         # typed-decisions (2000 decisions) | builtin (20)
+  limit: 0                     # N of the 400 states, evenly spaced (0 = all; the board is comparable at all)
+lanes:
+  gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
+  mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
+  gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
+  mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}
+  exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
+  #   recipe_choice: auto (default) = the default rung is converted smoothed / raw x Calib 3.0 / exllamav3's own
+  #   calibration, each measured by KLD through exllamav3 on the held-out text; the winner is that rung and every
+  #   other rung builds the same way. pollard | raw-calib | smooth-default | plain pin one (no A/B).
+  # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
+  exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
+  draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128,
+          prefer_own: false, train: {kind: eagle3, rung: Q4_K_M, taps: rung, samples: null, max_steps: null}}
+                               # speculative drafter (pollard-draft): drafter = auto (search the Hub) or a repo id;
+                               # measured against `targets` (all = every GGUF rung of this release, or a list of tags).
+                               # Nothing redistributable published (or prefer_own) -> Pollard trains its own head on a
+                               # CUDA box, quant-aware vs train.rung, measured vs the rungs AND f16

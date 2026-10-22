@@ -777,6 +777,20 @@ def _hf_to_gguf(a):
     conv = _find_convert(hf_dir)
     here = os.path.abspath(a.output) if a.output else os.path.dirname(os.path.abspath(hf_dir)) or "."
     out = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + "-f16.gguf")
+    import pollard_d3 as D3
+    if D3.decision_config(hf_dir) is not None:
+        # a d3 decision model: the body converts as Qwen3.5 (its tensors are stored as a bare Qwen3_5Model), with
+        # non-causal attention + last-token pooling in the metadata; readout + decision config ship beside it
+        cmd = D3.convert_cmd(hf_dir, out, conv)
+        if getattr(a, "gate", True):
+            print("   (d3 never generates text: no coherence gate on its rungs -- pollard-d3 gate judges the readout)")
+            a.gate = False
+        print(f"   convert d3 body -> f16 GGUF ({D3.FORMAT_ID}: non-causal, last pooling): {' '.join(cmd[1:4])} ...")
+        _emit_mmproj(a, conv, D3.convert_view(hf_dir, os.path.join(here, ".pollard-d3-view")), out)
+        if a.run:
+            subprocess.run(cmd)
+            D3.ship(hf_dir, here, "gguf")
+        return out
     print(f"   convert HF -> f16 GGUF: python {os.path.basename(conv)} {hf_dir} --outtype f16 --outfile {out}")
     _emit_mmproj(a, conv, hf_dir, out)
     if a.run:
@@ -928,6 +942,11 @@ def _imatrix_shape(gguf):
     except Exception:
         return []
     if any(".decision." in str(k) for k in meta):
+        return ["-c", "512", "-b", "512", "-ub", "512", "--no-ppl"]
+    import pollard_d3 as D3
+    if D3.gguf_is_d3(meta):
+        # a d3 body attends non-causally (its metadata says so): the activations are the ones it decides with, but a
+        # next-token perplexity over a prompt every position can see is meaningless; one ubatch per chunk
         return ["-c", "512", "-b", "512", "-ub", "512", "--no-ppl"]
     return []
 

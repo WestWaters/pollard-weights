@@ -2,7 +2,8 @@
 # prints the plan; add --run to build, --upload to publish (and set upload: true below).
 org: PollardWeights            # the HF account the lane repos go to
 base_model: null               # the HF repo id the card names as base_model (null = the --hf id / its config)
-preset: text                   # text | vlm | decision | moe -- fills anything not set here
+preset: text                   # text | vlm | decision | d3 | moe -- fills anything not set here (a d3
+                               # decision model -- decision_config.json d3-code-readout-v1 -- picks d3 itself)
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line
 gates: null                    # gates.yaml for pollard-verify --gate (null = the built-in defaults)

@@ -67,6 +67,11 @@ def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
     from transformers import AutoModelForCausalLM
     if dtype is None:
         dtype = _t.float32
+    try:                                        # a d3 body (bare Qwen3_5Model): its names, mapped onto the causal LM
+        import pollard_d3 as _D3
+        kw = {**_D3.causal_lm_kwargs(model_id), **kw}
+    except ImportError:
+        pass
     try:
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
     except ValueError as text_only_err:

@@ -84,6 +84,12 @@ def model_architectures(model_dir) -> list[str]:
     archs = d.get("architectures") or []
     text = d.get("text_config") or {}
     archs += text.get("architectures") or []
+    try:                                     # a d3 body (`Qwen3_5Model`, which no converter registers) converts as
+        import pollard_d3 as D3              # the class pollard-d3 convert names
+        if D3.decision_config(str(cfg.parent)) is not None and d.get("model_type") in D3.CONVERT_ARCH:
+            return [D3.CONVERT_ARCH[d["model_type"]]]
+    except ImportError:
+        pass
     return [str(a) for a in archs]
 
 

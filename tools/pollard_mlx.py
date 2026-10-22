@@ -194,6 +194,18 @@ def mlx_engine(model_dir):
     return "mlx_vlm", mt
 
 
+def d3_names(model_dir):
+    """A d3 decision model (decision_config.json d3-code-readout-v1) builds through mlx-vlm with pollard-d3's MLX
+    compatibility in place (its bare `Qwen3_5Model` names, and `layer_types` honoured -- d3-edge is llFllFllFFFF). The
+    readout and decision config ship byte-exact beside the MLX model (pollard-complete --fill -> pollard-d3 ship)."""
+    import contextlib
+    try:
+        import pollard_d3 as D3
+    except ImportError:
+        return contextlib.nullcontext()
+    return D3.mlx_compat() if D3.decision_config(model_dir) is not None else contextlib.nullcontext()
+
+
 def needs_mlx_vlm(model_dir):
     """True when this checkpoint carries a vision / audio tower, projector or talker: its MLX lane is mlx-vlm (decided
     from the safetensors index and config, nothing imported)."""
@@ -1671,6 +1683,7 @@ def main():
     existed = os.path.exists(a.out)
     try:
         with (rs if rs is not None else contextlib.nullcontext()), \
+                (d3_names(a.model) if engine == "mlx_vlm" else contextlib.nullcontext()), \
                 (mirror.hook() if mirror is not None else contextlib.nullcontext()), \
                 (StreamWriter(rs, guard, mirror=mirror, out_bytes=(bplan or {}).get("out_bytes", 0))
                  if stream else contextlib.nullcontext()):

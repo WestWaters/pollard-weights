@@ -328,7 +328,16 @@ def st_write(path, tensors, metadata=None):
 
 
 def source_shards(model_dir):
-    names = sorted(f for f in os.listdir(model_dir) if f.endswith(".safetensors"))
+    """The checkpoint's weight shards: the index's files when there is one, else model.safetensors -- a side file
+    beside them (a d3 model's readout.safetensors, clef-omni's joint head) is not a body shard and is never quantized;
+    it ships as stored (pollard-complete)."""
+    idx = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.isfile(idx):
+        wm = json.load(open(idx, encoding="utf-8")).get("weight_map") or {}
+        return sorted({os.path.join(model_dir, v) for v in wm.values()})
+    if os.path.isfile(os.path.join(model_dir, "model.safetensors")):
+        return [os.path.join(model_dir, "model.safetensors")]
+    names = sorted(f for f in os.listdir(model_dir) if f.endswith(".safetensors") and f != "readout.safetensors")
     if not names:
         raise SystemExit(f"no *.safetensors in {model_dir}")
     return [os.path.join(model_dir, n) for n in names]

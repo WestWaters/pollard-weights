@@ -77,7 +77,8 @@ TEMPLATE = """\
 # prints the plan; add --run to build, --upload to publish (and set upload: true below).
 org: PollardWeights            # the HF account the lane repos go to
 base_model: null               # the HF repo id the card names as base_model (null = the --hf id / its config)
-preset: text                   # text | vlm | decision | moe -- fills anything not set here
+preset: text                   # text | vlm | decision | d3 | moe -- fills anything not set here (a d3
+                               # decision model -- decision_config.json d3-code-readout-v1 -- picks d3 itself)
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line
 gates: null                    # gates.yaml for pollard-verify --gate (null = the built-in defaults)
@@ -129,6 +130,14 @@ PRESETS = {
     "decision": {"lanes": {"mlx": {"enabled": False}, "gptq": {"enabled": False}, "mx": {"enabled": False},
                            "exl3": {"enabled": False}, "exlr8": {"enabled": False}},
                  "measure": {"taskeval": None, "decision": True, "toolcall": False}},
+    # a d3 decision model (vllm-sr/d3: decision_config.json `d3-code-readout-v1`): every lane with a d3 runtime
+    # quantizes the BODY only and ships readout + decision config byte-exact; each rung is gated by pollard-d3 (its
+    # readout distribution vs bf16 through its own runtime) instead of text KLD / perplexity, which do not apply to a
+    # non-causal body read at one position. EXL3 / EXLR8 plan a hold with the reason (lane_steps): no runtime serves a
+    # d3 rung in those formats.
+    "d3": {"measure": {"taskeval": None, "decision": True, "toolcall": False},
+           "calib": {"reasoning": "off"},             # the base template's <think> is never used: d3 never generates
+           "d3": {"set": "typed-decisions", "limit": 0}},
     # MoE: vLLM's fused-MoE kernels want one scheme for all experts (--moe-protect-attn-only); 2/3-bit GPTQ
     # MoE kernels are poor, so the GPTQ ladder is 4 and 8. EXLR8 encodes every expert matrix as its own dense record
     # (checkpoint names), decoded by the reference loader -- not EXLR8's per-unit expert files
@@ -185,6 +194,19 @@ def load_plan(path=None, preset=None):
     cfg = deep_merge(deep_merge(_yaml(TEMPLATE), PRESETS[name]), user)
     cfg["preset"] = name
     return cfg
+
+
+def auto_preset(cfg, src, preset=None, plan=None):
+    """A d3 decision model picks the d3 preset itself when neither the command line nor the plan names one."""
+    if preset or cfg.get("preset") != "text" or not src or not os.path.isdir(str(src)):
+        return cfg
+    if plan and _yaml(open(plan, encoding="utf-8").read()).get("preset"):
+        return cfg
+    import pollard_d3 as D3
+    if D3.decision_config(src) is None:
+        return cfg
+    print(f"   {src}: a d3 decision model ({D3.FORMAT_ID}) -> preset d3")
+    return load_plan(plan, "d3")
 
 
 def repo_name(org, model, lane=None):
@@ -277,6 +299,11 @@ def _ctx(cfg, src):
         if cfg.get(plan_key):
             ctx[key] = os.path.abspath(str(cfg[plan_key]))
     ctx["given_f16"] = bool(cfg.get("f16"))
+    try:                                                 # a d3 decision model: gated on its readout, not on text
+        import pollard_d3 as D3
+        ctx["d3"] = D3.decision_config(hf_dir) is not None
+    except ImportError:
+        ctx["d3"] = False
     if cfg.get("measure_ref"):                           # the served measurements' reference (see measure_ref)
         ctx["measure_ref"] = os.path.abspath(str(cfg["measure_ref"]))
     return ctx
@@ -422,6 +449,15 @@ def prep_steps(cfg, c, lanes):
             probe += ["--device", "cpu"]                 # a shared GPU is not ours (see pollard --ngl 0)
         steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", cmd=probe, out=c["sens_raw"]))
     held = [l for l in lanes if l in ("gptq", "mx", "exl3", "exlr8")]
+    if smoothed and c.get("d3"):
+        # a d3 body is not smoothed: SmoothQuant would fold scales measured on CAUSAL next-token activations into a
+        # body that decides non-causally, and the smoothed copy is written as transformers' causal LM (other tensor
+        # names, no tower) -- not a d3 package any more. The HF lanes quantize the source body as it is.
+        c["smooth_dir"], c["sens_smooth"] = c["hf_dir"], c["sens_raw"]
+        steps.append(Step(id="prep/smooth", lane="prep", kind="note", requires="any",
+                          desc="d3 decision model: no SmoothQuant -- the HF lanes quantize the source body "
+                               "(its own names, towers and readout) with the raw-weights profile"))
+        smoothed = False
     access, why_not = hf_lanes_access(c) if smoothed else (True, "")
     if smoothed and not access:
         steps.append(Step(id="prep/smooth", lane="prep", kind="hold", requires="any", blocks=held,
@@ -561,6 +597,11 @@ def gguf_rung_steps(cfg, c, builds):
             steps.append(Step(id=f"{rid}/toolcall", lane="gguf", rung=tag, kind="measure", requires="any",
                               cmd=["pollard-toolcall", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
                               ok_codes=(0, 1)))                        # a FAIL is a number for the gate, not a crash
+        if c.get("d3"):                                    # the readout board vs bf16 IS this rung's gate
+            steps.append(d3_gate_step(cfg, c, "gguf", tag, path, res))
+            if c.get("free"):
+                steps.append(_publish_rung_step(c, "gguf", tag, path))
+            continue
         if m.get("decision"):
             steps.append(Step(id=f"{rid}/decision", lane="gguf", rung=tag, kind="measure", requires="any",
                               cmd=["pollard-decision", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
@@ -598,6 +639,40 @@ def taskeval_only_steps(cfg, c):
                       out=c["release_dir"], repo=repo))
     steps.append(Step(id="gguf/card-upload", lane="gguf", kind="upload", requires="any", fn="card_upload", repo=repo,
                       out=c["release_dir"], desc=f"the card with the retention numbers -> https://huggingface.co/{repo}"))
+    return steps
+
+
+def jev_index_only_steps(cfg, c, kit_python, lanes=("gguf", "mlx", "gptq", "mx"), limit=0):
+    """`pollard release --jev-index-only KIT_PYTHON` (a d3 decision model): the Decision Index (apolinario/decision-
+    index, the public part of the Jev Decision Index) for the bf16 source and every VERIFIED rung, each served on
+    /v1/systemone by pollard-d3 and run through the kit's http engine, then the card again with the index and its
+    delta vs bf16. Hours per rung on the full suite: an overnight step, never part of the publish path (a d3 rung
+    publishes on its pollard-d3 gate + the complete-model gate)."""
+    if not c.get("d3"):
+        raise SystemExit("--jev-index-only is for a d3 decision model (decision_config.json d3-code-readout-v1)")
+    repo = repo_name(c["org"], c["src"])
+    jdir = os.path.join(c["mdir"], "reports", "jev-index")
+    base = ["--source", c["hf_dir"], "--kit-python", kit_python] + (["--limit", str(limit)] if limit else [])
+    steps = [Step(id="d3/bf16/jev-index", lane="gguf", rung="bf16", kind="measure", requires="any",
+                  cmd=["pollard-d3", "jev-index", "--rung", c["hf_dir"]] + base +
+                      ["--out", os.path.join(jdir, "bf16"), "--results", results_path(c, "gguf"), "--rung-name", "bf16"],
+                  desc="the Decision Index of the bf16 source (the delta every rung is shown against)")]
+    for lane in lanes:
+        builds = gguf_builds(c) if lane == "gguf" else _lane_builds(c, lane, repo)
+        for b in builds:
+            if b.get("verified") is not True or not os.path.exists(str(b.get("path"))):
+                continue
+            tag = b.get("tag") or b.get("name")
+            steps.append(Step(id=f"{lane}/{tag}/jev-index", lane=lane, rung=tag, kind="measure",
+                              requires=REQUIRES[lane] if lane == "mlx" else "any",
+                              cmd=["pollard-d3", "jev-index", "--rung", b["path"]] + base +
+                                  ["--out", os.path.join(jdir, f"{lane}-{tag}"), "--results", results_path(c, lane),
+                                   "--rung-name", tag],
+                              desc=f"Decision Index of {lane} {tag} through /v1/systemone"))
+    steps.append(Step(id="gguf/card", lane="gguf", kind="card", requires="any", cmd=card_cmd(cfg, c, list(lanes)),
+                      out=c["release_dir"], repo=repo))
+    steps.append(Step(id="gguf/card-upload", lane="gguf", kind="upload", requires="any", fn="card_upload", repo=repo,
+                      out=c["release_dir"], desc=f"the card with the Decision Index -> https://huggingface.co/{repo}"))
     return steps
 
 
@@ -720,6 +795,26 @@ def _has_weights(d):
         return False
 
 
+def d3_gate_step(cfg, c, lane, tag, path, res):
+    """A d3 rung's verify step: pollard-d3 gate -- the rung through its own runtime (llama-server embeddings / MLX /
+    the d3 runtime on the rung's decoded weights), read out with the source's readout, against the bf16 reference:
+    option KL, top-choice agreement, calibration. Text KLD / perplexity / coherence do not apply to a non-causal body
+    read at its last token. Exit 0 = PASS; WEAK / FAIL block the rung like any failed gate."""
+    d = cfg.get("d3") or {}
+    cmd = ["pollard-d3", "gate", "--rung", path, "--source", c["hf_dir"], "--set", str(d.get("set", "typed-decisions")),
+           "--limit", str(int(d.get("limit") or 0)), "--results", res, "--rung-name", tag]
+    if lane == "gguf":
+        cmd += ["--ngl", c["ngl"]]
+    if d.get("device"):
+        cmd += ["--device", str(d["device"])]
+    elif c.get("ngl") == "0" and machine()["cuda"]:
+        cmd += ["--device", "cpu"]                       # a shared GPU is not ours (see pollard --ngl 0)
+    return Step(id=f"{lane}/{tag}/verify", lane=lane, rung=tag, kind="verify", out=path,
+                requires=REQUIRES[lane] if lane == "mlx" else "any", cmd=cmd,
+                mem="mlx-verify" if lane == "mlx" else None,
+                desc="d3 readout board vs bf16 (agreement / option KL / ECE) through the rung's own runtime")
+
+
 def lane_steps(cfg, c, lane):
     lc = (cfg.get("lanes") or {}).get(lane) or {}
     import pollard_workspace as ws
@@ -757,7 +852,11 @@ def lane_steps(cfg, c, lane):
             steps.append(Step(id=f"gguf/rungs-{label}", lane="gguf", kind="expand", requires="any"))
         return steps
     steps, res = [], results_path(c, lane)
-    tool = toolcall_wanted(cfg, c)
+    if c.get("d3") and lane in ("exl3", "exlr8"):
+        import pollard_d3 as D3
+        return [Step(id=f"{lane}/hold", lane=lane, kind="hold", requires="any", blocks=[lane],
+                     desc=f"{lane} held for this d3 decision model: {D3.HOLD_REASON[lane]}")]
+    tool = toolcall_wanted(cfg, c) and not c.get("d3")
     cfg_dir = next((d for d in (c["hf_dir"], c["src"]) if os.path.isfile(os.path.join(str(d), "config.json"))), None)
     if lane == "exl3" and cfg_dir:
         try:
@@ -844,10 +943,20 @@ def lane_steps(cfg, c, lane):
                                      f"{lane_folder(lane)}/{rung_subfolder({'name': name, 'tag': tag}, lane)}")
         steps.append(st_build)
         if _has_weights(c["hf_dir"]):                    # never a text-only rung: the gate lists what is missing
+            # a d3 rung: --fill puts the decision files byte-exact + the rung's own MODEL_MANIFEST.json in first
             steps.append(Step(id=f"{rid}/complete", lane=lane, rung=tag, kind="gate", requires="any", out=out,
-                              cmd=["pollard-complete", "--source", c["hf_dir"], "--out", out, "--lane", lane],
+                              cmd=["pollard-complete", "--source", c["hf_dir"], "--out", out, "--lane", lane]
+                              + (["--fill"] if c.get("d3") else []),
                               desc="the rung carries every tower / projector / talker / side weight and processor "
-                                   "file of the source"))
+                                   "file of the source" + (" + the d3 readout and decision config, byte-exact"
+                                                           if c.get("d3") else "")))
+        if c.get("d3"):
+            steps.append(d3_gate_step(cfg, c, lane, tag, out, res))
+            if c.get("free"):
+                st = _publish_rung_step(c, lane, tag, out)
+                st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
+                steps.append(st)
+            continue
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
                               cmd=toolcall_cmd(c, lane, out, name, res), ok_codes=(0, 1), rung_dir=out, results=res,
@@ -940,6 +1049,14 @@ def base_model_id(cfg, c):
             if _is_hf_id(nop):
                 return str(nop)
         except (OSError, ValueError, AttributeError):
+            pass
+    for d in (c.get("hf_dir"), c.get("src")):            # a d3 package names its own repo in MODEL_MANIFEST.json
+        try:
+            import pollard_d3 as D3
+            rid = (D3.info(str(d)) or {}).get("repo_id")
+            if _is_hf_id(rid):
+                return str(rid)
+        except Exception:                                    # noqa: BLE001
             pass
     for d in (c.get("hf_dir"), c.get("src")):
         base = os.path.basename(str(d or "").rstrip("/\\"))
@@ -2504,6 +2621,10 @@ def main(argv=None):
     ap.add_argument("--taskeval", action="store_true",
                     help="also run pollard-taskeval (lm-eval gsm8k/ifeval, ~1 h per rung) on every GGUF rung before "
                          "it is gated -- off by default: the release publishes on KLD + PPL + tool calls + coherence")
+    ap.add_argument("--jev-index-only", metavar="KIT_PYTHON",
+                    help="a d3 decision model, after publishing (overnight): the Decision Index of bf16 and every "
+                         "verified rung via apolinario/decision-index installed in KIT_PYTHON, then the card again")
+    ap.add_argument("--jev-index-limit", type=int, default=0, help="with --jev-index-only: first N requests (smoke)")
     ap.add_argument("--taskeval-only", action="store_true",
                     help="after publishing: task retention for every verified GGUF rung (its local file or a temporary "
                          "download of the published one), then regenerate + upload the card")
@@ -2517,6 +2638,7 @@ def main(argv=None):
         print(f"wrote {a.init} (preset {a.preset or 'text'}) -- edit it, then: pollard release --hf <model> --plan {a.init}")
         return 0
     cfg = load_plan(a.plan, a.preset)
+    cfg = auto_preset(cfg, a.hf or cfg.get("model"), a.preset, a.plan)
     if a.free_after_upload:
         if not (a.upload and cfg.get("upload")):
             ap.error("--free-after-upload deletes each rung once it is published: it needs --upload AND "
@@ -2540,6 +2662,9 @@ def main(argv=None):
     c, lanes, steps = plan_steps(cfg, src, only)
     if a.taskeval_only:
         steps = taskeval_only_steps(cfg, c)
+    if a.jev_index_only:
+        steps = jev_index_only_steps(cfg, c, a.jev_index_only, [l for l in lanes if l in ("gguf", "mlx", "gptq", "mx")],
+                                     a.jev_index_limit)
     have = machine()
     print(f"== pollard release :: {src}  (preset {cfg['preset']}, {'RUN' if run else 'plan only'})")
     print(f"   lanes: {', '.join(lanes) or 'none'}   |   this machine: "
@@ -2573,7 +2698,7 @@ def main(argv=None):
     if run:
         from pollard_auto import MachineLock
         with MachineLock("pollard release " + src, force=a.force):
-            if a.parallel and not a.taskeval_only:
+            if a.parallel and not (a.taskeval_only or a.jev_index_only):
                 st = execute_parallel(steps, c, cfg, upload_ok, a.redo, have)
             else:
                 st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)

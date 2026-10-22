@@ -1806,11 +1806,24 @@ _DECISION_TAGS =("decision-model", "calibrated-probabilities", "system-one")
 _DECISION_NAME = re.compile(r"(^|[^a-z])(jev|openjev|nanojev|laya|semif)([^a-z]|$)|decision[-_ ]?model", re.I)
 
 
+def _d3_format(model, conf) -> str | None:
+    """"d3-code-readout-v1" for a d3 package (vllm-sr/d3 family: decision_config.json next to the weights, or a GGUF
+    `pollard-d3 convert` tagged), else None. Its answer is a separate readout over the last token, not a letter."""
+    try:
+        import pollard_d3 as D3
+    except ImportError:
+        return None
+    meta = conf if isinstance(conf, dict) and "general.architecture" in conf else None
+    return D3.FORMAT_ID if D3.is_d3(str(model), meta) else None
+
+
 def _is_decision(model, conf) -> bool:
     """A decision HEAD first (clef: joint_head_config.json in the HF dir, a "<arch>.decision.*" block
     in the GGUF), then card tags (HF README front-matter or GGUF general.tags), then the names this
     family ships under. Never from the body's architecture alone: OpenJev is a stock qwen35 body."""
     if os.path.isdir(str(model)) and os.path.isfile(os.path.join(model, "joint_head_config.json")):
+        return True
+    if _d3_format(model, conf):                           # d3: decision_config.json, code-readout v1
         return True
     if isinstance(conf, dict) and any(".decision." in str(k) for k in conf):
         return True
@@ -1931,7 +1944,16 @@ def classify(model) -> dict:
     # gate and a text perplexity say nothing about a rung; calibration against f16 does. The card
     # says so ("decision-model" tag), and so do the names these ship under.
     decision = _is_decision(model, conf)
-    if decision:
+    decision_format = _d3_format(model, conf) if decision else None
+    if decision_format:
+        why.append(f"d3 decision model ({decision_format}) -> non-causal body, last-token pooling, FP32 readout over "
+                   "255 answer codes; gate = readout KL / agreement / ECE vs bf16 (pollard-d3), not first-position "
+                   "letters; the readout ships byte-exact in every lane")
+        if thinking or agentic:
+            why.append("the chat template's thinking / tool-call blocks are the base model's: a d3 model never "
+                       "generates, so neither is measured (no reasoning share, no tool-call gate)")
+        thinking = agentic = False
+    elif decision:
         why.append("decision model -> answers from first-position logits; gate = typed-set "
                    "agreement + option KL vs f16 (pollard-decision), not free-text coherence")
     if not instruct:
@@ -1942,7 +1964,7 @@ def classify(model) -> dict:
     multimodal = [m for m in modalities if m != "speech_out"]
     out = {
         "instruct": instruct, "thinking": thinking, "agentic": agentic, "vision": vision,
-        "diffusion": diffusion, "decision": decision,
+        "diffusion": diffusion, "decision": decision, "decision_format": decision_format,
         "runtime": "llama-diffusion-cli" if diffusion else "llama-server",
         "modalities": modalities, "base": not instruct,
         # A model tuned away from raw text must be scored on text it was tuned FOR, or the number

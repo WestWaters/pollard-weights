@@ -345,7 +345,8 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
     card: gemma-4-12B-it went out reading "Input support: text" while its 175MB projector sat in
     the same folder, and "imatrix: no" for a build an imatrix produced. What shipped is knowable
     from the model and the build directory, so read it."""
-    facts = {"input": None, "imatrix": None, "params_b": None, "decision": False, "tools": None}
+    facts = {"input": None, "imatrix": None, "params_b": None, "decision": False, "decision_format": None,
+             "tools": None}
     # classify needs something on disk. A repo id reads nothing, so fall back to a built GGUF
     # (which carries the chat template) or the pulled source in the workspace.
     probe = model_id if os.path.isdir(str(model_id)) else None
@@ -361,6 +362,7 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
         from pollard_modelkind import classify
         k = classify(probe)
         facts["decision"] = bool(k.get("decision"))
+        facts["decision_format"] = k.get("decision_format")
         facts["tools"] = k.get("tools")
         mods = [m for m in k.get("modalities", []) if m != "speech_out"]
         # A modality only ships if the projector that carries it ships too.
@@ -706,6 +708,23 @@ def lane_folder_section(lane, builds, results, repo, tools=None):
         return []
     F = LANE_FOLDER[lane]
     rows = []
+    if d3_boards(results):                     # a d3 decision model: its readout board, not text PPL / KLD
+        for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
+            d = _rung_result(results, b).get("decision") or {}
+            g = lambda k, fmt: fmt.format(float(d[k])) if d.get(k) is not None else "--"
+            rows.append(f"| `{F}/{rung_subfolder(b, lane)}/` | {human_gb(b.get('bytes'))} | {b.get('bpw') or '--'} | "
+                        f"{d.get('runtime', '--')} | {g('agreement', '{:.1%}')} | {_fmt_kl(d.get('option_kl'))} | "
+                        f"{g('ece', '{:.4f}')} |{verified_cell(b, results)}")
+        pick = rung_subfolder(min(builds, key=lambda x: x.get("bytes") or 0), lane)
+        here = lane_dir(repo)
+        return [f"## {LANE_TITLE.get(lane, lane.upper())} -- `{F}/`", "",
+                f"Each rung is a complete d3 package in its own folder under `{F}/` (the quantized body, the source's "
+                "`readout.safetensors` and `decision_config.json` byte-exact, its own `MODEL_MANIFEST.json`). Measured "
+                "on its readout against bf16 (see the decision-fidelity table):", "",
+                "| folder | size | avg bits | runtime | agrees with bf16 | option KL | ECE | verified |",
+                "|---|---:|---:|---|---:|---:|---:|---|", *rows, "",
+                "```bash", f'hf download {repo} --include "{F}/{pick}/*" --local-dir {here}', "```", ""] \
+            + provenance_lines(lane, builds)
     for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0)):
         r = _rung_result(results, b)
         top1 = r.get("top1")
@@ -835,10 +854,74 @@ def verified_cell(b, results):
     return " -- |" if v is None else (" yes |" if v else " **no** |")
 
 
+D3_FORMAT = "d3-code-readout-v1"
+
+
+def d3_boards(results):
+    """{rung: board} for the d3 readout boards (pollard-d3 gate) in a results file."""
+    return {k: v["decision"] for k, v in (results or {}).items()
+            if isinstance(v, dict) and isinstance(v.get("decision"), dict) and v["decision"].get("format") == D3_FORMAT}
+
+
+def d3_decision_section(builds, results):
+    """The d3 board: every rung through ITS runtime, read out with the source's readout, against bf16 through the
+    package's own runtime. Columns only for what was measured; the Decision Index (apolinario/decision-index, the
+    public part of the Jev Decision Index) only when the opt-in overnight run recorded it."""
+    boards = [(b, _rung_result(results, b).get("decision")) for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
+    boards = [(b, d) for b, d in boards if isinstance(d, dict) and d.get("format") == D3_FORMAT]
+    if not boards:
+        return []
+    ref = (results.get("bf16") or results.get("_d3_ref") or {}).get("decision") or {}
+    ref_idx = ref.get("jev_index") if isinstance(ref, dict) else None
+    has_idx = any(d.get("jev_index") is not None for _, d in boards)
+    n = boards[0][1].get("n")
+    qset = str(boards[0][1].get("set") or "")
+    f = lambda d, k, fmt: (fmt.format(float(d[k])) if d.get(k) is not None else "--")
+    rows = []
+    for b, d in boards:
+        idx = "--"
+        if d.get("jev_index") is not None:
+            idx = f"{float(d['jev_index']):.1f}"
+            if ref_idx is not None:
+                idx += f" ({float(d['jev_index']) - float(ref_idx):+.1f})"
+        bt = d.get("by_type") or {}
+        types = " / ".join(f"{t} {v['agreement']:.0%}" for t, v in bt.items()) or "--"
+        rows.append(f"| `{b.get('name', '-')}` | {human_gb(b.get('bytes'))} | {d.get('runtime', '--')} | "
+                    f"{f(d, 'agreement', '{:.1%}')} | {_fmt_kl(d.get('option_kl'))} | {f(d, 'option_kl_p95', '{:.4f}')} | "
+                    f"{f(d, 'ece', '{:.4f}')} | {f(d, 'delta_ece', '{:+.4f}')} | {types} |"
+                    + (f" {idx} |" if has_idx else ""))
+    asked = f"the same {n} typed decisions" if n else "the same typed decisions"
+    if qset.startswith("LocalLLaMA/typed-decisions"):
+        rev = qset.split("@", 1)[1].split(" ")[0] if "@" in qset else ""
+        asked = (f"{n} decisions of [typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) "
+                 f"(test split{', revision ' + rev if rev else ''}; choice, yes/no and score questions)")
+    out = ["## Decision fidelity (d3 readout)", "",
+           f"A d3 model answers through its `{D3_FORMAT}` readout: the body reads the whole prompt with non-causal "
+           "full attention, the last token's hidden state goes through the FP32 `readout.safetensors` (255 answer "
+           "codes), and the answer is a probability per option. So each rung is measured where the model's product "
+           f"is: on {asked}, run through the rung's own runtime and read out with the source's readout (shipped "
+           "byte-exact in every rung), against the **bf16** checkpoint through the package's own runtime "
+           "([pollard-d3](https://github.com/WestWaters/pollard-weights)).", "",
+           "| file | size | runtime | agrees with bf16 | option KL | KL p95 | ECE | ECE vs bf16 | agreement by type |"
+           + (" Decision Index (vs bf16) |" if has_idx else ""),
+           "|---|---:|---|---:|---:|---:|---:|---:|---|" + ("---:|" if has_idx else ""), *rows, "",
+           "_Agrees = the rung picks the same option as bf16. Option KL = KL(bf16 || rung) of the answer "
+           "distribution, averaged over decisions (p95 = the 95th percentile). ECE = expected calibration error "
+           "against the gold labels (10 bins, top label); `ECE vs bf16` = the change from bf16's own._"]
+    if has_idx:
+        out.append("_Decision Index = the public index of the Decision Index 0.3 kit "
+                   "([apolinario/decision-index](https://github.com/apolinario/decision-index), MIT) run on the rung "
+                   "through `/v1/systemone`" + (f"; bf16 scored {float(ref_idx):.1f} on the same run" if ref_idx is not None
+                                                else "") + "._")
+    return out + [""]
+
+
 def decision_section(builds, results):
     """The board a decision model is judged on: each rung against the f16, same typed questions, same
     readout (pollard-decision). Agreement = same answer as the f16; option KL = how far the option
     probabilities moved; drift = mean absolute change per option."""
+    if d3_boards(results):
+        return d3_decision_section(builds, results)
     rows, n = [], None
     boards = [(b, (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("decision"))
               for b in sorted(builds, key=lambda x: -(x.get("bytes") or 0))]
@@ -1331,8 +1414,10 @@ def main():
     out.append(f"| Input support | {inp} |")
     out.append(f"| imatrix | {'**yes** -- see [calibration](#imatrix-calibration)' if imat else 'no'} |")
     if decision:
-        out.append("| Measured | " + (f"**decision fidelity vs {decision_ref(results)}** through `/v1/systemone` -- "
-                   "[table below](#decision-fidelity) (perplexity does not apply: a decision model "
+        out.append("| Measured | " + (f"**decision fidelity vs {decision_ref(results)}** "
+                   + ("through each rung's own runtime, d3 readout -- " if d3_boards(results) else
+                      "through `/v1/systemone` -- ")
+                   + "[table below](#decision-fidelity) (perplexity does not apply: a decision model "
                    "answers with probabilities, not text)" if dec_rows else "decision fidelity -- pending") + " |")
     else:
         out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
@@ -1441,7 +1526,11 @@ def main():
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
                 "one the f16 would have picked (llama-perplexity's `Same top p` for GGUF, the same logit "
                 "comparison in pollard-verify for the other lanes). Higher is closer to the original model._"]
-    if has_v:
+    if has_v and d3_boards(results):
+        out += ["", "_Verified = the rung passed `pollard-d3 gate`: through its own runtime it picks the same option as "
+                "bf16 on at least 90% of the typed decisions with a mean option KL of at most 0.05, and it ships the "
+                "readout and decision config byte-exact (pollard-complete). A rung that failed is not published._"]
+    elif has_v:
         out += ["", "_Verified = the rung passed `pollard-verify --gate`: its KLD / top-1 against the source and "
                 "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
                 "and met. A rung that failed is not published._"]
@@ -1523,7 +1612,11 @@ def main():
 
     # ---- How to run
     out += ["## How to run", ""]
-    if "gguf" in lanes and decision:
+    if decision and (facts.get("decision_format") == D3_FORMAT or d3_boards(results)):
+        import pollard_d3 as D3
+        out += D3.serve_lines(D3.info(a.model) if os.path.isdir(str(a.model)) else {"repo_id": base_model},
+                              repo, lanes)
+    elif "gguf" in lanes and decision:
         out += decision_usage(exn, fork_arch if arch_verdict == "newer" else None)
     elif "gguf" in lanes:
         # The featured command has to name a file that command can actually open. If the
@@ -1594,7 +1687,13 @@ def main():
 
     # ---- Use it in your harness: rendered from pollard_harness.HARNESSES, the same table `pollard serve`
     # prints from, so the card and the CLI cannot drift apart
-    if "gguf" in lanes and builds:
+    if "gguf" in lanes and builds and d3_boards(results):
+        out += ["## Use it in your harness", "",
+                "A d3 rung has no chat endpoint. `pollard-d3 serve --rung <rung>.gguf --source . --port 8080` puts "
+                "`/v1/systemone` in front of llama-server (the readout applied to the last token's hidden state), so "
+                "anything that calls `/v1/systemone` -- Oh My Pi's `api: typesafe` judge role, the decision-index "
+                "`http` engine -- uses it unchanged.", ""]
+    elif "gguf" in lanes and builds:
         import pollard_harness as PH
         rt_ex = runtimes.get(ex.get("path"))
         stock_rungs = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
