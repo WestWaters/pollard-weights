@@ -211,6 +211,9 @@ def build_runtimes(builds, repo=None):
         src, where = path, "local file"
         if not os.path.isfile(path) and b.get("runtime"):
             out[path] = b["runtime"]                      # read before the rung was freed (pollard release)
+            if b["runtime"] == "pollard" and b.get("runtime_arch"):
+                out.setdefault("_fork_arch", b["runtime_arch"])
+                out.setdefault("_arch_verdict", "pollard")
             continue
         if not os.path.isfile(path):
             if not repo:
@@ -1107,6 +1110,12 @@ def decision_ref(results):
     return str((results or {}).get("_decision_ref") or "f16")
 
 
+def pollard_runtime_lines(need, build):
+    """'How to run' for a `pollard` architecture: the plain need line, then how to build and serve with Pollard's
+    runtime (pollard-runtime --update, or the pinned upstream base + the patch)."""
+    return [f"**{need}.** Build it, then serve any file here:", "", "```bash", *build, "```", ""]
+
+
 def decision_usage(exn, newer_arch=None):
     lead = (f"This model's architecture (`{newer_arch}`) needs a llama.cpp new enough to carry it. "
             if newer_arch else "")
@@ -1270,10 +1279,20 @@ def main():
     if arch_verdict == "newer":
         fork_where = "a current llama.cpp"
         fork_plain = "a current llama.cpp"
+    # 'pollard' = an architecture only a runtime patch POLLARD SHIPS implements (runtime-patches/, upstream PR
+    # pending): never "stock", never someone else's fork -- the card names the patch and how to build with it.
+    pol_need = pol_build = None
+    if arch_verdict == "pollard" and fork_arch:
+        import pollard_ggufcompat as _gc
+        _pi = _gc.pollard_archs().get(fork_arch) or {}
+        pol_need = _gc.pollard_need_line(fork_arch, _pi)
+        pol_build = _gc.pollard_build_lines(fork_arch, _pi)
+        fork_where = f"llama.cpp with Pollard's `{fork_arch}` patch"
+        fork_plain = "llama.cpp + Pollard patch"
     runtimes = {k: v for k, v in runtimes.items() if not k.startswith("_")}
     # Anything that is not plainly 'stock' has to be said on the card. 'newer' and 'unknown' belong
     # here too: a reader whose llama.cpp cannot open the file does not care why it cannot.
-    NONSTOCK = ("ik_llama", "fork", "newer", "unknown", "prism")
+    NONSTOCK = ("ik_llama", "fork", "newer", "pollard", "unknown", "prism")
     ik_builds = [b for b in builds if runtimes.get(b.get("path")) in NONSTOCK]
     # online-RHT rungs (prism.hadamard manifest): stock llama.cpp, but only from b11556 (#29600) --
     # a version requirement, not a fork -- and an older build loads them silently WRONG.
@@ -1370,6 +1389,11 @@ def main():
                         "enough to carry it runs these files -- llama.cpp itself, and Ollama or "
                         "LM Studio once they ship a runtime with it. An older build will refuse them "
                         "with `unknown model architecture`. The quants are ordinary K-quants.", ""]
+            elif fork_arch and pol_need:
+                out += [f"**{pol_need}.** This model's architecture (`{fork_arch}`) is implemented by a runtime "
+                        "patch Pollard ships and is not in upstream llama.cpp yet, so stock llama.cpp -- and "
+                        "therefore Ollama and LM Studio -- cannot load these files until it lands. Every rung here was "
+                        "built and verified with that runtime (see How to run).", ""]
             elif fork_arch:
                 where = fork_where or "the vendor's llama.cpp fork"
                 out += [f"**These files need {where}.** This model's architecture "
@@ -1447,7 +1471,7 @@ def main():
                 head += " *(ik_llama.cpp)*"
             elif rtb == "prism":
                 head += f" *(needs {PRISM_NEED})*"
-            elif rtb in ("fork", "newer", "unknown"):
+            elif rtb in ("fork", "newer", "pollard", "unknown"):
                 head += f" *(needs {fork_plain})*"
             out.append(f"{head} {note[:110]}{rec}" if note else f"{head}{rec}")
         out.append("")
@@ -1502,7 +1526,7 @@ def main():
         r = results.get(b.get("name", ""), results.get(b.get("tag", ""), {}))
         tps_c = f" {r.get('tps','--')} |" if has_tps else ""
         rt = runtimes.get(b.get("path"))
-        rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain,
+        rt_lbl = {"ik_llama": "ik_llama", "fork": fork_plain, "newer": fork_plain, "pollard": fork_plain,
                   "unknown": "unverified", "stock": "any llama.cpp",
                   "prism": PRISM_NEED}.get(rt, "--")
         rt_c = (" " + rt_lbl + " |") if mixed else ""
@@ -1617,6 +1641,8 @@ def main():
         out += D3.serve_lines(D3.info(a.model) if os.path.isdir(str(a.model)) else {"repo_id": base_model},
                               repo, lanes)
     elif "gguf" in lanes and decision:
+        if pol_need:
+            out += pollard_runtime_lines(pol_need, pol_build)
         out += decision_usage(exn, fork_arch if arch_verdict == "newer" else None)
     elif "gguf" in lanes:
         # The featured command has to name a file that command can actually open. If the
@@ -1626,7 +1652,9 @@ def main():
         ex_ik = runtimes.get(ex.get("path")) in NONSTOCK
         stock = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
         stock_pick = max(stock, key=lambda b: (b.get("bytes") or 0), default=None)
-        if not ex_ik:
+        if ex_ik and pol_need:
+            out += pollard_runtime_lines(pol_need, pol_build)
+        elif not ex_ik:
             out += ["These are standard GGUF and run with **llama.cpp**:", "", "```bash",
                     f"llama-server -hf {repo}:{extag}" if extag else f"llama-server -hf {repo}",
                     "```", "", "or from a local file:", "", "```bash",
@@ -1635,8 +1663,11 @@ def main():
                     "```", ""]
             out += ["They also work in anything built on llama.cpp -- **LM Studio, koboldcpp, Jan, "
                     f"ramalama, Ollama** (`ollama run hf.co/{repo}`).", ""]
-        else:
-            lead = (f"This model's architecture (`{fork_arch}`) needs a llama.cpp new enough to "
+        if ex_ik:
+            lead = (f"This model's architecture (`{fork_arch}`) needs llama.cpp with Pollard's patch, so every "
+                    "file here runs in the build above"
+                    if pol_need else
+                    f"This model's architecture (`{fork_arch}`) needs a llama.cpp new enough to "
                     "carry it, so build or update from upstream first"
                     if fork_arch and arch_verdict == "newer" else
                     f"This model's architecture (`{fork_arch}`) needs "
@@ -1655,6 +1686,9 @@ def main():
                 out += [f"For stock llama.cpp, Ollama or LM Studio, use `{st or sn}` instead:", "",
                         "```bash", f"llama-server -hf {repo}:{st}" if st else f"llama-server -hf {repo}",
                         f'llama-cli    -m {sn} -ngl 99 -p "Explain why the sky is blue."', "```", ""]
+            elif arch_verdict == "pollard":
+                out += ["Ollama and LM Studio will run these once upstream llama.cpp merges "
+                        f"`{fork_arch}` and they bundle a build that carries it.", ""]
             elif arch_verdict == "newer":
                 out += ["Ollama and LM Studio will run these once their bundled llama.cpp carries "
                         f"`{fork_arch}`.", ""]
@@ -1699,7 +1733,7 @@ def main():
         stock_rungs = [b for b in builds if runtimes.get(b.get("path")) == "stock"]
         stock_tag = extag if rt_ex == "stock" else \
             (max(stock_rungs, key=lambda b: (b.get("bytes") or 0)).get("tag") if stock_rungs else None)
-        needs = {"ik_llama": "ik_llama.cpp", "fork": fork_plain, "newer": "a current llama.cpp",
+        needs = {"ik_llama": "ik_llama.cpp", "fork": fork_plain, "newer": "a current llama.cpp", "pollard": fork_where,
                  "prism": PRISM_NEED}.get(rt_ex)
         out += PH.card_section(repo, exn, extag or None, decision=decision, stock_tag=stock_tag, needs=needs)
 
@@ -1747,6 +1781,11 @@ def main():
                        "model architecture` -- update llama.cpp rather than looking for a different "
                        "quant. Checked with `pollard-ggufcheck`, which reads the architecture and the "
                        "tensor types out of the header and asks upstream what it implements.")
+        elif ik_builds and fork_arch and pol_need:
+            out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp does not implement "
+                       f"yet. {pol_need} -- the quant types are ordinary and irrelevant to that. Checked with "
+                       "`pollard-ggufcheck`, which reads the architecture out of the header and the patches "
+                       "Pollard ships out of `runtime-patches/`.")
         elif ik_builds and fork_arch:
             out.append(f"- `general.architecture` is `{fork_arch}`, which upstream llama.cpp does not "
                        f"implement, so these files load only in "

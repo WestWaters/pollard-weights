@@ -28,7 +28,10 @@ ik_llama.cpp reads the keys but its default fused up/gate path skips the transfo
   pollard-ggufcheck --json *.gguf                   # machine-readable
   pollard-ggufcheck --offline model.gguf            # never consult upstream (claims less)
 
-Exit code is 1 if any file is not plain stock (ik_llama, fork, newer, prism), so this works as a
+An architecture that only a runtime patch POLLARD SHIPS implements (runtime-patches/, e.g. clef-omni, upstream PR
+pending) reports as `pollard` -- not stock, and not someone else's fork.
+
+Exit code is 1 if any file is not plain stock (ik_llama, fork, newer, pollard, prism), so this works as a
 pre-publish gate: every such file needs a line on the card."""
 import argparse
 import json
@@ -77,24 +80,172 @@ FORK_ARCHS = {
 }
 
 
-def stock_archs(vendored="runtime/llama.cpp/src/llama-arch.cpp"):
-    """The architecture names the llama.cpp BESIDE US knows.
+#: the checkout this file lives in (tools/..): the vendored runtime and runtime-patches/ are found from HERE, never
+#: from the current directory -- a release run from a model folder used to read no runtime and fall back to the
+#: snapshot, and a run from the repo read the patched tree and called a Pollard-only architecture "stock".
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VENDORED_ARCH_SRC = os.path.join("runtime", "llama.cpp", "src", "llama-arch.cpp")
+PATCH_DIR = os.path.join(REPO_ROOT, "runtime-patches")
+PATCH_URL = "https://github.com/WestWaters/pollard-weights/blob/main/runtime-patches/"
+#: the upstream remote a `pollard` architecture's patch must sit on: "llama.cpp with Pollard's patch" is a claim about
+#: ggml-org/llama.cpp. A patch onto a third-party fork (k2-horizon onto ik_llama) is a port, not Pollard support.
+UPSTREAM_REMOTE = "github.com/ggml-org/llama.cpp"
 
-    Prefers a vendored checkout, because that is the runtime this machine would actually build and run
-    with. Falls back to the snapshot when there is no source to read (an installed tool usually has no
-    runtime next to it). This is a local fact, not a claim about upstream -- see arch_support().
-    """
+
+def _resolve(path):
+    """A relative path resolved against the checkout (REPO_ROOT), not the current directory."""
+    path = os.path.expanduser(str(path))
+    return path if os.path.isabs(path) else os.path.join(REPO_ROOT, path)
+
+
+def _arch_names(src):
+    import re as _re
+    m = _re.search(r"LLM_ARCH_NAMES\s*=\s*\{(.*?)\n\};", src, _re.S)
+    if not m:
+        return set()
+    got = set(_re.findall(r'"\s*([a-z0-9._\-]+)\s*"', m.group(1)))
+    return got - {"clip"} if len(got) > 50 else set()     # sanity: a real list, not a stray match
+
+
+def engine_archs(vendored=VENDORED_ARCH_SRC):
+    """Every architecture the llama.cpp tree Pollard builds (runtime/llama.cpp beside this checkout) implements,
+    Pollard's own patches INCLUDED; None when there is no tree to read (an installed tool, CI)."""
     try:
-        import re as _re
-        src = open(vendored, encoding="utf-8").read()
-        m = _re.search(r"LLM_ARCH_NAMES\s*=\s*\{(.*?)\n\};", src, _re.S)
-        if m:
-            got = set(_re.findall(r'"\s*([a-z0-9._\-]+)\s*"', m.group(1)))
-            if len(got) > 50:                    # sanity: a real list, not a stray match
-                return got - {"clip"}
+        got = _arch_names(open(_resolve(vendored), encoding="utf-8").read())
     except OSError:
-        pass
-    return set(STOCK_ARCHS)
+        return None
+    return got or None
+
+
+def stock_archs(vendored=VENDORED_ARCH_SRC):
+    """The architecture names STOCK llama.cpp knows, as far as this machine can tell.
+
+    Prefers the vendored checkout (resolved from the repo, not the current directory), because that is the runtime
+    this machine would actually build and run with -- minus the architectures Pollard's own runtime patches add to
+    it: that tree carries them, stock does not, and a file that loads only because of our patch is not "stock".
+    Falls back to the snapshot when there is no source to read (an installed tool usually has no runtime next to
+    it). This is a local fact, not a claim about upstream -- see arch_support().
+    """
+    got = engine_archs(vendored)
+    if not got:
+        return set(STOCK_ARCHS)
+    return got - set(pollard_archs())
+
+
+def _patch_added_archs(text):
+    """Architecture names a llama.cpp patch ADDS to LLM_ARCH_NAMES in src/llama-arch.cpp (`+    { LLM_ARCH_X, "x" },`)."""
+    import re as _re
+    out, in_arch = [], False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            in_arch = line.rstrip().endswith("src/llama-arch.cpp")
+            continue
+        if in_arch and line.startswith("+") and not line.startswith("+++"):
+            m = _re.match(r'\+\s*\{\s*LLM_ARCH_[A-Z0-9_]+\s*,\s*"([a-z0-9._\-]+)"\s*\}', line)
+            if m and m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
+_pollard_cache = {}
+
+
+def pollard_archs(patch_dir=None):
+    """{arch: info} for every architecture a runtime patch POLLARD SHIPS implements on upstream llama.cpp.
+
+    An architecture counts when (1) a patch in runtime-patches/ adds it to LLM_ARCH_NAMES (read from the patch
+    content) or its manifest declares it in `adds_archs`, (2) the patch's tree is ggml-org/llama.cpp, and (3) an
+    engine in engines.json applies that patch -- i.e. the engine `pollard-runtime --update` builds carries it.
+    Third-party fork architectures (FORK_ARCHS) are never Pollard's, even when we keep a port of them.
+
+    info: {'patch': name, 'file': '<name>.patch', 'url': link, 'engine': engine, 'base': commit,
+    'upstream': 'upstream PR pending' | 'upstream PR <url>' | 'merged upstream in <tag>',
+    'needs': [every patch whose manifest `archs` lists it, in engines.json order]}. Empty when runtime-patches/ is
+    absent (an installed tool without the checkout)."""
+    d = patch_dir or PATCH_DIR
+    if d in _pollard_cache:
+        return _pollard_cache[d]
+    out = {}
+    try:
+        engines = json.load(open(os.path.join(d, "engines.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        engines = {}
+    order = {}
+    for eng, spec in engines.items():
+        if not isinstance(spec, dict):
+            continue
+        if UPSTREAM_REMOTE not in str(spec.get("url", "")) or spec.get("ref"):
+            continue                       # a fork, or a pull-request ref: not "llama.cpp with Pollard's patch"
+        for i, pname in enumerate(spec.get("patches") or []):
+            order.setdefault(pname, (eng, i))
+    declared = {}
+    for pname, (eng, _i) in sorted(order.items(), key=lambda kv: kv[1][1]):
+        try:
+            man = json.load(open(os.path.join(d, pname + ".json"), encoding="utf-8"))
+        except (OSError, ValueError):
+            man = {}
+        if man.get("remote") and UPSTREAM_REMOTE not in str(man["remote"]):
+            continue
+        try:
+            text = open(os.path.join(d, pname + ".patch"), encoding="utf-8", errors="replace").read()
+        except OSError:
+            text = ""
+        for a in man.get("archs") or []:
+            declared.setdefault(a, []).append(pname)
+        up = man.get("upstream") or {}
+        if isinstance(up, str):
+            up = {"pr": up}
+        if up.get("merged"):
+            status = f"merged upstream in {up['merged']}"
+        elif up.get("pr"):
+            status = f"upstream PR {up['pr']}"
+        else:
+            status = "upstream PR pending"
+        for a in list(man.get("adds_archs") or []) + _patch_added_archs(text):
+            if a in FORK_ARCHS or a in out:
+                continue
+            out[a] = {"patch": pname, "file": pname + ".patch", "url": PATCH_URL + pname + ".patch",
+                      "engine": eng, "base": man.get("base_commit", ""), "upstream": status}
+    for a, info in out.items():
+        needs = [info["patch"]] + [p for p in declared.get(a, []) if p != info["patch"]]
+        info["needs"] = needs
+    _pollard_cache[d] = out
+    return out
+
+
+def pollard_detail(arch, info=None):
+    """'<patch>; upstream PR pending' -- the arch_support() detail for a `pollard` architecture."""
+    info = info or pollard_archs().get(arch) or {}
+    return f"{info.get('patch', 'a Pollard runtime patch')}; {info.get('upstream', 'upstream PR pending')}"
+
+
+def pollard_need_line(arch, info=None, link=True):
+    """The plain card line: 'Needs llama.cpp with Pollard's <arch> patch (runtime-patches/<file>; upstream PR
+    pending)'. `link` renders the patch file as a Markdown link."""
+    info = info or pollard_archs().get(arch) or {}
+    f = f"runtime-patches/{info.get('file', '')}" if info.get("file") else "runtime-patches/"
+    where = f"[{f}]({info['url']})" if link and info.get("url") else f
+    return (f"Needs llama.cpp with Pollard's `{arch}` patch ({where}; "
+            f"{info.get('upstream', 'upstream PR pending')})")
+
+
+def pollard_build_lines(arch, info=None):
+    """How to get a llama.cpp that runs a `pollard` architecture: Pollard's managed tree, or the pinned base plus
+    the patch(es) by hand."""
+    info = info or pollard_archs().get(arch) or {}
+    needs = info.get("needs") or ([info["patch"]] if info.get("patch") else [])
+    base = info.get("base") or "<base>"
+    lines = ["# with Pollard installed: builds runtime/llama.cpp with every patch it ships",
+             "pollard-runtime --update",
+             "runtime/llama.cpp/build/bin/llama-server -m <file>.gguf -ngl 99",
+             "",
+             f"# or by hand: the pinned upstream base + the patch",
+             "git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp",
+             f"git checkout {base}"]
+    lines += [f"git apply ../pollard-weights/runtime-patches/{p}.patch" for p in needs]
+    lines += ["cmake -B build && cmake --build build -j --target llama-server",
+              "build/bin/llama-server -m <file>.gguf -ngl 99"]
+    return lines
 
 
 _UPSTREAM_URL = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/src/llama-arch.cpp"
@@ -127,21 +278,32 @@ def upstream_archs(offline=False):
 
 
 def arch_support(arch, local=None, offline=False):
-    """('stock'|'newer'|'fork'|'unknown', detail) for an architecture name.
+    """('stock'|'newer'|'pollard'|'fork'|'unknown', detail) for an architecture name.
 
-    Three different answers that a single list cannot tell apart, and conflating them makes a false
-    claim about someone else's runtime:
+    Four different answers that a single list cannot tell apart, and conflating them makes a false
+    claim about someone else's runtime (or our own):
 
-      stock   the llama.cpp here already knows it
+      stock   the llama.cpp here already knows it, without any Pollard patch
       newer   upstream has merged it, the runtime here is behind -- the user needs a newer llama.cpp,
               not a fork
-      fork    upstream does not implement it at all; support lives somewhere specific
+      pollard upstream does not have it yet; a runtime patch Pollard ships (runtime-patches/, applied by the
+              engine Pollard builds) implements it on upstream llama.cpp -- detail '<patch>; upstream PR pending'
+      fork    upstream does not implement it at all; support lives in someone else's fork (FORK_ARCHS)
       unknown the local list misses it and upstream could not be consulted -- say so, claim nothing
+
+    Order: stock > newer > pollard > fork > unknown. A `pollard` architecture needs no upstream answer to be
+    called that -- it is a fact about a patch we ship -- but when upstream HAS merged it, upstream wins.
     """
-    known = stock_archs() if local is None else local
-    if not arch or arch in known:
+    pol = pollard_archs()
+    known = stock_archs() if local is None else set(local)
+    if not arch or (arch in known and arch not in pol):
         return "stock", ""
     up = upstream_archs(offline=offline)
+    if arch in pol:
+        if up is not None and arch in up:
+            return ("stock", "") if arch in known else \
+                ("newer", "upstream llama.cpp implements it; the build here is older")
+        return "pollard", pollard_detail(arch, pol[arch])
     if up is None:
         return "unknown", ("not in the llama.cpp here, and upstream could not be checked "
                            "(offline?) -- no claim made")
@@ -407,7 +569,10 @@ def fork_only(counts):
 
 
 def runtime_of(path_or_url, archs=None, offline=False):
-    """('stock'|'prism'|'ik_llama'|'newer'|'fork'|'unknown', reasons) -- what this file needs, and why.
+    """('stock'|'prism'|'ik_llama'|'newer'|'pollard'|'fork'|'unknown', reasons) -- what this file needs, and why.
+
+    'pollard' = an architecture only Pollard's own runtime patch implements (see arch_support); reasons carry
+    'pollard_patch' and the card line 'pollard_needs'.
 
     'prism' = a prism.hadamard manifest: stock llama.cpp, but >= b11556 (a version requirement, NOT a
     fork), and not ik_llama. reasons['prism_hadamard'] carries the manifest summary and the note.
@@ -435,6 +600,12 @@ def runtime_of(path_or_url, archs=None, offline=False):
             where = FORK_ARCHS.get(arch)
             if where:
                 reasons["supported_by"], reasons["supported_url"] = where
+        elif verdict == "pollard":
+            info = pollard_archs().get(arch) or {}
+            reasons["supported_by"] = f"llama.cpp with Pollard's `{arch}` patch"
+            reasons["supported_url"] = info.get("url", "")
+            reasons["pollard_patch"] = info.get("patch", "")
+            reasons["pollard_needs"] = pollard_need_line(arch, info, link=False)
         return verdict, reasons
     if fork_only(counts):
         return "ik_llama", reasons
@@ -497,7 +668,7 @@ def main():
             ph = fo.get("prism_hadamard")
             if arch:
                 label = {"newer": "needs newer llama.cpp", "fork": "needs a fork",
-                         "unknown": "cannot verify"}.get(rt, "needs a fork")
+                         "pollard": "needs Pollard patch", "unknown": "cannot verify"}.get(rt, "needs a fork")
                 bits = [f"architecture `{arch}`: {fo.get('arch_detail','')}".rstrip(": ")]
                 if fo.get("supported_by"):
                     bits.append(f"supported by {fo['supported_by']} ({fo.get('supported_url','')})"
@@ -540,6 +711,9 @@ def main():
                   "them without error and produces garbage.")
         if by.get("ik_llama") or by.get("fork"):
             print("Say so on the card: these will not load in stock llama.cpp, Ollama or LM Studio.")
+        if by.get("pollard"):
+            print("Say so on the card: these need llama.cpp with Pollard's runtime patch (pollard-runtime --update); "
+                  "never call them stock.")
         if by.get("unknown"):
             print("Could not reach upstream to confirm an unrecognised architecture; nothing claimed.")
     return rc

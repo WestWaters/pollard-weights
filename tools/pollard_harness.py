@@ -454,7 +454,9 @@ def choose_runtime(verdict, arch, server=None, exe=None, supports_arch=None):
                                 "ik_llama's llama-server.")
         if arch and not supports_arch(binary, arch):
             return name, binary, (f"{binary} does not know architecture `{arch}`" +
-                                  (" -- update llama.cpp (upstream has it)" if verdict == "newer" else ""))
+                                  (" -- update llama.cpp (upstream has it)" if verdict == "newer" else
+                                   " -- it needs llama.cpp with Pollard's runtime patch: `pollard-runtime --update`"
+                                   if verdict == "pollard" else ""))
         return name, binary, None
     if verdict == "ik_llama":
         return "ik_llama", None, ("this rung carries ik_llama-only atoms (ggml types above 42); stock llama.cpp, "
@@ -511,7 +513,7 @@ def preflight(info, harness, ctx, verdict, arch, n_train, diffusion, decision, r
     if decision and not (harness == "omp"):
         fatal.append("this is a decision model: it answers /v1/systemone and cannot chat, so a chat harness "
                      "cannot drive it. Use --harness omp (the judge role, api: typesafe).")
-    if h.get("stock_only") and verdict in ("ik_llama", "fork"):
+    if h.get("stock_only") and verdict in ("ik_llama", "fork", "pollard"):
         fatal.append(f"{h['label']} runs its own bundled llama.cpp, which cannot load this rung "
                      f"({'ik_llama-only atoms' if verdict == 'ik_llama' else f'architecture `{arch}`'}). "
                      "Use a harness pointed at `pollard serve` instead.")
