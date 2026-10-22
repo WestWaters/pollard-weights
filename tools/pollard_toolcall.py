@@ -1211,13 +1211,43 @@ DECODED_METHODS = ("gptq", "compressed-tensors", "fp8")
 CPU_GBPS = 20.0
 
 
+def _meta_model_gb(model):
+    """GB of the plain float model the decoded loaders build for this rung (pollard_stream.decoded_hf_model,
+    pollard_mxfp6.load_hf_model: `from_config` at the config's dtype, bf16 when it names none), counted on the meta
+    device -- no weights read, no memory taken. None when transformers cannot build it here."""
+    try:
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+    except Exception:                                            # noqa: BLE001
+        return None
+    try:
+        cfg = AutoConfig.from_pretrained(model, trust_remote_code=_trust(model))
+        for sub in (cfg, getattr(cfg, "text_config", None)):
+            if sub is not None and hasattr(sub, "quantization_config"):
+                delattr(sub, "quantization_config")
+        dt = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None) or torch.bfloat16
+        dt = getattr(torch, dt, torch.bfloat16) if isinstance(dt, str) else dt
+        with torch.device("meta"):
+            m = AutoModelForCausalLM.from_config(cfg, trust_remote_code=_trust(model))
+        n = sum(p.numel() for p in m.parameters())
+        return n * torch.empty((), dtype=dt).element_size() / 1e9
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def decoded_gb(model):
-    """GB the rung takes decoded to bf16 (what the decoded loader holds), else its size on disk."""
+    """GB the rung takes decoded to its float dtype (bf16) -- what the decoded loader HOLDS, never the packed size on
+    disk: a 24B MoE MX rung is 13 GB of files and ~48 GB decoded (the box committed 49.6 GB of its 32 GB, 2026-10-19).
+    The architecture's own parameter count (meta device) first, else the safetensors headers (pollard_stream), else --
+    unknowable -- the packed size x 4 (a 4-bit rung decoded to bf16), never the packed size itself."""
+    gb = _meta_model_gb(model)
+    if gb:
+        return gb
     try:
         import pollard_stream as S
         return S.decoded_bytes(model) / 1e9
-    except Exception:                                            # noqa: BLE001 -- unreadable: size on disk
-        return model_gb(model)
+    except Exception:                                            # noqa: BLE001 -- unreadable: bound it from above
+        return model_gb(model) * 4
 
 
 def cpu_estimate(gb, n_probes, budget, gbps=None):
@@ -1252,7 +1282,22 @@ def preflight_inprocess(backend, model, kind=None):
     if not (_has_module("transformers") and _has_module("torch")):
         raise NotMeasured("transformers + torch are not installed here")
     import pollard_mxfp6                                         # a pollard-mx MXFP6 / mix rung: decoded, no loader
-    meth = "" if pollard_mxfp6.read_meta(model) else quant_method(model)
+    if pollard_mxfp6.read_meta(model):
+        # every quantized linear decoded from the rung's bytes into a plain bf16 model (pollard_mxfp6.load_hf_model):
+        # it HOLDS the decoded size, on whichever device -- sized from that, not from the packed files
+        dec = decoded_gb(model)
+        if _gpu_or_none() is None:
+            why = "no NVIDIA GPU here"
+        else:
+            try:
+                check_gpu("hf", dec)
+                return {"device": "cuda", "loader": "decoded", "decoded_gb": round(dec, 3)}
+            except NotMeasured as e:
+                why = str(e)
+        check_ram(dec)
+        return {"device": "cpu", "loader": "decoded", "decoded_gb": round(dec, 3),
+                "cpu_note": f"{why}: on the CPU through the decoded loader -- slow but valid"}
+    meth = quant_method(model)
     if meth:
         if meth not in HF_QUANT_NEEDS or HF_QUANT_NEEDS[meth] is None:
             raise NotMeasured(_HF_NO_LOADER.get(meth, f"transformers has no loader for a '{meth}' checkpoint here"))
