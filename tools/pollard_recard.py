@@ -196,7 +196,9 @@ def main():
             man["builds"].append({"name": fn, "lane": "gguf" if fn.endswith(".gguf") else "mlx",
                                   "tag": tag, "path": os.path.join(d, fn), "bpw": None, "ppl": None,
                                   "verified": True, "bytes": sz, "created": ""})
-        json.dump(man, open(os.path.join(d, "MANIFEST.json"), "w"), indent=2)
+        with ws.manifest_transaction(key) as current:
+            current.clear()
+            current.update(man)
 
         params = None
         src = results.get("_base") or rid

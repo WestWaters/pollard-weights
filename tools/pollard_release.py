@@ -968,6 +968,8 @@ def lane_steps(cfg, c, lane):
             ver += ["--trust-remote-code", c.get("trc", "auto")]
             if c.get("ngl") == "0" and machine()["cuda"]:
                 ver += ["--device", "cpu"]
+            if c.get("max_ram_gb"):                      # the streamed verify plans both passes under the plan's cap
+                ver += ["--max-ram-gb", str(c["max_ram_gb"])]
         ver += (["--end-to-end"] if lane == "exl3" else []) + ["--eval", c["heldout"]]
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
                           cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None,
@@ -1220,32 +1222,31 @@ def canonical_gguf(c):
     names a build after the f16 it came from, which is not a name to publish."""
     import pollard_workspace as ws
     key = c["f16"]
-    man = ws.read_manifest(key)
-    changed = False
-    for b in man.get("builds", []):
-        if b.get("lane") != "gguf" or not b.get("tag"):
-            continue
-        want = f"{c['name']}-Pollard-{b['tag']}.gguf"
-        path = b.get("path", "")
-        if os.path.basename(path) == want or not os.path.exists(path):
-            continue
-        target = os.path.join(os.path.dirname(path), want)
-        os.replace(path, target)
-        b["path"], b["name"] = os.path.abspath(target), want
-        changed = True
-    if changed:
-        # a re-run's rung lands on the published name an earlier, freed / kept / replaced build of the same tag had:
-        # the newest entry for a path is the build that is there now, so older entries for it go (publish_rung would
-        # otherwise find the stale one first -- unverified -- and keep the fresh, verified file off the Hub)
-        seen, keepl = set(), []
-        for b in reversed(man.get("builds", [])):
-            p = os.path.normcase(os.path.abspath(str(b.get("path", ""))))
-            if b.get("lane") == "gguf" and p in seen:
+    with ws.manifest_transaction(key) as man:
+        changed = False
+        for b in man.get("builds", []):
+            if b.get("lane") != "gguf" or not b.get("tag"):
                 continue
-            seen.add(p)
-            keepl.append(b)
-        man["builds"] = list(reversed(keepl))
-        ws._write_manifest(key, man)
+            want = f"{c['name']}-Pollard-{b['tag']}.gguf"
+            path = b.get("path", "")
+            if os.path.basename(path) == want or not os.path.exists(path):
+                continue
+            target = os.path.join(os.path.dirname(path), want)
+            os.replace(path, target)
+            b["path"], b["name"] = os.path.abspath(target), want
+            changed = True
+        if changed:
+            # a re-run's rung lands on the published name an earlier, freed / kept / replaced build of the same tag had:
+            # the newest entry for a path is the build that is there now, so older entries for it go (publish_rung would
+            # otherwise find the stale one first -- unverified -- and keep the fresh, verified file off the Hub)
+            seen, keepl = set(), []
+            for b in reversed(man.get("builds", [])):
+                p = os.path.normcase(os.path.abspath(str(b.get("path", ""))))
+                if b.get("lane") == "gguf" and p in seen:
+                    continue
+                seen.add(p)
+                keepl.append(b)
+            man["builds"] = list(reversed(keepl))
 
 
 def default_build(builds, lane, want):
@@ -1491,17 +1492,14 @@ def remote_mismatches(api, repo, pairs):
     return H.mismatches(api, repo, pairs)
 
 
-def _keep(c, lane, key, man, b, why, out):
+def _keep(key, b, why, out):
     """A rung that is NOT freed: recorded in the MANIFEST (kept = why) and said out loud."""
+    import pollard_workspace as ws
     b["kept"] = why
     b.pop("freed", None)
-    ws_write(key, man)
+    fields = ("kept", "streamed_unverified", "runtime", "uploaded_as")
+    ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("freed",))
     out(f"      KEPT {b.get('path')} -- {why}")
-
-
-def ws_write(key, man):
-    import pollard_workspace as ws
-    ws._write_manifest(key, man)
 
 
 def publish_rung(step, c, cfg, run_upload, out=print):
@@ -1530,11 +1528,20 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     import pollard_stream as PS
     streamed = PS.read_streamed(b["path"]) if lane != "gguf" and os.path.isdir(b.get("path", "")) else {}
     if b.get("verified") is not True:
+        if streamed and b.get("verified") is False and PS.staged_revisions(streamed):
+            # the gate measured it and it FAILED: its staging branch goes, main never held a byte of it
+            discard_streamed(b["path"], out)
+            _keep(key, b, "failed its gate -- not published; its streamed shards were on a staging branch, now "
+                  "deleted (main never held them)", out)
+            return "kept: not verified"
         if streamed:
             b["streamed_unverified"] = sorted(e["path_in_repo"] for e in streamed.values())
-        _keep(c, lane, key, man, b, "not verified (measure / verify / gate failed or did not run) -- not published"
-              + (f"; its {len(streamed)} streamed shard(s) stay in the PRIVATE repo, which will not go public "
-                 "until they are verified or removed" if streamed else ""), out)
+        staged = bool(PS.staged_revisions(streamed))
+        _keep(key, b, "not verified (measure / verify / gate failed or did not run) -- not published"
+              + (f"; its {len(streamed)} streamed shard(s) stay on "
+                 + ("their staging branch (not main) until the rung is verified" if staged else
+                    "the PRIVATE repo, which will not go public until they are verified or removed")
+                 if streamed else ""), out)
         return "kept: not verified"
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
@@ -1555,8 +1562,11 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     else:
         dest = f"{lane_folder(lane)}/{rung_subfolder(b, lane)}"
         if not b.get("uploaded") and streamed:
-            # the shards are already there (streamed + confirmed one by one); the rest, then the index LAST -- a
-            # loader sees the rung only once every shard it maps is in place
+            # the shards are already there (streamed + confirmed one by one) -- on the rung's staging branch: copied
+            # onto main now that it is verified (server side, nothing re-sent), the branch deleted; then the rest,
+            # then the index LAST -- a loader sees the rung only once every shard it maps is in place
+            if PS.staged_revisions(streamed):
+                PS.promote_staging(PS._hf_api(), streamed, log=out)
             api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo,
                               ignore_patterns=["model.safetensors.index.json", PS.STREAMED, "*.tmp"])
             if os.path.isfile(os.path.join(b["path"], "model.safetensors.index.json")):
@@ -1570,18 +1580,58 @@ def publish_rung(step, c, cfg, run_upload, out=print):
               for e in streamed.values()]
     bad = remote_mismatches(api, repo, pairs)
     if bad:
-        _keep(c, lane, key, man, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
+        _keep(key, b, "upload not confirmed: " + "; ".join(bad[:5]), out)
         raise RuntimeError(f"{dest} is not intact in {repo} after the upload ({bad[0]}) -- keeping the local copy")
     b["uploaded"] = repo
     b.pop("kept", None)
     if streamed:
         b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
-    ws._write_manifest(key, man)
+    fields = ("uploaded", "uploaded_as", "runtime", "bytes")
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
+    if not ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",)):
+        # the upload is confirmed but the MANIFEST no longer has this build to say so: freeing the file now would
+        # leave nothing on this machine recording where the rung went -- keep it
+        out(f"      KEPT {b.get('path')} -- uploaded, but its MANIFEST entry is gone, so the upload is not recorded")
+        return "kept: upload not recorded"
     if _free_local(c, b, out):
         b["freed"] = "uploaded + confirmed on the Hub"
-        ws._write_manifest(key, man)
+        ws.update_build(key, b["path"], {"freed": b["freed"]})
     return "done"
+
+
+def discard_streamed(path, out=print):
+    """A streamed rung that will never ship (its build or its gate failed): every staging branch its shards sit on is
+    deleted and the registry with it -- main never held them. Shards streamed onto main by an older Pollard (no
+    branch) are left alone: they keep the repo private (go_public) until someone removes them."""
+    import pollard_stream as PS
+    streamed = PS.read_streamed(path) if os.path.isdir(str(path)) else {}
+    revs = PS.staged_revisions(streamed)
+    if not revs:
+        return False
+    api = PS._hf_api()
+    for repo, rev in revs:
+        PS.discard_staging(api, repo, rev, log=lambda m: out("   " + m.strip()))
+    if all(e.get("revision") for e in streamed.values()):
+        try:
+            os.remove(os.path.join(path, PS.STREAMED))
+        except OSError:
+            pass
+    return True
+
+
+def drop_failed_stream(st, statuses, out=print):
+    """The publish step of a rung that will not ship: when its BUILD failed or its gate FAILED (not merely held or not
+    run -- that rung is resumable), the staging branch its streamed shards sit on is deleted. Never raises."""
+    if not st.out or st.lane == "gguf":
+        return False
+    import pollard_workspace as ws
+    try:
+        b = ws.find_build(st.out)[1] or {}
+        if str(statuses.get(f"{st.lane}/{st.rung}/build", "")) == "failed" or b.get("verified") is False:
+            return discard_streamed(st.out, out)
+    except Exception as e:                                       # noqa: BLE001
+        out(f"      could not delete the staging branch of {st.out}: {e} -- delete it on the Hub by hand")
+    return False
 
 
 def _free_vram_mib():
@@ -2027,19 +2077,33 @@ def run_cmd(cmd, ok_codes=(0,), env=None):
         raise RuntimeError(f"exit {r.returncode}")
 
 
-def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=False, have=None, out=print):
+class _ExecutionState:
+    def __init__(self):
+        self.failed_rungs, self.failed_lanes, self.unbuildable = set(), set(), set()
+        self.held_mem = set()
+        self.streamed = set()
+
+
+def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=False, have=None, out=print,
+            execution=None):
     """Print (dry-run) or run the plan, serially. Returns {step id: status}."""
     have = have or machine()
     state = load_state(c["state"])
-    statuses, failed_rungs, failed_lanes, unbuildable = {}, set(), set(), set()
-    held_mem = set()                                 # (lane, rung) held for RAM: kept on disk for a re-run
+    execution = execution or _ExecutionState()
+    statuses = {}
+    failed_rungs, failed_lanes, unbuildable = execution.failed_rungs, execution.failed_lanes, execution.unbuildable
+    held_mem = execution.held_mem                    # (lane, rung) held for RAM: kept on disk for a re-run
     kept = []                                        # (lane, rung, path) left on disk unpublished -- reported at the end
-    streamed = set()                                 # (lane, rung) built in streaming mode (shards already on the Hub)
+    streamed = execution.streamed                   # (lane, rung) built in streaming mode (shards already on the Hub)
     queue, n = list(steps), 0
     while queue:
         st = queue.pop(0)
         n += 1
         head = f"{n:3d}. [{st.lane}{'/' + st.rung if st.rung else ''}] {st.kind}"
+        if st.kind == "expand" and st.lane in failed_lanes:
+            out(f"{head}: SKIP (an earlier step of this lane failed)")
+            statuses[st.id] = "skipped: upstream failed"
+            continue
         if st.kind == "expand" and st.lane == "draft":
             import pollard_draft as D
             builds = D.draft_builds(c["src"])
@@ -2111,6 +2175,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             out(f"{head}: KEPT locally, not published (an earlier step of this rung failed) -- {st.out}")
             statuses[st.id] = "kept: upstream failed"
             kept.append((st.lane, st.rung, st.out))
+            if run:
+                drop_failed_stream(st, statuses, out)
             continue
         if st.lane in failed_lanes or (st.lane, st.rung) in failed_rungs:
             out(f"{head}: SKIP (an earlier step of this {'rung' if st.rung else 'lane'} failed) -- {what}")
@@ -2124,11 +2190,14 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
             if free < need + margin and st.stream_to and run_upload and free >= STREAM_SHARD_GB + margin:
                 import pollard_stream as PS
                 repo, sub = st.stream_to
+                # always onto the rung's own staging branch, never main: the repo may already be public (an earlier
+                # lane went out), and an unverified shard must not be on the branch people download
+                rev = PS.staging_branch(sub)
                 stream_env = dict(os.environ, **{PS.SHARD_UPLOAD_ENV: json.dumps(
-                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub})})
+                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub, "revision": rev})})
                 streamed.add((st.lane, st.rung))
                 out(f"{head}: ~{need:.1f} GB > {free:.1f} GB free -- STREAMING: each shard written -> uploaded to "
-                    f"{repo}/{sub}/ -> confirmed -> freed before the next (the repo stays private)")
+                    f"{repo}@{rev}/{sub}/ -> confirmed -> freed before the next (main gets it only once verified)")
             elif free < need + margin:
                 msg = f"held: disk (needs ~{need:.1f} GB + {margin:g} margin, {free:.1f} GB free)"
                 out(f"{head}: {msg} -- {what}")
@@ -2342,17 +2411,21 @@ class Admission:
 def rung_chains(steps):
     """[(lane, rung, [steps])] in plan order: a GGUF rung = its build + its expand; a directory-lane rung = build,
     complete gate, tool calls, verify, publish. Lane-level steps (card / upload / public) are not part of a chain."""
-    chains, idx = [], {}
+    chains, idx, last = [], {}, {}
     for st in steps:
         if st.kind in ("card", "upload", "finalize", "note", "hold") and not st.rung:
             continue
         # a lane-level build (the EXLR8 encode, the drafter's find / train / convert / expand) is its lane's own chain,
         # in plan order -- so it runs before that lane's rungs in the same slot
         key = (st.lane, st.rung or (st.id.split("rungs-", 1)[1] if "rungs-" in st.id else "_lane"))
+        if st.kind == "gate" and not st.rung and st.lane in (st.blocks or []):
+            # A whole-lane completion gate follows the build that produced its sidecars, before that rung expands.
+            key = last.get(st.lane, key)
         if key not in idx:
             idx[key] = len(chains)
             chains.append((key[0], key[1], []))
         chains[idx[key]][2].append(st)
+        last[st.lane] = key
     return chains
 
 
@@ -2365,7 +2438,8 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
     not fit. The lane cards / uploads and the public flip run last, serially. Per-slot timeline -> timeline."""
     import queue
     have = have or machine()
-    runner = runner or (lambda ss: execute(ss, c, cfg, True, run_upload, redo, False, have, out))
+    execution = _ExecutionState()
+    runner = runner or (lambda ss: execute(ss, c, cfg, True, run_upload, redo, False, have, out, execution))
     admission = admission or Admission(cfg, c, out=out)
     tl_path = timeline or os.path.join(c["mdir"], "release-timeline.log")
     os.makedirs(os.path.dirname(tl_path), exist_ok=True)
@@ -2402,8 +2476,21 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
             statuses.update(got)
         return got
 
+    pending = set()                                   # gate Events a slot is waiting on (under tl_lock)
+    measure_down = _threading.Event()                 # set when the measure worker exits, for any reason
+    measure_crash = []
+
+    def skip_unmeasured(ss, why):
+        with tl_lock:
+            statuses.update({s.id: why for s in ss if s.id not in statuses})
+
     def slot_worker(slot):
-        for lane, rung, ss in slots[slot]:
+        for i, (lane, rung, ss) in enumerate(slots[slot]):
+            if measure_down.is_set():
+                # nothing queued from here on would ever be measured: say so instead of building rungs nobody gates
+                for _, _, left in slots[slot][i:]:
+                    skip_unmeasured(left, "skipped: the measure worker stopped")
+                break
             builds = [s for s in ss if s.kind == "build"]
             rest = [s for s in ss if s.kind != "build"]
             ok = True
@@ -2414,21 +2501,62 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
                 with tl_lock:
                     statuses.update({s.id: "skipped: upstream failed" for s in rest if s.kind != "publish"})
                     statuses.update({s.id: "kept: upstream failed" for s in rest if s.kind == "publish"})
+                for s in rest:
+                    if s.kind == "publish":
+                        drop_failed_stream(s, statuses, out)
                 continue
             if rest:
-                mq.put((lane, rung, rest))
+                checked = _threading.Event() if any(s.kind == "gate" and lane in (s.blocks or []) for s in rest) else None
+                if checked:
+                    with tl_lock:
+                        pending.add(checked)
+                mq.put((lane, rung, rest, checked))
+                if measure_down.is_set():                  # put after the worker drained the queue: never measured
+                    skip_unmeasured(rest, "skipped: the measure worker stopped")
+                if checked:
+                    # Later builds in this lane depend on its complete-model gate. Other slots can carry on. A measure
+                    # worker that died never sets it: notice that rather than wait forever.
+                    while not checked.wait(1.0) and not measure_down.is_set():
+                        pass
+                    with tl_lock:
+                        pending.discard(checked)
         mq.put(None)
 
     def measure_worker(n_feeders):
         done_feeders = 0
-        while done_feeders < n_feeders:
-            item = mq.get()
-            if item is None:
-                done_feeders += 1
-                continue
-            lane, rung, rest = item
-            peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
-            run_job("measure", f"{lane}/{rung}", rest, peak)
+        try:
+            while done_feeders < n_feeders:
+                item = mq.get()
+                if item is None:
+                    done_feeders += 1
+                    continue
+                lane, rung, rest, checked = item
+                try:
+                    peak = max((job_peak(s, c, cfg) for s in rest), key=lambda p: p[0] + p[1]) if rest else (1, 0, 0)
+                    run_job("measure", f"{lane}/{rung}", rest, peak)
+                except BaseException:
+                    skip_unmeasured(rest, "failed: the measure worker stopped")
+                    raise
+                finally:
+                    if checked:
+                        checked.set()
+        except BaseException as e:                     # noqa: BLE001 -- reported after the join, never swallowed
+            measure_crash.append(e)
+        finally:
+            # every slot waiting on a gate wakes up; whatever is still queued will not be measured
+            measure_down.set()
+            with tl_lock:
+                for ev in list(pending):
+                    ev.set()
+            while True:
+                try:
+                    item = mq.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    skip_unmeasured(item[2], "skipped: the measure worker stopped")
+                    if item[3]:
+                        item[3].set()
 
     feeders = [_threading.Thread(target=slot_worker, args=(k,), name=f"slot-{k}", daemon=True) for k in slots]
     meas = _threading.Thread(target=measure_worker, args=(len(feeders),), name="measure", daemon=True)
@@ -2436,6 +2564,10 @@ def execute_parallel(steps, c, cfg, run_upload=False, redo=(), have=None, out=pr
         t.start()
     for t in feeders + [meas]:
         t.join()
+    if measure_crash:
+        # no card, upload or public flip on top of rungs that were never gated
+        skip_unmeasured(final, "skipped: the measure worker stopped")
+        raise RuntimeError(f"the measure worker stopped: {measure_crash[0]!r}") from measure_crash[0]
     statuses.update(runner(final))
     return statuses
 

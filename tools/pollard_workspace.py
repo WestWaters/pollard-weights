@@ -21,7 +21,8 @@ Tools call `resolve_out(model, lane, tag, explicit)` -- if the user passed --out
 the build lands in the workspace automatically. After a build, call `record_build(...)` to log it to the
 model's MANIFEST so `pollard-ls` can show what exists and whether it verified.
 """
-import json, os, sys, time
+import json, os, sys, time, tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 # Windows consoles default to cp1252 and CRASH (UnicodeEncodeError) on the progress bars / emoji that
@@ -162,80 +163,127 @@ def read_manifest(model: str) -> dict:
     p = _manifest_path(model)
     if os.path.exists(p):
         try:
-            return json.load(open(p))
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
     return {"model": model, "builds": []}
 
 
+@contextmanager
+def manifest_transaction(model: str):
+    """Lock the model's read/modify/replace transaction across tool processes.
+
+    Lock a stable sidecar, not MANIFEST.json itself: replacing the JSON changes its inode. Keep the
+    sidecar after unlocking so a waiting writer and a new writer always lock the same file.
+    """
+    model_dir(model, create=True)
+    with open(_manifest_path(model) + ".lock", "a+b") as lock:
+        if os.name == "nt":
+            import errno
+            import msvcrt
+            if lock.tell() == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            man = read_manifest(model)
+            yield man
+            _write_manifest(model, man)
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def record_build(model: str, lane: str, path: str, tag: str = "", bpw=None, ppl=None,
                  verified=None, extra: dict | None = None):
     """Append/replace a build entry in the model's MANIFEST.json."""
-    man = read_manifest(model)
-    man["model"] = model
     size = _dir_size(path)
     entry = {"name": os.path.basename(path.rstrip("/\\")), "lane": lane, "tag": str(tag),
              "path": os.path.abspath(path), "bpw": bpw, "ppl": ppl, "verified": verified,
              "bytes": size, "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     entry.update(extra or {})
-    man["builds"] = [b for b in man.get("builds", []) if b.get("path") != entry["path"]]
-    man["builds"].append(entry)
-    md = model_dir(model, create=True)
-    tmp = _manifest_path(model) + ".tmp"
-    json.dump(man, open(tmp, "w"), indent=2)
-    os.replace(tmp, _manifest_path(model))
+    with manifest_transaction(model) as man:
+        man["model"] = model
+        man["builds"] = [b for b in man.get("builds", []) if b.get("path") != entry["path"]]
+        man["builds"].append(entry)
     return entry
 
 
 def _write_manifest(model: str, man: dict):
-    model_dir(model, create=True)
-    tmp = _manifest_path(model) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(man, f, indent=2)
-    os.replace(tmp, _manifest_path(model))
+    """Replace a manifest while the caller holds manifest_transaction's lock."""
+    write_json_atomic(_manifest_path(model), man)
+
+
+def update_build(model: str, build_path: str, patch: dict, remove=()) -> bool:
+    """Apply just this writer's fields (and drop `remove`) on EVERY build entry recorded for `build_path`, under the
+    manifest lock, preserving the fields other writers own. True when at least one entry matched; False -- and the
+    MANIFEST unchanged -- when none did."""
+    build_path = os.path.abspath(build_path.rstrip("/\\"))
+    found = False
+    with manifest_transaction(model) as man:
+        for b in man.get("builds", []):
+            if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
+                b.update(patch)
+                for key in remove:
+                    b.pop(key, None)
+                found = True
+    return found
 
 
 def record_calibration(model: str, corpus: str, sources: dict):
     """Log a calibration corpus and EXACTLY what it was built from (dataset ids, revisions, licences,
     profile, self-generation) in the model's MANIFEST -- a build should be able to say what it saw."""
-    man = read_manifest(model)
-    man["model"] = model
     entry = {"path": os.path.abspath(corpus), **{k: v for k, v in sources.items() if k != "path"},
              "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    man["calibration"] = [c for c in man.get("calibration", []) if c.get("path") != entry["path"]] + [entry]
-    _write_manifest(model, man)
+    with manifest_transaction(model) as man:
+        man["model"] = model
+        man["calibration"] = [c for c in man.get("calibration", []) if c.get("path") != entry["path"]] + [entry]
     return entry
 
 
-def find_build(build_path: str):
-    """(model key, build entry) for a build path recorded in any MANIFEST, or (None, None)."""
+def _find_build(build_path: str):
     build_path = os.path.abspath(build_path.rstrip("/\\"))
     for slug in list_models():
         mpath = os.path.join(pollard_home(), "models", slug, "MANIFEST.json")
         try:
-            man = json.load(open(mpath))
+            with open(mpath, encoding="utf-8") as f:
+                man = json.load(f)
         except Exception:
             continue
         for b in man.get("builds", []):
             if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
-                return man.get("model") or slug, b
-    return None, None
+                return man.get("model") or slug, b, slug
+    return None, None, None
+
+
+def find_build(build_path: str):
+    """(model key, build entry) for a build path recorded in any MANIFEST, or (None, None)."""
+    return _find_build(build_path)[:2]
 
 
 def record_gate(build_path: str, gate: dict) -> bool:
     """Stamp a pollard-verify --gate verdict (pass/fail + every check) onto a build in its MANIFEST.
     `verified` follows the gate, so pollard-ls, pollard-release's resume and the card all agree."""
     build_path = os.path.abspath(build_path.rstrip("/\\"))
-    model, entry = find_build(build_path)
-    if not model:
+    model, entry, slug = _find_build(build_path)
+    if not slug:
         return False
-    man = read_manifest(model)
-    for b in man.get("builds", []):
-        if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
-            b["verified"] = bool(gate.get("pass"))
-            b["gate"] = gate
-    _write_manifest(model, man)
-    return True
+    return update_build(slug, build_path, {"verified": bool(gate.get("pass")), "gate": gate})
 
 
 def calib_samples(path: str) -> list:
@@ -264,18 +312,32 @@ def calib_samples(path: str) -> list:
         return [ln.strip() for ln in f if ln.strip()]
 
 
+def _process_umask() -> int:
+    """This process's umask, read once at import (os.umask can only be read by setting it, which is not safe to do
+    while other threads create files)."""
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+_UMASK = _process_umask()
+
+
 def write_json_atomic(path: str, obj, indent=2) -> None:
-    """Write `obj` as JSON to `path` through `path`.tmp + fsync + rename: a full disk (ENOSPC) or a crash mid-write
+    """Write `obj` as JSON to `path` through a unique temp file + fsync + rename: a full disk (ENOSPC) or a crash mid-write
     leaves the previous file exactly as it was, and the half-written temp file is removed. Raises OSError (same errno)
     naming the file."""
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=indent)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp creates the temp file 0600; the file it becomes is an ordinary one (0644 under the usual umask),
+        # as readable as a plain open() would have made it
+        os.chmod(tmp, 0o666 & ~_UMASK)
         os.replace(tmp, path)
     except BaseException as e:
         try:
@@ -310,29 +372,13 @@ def merge_results(path: str, rung: str, patch: dict, meta: dict | None = None) -
 def mark_verified(build_path: str, ok: bool, ppl=None):
     """Find the build with this path in any model's MANIFEST and stamp its verified flag (+ ppl).
     No-op if the build isn't in the workspace (e.g. user built to an explicit --out elsewhere)."""
-    build_path = os.path.abspath(build_path.rstrip("/\\"))
-    root = os.path.join(pollard_home(), "models")
-    if not os.path.isdir(root):
+    model, entry, slug = _find_build(build_path)
+    if not slug:
         return False
-    for slug in os.listdir(root):
-        mpath = os.path.join(root, slug, "MANIFEST.json")
-        if not os.path.exists(mpath):
-            continue
-        try:
-            man = json.load(open(mpath))
-        except Exception:
-            continue
-        changed = False
-        for b in man.get("builds", []):
-            if os.path.abspath(str(b.get("path", "")).rstrip("/\\")) == build_path:
-                b["verified"] = bool(ok)
-                if ppl is not None:
-                    b["ppl"] = ppl
-                changed = True
-        if changed:
-            tmp = mpath + ".tmp"; json.dump(man, open(tmp, "w"), indent=2); os.replace(tmp, mpath)
-            return True
-    return False
+    patch = {"verified": bool(ok)}
+    if ppl is not None:
+        patch["ppl"] = ppl
+    return update_build(slug, build_path, patch)
 
 
 def _dir_size(path: str) -> int:

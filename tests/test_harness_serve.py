@@ -279,3 +279,113 @@ def test_write_refuses_formats_it_does_not_merge(tmp_path):
         with pytest.raises(ValueError):
             H.write_config(name, _c(), home=str(tmp_path))
     assert not any(tmp_path.iterdir())
+
+
+# -- published split GGUFs ---------------------------------------------------------------------------
+
+def _mock_hub_serve(tmp_path, monkeypatch, files):
+    """Run the real serve CLI with a fake Hub and llama-server, never network or GPU."""
+    import fnmatch
+    from types import SimpleNamespace
+
+    snapshot = tmp_path / "hub" / "snapshots" / "revision"
+    calls = []
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "pollard"))
+    monkeypatch.setattr(H, "_manifest_builds", lambda model: [])
+    monkeypatch.setattr(H, "hf_gguf_files", lambda repo, fetch=None: files)
+    monkeypatch.setattr(H, "is_decision", lambda *args: False)
+    monkeypatch.setattr(H, "gguf_facts", lambda src: ("stock", "qwen3", None, False))
+    monkeypatch.setattr(H, "choose_runtime", lambda *args: ("llama.cpp", "llama-server", None))
+    monkeypatch.setitem(sys.modules, "pollard_bench", SimpleNamespace(_server_supports=lambda *args: True))
+
+    def download(repo, name):
+        calls.append(("download", repo, name))
+        path = snapshot / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"GGUF")
+        return str(path)
+
+    def download_snapshot(repo, *, allow_patterns):
+        selected = [f for f in files if any(fnmatch.fnmatchcase(f, p) for p in allow_patterns)]
+        calls.append(("snapshot", repo, selected))
+        for name in selected:
+            path = snapshot / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"GGUF")
+        return str(snapshot)
+
+    def start(argv, **kwargs):
+        calls.append(("start", argv))
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        hf_hub_download=download, snapshot_download=download_snapshot))
+    monkeypatch.setattr(H.subprocess, "Popen", start)
+    monkeypatch.setattr(H, "_wait_healthy", lambda *args: True)
+    return snapshot, calls
+
+
+@pytest.mark.parametrize("model", ["M", "M[1]"])
+def test_serve_downloads_complete_selected_split_rung_before_launch(tmp_path, monkeypatch, model):
+    shards = [f"weights/{model}-Q4_K_M-{i:05}-of-00003.gguf" for i in range(1, 4)]
+    other = [f"weights/{model}-Q6_K-00001-of-00002.gguf", f"weights/mmproj-{model}-Q4_K_M.gguf",
+             f"weights/{model}-extra-Q4_K_M-00001-of-00002.gguf", f"z/{model}-Q4_K_M-00002-of-00003.gguf",
+             f"weights/{model}-Q4_K_M-00002-of-00004.gguf", "README.md"]
+    snapshot, calls = _mock_hub_serve(tmp_path, monkeypatch, list(reversed(shards)) + other)
+    assert H.main(["Org/M:Q4_K_M", "--harness", "omp"]) == 0
+    assert calls[0] == ("snapshot", "Org/M", list(reversed(shards)))
+    assert calls[1][0] == "start" and len(calls) == 2
+    argv = calls[1][1]
+    assert argv[argv.index("-m") + 1] == str(snapshot / shards[0])
+    assert all((snapshot / name).is_file() for name in shards)
+    assert all(not (snapshot / name).exists() for name in other)
+
+
+def test_serve_single_gguf_keeps_single_file_download(tmp_path, monkeypatch):
+    name = "M-Q4_K_M.gguf"
+    snapshot, calls = _mock_hub_serve(tmp_path, monkeypatch, [name, "M-Q6_K.gguf", "mmproj-M-Q4_K_M.gguf"])
+    assert H.main(["Org/M:Q4_K_M"]) == 0
+    assert calls[0] == ("download", "Org/M", name)
+    argv = calls[1][1]
+    assert argv[argv.index("-m") + 1] == str(snapshot / name)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("files", [
+    ["weights/M-Q4_K_M-00002-of-00002.gguf"],
+    ["weights/M-Q4_K_M-00001-of-00003.gguf", "weights/M-Q4_K_M-00003-of-00003.gguf"],
+    ["weights/M-Q4_K_M-00001-of-00002.gguf", "z/M-Q4_K_M-00002-of-00002.gguf"],
+    ["weights/M-Q4_K_M-00001-of-00002.gguf", "weights/M-Q4_K_M-00002-of-00003.gguf"],
+    ["weights/M-Q4_K_M-00000-of-00000.gguf"],
+])
+def test_serve_rejects_incomplete_split_before_download_or_launch(tmp_path, monkeypatch, files):
+    _, calls = _mock_hub_serve(tmp_path, monkeypatch, files)
+    with pytest.raises(SystemExit, match="incomplete split GGUF"):
+        H.main(["Org/M:Q4_K_M"])
+    assert calls == []
+
+
+def test_serve_rejects_incomplete_download_before_launch(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    files = [f"M-Q4_K_M-{i:05}-of-00002.gguf" for i in range(1, 3)]
+    snapshot, calls = _mock_hub_serve(tmp_path, monkeypatch, files)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        snapshot_download=lambda *args, **kwargs: str(snapshot)))
+    with pytest.raises(SystemExit, match="incomplete split GGUF download.*00001.*00002"):
+        H.main(["Org/M:Q4_K_M"])
+    assert calls == []
+
+
+def test_serve_rejects_unbounded_shard_count_before_allocation(tmp_path, monkeypatch):
+    files = ["M-Q4_K_M-00001-of-999999999999999.gguf"]
+    _, calls = _mock_hub_serve(tmp_path, monkeypatch, files)
+
+    def no_range(*args):
+        raise AssertionError("invalid shard count reached sibling allocation")
+
+    # Fail promptly if a regression tries to allocate the untrusted count.
+    monkeypatch.setattr(H, "range", no_range, raising=False)
+    with pytest.raises(SystemExit, match="incomplete split GGUF"):
+        H.main(["Org/M:Q4_K_M"])
+    assert calls == []

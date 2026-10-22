@@ -36,14 +36,17 @@ def _lfs_sha(f):
     return lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
 
 
-def mismatches(api, repo, pairs):
+def mismatches(api, repo, pairs, revision=None):
     """[why] for every (path in repo, local file | {"size", "sha256"}) the Hub does NOT hold intact; [] = all there.
     A recorded entry (a streamed shard whose local copy is already gone) is checked against its recorded size and
-    sha256, which were computed from the bytes before they were uploaded."""
+    sha256, which were computed from the bytes before they were uploaded. `revision`: a branch (a streamed rung's
+    staging branch) instead of the default one."""
     if not pairs:
         return ["nothing to check"]
     try:
-        info = {f.path: f for f in api.get_paths_info(repo, [p for p, _ in pairs])}
+        paths = [p for p, _ in pairs]
+        got = api.get_paths_info(repo, paths, revision=revision) if revision else api.get_paths_info(repo, paths)
+        info = {f.path: f for f in got}
     except Exception as e:                                       # noqa: BLE001
         return [f"could not read the file list of {repo} back ({type(e).__name__}: {e})"]
     bad = []

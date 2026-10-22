@@ -15,24 +15,13 @@ echo "== Pollard Weights install =="
 python3 -m pip install --user "$HERE" 2>/dev/null || python3 -m pip install --break-system-packages --user "$HERE"
 echo "tools installed: pollard-calc, pollard-fit"
 
-# 2. the runtime (llama.cpp — Pollard builds are normal GGUFs; this is the engine)
-if command -v llama-quantize >/dev/null 2>&1; then
-  echo "runtime found: $(command -v llama-quantize) (using existing llama.cpp)"
-else
-  mkdir -p "$HERE/runtime"
-  if [ ! -d "$LLAMA_DIR" ]; then
-    git clone --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
-  fi
-  # -DGGML_RPC=ON builds the RPC backend + ggml-rpc-server so one Pollard build can
-  # span several machines (pipeline-parallel: each holds some layers, pooling
-  # their RAM). This is how a GGUF too big for one box runs across many — the
-  # llama.cpp answer to vLLM's clustering, no vLLM required.
-  #
-  # Each machine builds for ITS OWN accelerator; RPC then joins a MIXED cluster
-  # (Apple Metal + NVIDIA CUDA + AMD ROCm + Intel SYCL + CPU boxes together).
-  # Honor an explicit override, else auto-detect this machine's backend. Vulkan
-  # is the cross-vendor catch-all — it runs on AMD/Intel/NVIDIA off the graphics
-  # driver alone, no compute toolkit — so any GPU has a path.
+# Each machine builds for ITS OWN accelerator; RPC then joins a MIXED cluster
+# (Apple Metal + NVIDIA CUDA + AMD ROCm + Intel SYCL + CPU boxes together).
+# Honor an explicit override, else auto-detect this machine's backend. Vulkan
+# is the cross-vendor catch-all — it runs on AMD/Intel/NVIDIA off the graphics
+# driver alone, no compute toolkit — so any GPU has a path.
+GPU_FLAGS=""
+configure_gpu() {
   GPU_FLAGS=""
   if [ -n "${POLLARD_GPU:-}" ]; then
     GPU_FLAGS="$POLLARD_GPU"                    # override, e.g. POLLARD_GPU=-DGGML_VULKAN=ON
@@ -51,6 +40,22 @@ else
     echo "      toolkit (CUDA / ROCm / oneAPI) or Vulkan drivers and re-run, or force it:"
     echo "      POLLARD_GPU=-DGGML_VULKAN=ON ./install.sh"
   fi
+}
+
+# 2. the runtime (llama.cpp — Pollard builds are normal GGUFs; this is the engine)
+if command -v llama-quantize >/dev/null 2>&1; then
+  echo "runtime found: $(command -v llama-quantize) (using existing llama.cpp)"
+else
+  mkdir -p "$HERE/runtime"
+  if [ ! -d "$LLAMA_DIR" ]; then
+    git clone --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
+  fi
+  # -DGGML_RPC=ON builds the RPC backend + ggml-rpc-server so one Pollard build can
+  # span several machines (pipeline-parallel: each holds some layers, pooling
+  # their RAM). This is how a GGUF too big for one box runs across many — the
+  # llama.cpp answer to vLLM's clustering, no vLLM required.
+  #
+  configure_gpu
   cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release \
     -DGGML_RPC=ON $GPU_FLAGS
   # NOTE: the RPC server target is `ggml-rpc-server` in current llama.cpp
@@ -72,13 +77,14 @@ fi
 #    everywhere; the flagship's IQ1_KT/IQ2_KT quants only build + run with ik_llama.cpp.
 #    Skip with POLLARD_NO_IK=1 (K-quant-only install).
 IK_DIR="${IK_DIR:-$HERE/runtime/ik_llama.cpp}"
-if [ -n "$POLLARD_NO_IK" ]; then
+if [ -n "${POLLARD_NO_IK:-}" ]; then
   echo "ik_llama.cpp: skipped (POLLARD_NO_IK set) — flagship IQ*_KT builds unavailable, K-quants OK"
 elif [ -x "$IK_DIR/build/bin/llama-quantize" ]; then
   echo "ik_llama.cpp: found at $IK_DIR/build/bin (trellis engine ready)"
 else
   echo "building ik_llama.cpp (trellis engine for the flagship)…"
   [ -d "$IK_DIR" ] || git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp "$IK_DIR"
+  configure_gpu
   cmake -S "$IK_DIR" -B "$IK_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON $GPU_FLAGS
   cmake --build "$IK_DIR/build" -j \
     --target llama-quantize llama-cli llama-imatrix llama-perplexity

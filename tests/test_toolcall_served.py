@@ -287,3 +287,193 @@ def test_a_call_the_server_parser_dropped_is_unparsed_not_prose():
     row = TC.grade_reply(reply(content="", finish="tool_calls"), PROBE["s01"])
     assert row["failure"] == "unparsed"
     assert TC.grade_reply(reply(content="", finish="stop"), PROBE["s01"])["failure"] == "no-call"
+
+
+@pytest.mark.parametrize("candidate,reference", [
+    ("error", "error"), ("error", "zero"), ("good", "error"),
+    ("partial", "good"), ("good", "partial"), ("partial", None),
+])
+def test_server_errors_fail_the_gate_without_recording_a_measurement(
+        monkeypatch, tmp_path, capsys, candidate, reference):
+    """Exercise the actual CLI, URL transport, grading and persisted gate result."""
+    import io
+    import urllib.error
+    import pollard_verify as verify
+
+    counts = Counter()
+
+    def urlopen(req, **kwargs):
+        side = "reference" if req.full_url.startswith("http://reference/") else "candidate"
+        counts[side] += 1
+        behavior = reference if side == "reference" else candidate
+        # "partial": every probe but the last gets no reply -- a majority outage, still not a measurement
+        if behavior == "error" or (behavior == "partial" and counts[side] < len(TC._balanced(1))):
+            raise urllib.error.URLError("server unavailable")
+        if behavior == "zero":
+            out = reply([("unknown_tool", {})])
+        else:
+            body = json.loads(req.data)
+            p = next(p for p in TC.SUITE if p["prompt"] == body["messages"][-1]["content"])
+            out = reply(content="Sure.") if p["expect"] is None else reply([
+                (p["expect"]["name"], {k: _concrete(v) for k, v in p["expect"]["args"].items()})])
+        return io.BytesIO(json.dumps(out).encode())
+
+    monkeypatch.setattr(TC.urllib.request, "urlopen", urlopen)
+    res, out = tmp_path / "results.json", tmp_path / "rows.json"
+    # A failed rerun must also clear a previous passing measurement's numbers.
+    res.write_text(json.dumps({"served": {"toolcall": {
+        "pass": True, "status": "measured", "retention": 100, "rate": 1, "ref_rate": 1}}}))
+    args = ["--backend", "url", "--url", "http://candidate", "--limit", "1",
+            "--results", str(res), "--out", str(out)]
+    if reference is not None:
+        args += ["--ref-backend", "url", "--ref-url", "http://reference"]
+    with pytest.raises(SystemExit) as exc:
+        TC.main(args)
+    assert exc.value.code == 1
+    assert "\nPASS\n" not in capsys.readouterr().out
+    results = json.loads(res.read_text())
+    tc = results["served"]["toolcall"]
+    assert tc["pass"] is False and tc["status"] == "error"
+    assert "server-error" in tc["reason"]
+    assert tc.get("rate") is tc.get("ref_rate") is tc.get("retention") is None
+    metrics = verify.metrics_from_results(results, "served")
+    assert not verify.evaluate_gate(metrics, {"toolcall_pass": True})["pass"]
+    assert not verify.evaluate_gate(metrics, {"toolcall_retention_min": 90})["pass"]
+    assert any(r["failure"] == "server-error" for r in json.loads(out.read_text())["rows"] +
+               (json.loads(out.read_text())["ref_rows"] or []))
+
+
+def test_real_zero_capability_completions_still_pass_with_a_reference(monkeypatch, tmp_path):
+    import io
+    monkeypatch.setattr(TC.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(
+        json.dumps(reply([("unknown_tool", {})])).encode()))
+    res = tmp_path / "results.json"
+    with pytest.raises(SystemExit) as exc:
+        TC.main(["--backend", "url", "--url", "http://candidate", "--ref-backend", "url",
+                 "--ref-url", "http://reference", "--limit", "1", "--results", str(res)])
+    assert exc.value.code == 0
+    tc = json.loads(res.read_text())["served"]["toolcall"]
+    assert tc["pass"] is True and tc["status"] == "measured"
+    assert tc["rate"] == tc["ref_rate"] == 0
+
+
+@pytest.mark.parametrize("cached_error", [False, True])
+def test_reference_cache_recovers_after_server_errors(monkeypatch, tmp_path, cached_error):
+    cache = tmp_path / "reference.json"
+    monkeypatch.setattr(TC, "_ref_cache_path", lambda *a: str(cache))
+    error = TC.grade_reply({"error": "temporary outage"}, PROBE["s01"])
+    good = TC.grade_reply(reply([("get_weather", {"city": "Tokyo", "unit": "celsius"})]), PROBE["s01"])
+    runs = []
+    if cached_error:
+        cache.write_text(json.dumps({"rows": [error], "meta": {"backend": "gguf"}}))
+
+    def run(*args, **kwargs):
+        runs.append(1)
+        return ([good] if cached_error or len(runs) > 1 else [error]), {"backend": "gguf"}
+
+    monkeypatch.setattr(TC, "run_model", run)
+    first, _ = TC.run_ref_cached("reference.gguf", "0")
+    if cached_error:
+        assert first == [good] and len(runs) == 1
+    else:
+        assert first == [error] and not cache.exists()
+        assert TC.run_ref_cached("reference.gguf", "0")[0] == [good]
+    count = len(runs)
+    assert TC.run_ref_cached("reference.gguf", "0")[0] == [good]
+    assert len(runs) == count
+
+
+def _served(monkeypatch, fail, prose=()):
+    """A URL backend answering every probe correctly, except where fail(side, n) raises; a side in `prose` only
+    ever answers in prose (fails every call probe)."""
+    import io
+    seen = Counter()
+
+    def urlopen(req, **kwargs):
+        side = "reference" if req.full_url.startswith("http://reference/") else "candidate"
+        seen[side] += 1
+        fail(side, seen[side])
+        body = json.loads(req.data)
+        p = next(p for p in TC.SUITE if p["prompt"] == body["messages"][-1]["content"])
+        out = reply(content="Sure.") if p["expect"] is None or side in prose else reply([
+            (p["expect"]["name"], {k: _concrete(v) for k, v in p["expect"]["args"].items()})])
+        return io.BytesIO(json.dumps(out).encode())
+    monkeypatch.setattr(TC.urllib.request, "urlopen", urlopen)
+
+
+def _gate(tmp_path, *extra):
+    res = tmp_path / "results.json"
+    with pytest.raises(SystemExit) as exc:
+        TC.main(["--backend", "url", "--url", "http://candidate", "--ref-backend", "url",
+                 "--ref-url", "http://reference", "--results", str(res), *extra])
+    return exc.value.code, json.loads(res.read_text())["served"]["toolcall"]
+
+
+def _parse_500(url):
+    import io
+    import urllib.error
+    return urllib.error.HTTPError(url, 500, "Internal Server Error", {}, io.BytesIO(json.dumps(
+        {"error": {"code": 500, "message": "Failed to parse input at pos 12"}}).encode()))
+
+
+@pytest.mark.parametrize("side", ["candidate", "reference"])
+def test_one_parser_500_is_a_failed_probe_not_a_run_error(monkeypatch, tmp_path, side):
+    """llama-server answers an unparseable generation with HTTP 500 + body: the model failed that probe."""
+    def fail(s, n):
+        if s == side and n == 3:
+            raise _parse_500(f"http://{s}/v1/chat/completions")
+    _served(monkeypatch, fail)
+    code, tc = _gate(tmp_path)
+    assert code == 0 and tc["status"] == "measured" and tc["pass"] is True
+    assert tc["retention"] == pytest.approx(100 * 59 / 60 if side == "candidate" else 100 * 60 / 59, abs=0.01)
+    assert (tc["modes"] if side == "candidate" else {}).get("server-error", 0) == (side == "candidate")
+
+
+def test_parser_500s_on_every_probe_are_a_measured_fail(monkeypatch, tmp_path):
+    """A broken rung whose every generation fails the parser is a real 0% -- FAIL, not 'error'."""
+    def fail(s, n):
+        if s == "candidate":
+            raise _parse_500("http://candidate/v1/chat/completions")
+    _served(monkeypatch, fail)
+    code, tc = _gate(tmp_path, "--limit", "1")
+    assert code == 1 and tc["status"] == "measured" and tc["pass"] is False and tc["rate"] == 0
+
+
+def test_a_reference_that_only_errors_never_passes_the_rung_vacuously(monkeypatch, tmp_path):
+    """Every reference probe an HTTP error: no evidence there is nothing to retain -- the rung's own rate decides."""
+    def fail(s, n):
+        if s == "reference":
+            raise _parse_500("http://reference/v1/chat/completions")
+    _served(monkeypatch, fail)
+    code, tc = _gate(tmp_path, "--limit", "1")
+    assert code == 0 and tc["pass"] is True and tc["rate"] == 1      # the rung itself calls tools fine
+    _served(monkeypatch, fail, prose=("candidate",))
+    code, tc = _gate(tmp_path, "--limit", "1")
+    assert code == 1 and tc["pass"] is False                          # and a rung that cannot is failed
+
+
+@pytest.mark.parametrize("share,status", [(0.5, "measured"), (0.0, "error")])
+def test_a_minority_of_transport_failures_stays_in_the_score(monkeypatch, tmp_path, share, status):
+    import urllib.error
+
+    def fail(s, n):
+        if s == "candidate" and n == 2:
+            raise urllib.error.URLError("timed out")
+    _served(monkeypatch, fail)
+    code, tc = _gate(tmp_path, "--max-transport-share", str(share))
+    assert tc["status"] == status
+    if status == "measured":
+        assert code == 0 and tc["retention"] == pytest.approx(100 * 59 / 60, abs=0.01)
+    else:
+        assert code == 1 and tc["pass"] is False and "1/60 probes got no reply" in tc["reason"]
+
+
+def test_reference_cache_keeps_a_parser_500_but_not_an_outage(monkeypatch, tmp_path):
+    cache = tmp_path / "reference.json"
+    monkeypatch.setattr(TC, "_ref_cache_path", lambda *a: str(cache))
+    parse = TC.grade_reply({"error": {"code": 500, "message": "Failed to parse input"}, "http_status": 500},
+                           PROBE["s01"])
+    assert parse["failure"] == "server-error" and parse["transport"] is False
+    monkeypatch.setattr(TC, "run_model", lambda *a, **k: ([parse], {"backend": "gguf"}))
+    TC.run_ref_cached("reference.gguf", "0")
+    assert cache.exists()

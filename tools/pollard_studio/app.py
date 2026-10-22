@@ -46,12 +46,12 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 def load_manifest() -> list:
-    """Every tool and every flag, parsed out of the repo -- never hand-written.
+    """Every tool and every flag, parsed out of the tool sources -- never hand-written.
 
     Hand-writing a screen per tool does not survive 60 tools: the first flag anyone adds makes the
     UI a liar, and nothing fails when it happens.
     """
-    mf, tools = HERE / "manifest.py", runner.REPO / "tools"
+    mf, tools = HERE / "manifest.py", runner.tools_dir()
     if not (mf.exists() and tools.is_dir()):
         return []
     try:

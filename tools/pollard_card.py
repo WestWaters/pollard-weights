@@ -486,12 +486,14 @@ def tool_ready_cell(tc):
     """The Tool-ready cell from a pollard-toolcall result. The full gate (served by the lane's own server, 60 probes)
     reports retention vs the reference: 'yes (98% of f16; CI 90-104)', 'yes (97% of bf16)' for an MLX / vLLM rung
     against its bf16 original. Without a reference, or from the --quick check: 'yes (95%)' / 'no (60%)'. A rung this
-    machine could not serve: 'not measured (reason)'. '--' when nothing was recorded."""
+    machine could not serve: 'not measured (reason)'; a failed measurement: 'error (reason)'.
+    '--' when nothing was recorded."""
     if not isinstance(tc, dict):
         return "--"
-    if tc.get("status") == "not-measured":
+    if tc.get("status") in ("not-measured", "error"):
+        label = "error" if tc["status"] == "error" else "not measured"
         why = str(tc.get("reason") or "").strip().replace("|", "/")
-        return f"not measured ({why})" if why else "not measured"
+        return f"{label} ({why})" if why else label
     rate = tc.get("rate")
     ok = tc.get("pass")
     if ok is None and rate is not None:
@@ -516,18 +518,21 @@ def tool_ready_note(builds, results):
     seen = []
     for b in builds:
         tc = (results.get(b.get("name", ""), results.get(b.get("tag", ""), {})) or {}).get("toolcall")
-        if isinstance(tc, dict) and tc.get("status") != "not-measured":
+        if isinstance(tc, dict) and tc.get("status") not in ("not-measured", "error"):
             be = tc.get("backend") or "gguf"
             if be not in seen:
                 seen.append(be)
-    servers = ", ".join(TOOL_SERVERS.get(be, be) for be in (seen or ["gguf"]))
+    servers = ", ".join(TOOL_SERVERS.get(be, be) for be in seen)
+    measurement = (f"served with {servers}, asked 60 tool probes" if seen else
+                   "no completed measurement. The check asks 60 tool probes")
     return ("_Tool-ready = the rung still calls tools ([pollard-toolcall](https://github.com/WestWaters/"
-            f"pollard-weights)): served with {servers}, asked 60 tool probes (single call, choose among eight tools, "
+            f"pollard-weights)): {measurement} (single call, choose among eight tools, "
             "no call needed, nested arguments) through OpenAI-style `tools`, and scored on the calls that server "
             "parses -- shown as success relative to the reference (the f16 for GGUF, the bf16 original for the other "
             "lanes) with a 95% paired-bootstrap CI, or as a bare success rate when no reference run was recorded. "
             "\"cross-backend\" = the reference ran on a different server than the rung; \"not measured\" = this "
-            "lane's server could not run where the rung was built._")
+            "lane's server could not run where the rung was built; \"error\" = request failures prevented a valid "
+            "capability measurement._")
 
 
 def tool_serve_lines(tools, lanes, repo, example_file):
@@ -1002,6 +1007,8 @@ def retention_section(builds, results):
             tc = r.get("toolcall")
             if isinstance(tc, dict) and tc.get("status") == "not-measured":
                 cells.append("not measured")
+            elif isinstance(tc, dict) and tc.get("status") == "error":
+                cells.append("error")
             elif not isinstance(tc, dict) or tc.get("rate") is None:
                 cells.append("--")
             elif tc.get("retention") is not None:

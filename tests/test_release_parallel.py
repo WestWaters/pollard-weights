@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import pollard_release as R  # noqa: E402
@@ -161,3 +163,163 @@ def test_after_the_gpu_deadline_hf_lanes_go_to_the_cpu_and_gpu_only_steps_hold(t
     assert ran[0][-2:] == ["--device", "cpu"], "the streamed GPTQ build moves to the CPU"
     assert st["exl3/3.0bpw/build"].startswith("held: GPU-only") and len(ran) == 1
     assert st["exl3/3.0bpw/verify"] == "skipped: upstream failed"
+
+
+def _execute_plan(tmp_path, monkeypatch, steps, fail=(), have=None, free=False):
+    """Exercise the real execute runner across the scheduler's separate jobs."""
+    ran = []
+
+    def command(cmd, ok=(0,), **kwargs):
+        ran.append(cmd[0])
+        if cmd[0] in fail:
+            raise RuntimeError("exit 1")
+
+    monkeypatch.setattr(R, "run_cmd", command)
+    monkeypatch.setattr(R, "upload", lambda st, *args: ran.append(st.id) or "uploaded")
+    c = {"mdir": str(tmp_path), "state": str(tmp_path / "state.json"), "ngl": "0", "free": free}
+    statuses = R.execute_parallel(steps, c, {}, run_upload=True, have=have or {"any": True, "cuda": True},
+                                  out=lambda *_: None, admission=Open())
+    return statuses, ran
+
+
+def _lane_final(lane):
+    return [S(id=f"{lane}/card", lane=lane, kind="card", requires="any", cmd=[f"{lane}-card"]),
+            S(id=f"{lane}/upload", lane=lane, kind="upload", requires="any", fn="upload"),
+            S(id="release/public", lane="release", kind="finalize", requires="any", fn="go_public",
+              lanes=[lane], repo="test/model")]
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_parallel_prep_blocks_dependent_lane_but_independent_lane_continues(tmp_path, monkeypatch, held):
+    prep = S(id="prep/smooth", lane="prep", kind="hold" if held else "prep", requires="any",
+             cmd=["smooth"], blocks=["gptq"], desc="smoothing unavailable")
+    steps = [prep,
+             S(id="gptq/int4/build", lane="gptq", rung="int4", kind="build", requires="any", cmd=["gptq-build"]),
+             S(id="gptq/int4/verify", lane="gptq", rung="int4", kind="verify", requires="any", cmd=["gptq-verify"]),
+             S(id="gguf/build", lane="gguf", kind="build", requires="any", cmd=["gguf-build"]),
+             S(id="gguf/verify", lane="gguf", kind="verify", requires="any", cmd=["gguf-verify"])] + _lane_final("gptq")
+    st, ran = _execute_plan(tmp_path, monkeypatch, steps, fail={"smooth"})
+    assert "gguf-build" in ran and "gguf-verify" in ran
+    assert not any(x.startswith("gptq") for x in ran)
+    assert st["gptq/int4/build"] == st["gptq/int4/verify"] == "skipped: upstream failed"
+    assert st["gptq/card"] == st["gptq/upload"] == "skipped: upstream failed"
+    assert st["release/public"] == "held"
+
+
+def test_parallel_failed_lane_complete_gate_blocks_card_upload_and_public(tmp_path, monkeypatch):
+    steps = [S(id="gguf/build", lane="gguf", kind="build", requires="any", cmd=["gguf-build"]),
+             S(id="gguf/complete", lane="gguf", kind="gate", requires="any", blocks=["gguf"], cmd=["complete"]),
+             S(id="gptq/int4/build", lane="gptq", rung="int4", kind="build", requires="any", cmd=["gptq-build"]),
+             S(id="gptq/int4/verify", lane="gptq", rung="int4", kind="verify", requires="any", cmd=["gptq-verify"])
+             ] + _lane_final("gguf")
+    st, ran = _execute_plan(tmp_path, monkeypatch, steps, fail={"complete"})
+    assert st["gguf/complete"] == "failed"
+    assert "gptq-build" in ran and "gptq-verify" in ran
+    assert "gguf-card" not in ran and "gguf/upload" not in ran
+    assert st["gguf/card"] == st["gguf/upload"] == "skipped: upstream failed"
+    assert st["release/public"] == "held"
+
+
+def test_parallel_unbuildable_lane_does_not_run_card_or_upload(tmp_path, monkeypatch):
+    steps = [S(id="exl3/3bpw/build", lane="exl3", rung="3bpw", kind="build", requires=R.REQUIRES["exl3"],
+               cmd=["exl3-build"])] + _lane_final("exl3")
+    st, ran = _execute_plan(tmp_path, monkeypatch, steps, have={"any": True, R.REQUIRES["exl3"]: False})
+    assert ran == []
+    assert st["exl3/card"].startswith("skipped: needs") and st["exl3/upload"].startswith("skipped: needs")
+    assert st["release/public"] == "held"
+
+
+@pytest.mark.parametrize("gate_fails", [False, True])
+def test_parallel_free_completion_gate_runs_before_expanded_rungs_or_later_builds(tmp_path, monkeypatch, gate_fails):
+    rung = tmp_path / "rung.gguf"
+    rung.write_bytes(b"GGUF")
+    monkeypatch.setattr(R, "canonical_gguf", lambda c: None)
+    monkeypatch.setattr(R, "measure_ref", lambda cfg, c: "reference")
+    monkeypatch.setattr(R, "gguf_builds", lambda c: [{"tag": "Q6_K", "path": str(rung)}])
+    monkeypatch.setattr(R, "gguf_rung_steps", lambda cfg, c, builds: [
+        S(id="gguf/Q6_K/verify", lane="gguf", rung="Q6_K", kind="verify", requires="any", cmd=["gguf-verify"]),
+        S(id="gguf/Q6_K/publish", lane="gguf", rung="Q6_K", kind="publish", requires="any", cmd=["gguf-publish"])])
+    steps = [S(id="gguf/ladder-Q6_K", lane="gguf", rung="Q6_K", kind="build", requires="any", cmd=["first-build"]),
+             S(id="gguf/complete", lane="gguf", kind="gate", requires="any", blocks=["gguf"], cmd=["complete"]),
+             S(id="gguf/rungs-Q6_K", lane="gguf", kind="expand", requires="any"),
+             S(id="gguf/ladder-IQ4_XS", lane="gguf", rung="IQ4_XS", kind="build", requires="any", cmd=["later-build"]),
+             S(id="gptq/int4/build", lane="gptq", rung="int4", kind="build", requires="any", cmd=["gptq-build"]),
+             S(id="gptq/int4/verify", lane="gptq", rung="int4", kind="verify", requires="any", cmd=["gptq-verify"])]
+    st, ran = _execute_plan(tmp_path, monkeypatch, steps, fail={"complete"} if gate_fails else (), free=True)
+    assert "first-build" in ran
+    assert "gptq-build" in ran and "gptq-verify" in ran
+    if gate_fails:
+        assert st["gguf/complete"] == "failed"
+        assert "gguf-verify" not in ran and "gguf-publish" not in ran and "later-build" not in ran
+    else:
+        assert st["gguf/complete"] == "done"
+        assert ran.index("complete") < ran.index("gguf-verify") < ran.index("gguf-publish")
+        assert ran.index("complete") < ran.index("later-build")
+
+
+def test_a_measure_worker_crash_wakes_the_waiting_slot_and_stops_the_release(tmp_path):
+    """A non-SystemExit error in the measure worker must not leave a slot blocked on its lane's gate forever."""
+    steps = [S(id="gguf/ladder-Q6_K", lane="gguf", rung="Q6_K", kind="build"),
+             S(id="gguf/complete", lane="gguf", kind="gate", blocks=["gguf"]),
+             S(id="gguf/rungs-Q6_K", lane="gguf", kind="expand"),
+             S(id="gguf/ladder-IQ4_XS", lane="gguf", rung="IQ4_XS", kind="build"),
+             S(id="gguf/rungs-IQ4_XS", lane="gguf", kind="expand"),
+             S(id="gguf/card", lane="gguf", kind="card"), S(id="release/public", lane="release", kind="finalize")]
+    ran = []
+
+    def runner(ss):
+        ran.extend(s.id for s in ss)
+        if any(s.kind == "gate" for s in ss):
+            raise RuntimeError("bug in the measure path")
+        return {s.id: "done" for s in ss}
+
+    box = {}
+
+    def go():
+        try:
+            R.execute_parallel(steps, {"mdir": str(tmp_path), "ngl": "0"}, {}, True, out=lambda *_: None,
+                               runner=runner, admission=Open(), timeline=str(tmp_path / "tl.log"))
+        except BaseException as e:                  # noqa: BLE001
+            box["err"] = e
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(15)
+    assert not t.is_alive(), "the slot waiting on the gate hung"
+    assert isinstance(box.get("err"), RuntimeError) and "measure worker stopped" in str(box["err"])
+    assert "gguf/ladder-IQ4_XS" not in ran, "no later build of the lane without its gate"
+    assert "gguf/card" not in ran and "release/public" not in ran, "nothing final on top of ungated rungs"
+
+
+def test_a_gate_queued_after_the_measure_worker_died_does_not_hang(tmp_path):
+    """The worker dies on ANOTHER lane's job first; a slot that queues its gate afterwards must not wait forever."""
+    steps = [S(id="gptq/int4/build", lane="gptq", rung="int4", kind="build"),
+             S(id="gptq/int4/verify", lane="gptq", rung="int4", kind="verify"),
+             S(id="gguf/ladder-Q6_K", lane="gguf", rung="Q6_K", kind="build"),
+             S(id="gguf/complete", lane="gguf", kind="gate", blocks=["gguf"]),
+             S(id="gguf/rungs-Q6_K", lane="gguf", kind="expand"),
+             S(id="gguf/ladder-IQ4_XS", lane="gguf", rung="IQ4_XS", kind="build"),
+             S(id="gguf/card", lane="gguf", kind="card")]
+    ran = []
+
+    def runner(ss):
+        ran.extend(s.id for s in ss)
+        if any(s.id == "gguf/ladder-Q6_K" for s in ss):
+            time.sleep(0.3)                          # the GPU lane's measure job crashes first
+        if any(s.kind == "verify" for s in ss):
+            raise RuntimeError("bug in the measure path")
+        return {s.id: "done" for s in ss}
+
+    box = {}
+
+    def go():
+        try:
+            box["st"] = R.execute_parallel(steps, {"mdir": str(tmp_path), "ngl": "0"}, {}, True, out=lambda *_: None,
+                                           runner=runner, admission=Open(), timeline=str(tmp_path / "tl.log"))
+        except BaseException as e:                  # noqa: BLE001
+            box["err"] = e
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(15)
+    assert not t.is_alive(), "the slot waiting on the gate hung"
+    assert isinstance(box.get("err"), RuntimeError)
+    assert "gguf/complete" not in ran and "gguf/ladder-IQ4_XS" not in ran and "gguf/card" not in ran

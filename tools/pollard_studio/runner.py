@@ -27,21 +27,23 @@ from collections import deque
 from pathlib import Path
 
 def tools_dir() -> Path:
-    """Where Pollard's tool modules are, in a checkout OR a pip install.
+    """Where Pollard's tool modules are, in a checkout OR a pip install. First match wins:
 
-    pyproject sets package-dir {"" = "tools"}, so every tool installs FLAT next to this package:
-    in a checkout the parent of pollard_studio/ is tools/, and in site-packages it is
-    site-packages/. One expression covers both, which is why neither needs configuring.
+      1. $POLLARD_TOOLS, a directory holding the tool modules;
+      2. $POLLARD_REPO/tools, a checkout named explicitly -- it wins over the copy this package was installed with,
+         so a Studio from site-packages describes the checkout the user pointed it at;
+      3. beside this package: pyproject sets package-dir {"" = "tools"}, so every tool installs FLAT next to it --
+         in a checkout the parent of pollard_studio/ is tools/, in site-packages it is site-packages/.
     """
     env = os.environ.get("POLLARD_TOOLS")
     if env and (Path(env) / "pollard_bench.py").is_file():
         return Path(env)
+    repo = os.environ.get("POLLARD_REPO")
+    if repo and (Path(repo).expanduser() / "tools" / "pollard_bench.py").is_file():
+        return Path(repo).expanduser() / "tools"
     beside = Path(__file__).resolve().parent.parent
     if (beside / "pollard_bench.py").is_file():
         return beside
-    repo = os.environ.get("POLLARD_REPO")
-    if repo and (Path(repo) / "tools" / "pollard_bench.py").is_file():
-        return Path(repo) / "tools"
     return beside
 
 

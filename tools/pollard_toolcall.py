@@ -68,6 +68,10 @@ What --quick counts as a failure, in the order they actually happen:
 
 The full gate adds: unparsed (call-shaped text the parser -- the server's, or the in-process reader --
 rejected), bad-enum, bad-args, hallucinated-tool, wrong-value and false-call (a tool called where none was needed).
+server-error is a request that failed: one the server answered with an error body (llama-server's HTTP 500 "Failed
+to parse input" -- the model's output broke the parser) is a failed probe like any other; one that got NO reply
+(refused, timed out) is transport, and a side with more of those than --max-transport-share (default half) is
+recorded as status=error -- never a score, never a PASS.
 
 A drop in tool-call success between the reference and the build is a direct measurement of the
 fragile band, and pollard-sensitivity can then say which layers carry it.
@@ -595,7 +599,10 @@ def grade_reply(reply, probe):
            "sample": (json.dumps(calls[0].get("function", {}))[:160] if calls else text.replace("\n", " ")[:160])}
     if reply is None or "error" in (reply or {}):
         err = (reply or {}).get("error") if reply else "no reply"
-        row.update(failure="server-error", detail=str(err)[:160])
+        # A reply with an HTTP status is the server answering -- llama-server's 500 "Failed to parse input" is the
+        # MODEL's output failing the parser, a failed probe like any other. No status = the request never got an
+        # answer (refused, timed out, no reply, the in-process engine raised): transport, not model capability.
+        row.update(failure="server-error", detail=str(err)[:160], transport=not (reply or {}).get("http_status"))
         return row
     looks_like_call = _call_shaped(text)
     if exp is None:                                              # abstention: prose is the right answer
@@ -1204,13 +1211,43 @@ DECODED_METHODS = ("gptq", "compressed-tensors", "fp8")
 CPU_GBPS = 20.0
 
 
+def _meta_model_gb(model):
+    """GB of the plain float model the decoded loaders build for this rung (pollard_stream.decoded_hf_model,
+    pollard_mxfp6.load_hf_model: `from_config` at the config's dtype, bf16 when it names none), counted on the meta
+    device -- no weights read, no memory taken. None when transformers cannot build it here."""
+    try:
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+    except Exception:                                            # noqa: BLE001
+        return None
+    try:
+        cfg = AutoConfig.from_pretrained(model, trust_remote_code=_trust(model))
+        for sub in (cfg, getattr(cfg, "text_config", None)):
+            if sub is not None and hasattr(sub, "quantization_config"):
+                delattr(sub, "quantization_config")
+        dt = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None) or torch.bfloat16
+        dt = getattr(torch, dt, torch.bfloat16) if isinstance(dt, str) else dt
+        with torch.device("meta"):
+            m = AutoModelForCausalLM.from_config(cfg, trust_remote_code=_trust(model))
+        n = sum(p.numel() for p in m.parameters())
+        return n * torch.empty((), dtype=dt).element_size() / 1e9
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def decoded_gb(model):
-    """GB the rung takes decoded to bf16 (what the decoded loader holds), else its size on disk."""
+    """GB the rung takes decoded to its float dtype (bf16) -- what the decoded loader HOLDS, never the packed size on
+    disk: a 24B MoE MX rung is 13 GB of files and ~48 GB decoded (the box committed 49.6 GB of its 32 GB, 2026-10-19).
+    The architecture's own parameter count (meta device) first, else the safetensors headers (pollard_stream), else --
+    unknowable -- the packed size x 4 (a 4-bit rung decoded to bf16), never the packed size itself."""
+    gb = _meta_model_gb(model)
+    if gb:
+        return gb
     try:
         import pollard_stream as S
         return S.decoded_bytes(model) / 1e9
-    except Exception:                                            # noqa: BLE001 -- unreadable: size on disk
-        return model_gb(model)
+    except Exception:                                            # noqa: BLE001 -- unreadable: bound it from above
+        return model_gb(model) * 4
 
 
 def cpu_estimate(gb, n_probes, budget, gbps=None):
@@ -1245,7 +1282,22 @@ def preflight_inprocess(backend, model, kind=None):
     if not (_has_module("transformers") and _has_module("torch")):
         raise NotMeasured("transformers + torch are not installed here")
     import pollard_mxfp6                                         # a pollard-mx MXFP6 / mix rung: decoded, no loader
-    meth = "" if pollard_mxfp6.read_meta(model) else quant_method(model)
+    if pollard_mxfp6.read_meta(model):
+        # every quantized linear decoded from the rung's bytes into a plain bf16 model (pollard_mxfp6.load_hf_model):
+        # it HOLDS the decoded size, on whichever device -- sized from that, not from the packed files
+        dec = decoded_gb(model)
+        if _gpu_or_none() is None:
+            why = "no NVIDIA GPU here"
+        else:
+            try:
+                check_gpu("hf", dec)
+                return {"device": "cuda", "loader": "decoded", "decoded_gb": round(dec, 3)}
+            except NotMeasured as e:
+                why = str(e)
+        check_ram(dec)
+        return {"device": "cpu", "loader": "decoded", "decoded_gb": round(dec, 3),
+                "cpu_note": f"{why}: on the CPU through the decoded loader -- slow but valid"}
+    meth = quant_method(model)
     if meth:
         if meth not in HF_QUANT_NEEDS or HF_QUANT_NEEDS[meth] is None:
             raise NotMeasured(_HF_NO_LOADER.get(meth, f"transformers has no loader for a '{meth}' checkpoint here"))
@@ -1585,9 +1637,10 @@ def _post(base, payload, timeout=600):
             return json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:                          # a parse failure surfaces as a 500 with a body
         try:
-            return {"error": json.loads(e.read().decode("utf-8", "replace")).get("error", str(e))}
+            return {"error": json.loads(e.read().decode("utf-8", "replace")).get("error", str(e)),
+                    "http_status": e.code}
         except Exception:                                        # noqa: BLE001
-            return {"error": str(e)}
+            return {"error": str(e), "http_status": e.code}
     except Exception as e:                                       # noqa: BLE001
         return {"error": repr(e)[:200]}
 
@@ -1729,11 +1782,14 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
     if not refresh and os.path.isfile(path):
         try:
             d = json.load(open(path, encoding="utf-8"))
-            print(f"   reference: cached ({path})")
-            return d["rows"], d.get("meta", {})
+            if not any(is_transport_failure(r) for r in d["rows"]):
+                print(f"   reference: cached ({path})")
+                return d["rows"], d.get("meta", {})
         except (ValueError, OSError, KeyError):
             pass
     rows, meta = run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend)
+    if any(is_transport_failure(r) for r in rows):
+        return rows, meta                                      # an outage is not a reusable reference measurement
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         json.dump({"rows": rows, "meta": meta}, open(path, "w", encoding="utf-8"), indent=1)
@@ -1831,12 +1887,38 @@ def _same(rows, ref_rows):
     return sum(1 for r in rows if r["id"] in ref and ref[r["id"]] == r["ok"])
 
 
-def verdict_for(s, rs=None, ret=None, min_rate=0.75, min_retention=90.0):
+#: a side whose probes got no reply on more than this share is a failed measurement (status=error), not a score
+MAX_TRANSPORT_SHARE = 0.5
+
+
+def is_transport_failure(row):
+    """A probe that never got an answer (connection refused, timeout, no reply, the engine raised). A server-error
+    row from before the transport flag existed counts as one -- it cannot be told apart, so it is not trusted."""
+    return row.get("failure") == "server-error" and row.get("transport", True)
+
+
+def transport_error(rows, side, max_share=MAX_TRANSPORT_SHARE):
+    """'<side>: k/n probes got no reply (server-error: ...)' when transport failures exceed `max_share` of this
+    side's probes, else None. Below the share they stay ordinary failed probes in the score."""
+    bad = [r for r in rows if is_transport_failure(r)]
+    if not rows or not bad or len(bad) <= max_share * len(rows):
+        return None
+    return f"{side}: {len(bad)}/{len(rows)} probes got no reply (server-error: {bad[0].get('detail', '')[:80]})"
+
+
+def verdict_for(s, rs=None, ret=None, min_rate=0.75, min_retention=90.0, errors=()):
     """PASS/FAIL. With a reference the gate is retention (the rung against its own f16 -- a small model that was
-    never good at tools is not failed for that); without one it is the absolute success rate."""
+    never good at tools is not failed for that); without one it is the absolute success rate. A side that mostly
+    got no reply (`errors`) is not a measurement and never passes."""
+    if errors:
+        return False                                           # transport failures do not establish model capability
     if rs is not None and ret is not None:
         return 100.0 * ret >= min_retention
     if rs is not None and not rs["valid"]:
+        if rs.get("modes", {}).get("server-error"):
+            # the reference passed nothing because its server errored: that is no evidence there is nothing to
+            # retain -- judge the rung on its own success rate instead
+            return (s["rate"] or 0.0) >= min_rate
         return True                                        # the f16 passes nothing: there is nothing to retain
     return (s["rate"] or 0.0) >= min_rate
 
@@ -1920,13 +2002,19 @@ def main_full(a):
     print_board(rung, s, rows, a.verbose)
     ref_rows, ref_meta, ref_backend, ref_note = _resolve_ref(a, backend, kw)
     rs, ret = None, (None, None, None)
+    share = getattr(a, "max_transport_share", MAX_TRANSPORT_SHARE)
+    errors = [e for e in [transport_error(rows, "candidate", share)] if e]
     if ref_rows is not None:
         rs = score_suite(ref_rows)
         ref_name = os.path.basename(str((a.ref_rows if ref_note and "measured elsewhere" in ref_note else None)
                                         or (a.ref_fallback if ref_note else None) or a.ref or a.ref_url).rstrip("/\\"))
         print_board(f"{ref_name}  (reference, {BACKEND_SERVER.get(ref_backend, ref_backend)})", rs, ref_rows,
                     a.verbose)
-        ret = retention_ci(rows, ref_rows)
+        err = transport_error(ref_rows, "reference", share)
+        if err:
+            errors.append(err)
+        if not errors:
+            ret = retention_ci(rows, ref_rows)
         if ret[0] is not None:
             print(f"\n  RETENTION {100 * ret[0]:.1f}%  (95% paired-bootstrap CI {100 * ret[1]:.1f}-{100 * ret[2]:.1f}%)"
                   f"   success {_pct(s['rate'])} vs {_pct(rs['rate'])}")
@@ -1934,11 +2022,13 @@ def main_full(a):
             if cross_backend(backend, ref_backend):
                 print(f"  (cross-backend: rung via {BACKEND_SERVER.get(backend, backend)}, reference via "
                       f"{BACKEND_SERVER.get(ref_backend, ref_backend)} -- part of any gap is the server, not the quant)")
-        else:
+        elif not errors:
             print("\n  (the reference passes no probe: nothing to retain -- retention is undefined)")
     elif ref_note:
         print(f"\n  no reference measured ({ref_note}): the gate is the absolute success rate")
-    ok = verdict_for(s, rs, ret[0], a.min_rate, a.min_retention)
+    if errors:
+        print(f"\n  ERROR: {'; '.join(errors)}; tool-call capability was not measured.")
+    ok = verdict_for(s, rs, ret[0], a.min_rate, a.min_retention, errors)
     if not ok and ret[0] is not None:
         _advice()
     if a.out:
@@ -1969,6 +2059,12 @@ def main_full(a):
         if ret[0] is not None:
             tc.update({"retention": round(100 * ret[0], 2),
                        "retention_ci": [round(100 * ret[1], 2), round(100 * ret[2], 2)]})
+        if errors:
+            tc.update(status="error", reason="; ".join(errors))
+            # merge_results preserves old keys: explicitly clear any earlier successful measurement.
+            for key in ("rate", "rate_ci", "parse_rate", "function_acc", "args_valid", "exact", "abstention",
+                        "categories", "ref_rate", "ref_rate_ci", "drop", "agreement", "retention", "retention_ci"):
+                tc[key] = None
         ws.merge_results(a.results, rung, {"toolcall": tc})
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
@@ -2010,6 +2106,10 @@ def main(argv=None):
                     help="without --ref: fail below this success rate (default 0.75)")
     ap.add_argument("--min-retention", type=float, default=90.0,
                     help="with --ref: fail below this retention vs the f16, percent (default 90)")
+    ap.add_argument("--max-transport-share", type=float, default=MAX_TRANSPORT_SHARE,
+                    help="a side whose probes got NO reply (refused / timed out) on more than this share is recorded "
+                         "as status=error, not a score (default 0.5). A server reply with an error body -- "
+                         "llama-server's 500 'Failed to parse input' -- is the model's failed probe, not an error")
     ap.add_argument("--limit", type=int, default=0,
                     help="only the first N probes of each category (a smaller balanced suite)")
     ap.add_argument("--no-think", action="store_true",

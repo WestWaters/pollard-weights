@@ -455,12 +455,8 @@ def stage_hf(drafter_dir, dest, kind, target=None, speculators_bin=None, run=sub
 def record(key, path, tag, fmt, kind, meta):
     """A drafter rung in the model's MANIFEST, lane `draft`, with what it is and where it came from."""
     import pollard_workspace as ws
-    ws.record_build(key, "draft", path, tag=tag)
-    man = ws.read_manifest(key)
-    for b in man.get("builds", []):
-        if b.get("path") == os.path.abspath(path):
-            b.update({"format": fmt, "kind": kind, **{k: v for k, v in meta.items() if v is not None}})
-    ws._write_manifest(key, man)
+    ws.record_build(key, "draft", path, tag=tag,
+                    extra={"format": fmt, "kind": kind, **{k: v for k, v in meta.items() if v is not None}})
 
 
 def draft_builds(key):
