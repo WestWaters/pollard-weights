@@ -174,3 +174,9 @@ py-modules = ["pollard_auto", "pollard_calc", "pollard_fit", "pollard_ngram", "p
 # the window's own HTML/CSS/JS and the bear it puts in the dock
 [tool.setuptools.package-data]
 pollard_studio = ["ui/*.html", "ui/*.css", "ui/*.js", "ui/*.png"]
+
+# runtime-patches/ ships with every install (pip, nix): pollard_calc.patches_dir finds it at
+# <prefix>/share/pollard-weights/runtime-patches when there is no checkout, so an installed
+# pollard-ggufcheck still knows clef-omni is a `pollard` architecture, not `unknown`
+[tool.setuptools.data-files]
+"share/pollard-weights/runtime-patches" = ["runtime-patches/*.json", "runtime-patches/*.patch", "runtime-patches/*.md"]

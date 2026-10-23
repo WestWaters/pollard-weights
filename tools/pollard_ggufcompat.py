@@ -39,6 +39,8 @@ import os
 import struct
 import sys
 
+from pollard_calc import patches_dir as pc_patches_dir
+
 # Highest ggml type id stock llama.cpp knows. Anything above is a fork-only atom.
 STOCK_MAX = 42
 
@@ -85,7 +87,8 @@ FORK_ARCHS = {
 #: snapshot, and a run from the repo read the patched tree and called a Pollard-only architecture "stock".
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDORED_ARCH_SRC = os.path.join("runtime", "llama.cpp", "src", "llama-arch.cpp")
-PATCH_DIR = os.path.join(REPO_ROOT, "runtime-patches")
+#: the checkout's runtime-patches/, or the copy an installed package (pip / nix) ships as data
+PATCH_DIR = pc_patches_dir()
 PATCH_URL = "https://github.com/WestWaters/pollard-weights/blob/main/runtime-patches/"
 #: the upstream remote a `pollard` architecture's patch must sit on: "llama.cpp with Pollard's patch" is a claim about
 #: ggml-org/llama.cpp. A patch onto a third-party fork (k2-horizon onto ik_llama) is a port, not Pollard support.
