@@ -271,14 +271,18 @@ def ask_systemone(base: str, state: str, question: str, options: list[str], post
     return [v / s for v in p] if s > 0 else [1.0 / len(options)] * len(options)
 
 
-def run(base: str, post, items=None) -> list[dict]:
+def run(base: str, post, items=None, temps: dict | None = None) -> list[dict]:
+    """The built-in set on one server. `temps`: calibrated temperatures the served GGUF does not carry (the source's),
+    applied to the head's T=1 option softmax exactly as llama-server would (client_temperatures)."""
     rows = []
     head = native(base)
     for state, q, opts, ans in (items or DECISION_SET):
         if head:
             # the head's distribution is over the options by construction: there is no letter mass to lose
-            rows.append({"question": q, "options": opts, "answer": ans, "first": "",
-                         "probs": ask_systemone(base, state, q, opts, post), "mass": 1.0})
+            p = ask_systemone(base, state, q, opts, post)
+            if temps:
+                p = apply_temperature(p, temperature_for(temps, "choice", len(opts)))
+            rows.append({"question": q, "options": opts, "answer": ans, "first": "", "probs": p, "mass": 1.0})
             continue
         r = ask(base, build_prompt(state, q, opts), post)
         rows.append({"question": q, "options": opts, "answer": ans, "first": r["token"],
@@ -341,15 +345,19 @@ def _dist_kl(p, q):
     return sum(p.get(k, 0.0) * math.log(max(p.get(k, 0.0), 1e-9) / max(q.get(k, 0.0), 1e-9)) for k in keys)
 
 
-def run_typed(base, post, rows):
-    """Every row as one /v1/systemone request (its five questions answered together, as clef decides them)."""
+def run_typed(base, post, rows, temps: dict | None = None):
+    """Every row as one /v1/systemone request (its five questions answered together, as clef decides them).
+    `temps` as in run(): re-tempers each answer's distribution by its type and option count."""
     out = []
     for r in rows:
         got = post(base, "/v1/systemone", {"state": r["state"], "questions": r["questions"]})
         answers = got.get("answers") or {}
         for qid, q in r["questions"].items():
+            dist = _answer_dist(q, answers.get(qid))
+            if temps and dist:
+                dist = apply_temperature(dist, temperature_for(temps, str(q.get("type") or "choice"), len(dist)))
             out.append({"row": r["id"], "workflow": r["workflow"], "qid": qid, "type": q.get("type"),
-                        "dist": _answer_dist(q, answers.get(qid)), "gold": r["gold"].get(qid) or {}})
+                        "dist": dist, "gold": r["gold"].get(qid) or {}})
     return out
 
 
@@ -418,13 +426,98 @@ def _source_config(model: str, source: str | None) -> dict | None:
     return None
 
 
-def pregate_checks(meta: dict, cfg: dict | None = None) -> list[str]:
+def _source_head_config(model: str, source: str | None) -> dict | None:
+    """The source checkpoint's joint_head_config.json (a clef-layout decision head): --source (a dir, or a file in
+    it), else one beside the GGUF. None when there is none to read."""
+    for cand in ([source] if source else []) + [os.path.dirname(os.path.abspath(model))]:
+        if not cand:
+            continue
+        d = cand if os.path.isdir(cand) else os.path.dirname(os.path.abspath(cand))
+        p = os.path.join(d, "joint_head_config.json")
+        if os.path.isfile(p):
+            try:
+                return json.load(open(p, encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+    return None
+
+
+def head_temperatures(head_cfg: dict | None) -> dict[str, float]:
+    """The calibrated temperatures a clef-layout head config declares, keyed the way llama-server looks them up
+    (`<type>` or `<type>.<bucket>`; a single number becomes `all`). {} when it declares none -- Cloudflare's clef /
+    clef-flash / clef-omni declare none: their joint_schema_model.py answers with a plain softmax, i.e. T = 1."""
+    t = (head_cfg or {}).get("temperatures", (head_cfg or {}).get("temperature"))
+    if isinstance(t, (int, float)) and not isinstance(t, bool):
+        return {"all": float(t)} if t > 0 else {}
+    if isinstance(t, dict):
+        return {str(k): float(v) for k, v in t.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0}
+    return {}
+
+
+def gguf_temperatures(meta: dict) -> dict[str, float]:
+    """`<arch>.decision.temperature.<name>` from GGUF metadata -> {name: T}. llama-server applies these itself."""
+    arch = str((meta or {}).get("general.architecture", "") or "")
+    pre = f"{arch}.decision.temperature."
+    out = {}
+    for k, v in (meta or {}).items():
+        if str(k).startswith(pre):
+            try:
+                out[str(k)[len(pre):]] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _bucket(n: int) -> str:
+    """llama-server's option-count bucket for a temperature (server-decision.cpp get_temperature, non-lev types)."""
+    return "2" if n <= 2 else "3_5" if n <= 5 else "6_10" if n <= 10 else "11"
+
+
+def temperature_for(temps: dict[str, float], qtype: str, n: int) -> float:
+    """The temperature llama-server would use for a `qtype` question with `n` options: `<type>.<bucket>`, then
+    `<type>`, then (a scalar config) `all`, else 1."""
+    for name in (f"{qtype}.{_bucket(n)}", qtype, "all"):
+        if name in (temps or {}):
+            return float(temps[name])
+    return 1.0
+
+
+def apply_temperature(probs, T: float):
+    """Re-temper a T=1 softmax: softmax(z / T) = p^(1/T) / sum p^(1/T). Exact for the head's option softmax (and for
+    noul's two-way one); list in -> list out, dict in -> dict out."""
+    if not T or abs(T - 1.0) < 1e-12:
+        return probs
+    keys = list(probs) if isinstance(probs, dict) else None
+    vals = [float(probs[k]) for k in keys] if keys is not None else [float(v) for v in probs]
+    logs = [math.log(max(v, 1e-30)) / T for v in vals]
+    m = max(logs)
+    e = [math.exp(v - m) for v in logs]
+    s = sum(e)
+    out = [v / s for v in e]
+    return dict(zip(keys, out)) if keys is not None else out
+
+
+def client_temperatures(meta: dict, head_cfg: dict | None) -> dict[str, float]:
+    """The temperatures the BOARD must apply itself for this GGUF: the source's calibrated ones when the GGUF does not
+    carry them (llama-server applies GGUF-carried ones on its own, so applying those here would double them). {} when
+    there is nothing to add -- including every Cloudflare clef checkpoint, whose reference answers at T = 1."""
+    return {} if gguf_temperatures(meta) else head_temperatures(head_cfg)
+
+
+def pregate_checks(meta: dict, cfg: dict | None = None, head_cfg: dict | None = None,
+                   head_cfg_known: bool = False) -> list[str]:
     """Things the GGUF's own metadata says will make the board measure the wrong model. Warnings, not
     failures: each is a converter/runtime gap, and the gate still runs so the damage is measured.
 
-      * clef-type (a decision head): Unsloth's FastDecisionModel exports the calibrated per-type temperatures
-        as `<arch>.decision.temperature.<type>`. Upstream's converter drops them, the head then answers at
-        T=1, and every probability is off while the argmax -- and so agreement -- can look fine.
+      * clef-type (a decision head): llama-server applies `<arch>.decision.temperature.<type>[.<bucket>]` from the
+        GGUF. A head whose source calibrated temperatures (Unsloth FastDecisionModel writes them into
+        joint_head_config.json) loses them in the clef converter, which reads only the head's shape -- the GGUF then
+        answers at T=1 while the argmax, and so agreement, looks fine. The board applies the source's temperatures
+        to BOTH sides itself (like with like); the warning says the published GGUF still serves at T=1.
+        Cloudflare's clef / clef-flash / clef-omni declare NO temperatures (joint_schema_model.py: plain softmax),
+        so T=1 is their reference behaviour and there is nothing to warn about. Without a source head config to
+        read (`head_cfg_known` False) this says it could not check, not that something was dropped.
       * pplx-decider / d3-style: the source runs noncausal attention (config `attention_mode`). Upstream
         llama.cpp runs pplx-decider v1.1 causally unless the GGUF says `<arch>.attention.causal = false`;
         ~3 of 25 decisions flip.
@@ -433,12 +526,17 @@ def pregate_checks(meta: dict, cfg: dict | None = None) -> list[str]:
     arch = str(meta.get("general.architecture", "") or "")
     names = " ".join(str(meta.get(k, "")) for k in ("general.name", "general.basename", "general.architecture"))
     head = any(".decision." in str(k) for k in meta)
-    if head or "clef" in names.lower():
-        temps = [k for k in meta if str(k).startswith(f"{arch}.decision.temperature.")]
-        if not temps:
-            warns.append(f"no `{arch}.decision.temperature.*` keys: the calibrated per-type temperatures were "
-                         "dropped in conversion (upstream's converter does; Unsloth FastDecisionModel exports them), "
-                         "so the head answers at T=1 and its probabilities are uncalibrated")
+    if (head or "clef" in names.lower()) and not gguf_temperatures(meta):
+        src_t = head_temperatures(head_cfg)
+        if src_t:
+            warns.append(f"the source head calibrates temperatures {src_t} but the GGUF carries no "
+                         f"`{arch}.decision.temperature.*` keys (the clef converter reads only the head's shape): "
+                         "llama-server serves this file at T=1. The board applies the source's temperatures to the "
+                         "build and the reference alike, so its numbers compare like with like")
+        elif not head_cfg_known:
+            warns.append("decision head with no `.decision.temperature.*` keys and no source joint_head_config.json "
+                         "to check (pass --source <hf dir>): it answers at T=1, which is right only if the source "
+                         "declares no calibrated temperatures (Cloudflare's clef models declare none)")
     if _PPLX.search(names):
         mode = str((cfg or {}).get("attention_mode", "")).lower().replace("-", "_")
         noncausal = "noncausal" in mode or "non_causal" in mode or "bidirectional" in mode
@@ -523,28 +621,41 @@ def _ngl_arg(v: str) -> str:
     raise argparse.ArgumentTypeError(f"--ngl takes a number of GPU layers or `auto`, not {v!r}")
 
 
-def pregate(model: str, source: str | None = None) -> list[str]:
+def _meta(model: str) -> dict:
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from pollard_calc import read_gguf_meta
-        meta = read_gguf_meta(model)
+        return read_gguf_meta(model) or {}
     except Exception:
+        return {}
+
+
+def pregate(model: str, source: str | None = None) -> list[str]:
+    meta = _meta(model)
+    if not meta:
         return []
-    return pregate_checks(meta, _source_config(model, source))
+    head_cfg = _source_head_config(model, source)
+    return pregate_checks(meta, _source_config(model, source), head_cfg, head_cfg is not None)
 
 
 def gate(model: str, ngl, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
          limit: int = 0, source: str | None = None) -> dict:
     """Pre-gate metadata checks, then the board (see _gate). Warnings ride along in the result."""
     warns = pregate(model, source)
-    res = _gate(model, ngl, ctx, ref, qset, limit)
+    head_cfg = _source_head_config(model, source)
+    temps = client_temperatures(_meta(model), head_cfg)
+    ref_temps = client_temperatures(_meta(ref), head_cfg) if ref else {}
+    res = _gate(model, ngl, ctx, ref, qset, limit, temps, ref_temps)
+    if temps or ref_temps:
+        res["temperatures"] = {"build": temps, "ref": ref_temps,
+                               "note": "source-calibrated temperatures the GGUF does not carry, applied by the board"}
     if warns:
         res["warnings"] = warns
     return res
 
 
 def _gate(model: str, ngl, ctx: int = 4096, ref: str | None = None, qset: str = "builtin",
-          limit: int = 0) -> dict:
+          limit: int = 0, temps: dict | None = None, ref_temps: dict | None = None) -> dict:
     """Serve the build (and the reference), run the set on both, return the board + verdict in the
     same shape pollard-bench prints ("verdict", "rows", "reason").
 
@@ -571,12 +682,12 @@ def _gate(model: str, ngl, ctx: int = 4096, ref: str | None = None, qset: str = 
                         "rows": [{"prompt": "(not run)", "loop": None, "sample": "",
                                   "reason": "llama-server would not start" if base is None
                                   else "typed-decisions needs a native decision model (/v1/systemone)"}]}
-            rows = run_typed(base, _post, data["rows"])
+            rows = run_typed(base, _post, data["rows"], *([temps] if temps else []))
         ref_rows = None
         if ref:
             with _served(ref, fit(ref), ctx, extra=extra) as rbase:
                 if rbase is not None:
-                    ref_rows = run_typed(rbase, _post, data["rows"])
+                    ref_rows = run_typed(rbase, _post, data["rows"], *([ref_temps] if ref_temps else []))
         board = score_typed(rows, ref_rows)
         board["set"] = f"{data['dataset']}@{(data.get('revision') or '')[:8]}" + (f" (first {limit} rows)" if limit else "")
         v, why = verdict(board)
@@ -586,12 +697,12 @@ def _gate(model: str, ngl, ctx: int = 4096, ref: str | None = None, qset: str = 
         if base is None:
             return {"verdict": "NO_SERVER", "config": None, "rows": [{"prompt": "(not run)", "loop": None,
                     "reason": "llama-server would not start", "sample": ""}]}
-        rows = run(base, _post)
+        rows = run(base, _post, **({"temps": temps} if temps else {}))
     ref_rows = None
     if ref:
         with _served(ref, fit(ref), ctx) as rbase:
             if rbase is not None:
-                ref_rows = run(rbase, _post)
+                ref_rows = run(rbase, _post, **({"temps": ref_temps} if ref_temps else {}))
     board = score_rows(rows, ref_rows)
     v, why = verdict(board)
     out_rows = []
@@ -637,7 +748,8 @@ def main() -> None:
                          "decisions, native decision models; fetched once from the Hub and cached)")
     ap.add_argument("--limit", type=int, default=0, help="typed-decisions: only the first N states (smoke run)")
     ap.add_argument("--source", help="the source checkpoint (HF dir or its config.json), for the pre-gate checks "
-                    "(attention mode); default: a config.json beside the GGUF")
+                    "(attention mode) and a clef head's calibrated temperatures (joint_head_config.json); default: "
+                    "the files beside the GGUF")
     ap.add_argument("--results", help="merge this rung's decision board into this results.json (pollard-card "
                                       "--results: the Decision fidelity table and the retention table)")
     ap.add_argument("--rung", help="the rung's name/tag in --results (default: the GGUF file name)")
@@ -664,6 +776,9 @@ def main() -> None:
         cal = board_calibration_line(b)
         if cal:
             print("  " + cal)
+    if res.get("temperatures"):
+        t = res["temperatures"]
+        print(f"  temperatures applied by the board (not in the GGUF): build {t['build'] or 'none'}  ref {t['ref'] or 'none'}")
     for w in res.get("warnings") or []:
         print(f"  WARNING: {w}")
     print(f"VERDICT: {res['verdict']} -- {res.get('reason', '')}")

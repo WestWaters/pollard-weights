@@ -635,7 +635,9 @@ def gguf_rung_steps(cfg, c, builds):
             continue
         if m.get("decision") or c.get("decision_only"):     # decision-only: the board IS the fidelity number
             steps.append(Step(id=f"{rid}/decision", lane="gguf", rung=tag, kind="measure", requires="any",
-                              cmd=["pollard-decision", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]] + common,
+                              cmd=["pollard-decision", "--gguf", path, "--ref", ref, "--ngl", c["ngl"]]
+                              + (["--source", c["hf_dir"]] if c.get("hf_dir") and os.path.isdir(str(c["hf_dir"])) else [])
+                              + common,
                               ok_codes=(0, 1)))
         steps.append(Step(id=f"{rid}/verify", lane="gguf", rung=tag, kind="verify", requires="any", out=path,
                           cmd=["pollard-verify", "--lane", "gguf", "--model", path, "--ref", c["f16"],
@@ -1216,10 +1218,24 @@ def _manifest_entry(path):
     return ws.find_build(path)[1] if path else None
 
 
+def stale_imatrix_profile(path):
+    """True when `path` is a `pollard-probe --from-imatrix` profile made before MoE experts were weighted by routing
+    frequency (no `"experts"` key): on an MoE it costs every expert as if every token reached it, and attention lands
+    far too low (clef-omni IQ4_XS, 2026-10-22). Re-making it takes minutes and no forward pass."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            prof = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return False
+    return isinstance(prof, dict) and prof.get("method") == "imatrix-hessian" and not prof.get("experts")
+
+
 def resume_reason(step, state, redo=()):
     """Why this step can be skipped on a re-run, or None to run it."""
     if any(step.id == r or step.id.startswith(r.rstrip("/") + "/") for r in redo):
         return None
+    if step.id == "prep/probe" and "--from-imatrix" in (step.get("cmd") or []) and stale_imatrix_profile(step.out):
+        return None                                  # a pre-fix imatrix profile: re-probe (cheap) instead of reusing it
     if (state.get(step.id) or {}).get("status") == "done" and step.kind != "upload":
         return "done"
     if step.kind in ("build", "verify"):

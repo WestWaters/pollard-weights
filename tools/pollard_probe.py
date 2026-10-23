@@ -273,6 +273,12 @@ GROUP_GGUF = {"ffn": ("ffn_gate", "ffn_up", "ffn_down",
                        "shortconv.in_proj", "shortconv.out_proj")}
 
 
+#: written into every --from-imatrix profile. A profile WITHOUT it predates the fix (2026-10-22) that weights MoE
+#: experts by routing frequency: it costs every expert as if every token reached it, n_expert / n_used too heavy
+#: against attention -- clef-omni's IQ4_XS put 23 layers of attention at iq2_xxs from exactly that.
+EXPERT_WEIGHTING = "routing-frequency"
+
+
 def _gguf_slot(name, groups):
     """`blk.<N>.<base>.weight` -> (group, layer), or None for anything not in a scored group."""
     m = re.match(r"^blk\.(\d+)\.(.+)\.weight$", name)
@@ -285,27 +291,86 @@ def _gguf_slot(name, groups):
     return None
 
 
-def _hessians_from_imatrix(path):
-    """tensor name -> E[x_j^2], from EITHER imatrix format. Returns {} if neither parses."""
+def _imatrix_stats(path):
+    """(H, counts) from EITHER imatrix format. H: tensor name -> E[x_j^2] per input channel, CONDITIONAL on the
+    matrix being used (for a merged expert tensor: over the tokens routed to that expert, expert-major).
+    counts: tensor name -> tokens seen per matrix -- only the GGUF format keeps them (one per expert); the legacy
+    .dat normalizes them away, so it returns {} there. Returns ({}, {}) if neither format parses.
+
+    The GGUF branch used to divide EVERY expert's sums by expert 0's count; the per-expert count is the right
+    denominator for a per-expert mean."""
     from pollard_calc import read_imatrix_legacy
     try:                                                    # ik_llama's format, and ours
         raw = read_imatrix_legacy(path)
-        return {n: [v / max(e["ncall"], 1) for v in e["values"]]
-                for n, e in raw.items() if e["values"]}
+        return ({n: [v / max(e["ncall"], 1) for v in e["values"]]
+                 for n, e in raw.items() if e["values"]}, {})
     except Exception:
         pass
     try:                                                    # llama.cpp's newer GGUF imatrix
+        import numpy as np
         from gguf import GGUFReader
         rd = GGUFReader(path)
         sums = {t.name[:-len(".in_sum2")]: t for t in rd.tensors if t.name.endswith(".in_sum2")}
         cnts = {t.name[:-len(".counts")]: t for t in rd.tensors if t.name.endswith(".counts")}
-        out = {}
+        out, counts = {}, {}
         for n, t in sums.items():
-            c = float(cnts[n].data.reshape(-1)[0]) if n in cnts else 1.0
-            out[n] = (t.data.reshape(-1).astype("float64") / max(c, 1.0)).tolist()
-        return out
+            v = t.data.reshape(-1).astype("float64")
+            c = (cnts[n].data.reshape(-1).astype("float64") if n in cnts else np.ones(1))
+            if v.size % c.size:
+                c = c[:1]
+            per = v.reshape(c.size, -1) / np.maximum(c, 1.0)[:, None]
+            out[n] = per.reshape(-1).tolist()
+            counts[n] = c.tolist()
+        return out, counts
     except Exception:
-        return {}
+        return {}, {}
+
+
+def _hessians_from_imatrix(path):
+    """tensor name -> E[x_j^2], from EITHER imatrix format. Returns {} if neither parses."""
+    return _imatrix_stats(path)[0]
+
+
+def _gguf_int(rd, suffix):
+    """An integer metadata value whose key ends in `suffix` (e.g. `.expert_used_count`), or None."""
+    for k, f in rd.fields.items():
+        if k.endswith(suffix):
+            try:
+                return int(f.parts[f.data[0]][0])
+            except Exception:
+                return None
+    return None
+
+
+def _routing_freq(name, n_mat, counts, n_used, n_expert):
+    """Per-expert routing frequency p_e = P(a token reaches expert e) for a merged expert tensor, and how it was
+    obtained -- or (None, why) when it cannot be known.
+
+    An imatrix holds E[x_j^2] CONDITIONAL on the expert being routed to. Summed over all experts as-is, every expert
+    is costed as if every token passed through it: n_expert / n_used too heavy (16x on a 128-expert / top-8 MoE)
+    against attention, which does see every token. The expected output error of quantizing expert e is
+    p_e * E[||dW_e x||^2 | e], so the per-expert cost is scaled by p_e.
+
+    GGUF imatrix: exact, p_e = count_e / tokens, tokens = the layer's router count when present (the router sees
+    every token), else sum(count_e) / n_used. Legacy .dat: the per-expert counts are normalized away, so the mean
+    frequency n_used / n_expert from the GGUF metadata stands in for every expert."""
+    import numpy as np
+    c = counts.get(name)
+    if c is not None and len(c) == n_mat and sum(c) > 0:
+        m = re.match(r"^blk\.(\d+)\.", name)
+        router = counts.get(f"blk.{m.group(1)}.ffn_gate_inp.weight") if m else None
+        if router and len(router) == 1 and router[0] > 0:
+            tokens, how = float(router[0]), "per-expert counts / router tokens"
+        elif n_used:
+            tokens, how = sum(c) / n_used, "per-expert counts / (sum / expert_used_count)"
+        else:
+            tokens, how = None, ""
+        if tokens:
+            return np.asarray(c, dtype="float64") / tokens, how
+    if n_used and n_expert and n_expert == n_mat and 0 < n_used <= n_expert:
+        return np.full(n_mat, n_used / n_expert), f"mean routing {n_used}/{n_expert} (expert_used_count/expert_count)"
+    return None, (f"{name}: no per-expert counts in the imatrix and no expert_used_count / expert_count in the GGUF "
+                  "metadata to weight the experts by how often they are routed to")
 
 
 def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bits):
@@ -328,11 +393,13 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
     import numpy as np
     from gguf import GGUFReader
 
-    H = _hessians_from_imatrix(imatrix_path)
+    H, H_counts = _imatrix_stats(imatrix_path)
     if not H:
         raise SystemExit(f"could not read an imatrix from {imatrix_path} (tried legacy .dat and "
                          f"GGUF). Build one with llama-imatrix first.")
     rd = GGUFReader(gguf_path)
+    n_used, n_expert = _gguf_int(rd, ".expert_used_count"), _gguf_int(rd, ".expert_count")
+    routing = set()                                         # how each expert tensor was weighted (printed once)
     # A vendor-quantized source can carry a per-tensor scale beside an FP4 weight: NVIDIA's QAT
     # Nemotron GGUF stores ssm_in / ssm_out as NVFP4 plus `<name>.scale` (F32), and the runtime
     # multiplies the matmul output by it. The raw NVFP4 decode is ~1e4x the real weight, so without
@@ -371,7 +438,14 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
             W = torch.from_numpy(np.asarray(_dequant(t))).float()
             if t.name in scales:
                 W = _apply_scale(W, np.asarray(_dequant(scales[t.name])).reshape(-1))
-            h = _imatrix_weights(W, hj, t.name.endswith("_exps.weight"))
+            merged = t.name.endswith("_exps.weight")
+            h = _imatrix_weights(W, hj, merged)
+            if merged and W.ndim == 3:
+                p, how = _routing_freq(t.name, W.shape[0], H_counts, n_used, n_expert)
+                if p is None:
+                    raise ValueError(how)
+                h = h * torch.from_numpy(p).float().reshape(-1, 1, 1)
+                routing.add(how)
         except Exception as e:
             skipped.append(f"{t.name} ({e})")
             continue
@@ -430,6 +504,8 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
         raise SystemExit("every layer scored zero tensors -- nothing to allocate on.")
 
     print(f"  scored {scored} tensors across {layers} layers", flush=True)
+    for how in sorted(routing):
+        print(f"  MoE experts weighted by routing frequency: {how}", flush=True)
     if excluded:
         cost["excluded_tensors"] = excluded
         print(f"  {len(excluded)} MoE routers excluded from the score; retain their source "
@@ -789,7 +865,8 @@ def main():
         out = a.out or (os.path.splitext(a.gguf)[0] + ".sensitivity.json")
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)   # a fresh workspace has no calibration/
         json.dump({**profile, "noise": noise, "probe": f"rtn{a.probe_bits}", "layers": layers,
-                   "source": a.gguf, "method": "imatrix-hessian"}, open(out, "w"), indent=2)
+                   "source": a.gguf, "method": "imatrix-hessian",
+                   "experts": EXPERT_WEIGHTING}, open(out, "w"), indent=2)
         for g in groups:
             vals = [v for v in profile[g].values()]
             if vals:

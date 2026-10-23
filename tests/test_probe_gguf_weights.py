@@ -13,9 +13,13 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "tools"))
 import pollard_probe as P
 
 
-def write_tensor(path, name, weights, qtype):
+def write_tensor(path, name, weights, qtype, experts=None):
+    """experts: (n_used, n_expert) -> the MoE metadata a real merged-expert GGUF carries."""
     from gguf.quants import quantize
     writer = gguf.GGUFWriter(path, "qwen3moe")
+    if experts:
+        writer.add_expert_used_count(experts[0])
+        writer.add_expert_count(experts[1])
     writer.add_tensor(name, quantize(weights, qtype), raw_dtype=qtype)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -101,11 +105,12 @@ def test_merged_expert_probe_matches_separate_expert_costs(tmp_path, qtype):
                         [[.5, 1, -.5, .25], [2, 1, -1, .5]]], dtype=np.float32)
     importance = np.array([[1, 2, 3, 4], [8, 7, 6, 5]], dtype=np.float32)
     model, matrix = tmp_path / "model.gguf", tmp_path / "imatrix.dat"
-    write_tensor(model, name, weights, qtype)
+    write_tensor(model, name, weights, qtype, experts=(1, 2))
     write_imatrix(matrix, name, importance)
     costs, noise, layers = P._imatrix_sensitivity(str(model), str(matrix), ["ffn"], 2, [("iq2_s", 2)])
-    expected = sum(float(((torch.tensor(expert) - P._rtn(torch.tensor(expert), 2)) ** 2 *
-                          torch.tensor(h)).sum()) for expert, h in zip(weights, importance))
+    # each expert's conditional cost, weighted by how often it is routed to: 1 of 2 experts per token
+    expected = 0.5 * sum(float(((torch.tensor(expert) - P._rtn(torch.tensor(expert), 2)) ** 2 *
+                                torch.tensor(h)).sum()) for expert, h in zip(weights, importance))
     assert costs["ffn"]["0"] == pytest.approx(expected)
     assert noise["iq2_s"] == pytest.approx(expected)
     assert layers == 1 and math.isfinite(expected) and expected > 0
@@ -128,7 +133,7 @@ def test_dense_probe_uses_decoded_bf16_weights(tmp_path):
 def test_bad_expert_importance_refuses_partial_profile(tmp_path, importance):
     name = "blk.0.ffn_up_exps.weight"
     model, matrix = tmp_path / "model.gguf", tmp_path / "imatrix.dat"
-    write_tensor(model, name, np.ones((2, 2, 4), dtype=np.float32), gguf.GGMLQuantizationType.F32)
+    write_tensor(model, name, np.ones((2, 2, 4), dtype=np.float32), gguf.GGMLQuantizationType.F32, experts=(1, 2))
     write_imatrix(matrix, name, importance)
     with pytest.raises(SystemExit, match="partial"):
         P._imatrix_sensitivity(str(model), str(matrix), ["ffn"], 2, [])
