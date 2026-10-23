@@ -565,7 +565,11 @@ def _moe_rung(a):
         screen, judge = (os.path.join(here, f"{stem}.moe-screen.txt"), os.path.join(here, f"{stem}.moe-judge.txt"))
     steps = []
     if not os.path.exists(imx):
-        steps.append([bini, "-m", a.gguf, "-f", calib, "-o", imx, "-ngl", ngl, "-c", "512", "--chunks", "128"])
+        # the same runtime shape as every other imatrix (_imatrix_shape): a decision head (clef-omni is a MoE) needs
+        # -b/-ub 512 and --no-ppl, or llama-imatrix dies on GGML_ASSERT(params.n_ctx == n_seq * n_ctx) -- the
+        # clef-omni release's [gguf/MOE] step did, after the main imatrix had built fine
+        steps.append([bini, "-m", a.gguf, "-f", calib, "-o", imx, "-ngl", ngl]
+                     + (_imatrix_shape(a.gguf) or ["-c", "512"]) + ["--chunks", "128"])
     if not os.path.exists(em):
         steps.append(["pollard-moefit", "errmap", "--gguf", a.gguf, "--imatrix", imx, "--out", em,
                       "--llama-quantize", binq, "--workdir", os.path.join(here, f"{stem}.moe-probes")])
