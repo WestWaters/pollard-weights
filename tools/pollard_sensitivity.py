@@ -356,7 +356,8 @@ def main():
                  f"  fix: use a SMALLER --eval (a ~20-50 KB held-out snippet is plenty -- the "
                  f"sensitivity signal doesn't need a huge corpus).")
 
-    tmp = tempfile.mkdtemp(prefix="pollard_sens_")
+    import pollard_workspace as ws
+    tmp = tempfile.mkdtemp(prefix="pollard_sens_", dir=ws.cache_dir(create=True))   # GGUF-sized probes: in the workspace
     if a.passthrough:
         return _main_passthrough(a, layers, groups, tmp)
     base = os.path.join(tmp, "base.dat")

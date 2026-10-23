@@ -1898,26 +1898,34 @@ def record_toolcall_not_measured(st, why):
 
 class RelayApi:
     """The huggingface_hub calls a release makes, run on ANOTHER machine over ssh -- for a builder with no HF login
-    (the Mac builds MLX, the box holds the token). `ssh://user@host[:port]/<staging dir>?python=<python>&key=<identity>
-    &min_free_gb=40`. A folder or file is copied with scp into <staging>/<job>/ (after checking that machine keeps
-    min_free_gb free), uploaded from there with that machine's own login, checked on the Hub file by file (size, and
-    sha256 for LFS files) against the local copy, and the staging copy is deleted. Nothing local is touched."""
+    (the Mac builds MLX, the box holds the token). `ssh://user@host[:port]?python=<python>&key=<identity>
+    &min_free_gb=40[&home=<that machine's POLLARD_HOME>]`. A folder or file is copied with scp into that machine's
+    Pollard workspace -- <its POLLARD_HOME>/staging/<repo slug>/<path in repo>/, one fixed folder per rung, found by
+    asking its python (or `home=`) -- after checking it keeps min_free_gb free for the bytes still to send; uploaded
+    from there with that machine's own login; checked on the Hub file by file (size, and sha256 for LFS files)
+    against the local copy; and only then is the staging copy deleted. A transfer that dies part way (the box
+    rebooted mid-scp) leaves its folder for the next run, which sends only the files not already there at the
+    right size + sha256. Nothing local is touched. A path in the URL (the old <staging dir>) is no longer used."""
 
     def __init__(self, url, runner=None, out=print):
         from urllib.parse import urlparse, parse_qs, unquote
+        import pollard_workspace as ws
         u = urlparse(url)
         if u.scheme != "ssh" or not u.hostname:
-            raise SystemExit(f"--upload-via {url}: expected ssh://user@host[:port]/<staging dir>?python=<python>")
+            raise SystemExit(f"--upload-via {url}: expected ssh://user@host[:port]?python=<python>")
         q = {k: v[-1] for k, v in parse_qs(u.query).items()}
         self.host = f"{u.username}@{u.hostname}" if u.username else u.hostname
         self.port = str(u.port or 22)
         path = unquote(u.path)
-        self.staging = path[1:] if len(path) > 2 and path[2] == ":" else path      # /C:/x -> C:/x (Windows)
+        self.url_path = (path[1:] if len(path) > 2 and path[2] == ":" else path).rstrip("/") or None  # /C:/x -> C:/x
         self.python = q.get("python", "python3")
         self.key = os.path.expanduser(q["key"]) if q.get("key") else None
         self.min_free = float(q.get("min_free_gb", 40))
+        self.report_days = float(q.get("report_days", ws.STAGING_REPORT_DAYS))
+        self._home = q.get("home", "").replace("\\", "/").rstrip("/") or None
         self.run_, self.out = runner or subprocess.run, out
 
+    # -------------------------------------------------------------------------------------------- the remote side
     def _base(self, tool="ssh"):
         return [tool] + (["-i", self.key] if self.key else []) + ["-o", "BatchMode=yes",
                                                                    "-P" if tool == "scp" else "-p", self.port]
@@ -1931,6 +1939,38 @@ class RelayApi:
             raise RuntimeError(f"relay {self.host}: python exited {r.returncode}: {(r.stderr or '')[-800:]}")
         lines = [x for x in (r.stdout or "").splitlines() if x.strip()]
         return json.loads(lines[-1]) if lines else None
+
+    @staticmethod
+    def _ship(*fns):
+        """The source of self-contained pollard_workspace helpers, to define them on the relay machine (which may run
+        an older Pollard, or none)."""
+        import inspect
+        import textwrap
+        return "".join(textwrap.dedent(inspect.getsource(f)) + "\n" for f in fns)
+
+    @property
+    def home(self):
+        """The relay machine's Pollard workspace: `home=` in the URL, else what its pollard_workspace says (its
+        $POLLARD_HOME, default ~/pollard), asked once."""
+        if self._home is None:
+            h = self._py("try:\n    import pollard_workspace as _ws\n    h = _ws.pollard_home()\nexcept Exception:\n"
+                         "    h = os.path.abspath(os.environ.get('POLLARD_HOME', os.path.expanduser('~/pollard')))\n"
+                         "print(json.dumps(h.replace(os.sep, '/')))\n")
+            if not h:
+                raise RuntimeError(f"relay {self.host}: could not read its POLLARD_HOME -- pass home= in the URL")
+            self._home = str(h).replace("\\", "/").rstrip("/")
+            if self.url_path and self.url_path.rstrip("/") != self.staging:
+                self.out(f"      relay: the URL's staging path {self.url_path} is no longer used -- staging goes "
+                         f"to {self.staging} (the workspace of {self.host})")
+        return self._home
+
+    @property
+    def staging(self):
+        return f"{self.home}/staging"
+
+    def stage_dir(self, repo_id, path_in_repo):
+        import pollard_workspace as ws
+        return f"{self.staging}/{ws.model_slug(repo_id)}/{ws.staging_key(path_in_repo)}"
 
     def _api(self, call):
         return self._py(f"from huggingface_hub import HfApi\napi = HfApi()\nprint(json.dumps({call}))\n")
@@ -1958,50 +1998,96 @@ class RelayApi:
                         "print(json.dumps(d))\n") or []
         return [SimpleNamespace(path=p, size=s, lfs=({"sha256": h} if h else None), blob_id=b) for p, s, h, b in rows]
 
-    def _drop(self, job):
-        self._py(f"import shutil\nshutil.rmtree({job!r}, ignore_errors=True)\nprint('null')\n")
+    def listing(self, repo_id):
+        """{path: [size, lfs sha256 or None]} of every file in the repo, read on the relay."""
+        return self._py("from huggingface_hub import HfApi\napi = HfApi()\nd = {}\n"
+                        f"for f in api.list_repo_tree({repo_id!r}, recursive=True):\n"
+                        "    if hasattr(f, 'size') and not hasattr(f, 'tree_id'):\n"
+                        "        d[f.path] = [f.size, (f.lfs.sha256 if getattr(f, 'lfs', None) else None)]\n"
+                        "print(json.dumps(d))\n")
 
-    def _stage(self, local):
-        import uuid
-        job = f"{self.staging.rstrip('/')}/{uuid.uuid4().hex[:12]}"
-        size = _size_gb(local)
-        free = self._py(f"import shutil\nos.makedirs({job!r}, exist_ok=True)\n"
-                        f"print(json.dumps(shutil.disk_usage({job!r}).free / 1e9))\n")
-        if free - size < self.min_free:
-            self._drop(job)
-            raise RuntimeError(f"relay {self.host}: {size:.1f} GB to stage and {free:.1f} GB free there -- it must keep "
-                               f"{self.min_free:g} GB free")
-        self.out(f"      relay: scp {local} -> {self.host}:{job}/ ({size:.2f} GB; {free:.0f} GB free there)")
-        r = self.run_(self._base("scp") + ["-q", "-r", local, f"{self.host}:{job}/"])
-        if r.returncode:
-            self._drop(job)
-            raise RuntimeError(f"relay {self.host}: scp exited {r.returncode}")
-        return job
+    def _drop(self, stage):
+        """Delete one staging folder on the relay (only ever inside its workspace staging area)."""
+        import pollard_workspace as ws
+        self._py(self._ship(ws.remove_within) + f"remove_within({self.staging!r}, {stage!r})\nprint('null')\n")
+
+    # ------------------------------------------------------------------------------------------- staging + resume
+    @staticmethod
+    def _local_plan(local, prefix, ignore=()):
+        """[(path inside the staging folder, local file, path in repo)] as upload_file / upload_folder lay it out --
+        a folder's files keep their relative paths, a file sits in the folder under its own name."""
+        from fnmatch import fnmatch
+        if os.path.isfile(local):
+            return [(os.path.basename(local), local, prefix)]
+        items = []
+        for r, _, fs in os.walk(local):
+            for f in fs:
+                rel = os.path.relpath(os.path.join(r, f), local).replace(os.sep, "/")
+                if any(fnmatch(rel, p) for p in ignore or ()):
+                    continue
+                items.append((rel, os.path.join(r, f), "/".join(x for x in (prefix.strip("/"), rel) if x)))
+        return sorted(items)
 
     @staticmethod
-    def local_files(local, prefix):
+    def local_files(local, prefix, ignore=()):
         """{path in repo: (size, sha256)} of a local file or folder as upload_file / upload_folder lay it out."""
-        import hashlib
-        if os.path.isfile(local):
-            items = [(local, prefix)]
-        else:
-            items = [(os.path.join(r, f), "/".join(x for x in (prefix.strip("/"), os.path.relpath(
-                os.path.join(r, f), local).replace(os.sep, "/")) if x)) for r, _, fs in os.walk(local) for f in fs]
-        out = {}
-        for p, rp in items:
-            h = hashlib.sha256()
-            with open(p, "rb") as f:
-                for blk in iter(lambda: f.read(1 << 24), b""):
-                    h.update(blk)
-            out[rp] = (os.path.getsize(p), h.hexdigest())
-        return out
+        import pollard_hubcheck as H
+        return {rp: (os.path.getsize(p), H.sha256_file(p)) for _, p, rp in RelayApi._local_plan(local, prefix, ignore)}
+
+    def _stage(self, local, repo_id, path_in_repo, ignore=()):
+        """Copy `local` into its fixed staging folder on the relay, resuming: files already there at the same size
+        and sha256 are not sent again, a stray file (a different build of the rung) is removed from the folder.
+        Returns (staging folder, {path in repo: (size, sha256)})."""
+        import pollard_hubcheck as H
+        import pollard_workspace as ws
+        plan = self._local_plan(local, path_in_repo, ignore)
+        want = {rel: (os.path.getsize(p), H.sha256_file(p)) for rel, p, _ in plan}
+        stage = self.stage_dir(repo_id, path_in_repo)
+        mark = {"repo_id": repo_id, "path_in_repo": path_in_repo, "source": os.path.abspath(local),
+                "files": {rp: list(want[rel]) for rel, _, rp in plan},
+                "staged": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        got = self._py(self._ship(ws.sha256_files) + "import shutil\n"
+                       f"stage, want, mark = {stage!r}, {({k: v[0] for k, v in want.items()})!r}, {mark!r}\n"
+                       "os.makedirs(stage, exist_ok=True)\n"
+                       "have = {}\n"
+                       "for r, _, fs in os.walk(stage):\n"
+                       "    for f in fs:\n"
+                       "        rel = os.path.relpath(os.path.join(r, f), stage).replace(os.sep, '/')\n"
+                       f"        if rel != {ws.STAGING_MARK!r}:\n"
+                       "            have[rel] = os.path.getsize(os.path.join(r, f))\n"
+                       "for rel in [x for x in have if x not in want]:\n"
+                       "    os.remove(os.path.join(stage, rel))\n"
+                       "    del have[rel]\n"
+                       "for rel in want:\n"
+                       "    os.makedirs(os.path.dirname(os.path.join(stage, rel)), exist_ok=True)\n"
+                       f"with open(os.path.join(stage, {ws.STAGING_MARK!r} + '.tmp'), 'w', encoding='utf-8') as f:\n"
+                       "    json.dump(mark, f)\n"
+                       f"os.replace(os.path.join(stage, {ws.STAGING_MARK!r} + '.tmp'), os.path.join(stage, {ws.STAGING_MARK!r}))\n"
+                       "shas = sha256_files(stage, [r for r, s in want.items() if have.get(r) == s])\n"
+                       "print(json.dumps({'have': have, 'shas': shas, 'free': shutil.disk_usage(stage).free / 1e9}))\n")
+        have, shas, free = got["have"], got["shas"], float(got["free"])
+        send = [(rel, p) for rel, p, _ in plan if not (have.get(rel) == want[rel][0] and shas.get(rel) == want[rel][1])]
+        need = sum(max(0, want[rel][0] - int(have.get(rel, 0))) for rel, _ in send) / 1e9
+        kept = len(plan) - len(send)
+        if free - need < self.min_free:
+            raise RuntimeError(f"relay {self.host}: {need:.1f} GB still to stage and {free:.1f} GB free there -- it "
+                               f"must keep {self.min_free:g} GB free (the partial copy in {stage} is kept)")
+        self.out(f"      relay: {local} -> {self.host}:{stage}/ (" + (
+            f"resuming: {kept} of {len(plan)} file(s) already there, " if kept else "")
+            + f"{need:.2f} GB to send; {free:.0f} GB free there)")
+        groups = {}
+        for rel, p in send:
+            groups.setdefault(rel.rsplit("/", 1)[0] if "/" in rel else "", []).append(p)
+        for sub, paths in sorted(groups.items()):
+            dest = f"{stage}/{sub}/" if sub else f"{stage}/"
+            r = self.run_(self._base("scp") + ["-q"] + paths + [f"{self.host}:{dest}"])
+            if r.returncode:
+                raise RuntimeError(f"relay {self.host}: scp exited {r.returncode} (the partial copy in {stage} is "
+                                   "kept: the next run resumes it)")
+        return stage, {rp: want[rel] for rel, _, rp in plan}
 
     def check(self, repo_id, want):
-        got = self._py("from huggingface_hub import HfApi\napi = HfApi()\nd = {}\n"
-                       f"for f in api.list_repo_tree({repo_id!r}, recursive=True):\n"
-                       "    if hasattr(f, 'size') and not hasattr(f, 'tree_id'):\n"
-                       "        d[f.path] = [f.size, (f.lfs.sha256 if getattr(f, 'lfs', None) else None)]\n"
-                       "print(json.dumps(d))\n")
+        got = self.listing(repo_id) or {}
         bad = sorted(rp for rp, (size, sha) in want.items()
                      if rp not in got or got[rp][0] != size or (got[rp][1] and got[rp][1] != sha))
         if bad:
@@ -2009,27 +2095,82 @@ class RelayApi:
                                f"(size / sha256): {bad[:5]}")
         self.out(f"      relay: {len(want)} file(s) on the Hub match the local copy (size + sha256)")
 
-    def upload_folder(self, folder_path, path_in_repo, repo_id, **kw):
-        want = self.local_files(folder_path, path_in_repo)
-        job = self._stage(folder_path)
+    def _upload(self, local, path_in_repo, repo_id, call, ignore=()):
+        stage, want = self._stage(local, repo_id, path_in_repo, ignore)
         try:
-            src = f"{job}/{os.path.basename(os.path.normpath(folder_path))}"
-            self._api(f"str(api.upload_folder(folder_path={src!r}, path_in_repo={path_in_repo!r}, "
-                      f"repo_id={repo_id!r}))")
+            self._api(call(stage))
             self.check(repo_id, want)
-        finally:
-            self._drop(job)
+        except BaseException:
+            self.out(f"      relay: upload not confirmed -- the staging copy {self.host}:{stage} is kept (the next "
+                     "run resumes it)")
+            raise
+        self._drop(stage)                               # only after the Hub holds every file, size + sha256
+        return stage
+
+    def upload_folder(self, folder_path, path_in_repo, repo_id, ignore_patterns=None, **kw):
+        import pollard_workspace as ws
+        ignore = list(ignore_patterns or [])
+        pats = [ws.STAGING_MARK] + ignore
+        self._upload(folder_path, path_in_repo, repo_id, lambda stage: (
+            f"str(api.upload_folder(folder_path={stage!r}, path_in_repo={path_in_repo!r}, repo_id={repo_id!r}, "
+            f"ignore_patterns={pats!r}))"), ignore)
 
     def upload_file(self, path_or_fileobj, path_in_repo, repo_id, **kw):
-        want = self.local_files(path_or_fileobj, path_in_repo)
-        job = self._stage(path_or_fileobj)
-        try:
-            src = f"{job}/{os.path.basename(path_or_fileobj)}"
-            self._api(f"str(api.upload_file(path_or_fileobj={src!r}, path_in_repo={path_in_repo!r}, "
-                      f"repo_id={repo_id!r}))")
-            self.check(repo_id, want)
-        finally:
-            self._drop(job)
+        name = os.path.basename(path_or_fileobj)
+        self._upload(path_or_fileobj, path_in_repo, repo_id, lambda stage: (
+            f"str(api.upload_file(path_or_fileobj={stage + '/' + name!r}, path_in_repo={path_in_repo!r}, "
+            f"repo_id={repo_id!r}))"))
+
+    # ------------------------------------------------------------------------------------------------- the sweep
+    def sweep(self, repos=(), force=False, legacy_root=None):
+        """At the start of a run: on the relay machine, remove empty staging folders and copies already confirmed on
+        the Hub (size + sha256), report anything else older than report_days, keep recent partial copies for resume.
+        The legacy folder (C:/pollard/mlx-staging, random-named copies the old relay never reclaimed) is swept the
+        same way -- emptied of copies already on the Hub, removed once empty -- and nothing else outside the
+        workspace is ever touched. Returns (bytes freed, [(path, action, why)])."""
+        import pollard_workspace as ws
+        legacy = ws.LEGACY_STAGING if legacy_root is None else legacy_root
+        scans = self._py(self._ship(ws.scan_staging) +
+                         f"out = [scan_staging({self.staging!r}, 2), []]\n"
+                         f"if {legacy!r} and os.path.isdir({legacy!r}):\n"
+                         f"    out[1] = scan_staging({legacy!r}, 1)\n"
+                         f"print(json.dumps(out + [bool({legacy!r}) and os.path.isdir({legacy!r})]))\n")
+        cache = {}
+
+        def listing_of(repo):
+            if repo not in cache:
+                try:
+                    cache[repo] = self.listing(repo)
+                except Exception:                                         # noqa: BLE001
+                    cache[repo] = None
+            return cache[repo]
+
+        def shas_of(e, rels):
+            return self._py(self._ship(ws.sha256_files) + f"print(json.dumps(sha256_files({e['path']!r}, {rels!r})))\n")
+
+        freed, report = 0, []
+        for root, entries, is_legacy in ((self.staging, scans[0], False), (legacy, scans[1], True)):
+            if is_legacy and not scans[2]:
+                continue
+            plan = ws.plan_sweep(entries, listing_of, shas_of, repos, None, self.report_days, is_legacy)
+            gone = [e for e, act, _ in plan if act == "remove" or (force and not is_legacy)]
+            if gone:
+                self._py(self._ship(ws.remove_within) +
+                         f"for p in {[e['path'] for e in gone]!r}:\n    remove_within({root!r}, p)\nprint('null')\n")
+            for e, act, why in plan:
+                if e in gone:
+                    freed += e["bytes"]
+                    why = why if act == "remove" else "forced"
+                    act = "remove"
+                    self.out(f"   relay staging: removed {self.host}:{e['path']} -- {why}")
+                elif act == "report":
+                    self.out(f"   relay staging: KEPT {self.host}:{e['path']} -- {why}")
+                report.append((e["path"], act, why))
+            left = self._py(self._ship(ws._prune_empty) + f"_prune_empty({root!r}, {is_legacy!r}, log=lambda m: None)\n"
+                            f"print(json.dumps(os.path.isdir({root!r})))\n")
+            if is_legacy and not left:
+                self.out(f"   relay staging: removed the empty legacy folder {self.host}:{root}")
+        return freed, report
 
 
 def hf_api(cfg):
@@ -2038,6 +2179,35 @@ def hf_api(cfg):
         return RelayApi(str(cfg["upload_via"]))
     from huggingface_hub import HfApi
     return HfApi()
+
+
+def sweep_staging(cfg, c, out=print, relay=None):
+    """Start of an uploading run: reclaim staging copies left by earlier runs -- this machine's workspace staging area
+    and, with --upload-via, the relay machine's (plus its legacy C:/pollard/mlx-staging). Empty folders and copies
+    already confirmed on the Hub (size + sha256) go; recent partial copies stay for the upload to resume; anything
+    else older than a week is reported, not deleted. Never fails the run."""
+    import pollard_workspace as ws
+    repos = [repo_name(c.get("org", cfg.get("org", "PollardWeights")), c["src"])]
+    if os.path.isdir(ws.staging_root()) or os.path.isdir(ws.LEGACY_STAGING):
+        try:
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+            except ImportError:
+                api = None
+            freed, _ = ws.sweep_staging(api, repos, log=out)
+            if freed:
+                out(f"   staging: freed {ws.human(freed)} on this machine")
+        except Exception as e:                                            # noqa: BLE001
+            out(f"   staging: sweep of {ws.staging_root()} skipped ({type(e).__name__}: {e})")
+    if cfg.get("upload_via"):
+        try:
+            r = relay or RelayApi(str(cfg["upload_via"]), out=out)
+            freed, _ = r.sweep(repos)
+            if freed:
+                out(f"   relay staging: freed {ws.human(freed)} on {r.host}")
+        except Exception as e:                                            # noqa: BLE001
+            out(f"   relay staging: sweep skipped ({type(e).__name__}: {e})")
 
 
 #: a lane tool that exits with this code HELD the step for an exact reason it printed (no exllamav3 architecture, no
@@ -2659,8 +2829,9 @@ def main(argv=None):
                     help="build -> gate -> upload -> delete ONE rung at a time (a disk smaller than the ladder); "
                          "needs --upload and `upload: true`")
     ap.add_argument("--upload-via", metavar="SSH_URL",
-                    help="upload through another machine's HF login: ssh://user@host[:port]/<staging dir>?python="
-                         "<python>&key=<identity>&min_free_gb=40 (scp -> upload there -> size/sha256 checked on the "
+                    help="upload through another machine's HF login: ssh://user@host[:port]?python="
+                         "<python>&key=<identity>&min_free_gb=40[&home=<its POLLARD_HOME>] (scp into its workspace "
+                         "staging/<repo>/<path>/, resumed on a rerun -> upload there -> size/sha256 checked on the "
                          "Hub -> staging deleted). Also `upload_via:` in the plan")
     ap.add_argument("--rungs-only", action="store_true",
                     help="with --free-after-upload: publish each verified rung into its lane folder and stop there -- "
@@ -2749,6 +2920,8 @@ def main(argv=None):
     if run:
         from pollard_auto import MachineLock
         with MachineLock("pollard release " + src, force=a.force):
+            if upload_ok:
+                sweep_staging(cfg, c)
             if a.parallel and not (a.taskeval_only or a.jev_index_only):
                 st = execute_parallel(steps, c, cfg, upload_ok, a.redo, have)
             else:

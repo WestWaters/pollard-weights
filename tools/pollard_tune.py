@@ -554,9 +554,9 @@ def local_model(model):
         if isinstance(hit, str) and os.path.exists(os.path.join(os.path.dirname(hit), "tokenizer_config.json")) \
                 and glob.glob(os.path.join(os.path.dirname(hit), "*.safetensors")):
             return os.path.dirname(hit)
-        from huggingface_hub import snapshot_download
-        return snapshot_download(model, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja",
-                                                        "*.tiktoken", "*.py"])
+        import pollard_workspace as ws            # one findable copy in the workspace downloads/, not ~/.cache
+        return ws.fetch_source(model, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja",
+                                                      "*.tiktoken", "*.py"])
     except Exception:
         return model
 

@@ -115,6 +115,12 @@ _DENSE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down)\.weight$")
 _SEQMIX = re.compile(r"^blk\.\d+\.(attn_|ssm_|time_mix|shortconv|conv|mamba|linear_attn|indexer)")
 
 
+def _work_root():
+    """Probe GGUFs and base logits (model-sized) go in the workspace cache/, not the system temp dir."""
+    import pollard_workspace as ws
+    return ws.cache_dir(create=True)
+
+
 def type_rank(t):
     """position of a type on the low -> high byte scale (unknown types sort by their bpw)."""
     return bpw_of(t)
@@ -392,7 +398,7 @@ def errmap(gguf_path, imatrix, out, types=DEFAULT_TYPES, quantize="llama-quantiz
         if t.name not in store:
             fixed[t.name] = {"role": role_of(t.name, len(t.shape)), "numel": int(np.prod([int(x) for x in t.shape])),
                              "src_bytes": int(t.n_bytes)}
-    work = workdir or tempfile.mkdtemp(prefix="pollard_moefit_")
+    work = workdir or tempfile.mkdtemp(prefix="pollard_moefit_", dir=_work_root())
     os.makedirs(work, exist_ok=True)
     t0 = time.time()
     for q in types:
@@ -887,7 +893,7 @@ def lowbit(gguf_path, imatrix, eval_path, out, types=LOWBIT_TYPES, granularity="
                  "eval": os.path.abspath(eval_path), "granularity": granularity, "types": list(types),
                  "ref_kl": None, "classes": {c: {"tensors": classes[c], "kl": {}} for c in order}}
     state["types"] = sorted(set(state.get("types", [])) | set(types), key=bpw_of)
-    work = workdir or tempfile.mkdtemp(prefix="pollard_lowbit_")
+    work = workdir or tempfile.mkdtemp(prefix="pollard_lowbit_", dir=_work_root())
     os.makedirs(work, exist_ok=True)
     base = _base_logits(perplexity, gguf_path, eval_path, os.path.join(work, "lowbit-base.kld"), ngl, chunks)
     probe = os.path.join(work, "lowbit-probe.gguf")
@@ -1132,7 +1138,7 @@ def auto(src, imatrix, em, sens, lb, budget_bytes, prunes=(0.0, 0.10, 0.25, 0.40
 
     Returns the report (every candidate's screening + measured numbers, the winner and why)."""
     from pollard_prune import reap_layers  # noqa: F401 -- same scorer the CLI prune uses
-    work = workdir or tempfile.mkdtemp(prefix="pollard_moeauto_")
+    work = workdir or tempfile.mkdtemp(prefix="pollard_moeauto_", dir=_work_root())
     os.makedirs(work, exist_ok=True)
     screen_eval = screen_eval or judge_eval
     judge_eval = judge_eval or screen_eval

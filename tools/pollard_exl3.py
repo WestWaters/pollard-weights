@@ -741,7 +741,8 @@ def main():
             raise SystemExit(f"--model {a.model!r} is not a directory and huggingface_hub is not "
                              "installed to fetch it; pass a local path") from None
         print(f"   resolving {a.model} from the Hub ...", flush=True)
-        a.model = snapshot_download(a.model, allow_patterns=[
+        import pollard_workspace as ws        # one findable copy in the workspace downloads/, not ~/.cache
+        a.model = ws.fetch_source(a.model, allow_patterns=[
             "*.safetensors", "*.json", "*.model", "*.txt"])
         print(f"   -> {a.model}", flush=True)
 
