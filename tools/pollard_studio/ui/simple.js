@@ -247,7 +247,7 @@ llama-cli -m Qwen3-8B-Pollard.gguf</div></div>
             <div><code>pollard-doctor</code><span>diagnose · predict · repair any model, any lane</span></div></div></div>
           <div class="pane card"><h4>Runtime, cluster &amp; agents</h4><div class="dl">
             <div><code>pollard-run</code><span>measured expert placement, RAM-streaming</span></div>
-            <div><code>pollard-node</code><span>run on every box so Studio totals a cluster's RAM</span></div>
+            <div><code>pollard-node --lan</code><span>run on every box so Studio totals a cluster's RAM</span></div>
             <div><code>ggml-rpc</code><span>pool machines' memory over the network</span></div>
             <div><code>skills/pollard</code><span>agent skill — routes any model down the right lane</span></div></div></div>
         </div>

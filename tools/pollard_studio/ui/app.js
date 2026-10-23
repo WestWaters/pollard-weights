@@ -1403,7 +1403,7 @@ async function renderPool() {
     (s.no_agent && s.no_agent.length
       ? `<div class="nnote">${s.no_agent.length} box${s.no_agent.length === 1 ? "" : "es"}
            report only device memory — RPC has no call for a host's RAM or disk. Run
-           <b>pollard-node</b> there and its RAM, cards and storage join these totals.</div>`
+           <b>pollard-node --lan</b> there and its RAM, cards and storage join these totals.</div>`
       : "");
   refresh();
 }
@@ -1524,7 +1524,7 @@ async function loadRemoteModels() {
       ? `<div class="hint">${remoteModels.length} build${remoteModels.length === 1 ? "" : "s"}
            on ${(got.hosts || []).length} other box${(got.hosts || []).length === 1 ? "" : "es"} —
            they appear in the source and build lists, tagged with the box that holds them.</div>`
-      : `<div class="hint">No builds reported by other boxes. Run <b>pollard-node</b> there and
+      : `<div class="hint">No builds reported by other boxes. Run <b>pollard-node --lan</b> there and
            its workspace joins this list.</div>`;
   }
   refresh();

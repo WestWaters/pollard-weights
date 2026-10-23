@@ -13,16 +13,21 @@ So each box runs this next to its ggml-rpc-server. It is deliberately tiny:
   * no dependencies beyond the standard library, because a build box should not need a pip
     install to be counted.
 
-    pollard-node                      # serve on 0.0.0.0:50053
-    pollard-node --port 9100 --host 127.0.0.1
+    pollard-node                      # serve on 127.0.0.1:50053 (this machine only)
+    pollard-node --lan                # serve on 0.0.0.0:50053, so the cluster's Studio can count this box
+    pollard-node --port 9100 --host <this box's LAN address>
 
-It is machine specs on a LAN port, so treat it the way you would any other local service: bind it
-to an interface your cluster is actually on. Nothing it serves can change the box.
+It is machine specs and a model list (with paths), so it binds loopback unless told otherwise:
+`--lan` (or an explicit --host) is the deliberate step that puts it on the network. It sends no CORS
+header -- Studio reads it server-side, and a web page has no business reading it -- unless an origin is
+named with --allow-origin. A request whose Host is a name this box does not answer to (a DNS-rebinding
+page) or whose Origin is not on that list is refused. Nothing it serves can change the box.
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import pathlib
@@ -32,6 +37,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import cluster
 
 DEFAULT_PORT = 50053
+#: loopback unless --lan / --host says otherwise
+DEFAULT_HOST = "127.0.0.1"
+LAN_HOST = "0.0.0.0"
 #: bumped when the payload shape changes, so an older Studio can tell
 SCHEMA = 1
 
@@ -170,10 +178,54 @@ def report(home: str | None = None) -> dict:
     return got
 
 
+def _host_name(header: str | None) -> str:
+    """The name part of a Host header: 'box:50053' -> 'box', '[::1]:50053' -> '::1'."""
+    h = (header or "").strip().lower()
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else h[1:]
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _own_names() -> set:
+    names = {"localhost"}
+    try:
+        hn = socket.gethostname().lower()
+        names |= {hn, hn.split(".")[0], hn.split(".")[0] + ".local"}
+        names.add(socket.getfqdn().lower())
+    except OSError:
+        pass
+    return {n for n in names if n}
+
+
+def host_allowed(header: str | None, extra=()) -> bool:
+    """A Host this box answers to: an IP literal, localhost, its own hostname, or one named with --allow-host.
+    Anything else is a name someone else pointed here -- the DNS-rebinding way into a LAN service."""
+    name = _host_name(header)
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return name in _own_names() or name in {e.lower() for e in extra}
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "pollard-node"
+    #: origins a browser page may read /info from (--allow-origin); none by default
+    allow_origins: tuple = ()
+    #: extra Host names accepted beside the box's own (--allow-host)
+    allow_hosts: tuple = ()
 
     def do_GET(self):                                   # noqa: N802  (http.server's spelling)
+        if not host_allowed(self.headers.get("Host"), self.allow_hosts):
+            self.send_error(403, "unknown Host")
+            return
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in self.allow_origins:
+            self.send_error(403, "origin not allowed")
+            return
         if self.path.rstrip("/") not in ("", "/info"):
             self.send_error(404, "only /info")
             return
@@ -181,7 +233,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if origin is not None:                          # only ever an origin on the explicit list
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
@@ -190,11 +244,23 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
-def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT) -> None:
-    srv = ThreadingHTTPServer((host, port), _Handler)
+def make_handler(allow_origins=(), allow_hosts=()):
+    return type("_NodeHandler", (_Handler,), {"allow_origins": tuple(allow_origins),
+                                              "allow_hosts": tuple(allow_hosts)})
+
+
+def bind_host(host: str | None, lan: bool) -> str:
+    """--host wins; else --lan means every interface; else loopback."""
+    return host or (LAN_HOST if lan else DEFAULT_HOST)
+
+
+def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, allow_origins=(), allow_hosts=()) -> None:
+    srv = ThreadingHTTPServer((host, port), make_handler(allow_origins, allow_hosts))
     where = f"{socket.gethostname()} ({host}:{port})"
     print(f"pollard-node: serving this box's specs on {where}")
     print("             read-only; nothing here can change the machine. ctrl-c to stop.")
+    if host in ("127.0.0.1", "localhost", "::1"):
+        print("             loopback only -- other boxes cannot see it. `pollard-node --lan` to join a cluster.")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -205,16 +271,23 @@ def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--host", default="0.0.0.0",
-                    help="interface to bind (default: every one)")
+    ap.add_argument("--host", default=None,
+                    help=f"interface to bind (default {DEFAULT_HOST}: this machine only)")
+    ap.add_argument("--lan", action="store_true",
+                    help=f"bind every interface ({LAN_HOST}) so Studio on another box can count this one")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--allow-origin", action="append", default=[], metavar="ORIGIN",
+                    help="a web origin allowed to read /info from a browser (e.g. http://studio.lan:8000); "
+                         "repeatable. None by default -- Studio reads it server-side and needs no CORS")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="an extra Host name to answer to (a DNS alias of this box); repeatable")
     ap.add_argument("--once", action="store_true",
                     help="print the report and exit, instead of serving")
     a = ap.parse_args()
     if a.once:
         print(json.dumps(report(), indent=1))
         return
-    serve(a.host, a.port)
+    serve(bind_host(a.host, a.lan), a.port, a.allow_origin, a.allow_host)
 
 
 if __name__ == "__main__":
