@@ -1313,6 +1313,17 @@ def _floors(spec):
     return out
 
 
+def _engine(a, *names):
+    """The llama.cpp binaries for a subcommand, resolved the way every other pipeline step resolves them:
+    find_llama_bin with the model's architecture (set_model_arch from --gguf, as pollard / pollard-release /
+    pollard-verify do), so a clef-omni run gets the engine tree that carries its patches -- not whichever
+    llama-quantize comes first. An explicit path is honored as-is; an unresolved name is passed through."""
+    from pollard_calc import find_llama_bin, set_model_arch
+    if getattr(a, "gguf", None):
+        set_model_arch(a.gguf)
+    return tuple(find_llama_bin(n) or n for n in names)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
@@ -1436,8 +1447,7 @@ def main(argv=None):
         return 0
 
     if a.cmd == "errmap":
-        from pollard_calc import find_llama_bin
-        q = find_llama_bin(a.llama_quantize) or a.llama_quantize
+        q, = _engine(a, a.llama_quantize)
         types = [t.strip() for t in a.types.split(",") if t.strip()]
         bad = [t for t in types if t not in QUANT_SIZES]
         if bad:
@@ -1469,9 +1479,7 @@ def main(argv=None):
         return 0
 
     if a.cmd == "lowbit":
-        from pollard_calc import find_llama_bin
-        q = find_llama_bin(a.llama_quantize) or a.llama_quantize
-        ppl = find_llama_bin(a.llama_perplexity) or a.llama_perplexity
+        q, ppl = _engine(a, a.llama_quantize, a.llama_perplexity)
         types = [t.strip() for t in a.types.split(",") if t.strip()]
         print(f"== pollard-moefit lowbit :: {a.gguf}  types {types}  granularity {a.granularity}")
         lowbit(a.gguf, a.imatrix, a.eval, a.out, types, a.granularity, q, ppl, a.ngl, a.workdir, a.threads)
@@ -1479,9 +1487,7 @@ def main(argv=None):
         return 0
 
     if a.cmd == "auto":
-        from pollard_calc import find_llama_bin
-        q = find_llama_bin(a.llama_quantize) or a.llama_quantize
-        ppl = find_llama_bin(a.llama_perplexity) or a.llama_perplexity
+        q, ppl = _engine(a, a.llama_quantize, a.llama_perplexity)
         em = json.load(open(a.errmap))
         rep = auto(a.gguf, a.imatrix, em, json.load(open(a.sensitivity)),
                    json.load(open(a.lowbit)) if a.lowbit else None, _budget(a, em),
@@ -1495,8 +1501,7 @@ def main(argv=None):
         return 0
 
     if a.cmd == "build":
-        from pollard_calc import find_llama_bin
-        q = find_llama_bin(a.llama_quantize) or a.llama_quantize
+        q, = _engine(a, a.llama_quantize)
         res = build(a.gguf, a.imatrix, json.load(open(a.plan)), a.out, q, a.threads,
                     allow_requantize=a.allow_requantize)
         print(json.dumps({k: v for k, v in res.items() if k != "mismatched"}), f"mismatched={len(res['mismatched'])}")
