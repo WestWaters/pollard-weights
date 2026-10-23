@@ -426,27 +426,12 @@ def write_verifier_head(model, src_dir, out_dir):
 
 # ----------------------------------------------------------------------------- safety
 
-@contextlib.contextmanager
 def heavy_lock(path=None, poll=20, log=print):
-    """Hold the shared machine lock (a directory; mkdir is atomic) for a heavy stage. POLLARD_HEAVY_LOCK names it."""
-    path = path or os.environ.get("POLLARD_HEAVY_LOCK")
-    if not path:
-        yield
-        return
-    said = False
-    while True:
-        try:
-            os.mkdir(path)
-            break
-        except FileExistsError:
-            if not said and log:
-                log(f"   waiting for the heavy-job lock {path} ...")
-                said = True
-            time.sleep(poll)
-    try:
-        yield
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+    """Hold the shared machine lock (a directory; mkdir is atomic) for a heavy stage. POLLARD_HEAVY_LOCK names it.
+    The one implementation every heavy step shares (pollard_auto.heavy_dir_lock): owner file, a dead owner taken
+    over, a no-op under a release step that already holds it for this process."""
+    from pollard_auto import heavy_dir_lock
+    return heavy_dir_lock(path, what="pollard-draft train", poll=poll, log=log)
 
 
 def pick_device(want="auto"):
