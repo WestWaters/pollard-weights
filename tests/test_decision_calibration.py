@@ -6,13 +6,15 @@ should have escalated. So the board carries calibration against the gold labels,
 ECE change, the count of flipped decisions and a paired-bootstrap CI on agreement (20 questions is not 2000).
 
 And two converter/runtime gaps that make the board measure the wrong model, read off the GGUF before it runs:
-a clef-type head whose `<arch>.decision.temperature.*` keys were dropped (upstream's converter does; Unsloth's
-FastDecisionModel exports them) answers uncalibrated; a pplx-decider whose source is noncausal but whose GGUF
+a clef-type head whose SOURCE calibrated temperatures (Unsloth's FastDecisionModel writes them into
+joint_head_config.json) but whose GGUF lacks `<arch>.decision.temperature.*` answers uncalibrated -- Cloudflare's own
+clef checkpoints declare none, so T=1 is right for them; a pplx-decider whose source is noncausal but whose GGUF
 lacks `<arch>.attention.causal = false` runs causally upstream (~3/25 decisions flip). Warnings, not failures.
 """
 from __future__ import annotations
 
 import json
+import os
 import math
 import sys
 from pathlib import Path
@@ -97,12 +99,21 @@ def test_card_decision_table_shows_ece_and_flips_when_present():
 
 # ── pre-gate checks ──────────────────────────────────────────────────────────────────────────────────
 
-def test_clef_without_temperatures_warns_and_with_them_does_not():
+def test_clef_temperature_check_follows_the_source_head_config():
     meta = {"general.architecture": "clef", "general.name": "clef-flash", "clef.decision.n_types": 3}
+    # no source head config to read: it cannot tell -- says so and asks for --source, never claims a drop
     w = pd.pregate_checks(meta)
-    assert len(w) == 1 and "clef.decision.temperature" in w[0]
+    assert len(w) == 1 and "--source" in w[0] and "dropped" not in w[0]
+    # Cloudflare's checkpoints declare no temperatures (joint_schema_model.py: plain softmax) -> T=1 IS the reference
+    cloudflare = {"hidden_size": 2048, "width": 1024, "routing_layers": 2, "layers": 4, "heads": 16, "feedforward": 4096}
+    assert pd.pregate_checks(meta, None, cloudflare, True) == []
+    # a source that calibrated them (Unsloth FastDecisionModel) and a GGUF that lost them: warned, with the numbers
+    tuned = dict(cloudflare, temperatures={"choice": 1.3, "noul": 0.8})
+    w = pd.pregate_checks(meta, None, tuned, True)
+    assert len(w) == 1 and "1.3" in w[0] and "T=1" in w[0]
+    # the GGUF carries them: llama-server applies them itself, nothing to warn about
     meta["clef.decision.temperature.choice"] = 1.3
-    assert pd.pregate_checks(meta) == []
+    assert pd.pregate_checks(meta) == [] and pd.pregate_checks(meta, None, tuned, True) == []
     assert pd.pregate_checks({"general.architecture": "qwen3", "general.name": "Qwen3-8B"}) == []
 
 
@@ -131,3 +142,69 @@ def test_gate_attaches_warnings_and_still_runs(monkeypatch):
     assert res["verdict"] == "PASS" and res["warnings"] == ["dropped temperatures"]
     monkeypatch.setattr(pd, "pregate", lambda model, source=None: [])
     assert "warnings" not in pd.gate("m.gguf", 0)
+
+
+# ── decision temperatures: read like llama-server, applied like with like ───────────────────────────────
+
+def test_head_temperatures_shapes():
+    assert pd.head_temperatures(None) == {} and pd.head_temperatures({"layers": 4}) == {}
+    assert pd.head_temperatures({"temperature": 1.5}) == {"all": 1.5}
+    assert pd.head_temperatures({"temperatures": {"choice": 1.2, "noul.2": 0.9, "bad": "x", "zero": 0}}) == {
+        "choice": 1.2, "noul.2": 0.9}
+    meta = {"general.architecture": "clef-omni", "clef-omni.decision.temperature.choice.3_5": 1.1,
+            "clef-omni.decision.type": "clef"}
+    assert pd.gguf_temperatures(meta) == {"choice.3_5": 1.1}
+
+
+def test_temperature_lookup_matches_llama_server_buckets():
+    t = {"choice.3_5": 1.4, "choice": 1.2, "noul": 0.7}
+    assert pd.temperature_for(t, "choice", 4) == 1.4            # <type>.<bucket> first
+    assert pd.temperature_for(t, "choice", 2) == 1.2            # then <type>
+    assert pd.temperature_for(t, "noul", 2) == 0.7
+    assert pd.temperature_for(t, "score", 5) == 1.0             # nothing -> T=1, as the server
+    assert pd.temperature_for({"all": 2.0}, "score", 11) == 2.0
+    assert [pd._bucket(n) for n in (2, 3, 5, 6, 10, 11)] == ["2", "3_5", "3_5", "6_10", "6_10", "11"]
+
+
+def test_apply_temperature_is_softmax_of_logits_over_t():
+    import math
+    z = [2.0, 0.5, -1.0]
+    sm = lambda v: [math.exp(x - max(v)) / sum(math.exp(y - max(v)) for y in v) for x in v]
+    got = pd.apply_temperature(sm(z), 1.7)
+    assert all(abs(a - b) < 1e-12 for a, b in zip(got, sm([x / 1.7 for x in z])))
+    d = pd.apply_temperature({"true": 0.8, "false": 0.2}, 0.5)
+    assert abs(d["true"] - 0.64 / 0.68) < 1e-12
+    assert pd.apply_temperature([0.3, 0.7], 1.0) == [0.3, 0.7]
+
+
+def test_client_temperatures_never_double_the_servers():
+    tuned = {"temperatures": {"choice": 1.3}}
+    bare = {"general.architecture": "clef"}
+    carried = dict(bare, **{"clef.decision.temperature.choice": 1.3})
+    assert pd.client_temperatures(bare, tuned) == {"choice": 1.3}     # GGUF lost them: the board applies them
+    assert pd.client_temperatures(carried, tuned) == {}               # server applies them: never twice
+    assert pd.client_temperatures(bare, {"layers": 4}) == {}          # Cloudflare: T=1 both sides
+
+
+def test_board_applies_source_temperatures_to_build_and_reference(monkeypatch, tmp_path):
+    import contextlib
+    import pollard_bench as B
+    (tmp_path / "joint_head_config.json").write_text(json.dumps({"layers": 4, "temperatures": {"choice": 2.0}}))
+    seen = []
+
+    @contextlib.contextmanager
+    def fake_served(model, ngl, ctx=4096, port=0, extra=()):
+        yield "http://" + os.path.basename(model)
+
+    def fake_run(base, post, items=None, temps=None):
+        seen.append((base, temps))
+        return [{"question": q, "options": o, "answer": a, "first": "", "probs": [0.7] + [0.3 / (len(o) - 1)] * (len(o) - 1),
+                 "mass": 1.0} for _, q, o, a in pd.DECISION_SET]
+
+    monkeypatch.setattr(B, "_served", fake_served)
+    monkeypatch.setattr(pd, "run", fake_run)
+    monkeypatch.setattr(pd, "_meta", lambda m: {"general.architecture": "clef-omni", "clef-omni.decision.type": "clef"})
+    res = pd.gate("rung.gguf", "0", ref="ref.gguf", source=str(tmp_path))
+    assert seen == [("http://rung.gguf", {"choice": 2.0}), ("http://ref.gguf", {"choice": 2.0})]
+    assert res["temperatures"]["build"] == {"choice": 2.0} and "warnings" in res
+    assert any("2.0" in w for w in res["warnings"])

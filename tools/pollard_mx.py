@@ -58,7 +58,7 @@ import pollard_workspace as ws
 
 
 #: profile keys that are bookkeeping, never a group of per-layer scores (pollard-probe / pollard-sensitivity)
-PROFILE_META = frozenset({"noise", "probe", "layers", "source", "method", "stability", "excluded_tensors", "ref",
+PROFILE_META = frozenset({"noise", "probe", "layers", "source", "method", "stability", "excluded_tensors", "ref", "experts",
                           "base"})
 
 

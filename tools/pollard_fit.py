@@ -377,6 +377,23 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     return res + ({p for p, _ in pinned},) if want_pinned else res
 
 
+def stale_moe_profile(sensitivity, arch):
+    """Why an imatrix-derived profile must be re-made before it allocates this MoE, or None.
+
+    `pollard-probe --from-imatrix` profiles made before 2026-10-22 summed every expert's CONDITIONAL cost (E[x^2]
+    over only the tokens routed to it) as if every token reached every expert: n_expert / n_used too heavy against
+    attention, which sees every token. On clef-omni (128 experts, top-8) the IQ4_XS rung put 23 layers of attention
+    at iq2_xxs while the experts kept iq4_xs-q6_K. A current profile carries `"experts": "routing-frequency"`."""
+    if not sensitivity or (arch or {}).get("kind") != "moe":
+        return None
+    if sensitivity.get("method") != "imatrix-hessian" or sensitivity.get("experts"):
+        return None
+    return ("this sensitivity profile is from `pollard-probe --from-imatrix` before MoE experts were weighted by "
+            "routing frequency: it over-weights every expert by n_expert / n_used against attention, so attention "
+            "lands far too low. Re-run `pollard-probe --from-imatrix <imatrix> --gguf <f16>` (minutes, no forward "
+            "pass) and rebuild from the new profile.")
+
+
 def pin_uncovered(overrides, names, covered, base_preset, explicit=()):
     """(overrides, n_pinned): every tensor the imatrix does not cover, held at EMB_FLOOR wherever the plan
     puts it below that, the pins placed FIRST.
@@ -695,6 +712,10 @@ def main():
         print(f"   run it with:  pollard-ngram run <build>.gguf --ram {a.ram:.0f}   (mmap + --lazy-mode on; never --no-mmap)")
     elif disk and disk.get("note"):
         print(f"NOTE: {disk['note']}")
+
+    stale = stale_moe_profile(sensitivity, arch)
+    if stale:
+        print(f"WARNING: {stale}")
 
     # NOTE -- scope the evidence honestly. The reallocation can cost more than it buys, and on
     # Qwen2.5-0.5B at matched size it did (imatrix-only IQ3_S +7.48% over fp16 vs imatrix +
