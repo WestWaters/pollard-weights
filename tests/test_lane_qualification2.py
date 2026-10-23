@@ -243,7 +243,9 @@ def test_kvbench_shares_the_same_shell_list():
 # ------------------------------------------------------------------------- 4. clef-omni: quantize, imatrix, automap
 
 PATCH_NAME = "llama.cpp-quantize-dec-blk"
-_REAL_PATCH = ROOT / "runtime-patches" / f"{PATCH_NAME}.patch"
+#: the runtime-patches/ the tools themselves read: the checkout's, or the installed package's data copy
+_PATCHES = Path(__import__("pollard_calc").patches_dir())
+_REAL_PATCH = _PATCHES / f"{PATCH_NAME}.patch"
 #: the patch itself (the nix package ships no runtime-patches/): kept identical to the file, checked below
 DEC_BLK_PATCH = """\
 diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
@@ -305,16 +307,16 @@ index 9c6066796..a72518973 100644
 
 def test_the_embedded_patch_is_the_shipped_one():
     if not _REAL_PATCH.exists():
-        pytest.skip("runtime-patches/ not in this source tree")
+        pytest.skip("no runtime-patches/ in this checkout or install")
     assert _REAL_PATCH.read_text(encoding="utf-8") == DEC_BLK_PATCH
 
 
 def test_the_dec_blk_patch_is_declared_after_clef_omni_and_its_manifest_matches():
     if not _REAL_PATCH.exists():
-        pytest.skip("runtime-patches/ not in this source tree")
-    eng = json.load(open(ROOT / "runtime-patches" / "engines.json"))["llama.cpp"]["patches"]
+        pytest.skip("no runtime-patches/ in this checkout or install")
+    eng = json.load(open(_PATCHES / "engines.json"))["llama.cpp"]["patches"]
     assert PATCH_NAME in eng and eng.index(PATCH_NAME) > eng.index("llama.cpp-clef-omni")
-    man = json.load(open(ROOT / "runtime-patches" / f"{PATCH_NAME}.json"))
+    man = json.load(open(_PATCHES / f"{PATCH_NAME}.json"))
     import pollard_runtime_update as U
     assert set(man["files"]) == U._touched_files(DEC_BLK_PATCH) - {"/dev/null"} == {"src/llama-quant.cpp"}
     assert man["tree_slug"] == "llama.cpp" and man["remote"].endswith("ggml-org/llama.cpp")

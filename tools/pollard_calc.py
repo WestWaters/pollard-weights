@@ -125,6 +125,35 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+#: where an installed package keeps runtime-patches/ (pyproject [tool.setuptools.data-files]): <prefix>/share/...,
+#: beside the <prefix>/lib/pythonX.Y/site-packages the tools are installed into -- a venv, a --user install, a nix
+#: store path alike
+INSTALLED_PATCHES = os.path.join("share", "pollard-weights", "runtime-patches")
+
+
+def _installed_patches_dir():
+    """The data copy that belongs to THIS install: searched upward from the module itself (site-packages ->
+    pythonX.Y -> lib -> <prefix>; Windows: Lib -> <prefix>), never another environment's prefix."""
+    p = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        p = os.path.dirname(p)
+        d = os.path.join(p, INSTALLED_PATCHES)
+        if os.path.isfile(os.path.join(d, "engines.json")):
+            return d
+    return None
+
+
+def patches_dir(repo=None):
+    """runtime-patches/: the checkout's (tools/../runtime-patches) when there is one, else the copy an installed
+    package ships as data (share/pollard-weights/runtime-patches -- pip, nix). An explicit `repo` other than this
+    checkout is taken as given (a test tree, another checkout)."""
+    root = os.path.abspath(repo) if repo else _repo_root()
+    d = os.path.join(root, "runtime-patches")
+    if os.path.isdir(d) or root != _repo_root():
+        return d
+    return _installed_patches_dir() or d
+
+
 def engine_trees(repo=None):
     """Every managed engine tree Pollard keeps under runtime/: the engines in runtime-patches/engines.json, then any
     engine pollard-runtime --update built under another name (runtime/<name>.lock.json -- e.g. a staged
@@ -133,7 +162,7 @@ def engine_trees(repo=None):
     repo = repo or _repo_root()
     names = ["llama.cpp"]
     try:
-        with open(os.path.join(repo, "runtime-patches", "engines.json"), encoding="utf-8") as f:
+        with open(os.path.join(patches_dir(repo), "engines.json"), encoding="utf-8") as f:
             names += [k for k in json.load(f) if not k.startswith("_")]
     except (OSError, ValueError):
         pass
@@ -166,7 +195,7 @@ def _patch_manifests(repo=None):
     """runtime-patches/*.json with the path of each .patch beside it."""
     import glob
     out = []
-    for mp in sorted(glob.glob(os.path.join(repo or _repo_root(), "runtime-patches", "*.json"))):
+    for mp in sorted(glob.glob(os.path.join(patches_dir(repo), "*.json"))):
         if os.path.basename(mp) == "engines.json":
             continue
         try:

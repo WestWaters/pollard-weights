@@ -351,9 +351,9 @@ def test_set_model_arch_reads_the_gguf(tmp_path):
 
 
 def test_the_shipped_dec_blk_patch_declares_clef_omni():
-    """The repo's own manifest is what sends clef-omni to the patched engine (skipped where runtime-patches/ is not
-    part of the package, e.g. the nix build)."""
-    p = ROOT / "runtime-patches" / "llama.cpp-quantize-dec-blk.json"
+    """The repo's own manifest is what sends clef-omni to the patched engine (skipped only where runtime-patches/ is not
+    found at all -- neither in the checkout nor as an installed package's data)."""
+    p = Path(PC.patches_dir()) / "llama.cpp-quantize-dec-blk.json"
     if not p.is_file():
-        pytest.skip("runtime-patches/ not in this source tree")
+        pytest.skip("no runtime-patches/ in this checkout or install")
     assert "clef-omni" in json.loads(p.read_text())["archs"]

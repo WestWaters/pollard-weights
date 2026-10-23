@@ -36,10 +36,10 @@ def _gguf(path, arch, types=(12,)):
     return str(path)
 
 
-#: the nix package's fileset ships tools/ and tests/ only -- no runtime-patches/ -- so the checks that read the SHIPPED
-#: clef-omni patch skip there; the synthetic-patch-dir test covers the logic everywhere.
-shipped_patches = pytest.mark.skipif(not (ROOT / "runtime-patches" / "llama.cpp-clef-omni.patch").exists(),
-                                     reason="runtime-patches/ not in this fileset (nix package)")
+#: the checks that read the SHIPPED clef-omni patch run wherever the tool finds runtime-patches/ -- the checkout, or
+#: the copy every install (pip, nix) ships as data; the synthetic-patch-dir test covers the logic everywhere.
+shipped_patches = pytest.mark.skipif(not (Path(gc.PATCH_DIR) / "llama.cpp-clef-omni.patch").exists(),
+                                     reason="no runtime-patches/ in this checkout or install")
 
 
 @pytest.fixture
