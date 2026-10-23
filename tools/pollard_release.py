@@ -34,8 +34,10 @@ Repos published before this (<M>-Pollard-MLX and friends) are left as they are.
 
 How it runs -- and why:
   * pollard-smoke preflight FIRST, before anything is spent.
-  * SERIAL, one heavy job at a time, under the machine lock. Lanes this machine cannot build (MLX needs Apple
-    Silicon; GPTQ / MX / EXL3 need CUDA) are skipped with the command to run them where they can be built.
+  * SERIAL, one heavy job at a time: each COMPUTE step (build / measure / verify) holds the machine lock (and
+    POLLARD_HEAVY_LOCK, a shared lock directory, when set) for its own length; uploads never hold it. Lanes this
+    machine cannot build (MLX needs Apple Silicon; GPTQ / MX / EXL3 need CUDA) are skipped with the command to run
+    them where they can be built.
   * RESUMABLE: every step is recorded in <workspace>/models/<M>/release-state.json, and a rung the MANIFEST
     already shows built AND verified is never rebuilt -- so the Mac can do MLX and the box the CUDA lanes,
     each re-running the same plan.
@@ -70,7 +72,7 @@ How it runs -- and why:
 """
 from __future__ import annotations
 
-import argparse, copy, json, os, platform, re, shutil, subprocess, sys, time
+import argparse, contextlib, copy, json, os, platform, re, shutil, subprocess, sys, time
 
 TEMPLATE = """\
 # pollard release plan -- every lane, each a ladder of rungs. `pollard release --hf <model> --plan this.yaml`
@@ -2309,6 +2311,23 @@ def run_cmd(cmd, ok_codes=(0,), env=None):
         raise RuntimeError(f"exit {r.returncode}")
 
 
+#: step kinds that compute (quantize, imatrix, perplexity / KLD, a model loaded to verify) -- the machine locks cover
+#: these and nothing else
+HEAVY_KINDS = ("build", "prep", "measure", "verify", "gate")
+#: preparation steps that only move bytes (a download / a sparse mirror): network, not compute
+LIGHT_PREP = ("prep/fetch", "prep/mirror")
+
+
+def is_heavy(st):
+    """True for a compute-heavy step (build / measure / verify / gate / compute prep). Publish, upload, relay,
+    card and finalize steps are not: an upload-only release must not hold the machine lock while it uploads."""
+    if st.kind not in HEAVY_KINDS:
+        return False
+    if st.id in LIGHT_PREP or st.fn == "fetch":
+        return False
+    return st.fn not in ("upload", "publish_rung", "card_upload", "go_public")
+
+
 class _ExecutionState:
     def __init__(self):
         self.failed_rungs, self.failed_lanes, self.unbuildable = set(), set(), set()
@@ -2488,68 +2507,75 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 else:
                     failed_lanes.add(st.lane)
                 continue
-        try:
-            if st.fn == "fetch":
-                fetch(c)
-                res = "done"
-            elif st.fn == "upload":
-                res = "done" if upload(st, c, cfg, run_upload) == "uploaded" else "held"
-            elif st.fn == "go_public":
-                res = go_public(st, c, cfg, run_upload, statuses, out)
-            elif st.fn == "imatrix":
-                build_imatrix(c, cfg, out)
-                res = "done"
-            elif st.fn == "publish_rung":
-                res = publish_rung(st, c, cfg, run_upload, out)
-            elif st.fn == "taskeval_rung":
-                res = taskeval_rung(st, c, run_upload, out)
-            elif st.fn == "card_upload":
-                res = card_upload(st, c, run_upload, out)
-            elif st.kind == "measure" and (st.lane, st.rung) in streamed and "pollard-toolcall" in str(st.cmd[0]):
-                res = _toolcall_not_measured(st, "the rung was streamed to the Hub shard by shard while it was built "
-                                                 "(bigger than the free disk); the tool-call probe needs it on disk")
-                out("      tool calls: not measured (streamed rung)")
-            else:
-                env = stream_env
-                if st.lane in EXL3_ENV_LANES:
-                    env = exl3_env(stream_env)
-                if st.lane == "mlx" and cfg.get("disk_margin_gb") is not None:
-                    # the streamed MLX tools size their disk reserve from the plan's margin (never under their floor)
-                    env = dict(env or os.environ, POLLARD_DISK_MARGIN_GB=str(float(cfg["disk_margin_gb"])))
-                try:
-                    run_cmd(st.cmd, st.ok_codes or (0,), **({"env": env} if env else {}))
-                except RuntimeError as e:
-                    if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
-                        raise Held(f"{e} (the reason is the HELD: line above)") from None
-                    raise
-                res = "done"
-        except Held as e:
-            out(f"      HELD: {e}")
-            statuses[st.id] = f"held: {e}"
-            if st.rung:
-                failed_rungs.add((st.lane, st.rung))
-            else:
-                failed_lanes.add(st.lane)
-            continue
-        except Exception as e:                                   # noqa: BLE001
-            res = "failed"
-            out(f"      FAILED: {e}")
-            if st.blocks and not stop_on_fail:            # e.g. the smoothed copy: only its lanes depend on it
-                failed_lanes.update(st.blocks)
-                statuses[st.id] = res
-                state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_entry(c["state"], st.id, state[st.id])
+        # the machine locks cover the COMPUTE only: a build / measure / verify waits for (and holds) them; a publish,
+        # upload, relay or card runs outside them -- an upload-only release used to hold the machine for hours
+        from pollard_auto import heavy_step
+        with (heavy_step(f"pollard release {c.get('src', '')}: {st.id}", force=bool(c.get("_force_lock")), log=out)
+              if is_heavy(st) else contextlib.nullcontext()):
+            try:
+                if st.fn == "fetch":
+                    fetch(c)
+                    res = "done"
+                elif st.fn == "upload":
+                    res = "done" if upload(st, c, cfg, run_upload) == "uploaded" else "held"
+                elif st.fn == "go_public":
+                    res = go_public(st, c, cfg, run_upload, statuses, out)
+                elif st.fn == "imatrix":
+                    build_imatrix(c, cfg, out)
+                    res = "done"
+                elif st.fn == "publish_rung":
+                    res = publish_rung(st, c, cfg, run_upload, out)
+                elif st.fn == "taskeval_rung":
+                    res = taskeval_rung(st, c, run_upload, out)
+                elif st.fn == "card_upload":
+                    res = card_upload(st, c, run_upload, out)
+                elif st.kind == "measure" and (st.lane, st.rung) in streamed and "pollard-toolcall" in str(st.cmd[0]):
+                    res = _toolcall_not_measured(st, "the rung was streamed to the Hub shard by shard while it was built "
+                                                     "(bigger than the free disk); the tool-call probe needs it on disk")
+                    out("      tool calls: not measured (streamed rung)")
+                else:
+                    env = stream_env
+                    if st.lane in EXL3_ENV_LANES:
+                        env = exl3_env(stream_env)
+                    if st.lane == "mlx" and cfg.get("disk_margin_gb") is not None:
+                        # the streamed MLX tools size their disk reserve from the plan's margin (never under their floor)
+                        env = dict(env or os.environ, POLLARD_DISK_MARGIN_GB=str(float(cfg["disk_margin_gb"])))
+                    from pollard_auto import heavy_env
+                    env = heavy_env(env)                     # a child never waits on the lock held for it
+                    try:
+                        run_cmd(st.cmd, st.ok_codes or (0,), **({"env": env} if env else {}))
+                    except RuntimeError as e:
+                        if str(e) in {f"exit {h}" for h in (st.held_codes or ())}:
+                            raise Held(f"{e} (the reason is the HELD: line above)") from None
+                        raise
+                    res = "done"
+            except Held as e:
+                out(f"      HELD: {e}")
+                statuses[st.id] = f"held: {e}"
+                if st.rung:
+                    failed_rungs.add((st.lane, st.rung))
+                else:
+                    failed_lanes.add(st.lane)
                 continue
-            if st.lane == "prep" or stop_on_fail:
-                statuses[st.id] = res
-                state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_entry(c["state"], st.id, state[st.id])
-                raise SystemExit(f"   release stopped at {st.id}" + ("" if st.lane != "prep" else
-                                 " -- a preparation step failed, nothing after it can be trusted"))
-            if st.rung:
-                failed_rungs.add((st.lane, st.rung))
-            elif st.kind in ("build", "card"):
-                failed_lanes.add(st.lane)                    # no card -> nothing to publish
+            except Exception as e:                                   # noqa: BLE001
+                res = "failed"
+                out(f"      FAILED: {e}")
+                if st.blocks and not stop_on_fail:            # e.g. the smoothed copy: only its lanes depend on it
+                    failed_lanes.update(st.blocks)
+                    statuses[st.id] = res
+                    state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                    save_entry(c["state"], st.id, state[st.id])
+                    continue
+                if st.lane == "prep" or stop_on_fail:
+                    statuses[st.id] = res
+                    state[st.id] = {"status": res, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                    save_entry(c["state"], st.id, state[st.id])
+                    raise SystemExit(f"   release stopped at {st.id}" + ("" if st.lane != "prep" else
+                                     " -- a preparation step failed, nothing after it can be trusted"))
+                if st.rung:
+                    failed_rungs.add((st.lane, st.rung))
+                elif st.kind in ("build", "card"):
+                    failed_lanes.add(st.lane)                    # no card -> nothing to publish
         statuses[st.id] = res
         if str(res).startswith("kept"):
             kept.append((st.lane, st.rung, st.out))
@@ -2822,7 +2848,7 @@ def main(argv=None):
                     help="re-run this step id (or prefix, e.g. mlx/4bit) even if the state says done")
     ap.add_argument("--stop-on-fail", action="store_true", help="stop at the first failed rung (default: carry on)")
     ap.add_argument("--init", metavar="PATH", help="write the plan template (with --preset applied) and exit")
-    ap.add_argument("--force", action="store_true", help="ignore the machine lock")
+    ap.add_argument("--force", action="store_true", help="ignore the machine locks (the per-step compute hold)")
     ap.add_argument("--skip-setup-check", action="store_true",
                     help="run even when `pollard setup` finds a lane's dependencies missing on this machine")
     ap.add_argument("--free-after-upload", action="store_true",
@@ -2918,14 +2944,15 @@ def main(argv=None):
     elif not run:
         S.hint(here, out=print)
     if run:
-        from pollard_auto import MachineLock
-        with MachineLock("pollard release " + src, force=a.force):
-            if upload_ok:
-                sweep_staging(cfg, c)
-            if a.parallel and not (a.taskeval_only or a.jev_index_only):
-                st = execute_parallel(steps, c, cfg, upload_ok, a.redo, have)
-            else:
-                st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)
+        # no whole-run lock: each compute step takes the machine lock (and POLLARD_HEAVY_LOCK) for its own length
+        # (execute -> heavy_step), so the hours a release spends uploading never block another job
+        c["_force_lock"] = bool(a.force)
+        if upload_ok:
+            sweep_staging(cfg, c)
+        if a.parallel and not (a.taskeval_only or a.jev_index_only):
+            st = execute_parallel(steps, c, cfg, upload_ok, a.redo, have)
+        else:
+            st = execute(steps, c, cfg, True, upload_ok, a.redo, a.stop_on_fail, have)
     else:
         st = execute(steps, c, cfg, False, False, a.redo, a.stop_on_fail, have)
         print("\n   plan only -- add --run to execute (serially, resumable), --upload to publish.")

@@ -1018,31 +1018,47 @@ class MachineLock:
     and an unusable desktop was remembering not to.
 
     Advisory and self-healing: a lock whose process is gone is taken over, never a reason to be
-    stuck. --force ignores it outright."""
+    stuck. --force ignores it outright. `wait=True` (the release's per-step hold) waits for the other job
+    instead of refusing to start."""
 
-    def __init__(self, what, force=False):
+    def __init__(self, what, force=False, wait=False, poll=20, log=None):
         home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
-        os.makedirs(home, exist_ok=True)
-        self.path, self.what, self.force, self.held = os.path.join(home, ".pollard.lock"), what, force, False
+        path = os.environ.get("POLLARD_MACHINE_LOCK") or os.path.join(home, ".pollard.lock")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.path, self.what, self.force, self.held = path, what, force, False
+        self.wait, self.poll, self.log = wait, poll, log
 
-    def __enter__(self):
-        if self.force:
-            return self
+    def _holder(self):
+        """{pid, what} of ANOTHER live process holding the lock, else None (free, stale, ours, or unreadable)."""
         try:
             if os.path.exists(self.path):
                 prev = json.loads(open(self.path, encoding="utf-8").read() or "{}")
                 pid = int(prev.get("pid", 0))
                 if pid and pid != os.getpid() and _pid_alive(pid):
-                    raise SystemExit(
-                        f"\n   another Pollard job is running on this machine (pid {pid}): "
-                        f"{prev.get('what', '?')}\n"
-                        "   Running two at once does not finish sooner -- they contend for the GPU,\n"
-                        "   the disk and the cores, and on a shared machine someone else feels it.\n"
-                        "   Wait for it, or pass --force if you know it is finished.")
-        except SystemExit:
-            raise
+                    return prev
         except Exception:
             pass                                            # an unreadable lock never blocks a build
+        return None
+
+    def __enter__(self):
+        if self.force:
+            return self
+        said = False
+        while True:
+            prev = self._holder()
+            if prev is None:
+                break
+            if not self.wait:
+                raise SystemExit(
+                    f"\n   another Pollard job is running on this machine (pid {prev.get('pid')}): "
+                    f"{prev.get('what', '?')}\n"
+                    "   Running two at once does not finish sooner -- they contend for the GPU,\n"
+                    "   the disk and the cores, and on a shared machine someone else feels it.\n"
+                    "   Wait for it, or pass --force if you know it is finished.")
+            if not said and self.log:
+                self.log(f"      waiting for the machine lock (pid {prev.get('pid')}: {prev.get('what', '?')}) ...")
+                said = True
+            time.sleep(self.poll)
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump({"pid": os.getpid(), "what": self.what}, f)
@@ -1058,6 +1074,114 @@ class MachineLock:
             except OSError:
                 pass
         return False
+
+
+#: the shared heavy-job lock directory (mkdir is atomic): every Pollard heavy step, and anything else on the machine
+#: that agrees on the same directory (a test run, another tool), takes it for the length of the step
+HEAVY_LOCK_ENV = "POLLARD_HEAVY_LOCK"
+#: set in the environment of everything a holder starts: the lock is already held FOR it (a child that waited on its
+#: own parent's lock would wait forever)
+HEAVY_HELD_ENV = "POLLARD_HEAVY_LOCK_HELD"
+
+
+def _dir_lock_owner_dead(path):
+    """True when the lock directory's owner file names a pid that is gone (the holder died without its trap)."""
+    try:
+        with open(os.path.join(path, "owner"), encoding="utf-8") as f:
+            pid = int((f.read().split() or ["0"])[0])
+    except (OSError, ValueError):
+        return False                                        # no owner yet (just created) or unreadable: not stale
+    return pid > 0 and pid != os.getpid() and not _pid_alive(pid)
+
+
+@contextlib.contextmanager
+def heavy_dir_lock(path=None, what="pollard", poll=20, log=print):
+    """Hold the shared heavy-job lock directory for one heavy stage. POLLARD_HEAVY_LOCK names it; unset, a no-op.
+    Writes `<pid> <what> <date>` to <dir>/owner (the shell wrappers' format); a lock whose owner is dead is taken
+    over. Under a holder (POLLARD_HEAVY_LOCK_HELD names this lock) it is a no-op: the parent holds it for us."""
+    path = path or os.environ.get(HEAVY_LOCK_ENV)
+    if not path or os.environ.get(HEAVY_HELD_ENV) == path:
+        yield
+        return
+    said = False
+    while True:
+        try:
+            os.mkdir(path)
+            break
+        except FileExistsError:
+            if _dir_lock_owner_dead(path):
+                import shutil
+                shutil.rmtree(path, ignore_errors=True)
+                continue
+            if not said and log:
+                try:
+                    who = open(os.path.join(path, "owner"), encoding="utf-8").read().strip()
+                except OSError:
+                    who = "?"
+                log(f"      waiting for the heavy-job lock {path} ({who}) ...")
+                said = True
+            time.sleep(poll)
+    try:
+        with open(os.path.join(path, "owner"), "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()} {what} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class _HeavyHold:
+    """The per-process hold behind heavy_step: the parallel scheduler runs several heavy steps of ONE release at
+    once (admission control sizes them), so the machine-wide locks are taken by the first and released by the last."""
+
+    def __init__(self):
+        import threading
+        self.mu, self.n, self.stack, self.path = threading.Lock(), 0, None, None
+
+
+_HOLD = _HeavyHold()
+
+
+@contextlib.contextmanager
+def heavy_step(what, force=False, poll=20, log=print):
+    """One compute-heavy step (build / measure / verify) under the machine locks: the $POLLARD_HOME machine lock
+    (waiting for another job instead of refusing) and the shared POLLARD_HEAVY_LOCK directory when one is set.
+    Publish / upload / relay steps run outside it -- hours of uploading never hold the machine."""
+    if force:
+        yield
+        return
+    with _HOLD.mu:
+        if _HOLD.n == 0:
+            st = contextlib.ExitStack()
+            try:
+                st.enter_context(MachineLock(what, wait=True, poll=poll, log=log))
+                st.enter_context(heavy_dir_lock(what=what, poll=poll, log=log))
+            except BaseException:
+                st.close()
+                raise
+            _HOLD.stack, _HOLD.path = st, os.environ.get(HEAVY_LOCK_ENV)
+            if _HOLD.path and os.environ.get(HEAVY_HELD_ENV) != _HOLD.path:
+                os.environ[HEAVY_HELD_ENV] = _HOLD.path
+                st.callback(os.environ.pop, HEAVY_HELD_ENV, None)
+        _HOLD.n += 1
+    try:
+        yield
+    finally:
+        with _HOLD.mu:
+            _HOLD.n -= 1
+            if _HOLD.n == 0 and _HOLD.stack is not None:
+                st, _HOLD.stack = _HOLD.stack, None
+                st.close()
+
+
+def heavy_env(env):
+    """`env` (a child's environment dict built before the hold) with the held marker the hold set, if any."""
+    if env is None or HEAVY_HELD_ENV not in os.environ:
+        return env
+    return dict(env, **{HEAVY_HELD_ENV: os.environ[HEAVY_HELD_ENV]})
 
 
 
