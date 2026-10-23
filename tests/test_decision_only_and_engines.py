@@ -91,6 +91,27 @@ def test_a_custom_gates_file_cannot_hold_a_decision_rung_to_a_kld_that_cannot_ex
     assert V.decision_only_thresholds(V.thresholds_for(mine, "IQ3_S"), mine, "IQ3_S") == {"decision_agreement_min": 99}
 
 
+def test_a_decision_only_rung_with_a_tool_template_is_not_held_to_tool_calls():
+    # clef-omni's chat template carries tools, so pollard-modelkind also reports `agentic`; its decision-only graph
+    # writes no text, so the release (box, 2026-10-22) failed Q6_K on "tool-call retention: None (want >= 90)"
+    # while its decision board was 100% / option KL 0.0001
+    g = V.load_gates(None)
+    kinds = ["instruct", "thinking", "agentic", "decision", "decision_only"]
+    for rung in ("Q6_K", "IQ4_XS", "IQ3_S", "IQ2_XXS"):
+        th = V.decision_only_thresholds(V.thresholds_for(g, rung, "gguf", kinds), g, rung)
+        assert "toolcall_retention_min" not in th and "toolcall_pass" not in th, rung
+        assert "decision_agreement_min" in th and "decision_option_kl_max" in th
+        ok = V.evaluate_gate({"decision_agreement": 100, "decision_option_kl": 0.0001},
+                             {k: v for k, v in th.items() if k.startswith(("decision_", "toolcall_"))}, "fail")
+        assert ok["pass"], (rung, ok)
+    # a custom gates file whose agentic section has no decision_only skip is covered too
+    custom = {"missing": "fail", "kinds": {"agentic": {"toolcall_retention_min": 90}}}
+    th = V.decision_only_thresholds(V.thresholds_for(custom, "Q6_K", "gguf", ["agentic", "decision_only"]), custom, "Q6_K")
+    assert "toolcall_retention_min" not in th
+    # an agentic model that is NOT decision-only keeps its tool-call gate
+    assert V.thresholds_for(g, "Q6_K", "gguf", ["agentic"])["toolcall_retention_min"] == 90
+
+
 def test_option_kl_is_a_gate_metric():
     m = V.metrics_from_results({"Q4_K_M": {"decision": {"agreement": 0.95, "option_kl": 0.02}}}, "Q4_K_M")
     assert m == {"decision_agreement": 95.0, "decision_option_kl": 0.02}

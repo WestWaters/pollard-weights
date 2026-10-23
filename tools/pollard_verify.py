@@ -827,9 +827,11 @@ kinds:
   # decision_only = the graph ends in a decision head and has NO per-token logits (clef / clef-omni, a d3 readout
   # GGUF): llama-perplexity KLD / PPL cannot exist ("not applicable"), so the rung is gated on its decision board --
   # agreement with the reference's decisions and the option-distribution KL (pollard-decision --ref --results).
-  # Applied by pollard-verify itself when it finds such a model, whatever gates file is in use.
+  # Applied by pollard-verify itself when it finds such a model, whatever gates file is in use. Such a graph never
+  # generates text either, so tool-call numbers cannot exist: a template with tools (pollard-modelkind: agentic)
+  # must not hold the rung to a tool-call retention it has no way to measure.
   decision_only:
-    skip: [kld_max, top1_min]
+    skip: [kld_max, top1_min, toolcall_retention_min, toolcall_pass]
     decision_agreement_min: 85
     decision_option_kl_max: 0.15
     rungs:
@@ -893,11 +895,12 @@ def thresholds_for(gates, rung, lane=None, kinds=()):
     return th
 
 
-DECISION_ONLY_NA = ("kld_max", "top1_min")
+DECISION_ONLY_NA = ("kld_max", "top1_min", "toolcall_retention_min", "toolcall_pass")
 
 
 def decision_only_thresholds(th, gates, rung):
-    """A decision-only rung's thresholds: KLD / top-1 removed (not applicable -- no per-token logits), and the
+    """A decision-only rung's thresholds: KLD / top-1 and the tool-call checks removed (not applicable -- no
+    per-token logits, no generated text), and the
     decision board's thresholds present. A gates file without a `kinds.decision_only` section gets the built-in
     ones for the rung's bit band, so a custom file can never gate a decision model on a number that cannot exist."""
     th = {k: v for k, v in th.items() if k not in DECISION_ONLY_NA}
