@@ -474,7 +474,8 @@ def cmd_train(a):
         a.lr * (a.min_lr + (1 - a.min_lr) * 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, steps - warm))))
     start = 0
     if a.resume and os.path.exists(state_p):
-        st = torch.load(state_p, map_location="cpu", weights_only=False)
+        from pollard_safeload import safe_torch_load       # optimizer state: tensors, numbers, lists only
+        st = safe_torch_load(state_p, map_location="cpu")
         opt.load_state_dict(st["opt"]); start = st["step"]
         if main_proc:
             print(f"   resumed at step {start}", flush=True)

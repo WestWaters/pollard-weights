@@ -34,8 +34,8 @@ def attach_brain(brain_path: str, out_dir: str, fmt: str) -> None:
 
     meta = {}
     try:
-        import torch
-        meta = torch.load(brain_path, map_location="cpu", weights_only=False).get("meta", {})
+        from pollard_safeload import safe_torch_load       # the brain being shipped is never executed
+        meta = safe_torch_load(brain_path, map_location="cpu", numpy=True).get("meta", {})
     except Exception:
         pass
     live = fmt in LIVE_LANES

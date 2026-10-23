@@ -242,7 +242,8 @@ class FlyBrain:
     # ------------------------------------------------------------------ loading / binding
     @classmethod
     def load(cls, path: str, device: str = "cpu") -> "FlyBrain":
-        return cls(torch.load(path, map_location=device, weights_only=False), device=device)
+        from pollard_safeload import safe_torch_load       # no pickle code execution from a shared brain
+        return cls(safe_torch_load(path, map_location=device, numpy=True), device=device)
 
     def bind(self, model, tokenizer=None, verbose: bool = True,
              probe_text: Optional[str] = None) -> "FlyBrain":
@@ -361,7 +362,8 @@ class FlyBrain:
         with open(path, "rb") as f:
             if f.read(4) != _STATE_MAGIC:
                 raise ValueError(f"{path} is not a flybrain state file")
-            s = torch.load(f, map_location=self.device, weights_only=False)
+            from pollard_safeload import safe_torch_load   # tensors + ints only
+            s = safe_torch_load(f, map_location=self.device)
         if int(s["neurons"]) != self.n or int(s.get("width", self.width)) != self.width:
             raise ValueError("state was written by a differently shaped brain")
         self.mem, self.z = s["mem"].to(self.device), s["z"].to(self.device)
@@ -723,7 +725,8 @@ def train_brain(model, tokenizer, corpus, connectome, signs, *, out, steps=900, 
     torch.nn.init.normal_(ADDR_E.weight, std=0.02)
     if continue_from:
         # Pick up where a previous run stopped -- on this backbone, or on a different one.
-        ck = torch.load(continue_from, map_location=device, weights_only=False)
+        from pollard_safeload import safe_torch_load
+        ck = safe_torch_load(continue_from, map_location=device, numpy=True)
         prev = ck.get("meta", {})
         # A payload change is allowed. --continue-from carries trained WEIGHTS, and the written
         # memory is runtime state that lives in a .flystate file, not in the checkpoint -- so there
