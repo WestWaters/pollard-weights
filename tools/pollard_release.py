@@ -473,9 +473,13 @@ def prep_steps(cfg, c, lanes):
                                "towers and projector held high, the body at the rung's bits"))
     elif raw_probe and route == "imatrix":
         print(f"   probe: from the imatrix on {c['f16']} -- {why}")
-        steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", out=c["sens_raw"],
-                          cmd=["pollard-probe", "--from-imatrix", str(c["imatrix"]), "--gguf", c["f16"],
-                               "--out", c["sens_raw"]]))
+        probe = ["pollard-probe", "--from-imatrix", str(c["imatrix"]), "--gguf", c["f16"], "--out", c["sens_raw"]]
+        tok = next((d for d in (c.get("hf_dir"), c.get("src")) if d and os.path.isfile(os.path.join(str(d),
+                                                                                                    "tokenizer.json"))),
+                   None)
+        if tok:                                      # a lookup table (Gemma 4's per-layer embedding) is measured too
+            probe += ["--text", c["calib"], "--tokenizer", str(tok)]
+        steps.append(Step(id="prep/probe", lane="prep", kind="prep", requires="any", out=c["sens_raw"], cmd=probe))
     elif raw_probe:
         probe = ["pollard-probe", "--model", c["hf_dir"], "--eval", c["heldout"], "--out", c["sens_raw"]]
         if c["ngl"] == "0" and machine()["cuda"]:

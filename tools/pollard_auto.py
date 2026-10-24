@@ -315,7 +315,7 @@ def ladder_points(gguf, imatrix=None, sensitivity=None, step=0.1):
     arch = analyse(gguf_to_config(meta, gguf))
     covered = imatrix_covered_tensors(imatrix) if imatrix else None
     emb_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
-    disk = disk_plan(meta, "auto", "q8_0")
+    disk = disk_plan(meta, "auto", "auto")             # a measured table is allocated, else pinned at q8_0
     sens = json.load(open(sensitivity)) if sensitivity else None
     top = os.path.getsize(gguf) / 1e9 * 1.25 if os.path.exists(gguf) else 64.0
     pts, r = [], 1.0

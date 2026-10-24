@@ -100,6 +100,12 @@ DENSE_FFN_GATEUP = [r"blk\.{layer}\.ffn_up\.weight", r"blk\.{layer}\.ffn_gate\.w
 DENSE_FFN_DOWN = [r"blk\.{layer}\.ffn_down\.weight"]
 
 
+#: the types a measured lookup table (Gemma 4's per-layer token embedding) walks, high -> low. It starts where the old
+#: pin was (q8_0), so measuring it can only ever make it smaller; no imatrix-only type (llama-imatrix never sees a
+#: get_rows table), q2_K standing in for the IQ2 rung. Matches pollard_probe.TABLE_LADDER_BITS.
+TABLE_LADDER = ["q8_0", "q6_K", "q5_K", "iq4_xs", "iq3_s", "q2_K"]
+
+
 def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
     """items: [(params, importance)] -- an FFN layer, an expert layer, or the
     attn/embed 'other' group. Assign each a ladder type to MINIMIZE total KL
@@ -111,20 +117,26 @@ def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
     catastrophic marginal cost, so no victim layers; high-importance items stay
     high on their own (protection is emergent, not a rule). Returns
     ([type per item], gb) or None if it cannot fit even at the floor."""
-    tot_imp = sum(imp for _, imp in items) or 1.0
-    lvl = [0] * len(items)                              # LADDER index per item, 0 = top
+    # An item is (params, importance), or (params, importance, costs, own_ladder) for one whose cost at each type was
+    # MEASURED directly (a lookup table: pollard-probe's `tables`), in the same units as importance x noise.
+    tot_imp = sum(it[1] for it in items if len(it) < 3) or 1.0
+    lads = [it[3] if len(it) > 3 else ladder for it in items]
+    lvl = [0] * len(items)                              # ladder index per item, 0 = top
 
     def size_gb():
-        return sum(p * BPW[ladder[lvl[j]]] for j, (p, _) in enumerate(items)) / 8 / 1e9
+        return sum(it[0] * BPW[lads[j][lvl[j]]] for j, it in enumerate(items)) / 8 / 1e9
 
     def marginal(j):
-        p, imp = items[j]
-        i = lvl[j]
-        if i + 1 >= len(ladder):
+        p, imp = items[j][0], items[j][1]
+        lad, i = lads[j], lvl[j]
+        if i + 1 >= len(lad):
             return None                                 # already at the floor
-        a, b = ladder[i], ladder[i + 1]
+        a, b = lad[i], lad[i + 1]
         dbytes = p * (BPW[a] - BPW[b]) / 8
-        dkl = (imp / tot_imp) * (noise[b] - noise[a])
+        if len(items[j]) > 2:
+            dkl = items[j][2][b] - items[j][2][a]
+        else:
+            dkl = (imp / tot_imp) * (noise[b] - noise[a])
         return ((dkl / dbytes) if dbytes > 0 else float("inf"), j)
 
     heap = [m for j in range(len(items)) if (m := marginal(j)) is not None]
@@ -137,7 +149,7 @@ def _alloc_klaware(items, budget, noise=NOISE, ladder=LADDER):
             heapq.heappush(heap, nxt)
     if size_gb() > budget:
         return None
-    return [ladder[lvl[j]] for j in range(len(items))], size_gb()
+    return [lads[j][lvl[j]] for j in range(len(items))], size_gb()
 
 
 def _fill_noise(measured):
@@ -224,7 +236,11 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
 
     `disk` (from pollard_ngram.disk_plan) names lookup tables that llama.cpp reads row by row from the file
     (--lazy-mode): an n-gram / per-layer embedding table. Their params leave the 'other' group, they are pinned
-    to disk['type'], and their bytes are NOT charged to RAM -- so a 51B table no longer crushes the transformer."""
+    to disk['type'], and their bytes are NOT charged to RAM -- so a 51B table no longer crushes the transformer.
+    disk['type'] `auto` / `measured`: when the profile MEASURED the table (pollard-probe --from-imatrix --text, its
+    `tables` entry), the table is allocated like every other tensor instead -- its own cost per type, its bytes in
+    the budget (they are in the file), walking TABLE_LADDER down from q8_0 only where that is the cheapest KL per
+    byte. It is still read lazily from the SSD at run time. `auto` without a measurement keeps the q8_0 pin."""
     budget = ram_gb * 0.85 - reserve_gb
     if budget <= 0:
         sys.exit(f"ERROR: RAM budget {ram_gb}GB minus {reserve_gb}GB activation "
@@ -310,8 +326,30 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     # budget is spent only where allocation still has a choice.
     tiers = tiers or {}
     pinned, pinned_gb = [], 0.0
+    table_meta, table_pats = [], set()
     if disk_params:
-        pinned += [(pat, disk["type"]) for pat in disk["patterns"]]     # pinned, but 0 GB of RAM
+        dtype = str(disk.get("type"))
+        prof_tables = (sensitivity or {}).get("tables") or {}
+        names = disk.get("names") or []
+        measured = (dtype in ("auto", "measured") and bool(prof_noise) and names
+                    and all(n in prof_tables and all(t in (prof_tables[n].get("cost") or {}) for t in TABLE_LADDER)
+                            for n in names))
+        if dtype == "measured" and not measured:
+            sys.exit("ERROR: --disk-type measured, but the sensitivity profile has no measured cost for "
+                     f"{', '.join(names) or 'the table'} -- run pollard-probe --from-imatrix with --text and "
+                     "--tokenizer (or use --disk-type auto / q8_0).")
+        if measured:
+            for n, pat in zip(names, disk["patterns"]):
+                tc = prof_tables[n]
+                items.append((int(tc.get("params") or disk_params), 1.0, dict(tc["cost"]), TABLE_LADDER))
+                table_meta.append((n, pat))
+                table_pats.add(pat)
+            src += " + measured lookup table" + ("s" if len(names) > 1 else "")
+        else:
+            ptype = "q8_0" if dtype in ("auto", "measured") else dtype
+            pinned += [(pat, ptype) for pat in disk["patterns"]]       # pinned, but 0 GB of RAM
+    tables_items = items[len(meta):]                    # measured lookup tables ride at the end, never tier-pinned
+    items = items[:len(meta)]
     if tiers:
         keep_items, keep_meta = [], []
         for (kind, pats), (params, imp) in zip(meta, items):
@@ -323,6 +361,8 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
                 keep_items.append((params, imp))
                 keep_meta.append((kind, pats))
         items, meta = keep_items, keep_meta
+    n_meta = len(items)
+    items = items + tables_items
 
     # The embed/output ladder must not descend into an imatrix-REQUIRED type when the imatrix
     # does not cover those tensors. llama-imatrix does not collect token_embd/output, so on a
@@ -357,9 +397,13 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
                      f"the floor. pollard-calc will tell you the streaming tier.{hint}")
     types, alloc_gb = res
     gb = alloc_gb + emb_gb + pinned_gb
+    table_types = types[n_meta:]
+    types = types[:n_meta]
 
     from collections import Counter
     overrides, bulk_types = list(pinned), []
+    for (n, pat), t in zip(table_meta, table_types):
+        overrides.append((pat, t))
     for (kind, pats), t in zip(meta, types):
         overrides += [(p, t) for p in pats]
         if kind == "bulk":
@@ -369,12 +413,16 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     summary = ", ".join(f"{n}L@{t}" for t, n in sorted(c.items(), key=lambda x: -BPW[x[0]]))
     if tiers:
         summary += "  [pinned: " + ", ".join(f"{k}={v}" for k, v in sorted(tiers.items())) + "]"
-    if disk_params:
-        summary += f"  [disk: {len(disk['patterns'])} table(s) @ {disk['type']}, {disk['gb']:.1f} GB on SSD]"
+    if table_meta:
+        summary += "  [measured table(s), read lazily from the SSD: " + ", ".join(
+            f"{n.split('.')[0]} @ {t}" for (n, _), t in zip(table_meta, table_types)) + "]"
+    elif disk_params:
+        ptype = "q8_0" if str(disk["type"]) in ("auto", "measured") else disk["type"]
+        summary += f"  [disk: {len(disk['patterns'])} table(s) @ {ptype}, {disk['gb']:.1f} GB on SSD]"
     if not bulk_types:
         base_t = tiers.get("bulk") or LADDER[0]
     res = (overrides, emb_type, gb, PRESET[base_t], (summary, src))
-    return res + ({p for p, _ in pinned},) if want_pinned else res
+    return res + ({p for p, _ in pinned} | table_pats,) if want_pinned else res
 
 
 def stale_moe_profile(sensitivity, arch):
@@ -552,8 +600,11 @@ def main():
                     help="lookup tables (n-gram / per-layer embeddings) that llama.cpp reads from the SSD on demand: "
                          "pinned to --disk-type and NOT charged to --ram (default auto: detect, if this runtime "
                          "lazy-reads the architecture). See pollard-ngram.")
-    ap.add_argument("--disk-type", default="q8_0", choices=["q8_0", "q6_K", "q5_K", "f16", "bf16"],
-                    help="precision for --disk tables (default q8_0: disk is cheap, so keep them near-lossless)")
+    ap.add_argument("--disk-type", default="auto", choices=["auto", "measured", "q8_0", "q6_K", "q5_K", "f16", "bf16"],
+                    help="precision for --disk tables. auto (default): MEASURED like every other tensor when the "
+                         "--sensitivity profile scored the table (pollard-probe --from-imatrix --text), its bytes "
+                         "counted in the budget and its type the allocator's call from q8_0 down; q8_0 otherwise. "
+                         "measured: require the measurement. A type pins it there, outside the RAM budget")
     ap.add_argument("--allow-1bit", action="store_true",
                     help="extend the floor to 1-bit (iq1_m/iq1_s) for models that won't "
                          "fit at iq2_xxs -- heavy quality loss, but giant MoEs absorb it. "
@@ -706,8 +757,13 @@ def main():
     label = "expert+attn mix" if arch["kind"] == "moe" else "FFN+attn mix   "
     print(f"{label}     : {summary}  (base {base_preset})")
     print(f"sensitivity source  : {src}")
-    if disk and disk["params"]:
-        print(f"on the SSD (lazy)   : {disk['params']/1e9:.2f}B params @ {disk['type']} = {disk['gb']:.1f} GB, not in the RAM "
+    if disk and disk["params"] and "measured table" in summary:
+        print(f"on the SSD (lazy)   : {disk['params']/1e9:.2f}B params, MEASURED -- type and bytes in the plan above "
+              f"(counted in the budget): {', '.join(disk['names'][:3])}{' ...' if len(disk['names']) > 3 else ''}")
+        print(f"   run it with:  pollard-ngram run <build>.gguf --ram {a.ram:.0f}   (mmap + --lazy-mode on; never --no-mmap)")
+    elif disk and disk["params"]:
+        dt = "q8_0" if str(disk["type"]) in ("auto", "measured") else disk["type"]
+        print(f"on the SSD (lazy)   : {disk['params']/1e9:.2f}B params @ {dt} = {disk['gb']:.1f} GB, not in the RAM "
               f"budget: {', '.join(disk['names'][:3])}{' ...' if len(disk['names']) > 3 else ''}")
         print(f"   run it with:  pollard-ngram run <build>.gguf --ram {a.ram:.0f}   (mmap + --lazy-mode on; never --no-mmap)")
     elif disk and disk.get("note"):
