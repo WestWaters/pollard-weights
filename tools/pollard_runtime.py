@@ -29,6 +29,7 @@ working-tree edit.
   pollard-runtime --arch k2-horizon        # who has this architecture? does upstream?
   pollard-runtime --capture NAME           # export each tree's uncommitted changes to runtime-patches/
   pollard-runtime --verify                 # is every captured patch still applied? (non-zero if not)
+  pollard-runtime --check-patches all      # ...and does each still apply to upstream? (no build; daily CI)
   pollard-runtime --apply NAME             # re-apply a captured patch after a clone or reset
   pollard-runtime --check                  # each engine vs upstream + how its last update ended
 
@@ -491,6 +492,13 @@ def main():
                     help="check every captured patch is still applied in its tree (source AND "
                          "binaries); non-zero if any has been lost")
     ap.add_argument("--apply", metavar="NAME", help="re-apply a captured patch after a clone or reset")
+    ap.add_argument("--check-patches", metavar="ENGINE",
+                    help="drift check, no build: stage ENGINE's upstream (or 'all'), apply its captured patches exactly "
+                         "as --update re-applies them, and report each one plain + 3-way. Non-zero if one needs a rebase")
+    ap.add_argument("--tree", metavar="DIR", help="with --check-patches ENGINE: use this already-fetched upstream tree")
+    ap.add_argument("--work", metavar="DIR", help="with --check-patches: where to stage upstream (default: a temp dir)")
+    ap.add_argument("--summary", metavar="FILE", help="with --check-patches: append the markdown report here "
+                                                         "(e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--patch-dir", default=PATCH_DIR, help=f"where patches live (default {PATCH_DIR})")
     ap.add_argument("--install", action="store_true",
                     help="check the install can RUN what the repo declares -- an editable install "
@@ -542,6 +550,15 @@ def main():
         ok = all([U.update_engine(n, check=a.check, jobs=a.jobs, allow_drop=a.allow_drop, extra=extra,
                                   cuda_arch=a.cuda_arch) for n in names])
         return 0 if ok else 1
+
+    if a.check_patches:
+        import pollard_runtime_update as U
+        names = list(U.ENGINES) if a.check_patches == "all" else [a.check_patches]
+        bad = [n for n in names if n not in U.ENGINES]
+        if bad or (a.tree and len(names) != 1):
+            print(f"unknown engine {bad}; choose from {list(U.ENGINES)} or all" if bad else "--tree needs one engine")
+            return 2
+        return U.drift_main(names, work=a.work, tree=a.tree, summary=a.summary)
 
     trees = find_trees(a.scan)
     if not trees:

@@ -91,6 +91,14 @@ used to print a bare `git pull`, which was advice that could destroy a published
 `ik_llama.cpp`, `llama-stq`) are pinned to the bases their patches were written against. A current
 upstream runtime is a SEPARATE clone, so nothing a pull does can reach the patched trees.
 
+## Daily drift check (CI)
+
+`.github/workflows/runtime-patch-drift.yml` runs every day (and on demand): it shallow-fetches each engine in
+`engines.json` from its public remote and runs `pollard-runtime --check-patches all`, which is `--update`'s own
+re-apply (same function, same order, every declared patch required) with no build. Each patch is reported plain
+(`git apply --check`) and 3-way, with the upstream commit; a patch that needs a rebase fails the job and opens (or
+comments on) one issue. Locally: `pollard-runtime --check-patches llama.cpp [--tree <an upstream checkout>]`.
+
 ## After a sync that adds a tool
 
 Syncing the repo updates the code but not the commands. An editable install resolves modules straight
