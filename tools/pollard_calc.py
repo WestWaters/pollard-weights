@@ -396,7 +396,8 @@ def _read_one_gguf(path):
             k = rd_str()
             t, = struct.unpack("<I", f.read(4))
             v = rd_val(t)
-            if not (isinstance(v, list) and len(v) > 64):  # skip tokenizer blobs
+            # skip tokenizer blobs, keep per-layer arrays (Nemotron-H: 88 layers of expert_used_count)
+            if not (isinstance(v, list) and (k.startswith("tokenizer.") or len(v) > 4096)):
                 meta[k] = v
         # tensor table follows the KV section (cursor is already there):
         # exact per-tensor shapes. Summing gives a ground-truth param count
@@ -579,10 +580,12 @@ def gguf_to_config(meta, path):
         "_tensor_param_sum": meta.get("_tensor_param_sum"),
         "_shard_count": meta.get("_shard_count", 1),
     }
-    if isinstance(cfg["num_attention_heads"], list):  # per-layer lists
-        cfg["num_attention_heads"] = max(cfg["num_attention_heads"])
-    if isinstance(cfg["num_key_value_heads"], list):
-        cfg["num_key_value_heads"] = max(cfg["num_key_value_heads"])
+    # per-layer lists (0 on layers without that block, e.g. Nemotron-H's Mamba layers): the widest layer
+    for k in ("num_attention_heads", "num_key_value_heads", "intermediate_size", "num_experts",
+              "num_experts_per_tok", "moe_intermediate_size", "head_dim"):
+        if isinstance(cfg[k], list):
+            vals = [v for v in cfg[k] if isinstance(v, (int, float)) and v]
+            cfg[k] = max(vals) if vals else None
     return cfg
 
 
