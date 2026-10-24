@@ -104,3 +104,16 @@ pollard-runtime --install        # does the install run what the repo declares?
 Non-zero means a declared command has no launcher, and it prints the exact `pip install -e` to fix it.
 Run that wherever Pollard is installed. Every tool added in one session was in that state on both
 machines, and nothing surfaced it until someone typed a name that did not exist.
+
+## Scheduled updates
+
+`pollard-runtime --schedule daily|weekly` installs a launchd agent (macOS) or a Task Scheduler task (Windows, as SYSTEM,
+`start /low`, `--jobs` half the cores, start date in the past so it never fires on creation) that runs
+`pollard-runtime --update all --scheduled <when>` at 04:30 and once an hour for the next 8 hours. Each attempt SKIPS
+(and logs why) while the machine lock (`$POLLARD_HOME/.pollard.lock`), a `POLLARD_HEAVY_LOCK` directory, a release /
+`pollard --run` / `pollard-*` step / `llama-*` binary / GGUF conversion, or on Windows a running SYSTEM release task is
+present, and asks again right before the swap. Once an attempt has run, the rest of the window is a no-op.
+
+A refused update (a patch that no longer applies, a failed build, a lost architecture) removes its `.next`, keeps
+`.prev`, and is recorded in `runtime/update-status.json`; `pollard-runtime --check` prints it, e.g.
+`update blocked: llama.cpp-qwen3omni-deepstack needs a rebase`.

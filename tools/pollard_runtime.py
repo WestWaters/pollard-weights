@@ -30,6 +30,7 @@ working-tree edit.
   pollard-runtime --capture NAME           # export each tree's uncommitted changes to runtime-patches/
   pollard-runtime --verify                 # is every captured patch still applied? (non-zero if not)
   pollard-runtime --apply NAME             # re-apply a captured patch after a clone or reset
+  pollard-runtime --check                  # each engine vs upstream + how its last update ended
 
 Exit code is 1 when a build is behind upstream on an architecture we have published against, or when a
 captured patch has gone missing -- both states where a shipped repo has no runtime on this machine."""
@@ -503,7 +504,12 @@ def main():
     ap.add_argument("--update", nargs="?", const="llama.cpp", metavar="ENGINE",
                     help="update a managed engine from upstream: llama.cpp (default), ik_llama.cpp or all. "
                          "Captures local work, builds beside the live tree, verifies, never goes backward")
-    ap.add_argument("--check", action="store_true", help="with --update: only report live vs upstream")
+    ap.add_argument("--check", action="store_true",
+                    help="report each engine's live build vs upstream and how its last update ended (e.g. 'update "
+                         "blocked: <patch> needs a rebase'); alone it means --update all --check")
+    ap.add_argument("--scheduled", choices=["daily", "weekly"],
+                    help="with --update: what the scheduled task runs -- skips (retried next hour) while a release, "
+                         "`pollard --run`, a llama-* binary or the machine/heavy lock is busy, and re-checks before the swap")
     ap.add_argument("--rollback", metavar="ENGINE", help="swap the previous build back in")
     ap.add_argument("--schedule", choices=["daily", "weekly", "off"], help="update automatically (low priority)")
     ap.add_argument("--allow-drop", action="store_true", help="with --update: swap even if an architecture is lost")
@@ -516,6 +522,8 @@ def main():
                          "still covers this box's GPU under this toolkit, else pick one from nvidia-smi + nvcc")
     a = ap.parse_args()
 
+    if a.check and not (a.update or a.rollback or a.schedule):
+        a.update = "all"
     if a.update or a.rollback or a.schedule:
         import pollard_runtime_update as U
         if a.schedule:
@@ -529,6 +537,8 @@ def main():
             print(f"unknown engine {bad}; choose from {list(U.ENGINES)} or all")
             return 2
         extra = dict(f.split("=", 1) for f in a.with_flags if "=" in f)
+        if a.scheduled and not a.check:
+            return 0 if U.scheduled_update(names, a.scheduled, jobs=a.jobs or U.scheduled_jobs()) else 1
         ok = all([U.update_engine(n, check=a.check, jobs=a.jobs, allow_drop=a.allow_drop, extra=extra,
                                   cuda_arch=a.cuda_arch) for n in names])
         return 0 if ok else 1
