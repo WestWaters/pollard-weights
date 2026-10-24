@@ -74,3 +74,21 @@ def mismatches(api, repo, pairs, revision=None):
         else:
             bad.append(f"{rp}: the Hub gave no hash to check against")
     return bad
+
+
+def records(api, repo, paths, revision=None):
+    """{path in repo: {size, sha256, git_sha1}} as the Hub reports them -- written into a build's MANIFEST entry
+    (`hub_files`) once its upload is confirmed, so a later check (pollard-ls --clean-mirrors) can compare the Hub
+    against size + sha256 even after the local copy is freed. {} when the Hub cannot be read."""
+    try:
+        got = api.get_paths_info(repo, list(paths), revision=revision) if revision else \
+            api.get_paths_info(repo, list(paths))
+    except Exception:                                            # noqa: BLE001
+        return {}
+    out = {}
+    for f in got:
+        if getattr(f, "size", None) is None:
+            continue
+        sha = _lfs_sha(f)
+        out[f.path] = {"size": f.size, "sha256": sha, "git_sha1": None if sha else getattr(f, "blob_id", None)}
+    return out

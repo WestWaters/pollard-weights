@@ -181,6 +181,9 @@ def test_each_rung_is_uploaded_then_freed_and_the_inputs_never_are(model, inputs
     man = {b["tag"]: b for b in R.gguf_builds(c)}
     assert man["Q6_K"]["uploaded"] == repo and man["Q6_K"]["freed"].startswith("uploaded")
     assert man["IQ3_S"].get("uploaded") is None and not man["IQ3_S"].get("freed")
+    rec = man["Q6_K"]["hub_files"]["Tiny-1B-Pollard-Q6_K.gguf"]
+    assert (rec["size"], rec["sha256"]) == hub["__meta__"][(repo, "Tiny-1B-Pollard-Q6_K.gguf")], \
+        "the confirmed upload's size + sha256 is recorded, so a later check works after the local copy is freed"
 
 
 def test_a_rung_that_does_not_fit_is_held_and_the_release_goes_on(model, inputs, hub, monkeypatch):

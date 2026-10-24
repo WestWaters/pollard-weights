@@ -12,6 +12,8 @@ hf_weights: null               # the checkpoint the HF lanes read (dir or repo i
 max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
 remote_source: null            # ssh://user@host/<dir>?python=..&key=..: the MLX lane reads the source through a sparse
                                # local mirror at --hf (tensors fetched as read, cached within the free disk)
+reclaim_mirror: true           # once the repo is public, remove its $POLLARD_HOME/mirror/<model> source mirror if
+                               # every build from it is confirmed on the Hub (size + sha256); false = keep it
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300

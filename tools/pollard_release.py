@@ -89,6 +89,8 @@ hf_weights: null               # the checkpoint the HF lanes read (dir or repo i
 max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
 remote_source: null            # ssh://user@host/<dir>?python=..&key=..: the MLX lane reads the source through a sparse
                                # local mirror at --hf (tensors fetched as read, cached within the free disk)
+reclaim_mirror: true           # once the repo is public, remove its $POLLARD_HOME/mirror/<model> source mirror if
+                               # every build from it is confirmed on the Hub (size + sha256); false = keep it
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
   per_domain: 300
@@ -1442,7 +1444,33 @@ def go_public(step, c, cfg, run_upload, statuses, out=print):
     except AttributeError:                                       # older huggingface_hub
         api.update_repo_visibility(step.repo, private=False)
     out(f"      PUBLIC: https://huggingface.co/{step.repo}  ({', '.join(shipped)}; {len(files)} files checked)")
+    reclaim_after_public(c, cfg, step.repo, api, out)
     return "done"
+
+
+def reclaim_after_public(c, cfg, repo, api, out=print):
+    """Once the repo is public: the source mirror this release read ($POLLARD_HOME/mirror/<model>, and its
+    -smoothed twin) goes when EVERY build its MANIFESTs record is confirmed on the Hub by size + sha256 -- the same
+    check as `pollard-ls --clean-mirrors` (a mirror with an unpublished build, or a Hub that cannot be read, is
+    kept). `reclaim_mirror: false` in the plan keeps it. Never fails the release. cache/ is not touched here (its
+    entries are content-keyed, not per model): `pollard-ls --clean-cache` reclaims it."""
+    import pollard_workspace as ws
+    if cfg.get("reclaim_mirror") is False:
+        return 0
+    root = os.path.normcase(os.path.realpath(ws.mirror_root())) + os.sep
+    dirs = [d for d in (c.get("hf_dir"), c.get("smooth_dir"))
+            if d and os.path.isdir(d) and os.path.normcase(os.path.realpath(d)).startswith(root)]
+    if not dirs:
+        return 0
+    try:
+        # this release's own steps are finished, so no age rule: only a file some process holds open keeps it
+        freed, _ = ws.clean_mirrors(api, [repo], only=dirs, min_age_min=0, log=out)
+    except Exception as e:                                                # noqa: BLE001
+        out(f"      mirror: reclaim skipped ({type(e).__name__}: {e})")
+        return 0
+    if freed:
+        out(f"      mirror: freed {ws.human(freed)} (reclaim cache/ with `pollard-ls --clean-cache`)")
+    return freed
 
 
 def _size_gb(path):
@@ -1650,7 +1678,13 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     b.pop("kept", None)
     if streamed:
         b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
-    fields = ("uploaded", "uploaded_as", "runtime", "runtime_arch", "bytes")
+    import pollard_hubcheck as H
+    # what the Hub holds for it (size + sha256 / git blob id): pollard-ls --clean-mirrors checks the Hub against
+    # this once the local copy is freed
+    rec = H.records(api, repo, [rp for rp, _ in pairs])
+    if rec and len(rec) == len(pairs):
+        b["hub_files"] = rec
+    fields = ("uploaded", "uploaded_as", "runtime", "runtime_arch", "bytes", "hub_files")
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if not ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",)):
         # the upload is confirmed but the MANIFEST no longer has this build to say so: freeing the file now would
