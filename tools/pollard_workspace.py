@@ -15,7 +15,10 @@ Layout (default ~/pollard, override with $POLLARD_HOME):
         calibration/                          imatrix, cal data, sensitivity.json
         reports/                              pollard-verify / scorecard / ppl outputs
         MANIFEST.json                         every build here: lane, bpw, ppl, verified, size, date
-    cache/                                    _work dirs: probe GGUFs, base logits (safe to delete)
+    cache/                                    _work dirs: probe GGUFs, base logits (safe to delete;
+                                              `pollard-ls --clean-cache`)
+    mirror/<model>/                           sparse / streamed source mirrors (remote sources, MLX --hf);
+                                              `pollard-ls --clean-mirrors` once every build is on the Hub
     staging/                                  copies waiting to be uploaded FROM this machine (the --upload-via
       <Org>__<Repo>/<LANE>__<rung>/           relay): one fixed folder per rung, resumed by a rerun, deleted once
                                               the Hub holds it (size + sha256); `pollard-ls --clean-staging`
@@ -200,14 +203,24 @@ def scan_staging(root, depth=2):
 
 
 def remove_within(root, path):
-    """Delete `path` (a folder strictly inside `root`) and then every folder between it and `root` left empty.
-    Refuses anything else. True when removed. Self-contained -- shipped to the relay machine like scan_staging."""
+    """Delete `path` (a folder or file strictly inside `root`) and then every folder between it and `root` left
+    empty. Refuses anything else -- a path that resolves (through a symlink or ..) outside `root`, or `root` itself.
+    A symlink is never followed: one inside `root` is unlinked (whatever it points at is left alone). True when
+    removed. Self-contained -- shipped to the relay machine like scan_staging."""
     import shutil
     r = os.path.normcase(os.path.realpath(root))
-    p = os.path.normcase(os.path.realpath(path))
+    if os.path.islink(path):
+        p = os.path.normcase(os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(path))),
+                                          os.path.basename(os.path.abspath(path))))
+    else:
+        p = os.path.normcase(os.path.realpath(path))
     if p == r or not p.startswith(r.rstrip(os.sep) + os.sep):
         raise ValueError(f"refusing to delete {path}: not inside {root}")
-    shutil.rmtree(path)
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+        path = p
+    else:
+        shutil.rmtree(path)
     d = os.path.dirname(os.path.realpath(path))
     while os.path.normcase(d) != r and os.path.normcase(d).startswith(r) and os.path.isdir(d) and not os.listdir(d):
         os.rmdir(d)
@@ -358,6 +371,412 @@ def _prune_empty(root, legacy, log=print):
     if legacy and not os.listdir(root):
         os.rmdir(root)
         log(f"   staging: removed the empty legacy folder {root}")
+
+
+# --------------------------------------------------------------------------------------------- reclaim space
+# `pollard-ls --clean-cache / --clean-mirrors / --clean-all`. Everything removed here is strictly inside
+# $POLLARD_HOME (remove_within), symlinks are never followed out, and models/ (the builds) is never touched.
+
+#: cache/ subfolders that hold many independent cache files (each file is its own entry); every other
+#: top-level item under cache/ (a probe / eval work dir, a verify reference, a KL base) is one entry
+CACHE_BUCKETS = ("toolcall", "d3-ref")
+#: an entry written to in the last this-many minutes may belong to a running job: kept
+CLEAN_MIN_AGE_MIN = 30
+
+
+def mirror_root(home: str | None = None) -> str:
+    """$POLLARD_HOME/mirror: sparse / streamed source mirrors (remote sources, the MLX lane's --hf mirrors)."""
+    return os.path.join(home or pollard_home(), "mirror")
+
+
+def _disk_bytes(st) -> int:
+    """What a file really holds on disk: a sparse mirror shard (a 5 GB header-only file with a few tensors fetched)
+    counts its allocated blocks, not its apparent size; a small file counts its own size."""
+    blocks = getattr(st, "st_blocks", None)
+    return min(st.st_size, blocks * 512) if blocks is not None else st.st_size
+
+
+def tree_bytes(path) -> int:
+    """Bytes `path` holds on disk, counted with lstat: a symlink counts as itself, never as what it points at."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0
+    if not os.path.isdir(path) or os.path.islink(path):
+        return _disk_bytes(st)
+    total = 0
+    for r, _, fs in os.walk(path):
+        for f in fs:
+            try:
+                total += _disk_bytes(os.lstat(os.path.join(r, f)))
+            except OSError:
+                pass
+    return total
+
+
+def newest_mtime(path) -> float:
+    """The latest mtime of `path` or anything under it (lstat, symlinks not followed)."""
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+    if os.path.isdir(path) and not os.path.islink(path):
+        for r, ds, fs in os.walk(path):
+            for n in ds + fs:
+                try:
+                    newest = max(newest, os.lstat(os.path.join(r, n)).st_mtime)
+                except OSError:
+                    pass
+    return newest
+
+
+def held_open(root):
+    """Paths under `root` some process has open right now, or None when this machine cannot tell (no /proc and no
+    lsof, e.g. Windows -- where deleting an open file fails on its own anyway)."""
+    root = os.path.realpath(root)
+    pre = root.rstrip(os.sep) + os.sep
+    if os.path.isdir("/proc/self/fd"):                                     # Linux: every fd we may read
+        out = set()
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    t = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if t == root or t.startswith(pre):
+                    out.add(t)
+        return out
+    import shutil as _sh
+    import subprocess
+    lsof = _sh.which("lsof")
+    if not lsof:
+        return None
+    try:
+        r = subprocess.run([lsof, "-n", "-P", "-F", "n", "+D", root], capture_output=True, text=True, timeout=120)
+    except Exception:                                                     # noqa: BLE001
+        return None
+    if r.returncode not in (0, 1):                                        # 1 = nothing open under it
+        return None
+    return {ln[1:] for ln in r.stdout.splitlines() if ln.startswith("n") and ln[1:].startswith((pre, root))}
+
+
+def running_job(home: str | None = None):
+    """{pid, what} of a live process holding this workspace's machine lock (a Pollard build / measure), else None."""
+    path = os.environ.get("POLLARD_MACHINE_LOCK") or os.path.join(home or pollard_home(), ".pollard.lock")
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = json.loads(f.read() or "{}")
+        pid = int(prev.get("pid", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if not pid or pid == os.getpid():
+        return None
+    try:
+        if os.name == "nt":
+            import subprocess
+            alive = str(pid) in subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True,
+                                               text=True, timeout=10).stdout
+        else:
+            os.kill(pid, 0)
+            alive = True
+    except PermissionError:
+        alive = True
+    except Exception:                                                     # noqa: BLE001
+        alive = False
+    return prev if alive else None
+
+
+def _in_use(path, opened, cutoff):
+    """Why `path` looks in use (a file under it is open, or it was written after `cutoff`), else ''."""
+    real = os.path.realpath(path)
+    pre = real.rstrip(os.sep) + os.sep
+    if opened and any(p == real or p.startswith(pre) for p in opened):
+        return "a running process has a file in it open"
+    m = newest_mtime(path)
+    if m > cutoff:
+        return f"written {max(0, (time.time() - m)) / 60:.0f} min ago (may belong to a running job)"
+    return ""
+
+
+def _remove_logged(root, e, why, log, tag):
+    try:
+        remove_within(root, e["path"])
+    except (OSError, ValueError) as err:
+        log(f"   {tag}: could not remove {e['path']} ({err}) -- kept")
+        return False
+    log(f"   {tag}: removed {e['path']} ({human(e['bytes'])}) -- {why}")
+    return True
+
+
+def cache_entries(home: str | None = None) -> list:
+    """Each reclaimable item under cache/: the files of the bucket folders (toolcall/, d3-ref/), every other
+    top-level file or folder whole. [{path, bytes}]"""
+    root = os.path.join(home or pollard_home(), "cache")
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for n in sorted(os.listdir(root)):
+        p = os.path.join(root, n)
+        if n in CACHE_BUCKETS and os.path.isdir(p) and not os.path.islink(p):
+            out += [{"path": os.path.join(p, k), "bytes": tree_bytes(os.path.join(p, k))} for k in sorted(os.listdir(p))]
+        else:
+            out.append({"path": p, "bytes": tree_bytes(p)})
+    return out
+
+
+def clean_cache(home: str | None = None, min_age_min: float = CLEAN_MIN_AGE_MIN, log=print, now=None):
+    """Remove everything under cache/ (verify reference logits, KL bases, probe / eval work dirs, toolcall and d3
+    reference caches -- all rebuilt on demand) EXCEPT what a running job may be using: an entry with a file open in
+    some process, or written in the last `min_age_min` minutes. Returns (bytes freed, [(entry, action, why)])."""
+    home = home or pollard_home()
+    root = os.path.join(home, "cache")
+    entries = cache_entries(home)
+    if not entries:
+        return 0, []
+    cutoff = (time.time() if now is None else now) - min_age_min * 60
+    job = running_job(home)
+    if job:
+        log(f"   cache: a Pollard job is running (pid {job.get('pid')}: {job.get('what', '?')}) -- anything it "
+            "may be using is kept")
+    opened = held_open(root)
+    if opened is None:
+        log(f"   cache: this machine cannot list open files -- anything written in the last {min_age_min:g} min "
+            "is kept instead")
+    freed, plan = 0, []
+    for e in entries:
+        why = _in_use(e["path"], opened, cutoff)
+        if why:
+            log(f"   cache: KEPT {e['path']} -- {why}")
+            plan.append((e, "keep", why))
+        elif _remove_logged(root, e, "cache entry (rebuilt on demand)", log, "cache"):
+            freed += e["bytes"]
+            plan.append((e, "remove", "cache entry"))
+        else:
+            plan.append((e, "keep", "could not remove"))
+    _prune_empty(root, False, log)
+    return freed, plan
+
+
+# ---- sources (mirror/<model>/, downloads/<Org>__<Model>/): reclaimable once every build made from them is on the Hub
+
+def source_manifests(src_dir, home: str | None = None) -> list:
+    """[(slug, MANIFEST)] of every model whose builds were made from the source folder `src_dir`. The release
+    records each lane under its own key -- the MLX lane under the source folder itself, GPTQ / MX / EXL3 under
+    <source>-smoothed, GGUF under <source>-f16.gguf -- so all three are looked up, plus any MANIFEST whose
+    `model` is the folder (or inside it)."""
+    home = home or pollard_home()
+    name = os.path.basename(str(src_dir).rstrip("/\\"))
+    base = name[:-len("-smoothed")] if name.endswith("-smoothed") else name
+    want = {base, base + "-smoothed", base + "-f16.gguf"}
+    real = os.path.normcase(os.path.realpath(src_dir))
+    roots = {real, os.path.normcase(os.path.realpath(os.path.join(os.path.dirname(src_dir), base)))}
+    out = []
+    mroot = os.path.join(home, "models")
+    for slug in (sorted(os.listdir(mroot)) if os.path.isdir(mroot) else []):
+        p = os.path.join(mroot, slug, "MANIFEST.json")
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                man = json.load(f)
+        except (OSError, ValueError):
+            continue
+        m = str(man.get("model") or "")
+        mp = os.path.normcase(os.path.realpath(m)) if m and (os.path.isabs(m) or m.startswith(".")) else ""
+        if slug in want or (mp and any(mp == r or mp.startswith(r.rstrip(os.sep) + os.sep) or
+                                       mp in (r + "-smoothed", r + "-f16.gguf") for r in roots)):
+            out.append((slug, man))
+    return out
+
+
+def _lane_dest(b):
+    """Where a build sits in its repo when the MANIFEST does not say (`uploaded_as`): the GGUF file at the root,
+    a directory lane in <LANE>/<rung>/."""
+    if b.get("uploaded_as"):
+        return b["uploaded_as"]
+    lane = str(b.get("lane") or "")
+    name = b.get("name") or os.path.basename(str(b.get("path", "")).rstrip("/\\"))
+    if lane == "gguf":
+        return name
+    folder = {"mlx": "MLX", "gptq": "GPTQ", "mx": "MX", "exl3": "EXL3", "exlr8": "EXLR8", "draft": "DRAFT"}.get(lane)
+    if not folder:
+        return None
+    marker = f"-Pollard-{lane.upper()}-"
+    sub = (name.split(marker, 1)[1] if marker in name else str(b.get("tag") or name)).lower()
+    return folder if lane == "draft" else f"{folder}/{sub}"
+
+
+def _build_pairs(b, dest):
+    """[(path in repo, local file | recorded {size, sha256})] for one build: what its upload was confirmed with
+    (`hub_files`), else its local files (hashed), plus the shards a streamed rung already uploaded + freed."""
+    rec = b.get("hub_files")
+    if isinstance(rec, dict) and rec:
+        return [(rp, v) for rp, v in sorted(rec.items()) if isinstance(v, dict)]
+    path = str(b.get("path") or "")
+    pairs = []
+    if os.path.isfile(path) and not os.path.islink(path):
+        pairs.append((dest, path))
+    elif os.path.isdir(path) and not os.path.islink(path):
+        streamed = {}
+        sp = os.path.join(path, "pollard-streamed.json")
+        if os.path.isfile(sp):
+            try:
+                with open(sp, encoding="utf-8") as f:
+                    streamed = json.load(f).get("files") or {}
+            except (OSError, ValueError):
+                streamed = {}
+        for r, _, fs in os.walk(path):
+            for f in fs:
+                full = os.path.join(r, f)
+                rel = os.path.relpath(full, path).replace(os.sep, "/")
+                if rel == "pollard-streamed.json" or rel.endswith(".tmp") or os.path.islink(full):
+                    continue
+                pairs.append((f"{dest}/{rel}", full))
+        pairs += [(e["path_in_repo"], {"size": e["size"], "sha256": e["sha256"], "git_sha1": e.get("git_sha1")})
+                  for e in streamed.values() if isinstance(e, dict) and e.get("path_in_repo")]
+    return sorted(pairs, key=lambda x: x[0])
+
+
+def build_on_hub(api, b, repos=(), files_of=None):
+    """(True | False | None, why) -- is this build on the Hub intact? True: every file matches by size + sha256 (or,
+    for a rung freed after its upload was confirmed that way, the Hub still holds it). False: it is not (never
+    uploaded, missing, differs). None: the Hub could not be asked (offline, no huggingface_hub) -- never a yes."""
+    import pollard_hubcheck as H
+    if api is None:
+        return None, "the Hub cannot be asked (huggingface_hub not installed / offline)"
+    targets = [b["uploaded"]] if b.get("uploaded") else list(repos)
+    if not targets:
+        return False, "never uploaded (no repo in its MANIFEST entry -- name one with --repo)"
+    dest = _lane_dest(b)
+    if not dest:
+        return False, f"no repo path known for a {b.get('lane')!r} build"
+    pairs = _build_pairs(b, dest)
+    last = None
+    for repo in targets:
+        if pairs:
+            bad = H.mismatches(api, repo, pairs)
+            if not bad:
+                return True, f"{repo}:{dest} (size + sha256 confirmed)"
+            if bad[0].startswith("could not read"):
+                return None, bad[0]
+            last = f"{repo}: " + "; ".join(bad[:3])
+        elif b.get("uploaded") == repo and b.get("freed"):
+            # freed after its upload was confirmed by size + sha256 (publish_rung): the Hub must still hold it
+            try:
+                files = files_of(repo) if files_of else set(api.list_repo_files(repo))
+            except Exception as e:                                        # noqa: BLE001
+                return None, f"could not read the file list of {repo} ({type(e).__name__}: {e})"
+            if files is None:
+                return None, f"could not read the file list of {repo}"
+            if dest in files or any(f.startswith(dest.rstrip("/") + "/") for f in files):
+                return True, f"{repo}:{dest} (confirmed by size + sha256 when uploaded + freed; still on the Hub)"
+            last = f"{repo}: {dest} is no longer on the Hub"
+        else:
+            last = "its local copy is gone and no upload of it is recorded"
+    return False, last or "not confirmed on the Hub"
+
+
+def source_status(src_dir, home=None):
+    """Offline view for pollard-ls: (reclaimable?, why) from the MANIFESTs alone -- no Hub call, no hashing."""
+    builds = [b for _, man in source_manifests(src_dir, home) for b in man.get("builds", [])]
+    if not builds:
+        return False, "no build recorded from it"
+    up = [b for b in builds if b.get("uploaded")]
+    if len(up) < len(builds):
+        return False, f"{len(builds) - len(up)} of {len(builds)} build(s) not uploaded"
+    repos = sorted({b["uploaded"] for b in up})
+    return True, f"all {len(builds)} build(s) recorded as uploaded ({', '.join(repos)})"
+
+
+def source_entries(root):
+    """[{path, bytes}] for each folder under a sources root (mirror/ or downloads/)."""
+    if not os.path.isdir(root):
+        return []
+    return [{"path": os.path.join(root, n), "bytes": tree_bytes(os.path.join(root, n))}
+            for n in sorted(os.listdir(root)) if os.path.isdir(os.path.join(root, n)) or
+            os.path.islink(os.path.join(root, n))]
+
+
+def clean_sources(root, api=None, repos=(), force=False, home=None, min_age_min=CLEAN_MIN_AGE_MIN, log=print,
+                  now=None, tag="mirror", hidden=False, only=None):
+    """Reclaim the source folders under `root` (mirror/ or downloads/): one goes when EVERY build its MANIFESTs
+    record is confirmed on the Hub (build_on_hub). One with an unpublished build, or no recorded build, or whose
+    Hub check cannot be done, is kept -- unless `force`, which removes it anyway and says so. A folder a running job
+    may be using (a file open, or written in the last `min_age_min` minutes) is kept even with `force`. `hidden`
+    also takes dot-folders (downloads/.hf-cache) -- only ever with `force`. `only` limits it to these folders.
+    Returns (bytes freed, [(entry, action, why)])."""
+    home = home or pollard_home()
+    entries = [e for e in source_entries(root)
+               if (hidden or not os.path.basename(e["path"]).startswith("."))
+               and (only is None or os.path.normcase(os.path.realpath(e["path"])) in
+                    {os.path.normcase(os.path.realpath(o)) for o in only})]
+    if not entries:
+        return 0, []
+    cutoff = (time.time() if now is None else now) - min_age_min * 60
+    opened = held_open(root)
+    if opened is None:
+        log(f"   {tag}: this machine cannot list open files -- anything written in the last {min_age_min:g} min "
+            "is kept instead")
+    listings = {}
+
+    def files_of(repo):
+        if repo not in listings:
+            try:
+                listings[repo] = set(api.list_repo_files(repo))
+            except Exception:                                             # noqa: BLE001
+                listings[repo] = None
+        return listings[repo]
+
+    freed, plan = 0, []
+    for e in entries:
+        busy = _in_use(e["path"], opened, cutoff)
+        if busy:
+            log(f"   {tag}: KEPT {e['path']} -- {busy}")
+            plan.append((e, "keep", busy))
+            continue
+        builds = [b for _, man in source_manifests(e["path"], home) for b in man.get("builds", [])]
+        bad = None
+        if not builds:
+            bad = "no build recorded from it (nothing built yet, or a build is still going)"
+        for b in builds:
+            ok, why = build_on_hub(api, b, repos, files_of)
+            if ok is not True:
+                bad = (f"{b.get('name') or b.get('path')}: {why}" if ok is False else
+                       f"the Hub check could not be done ({why})")
+                break
+        if bad and not force:
+            log(f"   {tag}: KEPT {e['path']} ({human(e['bytes'])}) -- {bad}; `--force` removes it anyway")
+            plan.append((e, "keep", bad))
+            continue
+        why = (f"every build ({len(builds)}) confirmed on the Hub" if not bad else
+               f"FORCED (--force) -- NOT confirmed on the Hub: {bad}")
+        if bad:
+            log(f"   {tag}: !! --force: removing {e['path']} although it is NOT confirmed on the Hub ({bad})")
+        if _remove_logged(root, e, why, log, tag):
+            freed += e["bytes"]
+            plan.append((e, "remove", why))
+        else:
+            plan.append((e, "keep", "could not remove"))
+    return freed, plan
+
+
+def clean_mirrors(api=None, repos=(), force=False, home=None, min_age_min=CLEAN_MIN_AGE_MIN, log=print, now=None,
+                  only=None):
+    """clean_sources over $POLLARD_HOME/mirror."""
+    return clean_sources(mirror_root(home), api, repos, force, home, min_age_min, log, now, "mirror", only=only)
+
+
+def clean_downloads_confirmed(api=None, repos=(), force=False, home=None, min_age_min=CLEAN_MIN_AGE_MIN, log=print,
+                              now=None):
+    """clean_sources over $POLLARD_HOME/downloads (with `force`, the hub cache folder .hf-cache too)."""
+    return clean_sources(os.path.join(home or pollard_home(), "downloads"), api, repos, force, home, min_age_min,
+                         log, now, "downloads", hidden=force)
 
 
 def charts_dir(model: str | None = None, create: bool = False) -> str:
