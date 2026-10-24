@@ -331,14 +331,27 @@ def _hessians_from_imatrix(path):
     return _imatrix_stats(path)[0]
 
 
-def _gguf_int(rd, suffix):
-    """An integer metadata value whose key ends in `suffix` (e.g. `.expert_used_count`), or None."""
+def _gguf_ints(rd, suffix):
+    """Integer metadata whose key ends in `suffix`, as a list: [v] for a scalar, one value per layer for an array
+    (Nemotron-H stores expert_used_count per layer, 0 on its Mamba and attention layers), or None if absent."""
     for k, f in rd.fields.items():
         if k.endswith(suffix):
             try:
-                return int(f.parts[f.data[0]][0])
+                return [int(f.parts[i][0]) for i in f.data]
             except Exception:
                 return None
+    return None
+
+
+def _layer_value(vals, name):
+    """The value for tensor `name`'s layer from a _gguf_ints list: the scalar, or that layer's entry (0 -> None)."""
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    m = re.match(r"^blk\.(\d+)\.", name)
+    if m and int(m.group(1)) < len(vals):
+        return vals[int(m.group(1))] or None
     return None
 
 
@@ -398,7 +411,7 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
         raise SystemExit(f"could not read an imatrix from {imatrix_path} (tried legacy .dat and "
                          f"GGUF). Build one with llama-imatrix first.")
     rd = GGUFReader(gguf_path)
-    n_used, n_expert = _gguf_int(rd, ".expert_used_count"), _gguf_int(rd, ".expert_count")
+    used_all, expert_all = _gguf_ints(rd, ".expert_used_count"), _gguf_ints(rd, ".expert_count")
     routing = set()                                         # how each expert tensor was weighted (printed once)
     # A vendor-quantized source can carry a per-tensor scale beside an FP4 weight: NVIDIA's QAT
     # Nemotron GGUF stores ssm_in / ssm_out as NVFP4 plus `<name>.scale` (F32), and the runtime
@@ -441,6 +454,9 @@ def _imatrix_sensitivity(gguf_path, imatrix_path, groups, probe_bits, ladder_bit
             merged = t.name.endswith("_exps.weight")
             h = _imatrix_weights(W, hj, merged)
             if merged and W.ndim == 3:
+                n_used, n_expert = _layer_value(used_all, t.name), _layer_value(expert_all, t.name)
+                if n_expert and expert_all and len(expert_all) == 1 and W.shape[0] < n_expert:
+                    n_expert = W.shape[0]                   # scalar expert_count is the widest layer; the tensor is this one
                 p, how = _routing_freq(t.name, W.shape[0], H_counts, n_used, n_expert)
                 if p is None:
                     raise ValueError(how)
