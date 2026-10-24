@@ -150,3 +150,42 @@ def test_clef_omni_profile_shape_no_longer_crushes_attention():
     before, after = attn_types(1.0), attn_types(8 / 128)
     assert before.count("iq2_xxs") >= 20                  # the shipped IQ4_XS rung: 23 layers of attention at 2 bits
     assert after.count("iq2_xxs") <= 4
+
+
+def write_model_per_layer(path, used, n_expert):
+    """Nemotron-H style metadata: expert_used_count is an ARRAY, one entry per layer (0 on non-MoE layers)."""
+    w = gguf.GGUFWriter(path, "nemotron_h_moe")
+    w.add_array("nemotron_h_moe.expert_used_count", used)
+    w.add_expert_count(n_expert)
+    w.add_tensor("blk.0.attn_q.weight", W_ATT)
+    w.add_tensor("blk.0.ffn_up_exps.weight", W_EXP)
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
+def test_per_layer_expert_used_count_array(tmp_path, capsys):
+    # NVIDIA Nemotron-3.5-Bolt, 2026-10-23: expert_used_count is a per-layer array, the probe read it as missing
+    # and refused the whole profile
+    model, mat = tmp_path / "m.gguf", tmp_path / "m.dat"
+    write_model_per_layer(model, [2, 0, 0], E)
+    write_legacy(mat)
+    costs, _, _ = P._imatrix_sensitivity(str(model), str(mat), ["ffn", "attn"], 2, [])
+    assert costs["ffn"]["0"] == pytest.approx(sum(one(W_EXP[e]) for e in range(E)) * 2 / E)
+    assert "mean routing 2/4" in capsys.readouterr().out
+
+
+def test_scalar_expert_count_wider_than_the_layer_uses_the_tensor(tmp_path, capsys):
+    # per-layer expert counts vary (Bolt: 240-496); the scalar is the widest layer, the tensor shape is this one
+    model, mat = tmp_path / "m.gguf", tmp_path / "m.dat"
+    write_model_per_layer(model, [1], 2 * E)
+    write_legacy(mat)
+    costs, _, _ = P._imatrix_sensitivity(str(model), str(mat), ["ffn", "attn"], 2, [])
+    assert costs["ffn"]["0"] == pytest.approx(sum(one(W_EXP[e]) for e in range(E)) / E)
+    assert "mean routing 1/4" in capsys.readouterr().out
+
+
+def test_layer_value_helper():
+    assert P._layer_value(None, "blk.0.x") is None
+    assert P._layer_value([8], "blk.5.x") == 8
+    assert P._layer_value([0, 6, 0], "blk.1.x") == 6
+    assert P._layer_value([0, 6, 0], "blk.0.x") is None
+    assert P._layer_value([0, 6], "blk.9.x") is None
