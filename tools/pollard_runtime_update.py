@@ -569,11 +569,13 @@ def refresh_staging_index(staging):
             + " -- reset to HEAD before applying patches")
 
 
-def reapply(staging, tree, fresh=False):
+def reapply(staging, tree, fresh=False, record=None):
     """Captured patches + scripted patches. Returns (blocking_failures, notes).
 
     `fresh`: there is no live tree to compare against, so every DECLARED patch is part of what this
-    engine is (ik_llama without k2-horizon is not the engine Pollard means) and must apply."""
+    engine is (ik_llama without k2-horizon is not the engine Pollard means) and must apply.
+    `record`: a list that gets one row per captured patch -- {patch, plain, threeway, verdict, git} -- for the
+    drift check (check_patches), which runs exactly this, in this order, without building."""
     from pollard_runtime import _arch_list_from_source
     up = _arch_list_from_source(staging) or set()
     block, notes = [], []
@@ -581,11 +583,20 @@ def reapply(staging, tree, fresh=False):
     if n:
         notes.append(n)
     for m in _patches_for(tree):
+        row = {"patch": os.path.basename(m["_patch"])[:-6]}
+        if record is not None:
+            # exact-context apply on the tree as the earlier patches left it: does it still apply without a merge?
+            p = _run(["git", "-C", staging, "apply", "--check", "--ignore-whitespace", m["_patch"]], timeout=300)
+            row["plain"] = p.returncode == 0
+            record.append(row)
         snap = _git(staging, "stash", "create")          # index + tree as the earlier patches left them
         r = _run(["git", "-C", staging, "apply", "--3way", "--ignore-whitespace", m["_patch"]], timeout=300)
+        row["threeway"] = r.returncode == 0
         if r.returncode == 0:
+            row["verdict"] = "applied"
             notes.append(f"re-applied {os.path.basename(m['_patch'])}")
             continue
+        row["git"] = _git_err(r, 300)
         # Keep git's own words: a failure that is not a real conflict (a stale index, a missing base blob)
         # reads exactly like one without them.
         notes.append(f"{os.path.basename(m['_patch'])}: git apply failed (exit {r.returncode}): {_git_err(r)}")
@@ -597,12 +608,16 @@ def reapply(staging, tree, fresh=False):
             _run(["git", "-C", staging, "stash", "apply", "-q", "--index", snap], timeout=300)
         name = os.path.basename(m["_patch"])
         if not fresh and not patch_is_live(tree, m):
+            row["verdict"] = "not live"
             notes.append(f"{name} is not in the live build -- nothing to carry over")
         elif _is_arch_patch(m, up):
+            row["verdict"] = "superseded"
             notes.append(f"{name} not needed: upstream now carries the architecture it added")
         elif _absorbed(staging, m):
+            row["verdict"] = "absorbed"
             notes.append(f"{name} not needed: upstream already carries its changes")
         else:
+            row["verdict"] = "CONFLICT"
             block.append(f"{name} is live in this engine and does not apply to upstream -- rebase it first "
                          f"(it changes {', '.join(m.get('files', [])[:4])}{'...' if len(m.get('files', [])) > 4 else ''}; git: {_git_err(r, 300)})")
     for sc in sorted(glob.glob(os.path.join(REPO, "runtime-patches", "scripts", "*.py"))):
@@ -910,3 +925,115 @@ def auto_update_for(arch):
         return False
     log(f"no local build loads '{arch}' -- updating llama.cpp from upstream (POLLARD_AUTO_UPDATE=0 to disable)")
     return update_engine("llama.cpp")
+
+
+# ---- patch drift: does every captured patch still apply to upstream? (CI; no build) -------------------------
+
+def stage_upstream(name, staging):
+    """Fetch engine `name`'s source into `staging` as --update stages it: a depth-1 clone (or init + fetch of its
+    branch / pull ref), then history back to the oldest declared patch's base so `git apply --3way` can merge.
+    -> (ok, upstream commit or the error)."""
+    e = ENGINES[name]
+    url, ref = e["url"], e.get("ref")
+    _rmtree(staging)
+    if ref:
+        steps = [["git", "init", "-q", staging], ["git", "-C", staging, "remote", "add", "origin", url],
+                 ["git", "-C", staging, "fetch", "-q", "--depth", "1", "origin", ref],
+                 ["git", "-C", staging, "checkout", "-q", "FETCH_HEAD"]]
+    else:
+        steps = [["git", "clone", "-q", "--depth", "1", url, staging]]
+    for stp in steps:
+        for attempt in range(3):                      # a dropped connection is not drift: try again before failing
+            r = _run(stp, timeout=1800)
+            if r.returncode == 0:
+                break
+            if stp[1:2] == ["clone"]:
+                _rmtree(staging)
+        if r.returncode != 0:
+            return False, f"fetch failed ({' '.join(stp[-2:])}): {_git_err(r, 300)}"
+    pats = _patches_for(e["dir"])
+    if pats:
+        since = min((m.get("base_date") or "2026-01-01") for m in pats)
+        since = (_dt.date.fromisoformat(since) - _dt.timedelta(days=2)).isoformat()
+        r = _run(["git", "-C", staging, "fetch", "-q", f"--shallow-since={since}", "origin"] + ([ref] if ref else []),
+                 timeout=1800)
+        if r.returncode != 0:
+            log(f"{name}: history fetch back to {since} failed ({_git_err(r, 200)}) -- 3-way merges may fall back")
+    return True, _git(staging, "rev-parse", "--short=9", "HEAD")
+
+
+def check_patches(name, staging):
+    """Apply engine `name`'s captured patches to an upstream tree exactly as --update's re-apply does (same function,
+    same order, every declared patch required as on a fresh install), and build nothing.
+    -> (rows, notes): one row per patch {patch, plain, threeway, verdict, git}; verdict CONFLICT = needs a rebase."""
+    trust_trees(staging)
+    rows = []
+    _block, notes = reapply(staging, ENGINES[name]["dir"], fresh=True, record=rows)
+    return rows, notes
+
+
+def drift_report(results):
+    """Markdown for the drift check. `results`: [(engine, upstream commit, rows, error)]."""
+    lines, bad = ["# Runtime patch drift", ""], []
+    for name, head, rows, err in results:
+        e = ENGINES.get(name, {})
+        src = e.get("url", "").replace("https://github.com/", "") + (f" {e['ref']}" if e.get("ref") else "")
+        commit = (f"[`{head}`]({e['url']}/commit/{head})" if head and e.get("url", "").startswith("https://github.com/")
+                  else f"`{head or '?'}`")
+        lines += [f"## {name} @ {commit} ({src})", ""]
+        if err:
+            lines += [f"**could not stage upstream:** {err}", ""]
+            bad.append(f"{name}: could not stage upstream ({err})")
+            continue
+        if not rows:
+            lines += ["no captured patches", ""]
+            continue
+        lines += ["| patch | plain apply | 3-way apply | result |", "|---|---|---|---|"]
+        for r in rows:
+            res = r.get("verdict", "?")
+            if res == "CONFLICT":
+                res = "**CONFLICT -- needs a rebase**"
+                bad.append(f"{r['patch']} no longer applies to {name} @ {head}"
+                           + (f" (git: {r['git']})" if r.get("git") else ""))
+            lines.append(f"| `{r['patch']}` | {'ok' if r.get('plain') else 'FAILS'} | "
+                         f"{'ok' if r.get('threeway') else 'FAILS'} | {res} |")
+        lines.append("")
+    lines += (["## Needs a rebase", ""] + [f"- {b}" for b in bad] if bad else ["Every captured patch applies."])
+    return "\n".join(lines) + "\n", bad
+
+
+def drift_main(names, work=None, tree=None, summary=None):
+    """`pollard-runtime --check-patches ENGINE|all`: 0 when every captured patch applies to its upstream, else 1."""
+    import tempfile
+    work = work or tempfile.mkdtemp(prefix="pollard-drift-")
+    results = []
+    for name in names:
+        if not _patches_for(ENGINES[name]["dir"]):
+            log(f"{name}: no captured patches -- nothing to check")
+            continue
+        staging = tree or os.path.join(work, name)
+        if tree:
+            ok, head = True, _git(tree, "rev-parse", "--short=9", "HEAD")
+        else:
+            log(f"{name}: staging {ENGINES[name]['url']} {ENGINES[name].get('ref') or ''} into {staging}")
+            ok, head = stage_upstream(name, staging)
+        if not ok:
+            log(f"{name}: {head}")
+            results.append((name, None, [], head))
+            continue
+        rows, notes = check_patches(name, staging)
+        for n in notes:
+            log(f"{name}: {n}")
+        for r in rows:
+            log(f"{name} @ {head}: {r['patch']:40s} plain {'ok' if r.get('plain') else 'FAILS':5s} "
+                f"3-way {'ok' if r.get('threeway') else 'FAILS':5s} -> {r.get('verdict')}")
+        results.append((name, head, rows, None))
+    md, bad = drift_report(results)
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(md)
+    for b in bad:
+        log(f"DRIFT: {b}")
+    if not bad:
+        log("every captured patch applies to its upstream")
+    return 0 if not bad else 1

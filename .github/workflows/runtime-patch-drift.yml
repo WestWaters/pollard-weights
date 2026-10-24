@@ -1,0 +1,71 @@
+name: runtime-patch-drift
+
+# Daily: does every captured runtime patch (runtime-patches/) still apply to its engine's upstream?
+# Runs pollard-runtime's own re-apply (the code path `pollard-runtime --update` uses) on a fresh shallow fetch of each
+# engine in runtime-patches/engines.json, plain and 3-way, and builds nothing. A patch that needs a rebase fails the
+# job, with the patch and the upstream commit in the summary, before it blocks a release's engine update.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+# read-only by default; only the job that files the issue may write issues
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-patch-drift
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      report: ${{ steps.check.outputs.report }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Apply every engine's captured patches to upstream (no build)
+        id: check
+        run: |
+          set +e
+          python tools/pollard_runtime.py --check-patches all --work "$RUNNER_TEMP/engines" --summary "$RUNNER_TEMP/drift.md"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/drift.md" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "report<<POLLARD_DRIFT_EOF"
+            cat "$RUNNER_TEMP/drift.md"
+            echo "POLLARD_DRIFT_EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit $rc
+
+  issue:
+    needs: drift
+    if: failure() && needs.drift.outputs.report != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the drift issue (one per title)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REPORT: ${{ needs.drift.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Runtime patch drift check failed"
+          body="$(printf '%s\n\nRun: %s\n' "$REPORT" "$RUN_URL")"
+          num="$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+                 --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
