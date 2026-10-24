@@ -26,7 +26,8 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
-lanes:
+lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
+                               # the whole release stops before calibration (default: only that lane is held)
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
   mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}

@@ -193,6 +193,15 @@ def smoke(r: dict) -> tuple[str, list]:
     return "pollard_smoke", a
 
 
+def preflight(r: dict) -> tuple[str, list]:
+    """Every engine step a build runs, resolved and loaded on THIS model on the CPU (pollard-preflight)."""
+    a: list[str] = []
+    _opt(a, "--gguf", r.get("gguf"))
+    _opt(a, "--hf", r.get("source"))
+    _opt(a, "--lanes", r.get("lanes"))
+    return "pollard_preflight", a
+
+
 def setup(r: dict) -> tuple[str, list]:
     """What every lane needs on this machine, checked working. Report + the exact commands only: installing
     asks for a terminal (`pollard setup`), never a button."""
@@ -630,7 +639,7 @@ def publish(r: dict) -> tuple[str, list]:
 
 ACTIONS = {
     "build": lane, "fit": build, "automap": automap, "bench": bench, "bench-all": bench,
-    "eval": evaluate, "doctor": doctor, "smoke": smoke, "ggufcheck": ggufcheck, "setup": setup,
+    "eval": evaluate, "doctor": doctor, "smoke": smoke, "preflight": preflight, "ggufcheck": ggufcheck, "setup": setup,
     "verify": verify, "gate": verify, "card": card_local, "fragile": fragile, "train": train,
     "ls": ls, "publish": publish, "routecheck": routecheck,
     "mmeval": mmeval, "taskeval": taskeval, "failmode": failmode,

@@ -755,6 +755,31 @@ def _preflight(a, hf_dir):
         pass                                            # placement is advisory, never a blocker
 
 
+def _engine_preflight(a):
+    """Every llama.cpp step this run is about to take (imatrix, quantize, perplexity, the tool-call server, mtmd with
+    the mmproj, ik_llama's quantize for the flagship), resolved as the step resolves it and loaded on the real file on
+    the CPU (pollard_preflight). A critical step that cannot run stops the run HERE, with the fix, not hours into the
+    imatrix; an ik_llama that cannot take the file only drops the flagship rung."""
+    try:
+        import pollard_preflight as PF
+    except ImportError:
+        return
+    if PF.disabled():
+        return
+    ik_dir = find_ik_build(getattr(a, "bin", None))
+    want = _wanted_rungs(a)
+    flagship = bool(ik_dir) and bool(a.imatrix or a.auto_imatrix) and (want is None or "flagship" in want)
+    res = PF.run(["gguf"], gguf=a.gguf, mmproj=PF.find_mmproj(a.gguf), toolcall=getattr(a, "toolcall", True),
+                 flagship=flagship, imatrix=not a.imatrix and a.auto_imatrix, ik_dir=ik_dir,
+                 bin_dir=getattr(a, "bin", None))
+    if res["failed_lanes"]:
+        raise SystemExit("   STOPPING before the imatrix and the ladder: an engine step above cannot run on this file "
+                         "(fix shown; --no-engine-preflight to try anyway)")
+    bad = [r for r in res["rows"] if r["step"] == "ik-quantize" and not r["ok"]]
+    if bad:
+        a._ik_preflight_failed = bad[0]["fix"] or bad[0]["detail"]
+
+
 def _resolve_hf(a):
     """A local HF dir is used as-is; a repo id is downloaded (snapshot) so users can point at either.
     Opt-in --abliterate/--smooth transforms are applied here so every lane inherits them."""
@@ -1384,6 +1409,9 @@ def main():
                     help="skip the up-front capability check (converter knows this architecture, "
                          "weights fit somewhere) and start the build regardless")
     ap.set_defaults(preflight=True)
+    ap.add_argument("--no-engine-preflight", dest="engine_preflight", action="store_false",
+                    help="skip the engine preflight (every llama.cpp step resolved and loaded on the real file, CPU, "
+                         "seconds) that runs before the imatrix")
     ap.add_argument("--probe-method", choices=("auto", "stream", "kl"), default="auto",
                     help="sensitivity estimator: 'kl' = perturb+KL (layers*groups forward passes), "
                          "'stream' = one-pass Hessian diagonal, 'auto' (default) picks stream when "
@@ -1563,6 +1591,8 @@ def _dispatch(a):
     # show the size ladder so the user sees the shrink + can compare to NVFP4/Q4/etc.
     # (actual built size is reported by the build step; this is where Pollard will land)
     size_ladder((arch.get("total") or 0) / 1e9)
+    if a.run and getattr(a, "engine_preflight", True):
+        _engine_preflight(a)                         # before the imatrix: every engine step, on THIS file, in seconds
 
     # ALREADY-QUANTIZED source (a vendor QAT GGUF): the passthrough policy. Its QAT tensors are copied
     # byte-for-byte; the imatrix and the sensitivity sweep run on this file as host; the measured
@@ -1622,6 +1652,9 @@ def _dispatch(a):
               + ". Build ik_llama.cpp and set IK_LLAMA_BIN (or --bin) to its build/bin to add it.)")
     elif a.imatrix and want is not None and "flagship" not in want:
         print(f"   2) (the {flagship} flagship is not in --rung this run)")
+    elif a.imatrix and getattr(a, "_ik_preflight_failed", None):
+        print(f"   2) (skipped the {flagship} flagship: the engine preflight found ik_llama.cpp cannot take this file -- "
+              f"{a._ik_preflight_failed}. The ladder above ships.)")
     elif a.imatrix:
         print(f"   2) the {flagship} mixed-precision flagship (automap trellis mix):")
         _automap_mix(a, is_moe=is_moe, ik_dir=ik_dir)

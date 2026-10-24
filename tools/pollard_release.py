@@ -33,7 +33,10 @@ lane that ships this run is uploaded and the file list (README, every rung in it
 Repos published before this (<M>-Pollard-MLX and friends) are left as they are.
 
 How it runs -- and why:
-  * pollard-smoke preflight FIRST, before anything is spent.
+  * pollard-smoke preflight FIRST, before anything is spent; then the engine preflight (prep/engines,
+    pollard-preflight): every llama.cpp / MLX step the plan runs is resolved the way that step resolves it and loads
+    THIS model on the CPU in seconds. A lane that cannot run is held there, with the fix (`pollard-runtime --update`,
+    "converter for <arch> only in <tree>"); `critical: true` on a lane stops the whole release instead.
   * SERIAL, one heavy job at a time: each COMPUTE step (build / measure / verify) holds the machine lock (and
     POLLARD_HEAVY_LOCK, a shared lock directory, when set) for its own length; uploads never hold it. Lanes this
     machine cannot build (MLX needs Apple Silicon; GPTQ / MX / EXL3 need CUDA) are skipped with the command to run
@@ -103,7 +106,8 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
-lanes:
+lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
+                               # the whole release stops before calibration (default: only that lane is held)
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
   mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
@@ -440,6 +444,10 @@ def prep_steps(cfg, c, lanes):
                           desc=f"pull {what} -> {c['hf_dir']}"))
     steps.append(Step(id="prep/smoke", lane="prep", kind="prep", requires="any",
                       cmd=["pollard-smoke", "--model", c["hf_dir"]]))
+    steps.append(Step(id="prep/engines", lane="prep", kind="prep", requires="any", fn="engine_preflight",
+                      lanes=list(lanes),
+                      desc="engine preflight: every llama.cpp / MLX step this plan runs, resolved as the step resolves "
+                           "it and loaded on THIS model on the CPU (seconds) -- a lane that cannot run stops here"))
     calib = ["pollard-calib", "--profile", str(cal.get("profile", "auto")), "--model", c["hf_dir"],
              "--per-domain", str(cal.get("per_domain", 300)), "--out", c["calib"], "--held-out", c["heldout"],
              "--record-model", c["src"]]
@@ -1242,6 +1250,8 @@ def resume_reason(step, state, redo=()):
     """Why this step can be skipped on a re-run, or None to run it."""
     if any(step.id == r or step.id.startswith(r.rstrip("/") + "/") for r in redo):
         return None
+    if step.fn == "engine_preflight":
+        return None                                  # the engines may have changed since: re-checked (cached passes)
     if step.id == "prep/probe" and "--from-imatrix" in (step.get("cmd") or []) and stale_imatrix_profile(step.out):
         return None                                  # a pre-fix imatrix profile: re-probe (cheap) instead of reusing it
     if (state.get(step.id) or {}).get("status") == "done" and step.kind != "upload":
@@ -1274,6 +1284,51 @@ def _fmt_cmd(cmd):
             x = "$POLLARD_HOME" + x[len(home):]
         parts.append(f'"{x}"' if " " in x else x)
     return " ".join(parts)
+
+
+class PreflightFailed(RuntimeError):
+    """The engine preflight found a step the release cannot run -- raised before any long step."""
+
+
+def engine_preflight(st, c, cfg, have=None, out=print):
+    """prep/engines: prove every engine step this plan runs works on THIS model, before calibration, the imatrix or
+    any build (pollard_preflight). Returns the lanes to hold: a lane whose critical step cannot run is held here and
+    the other lanes carry on. Raises PreflightFailed -- the release stops, nothing long has started -- when a lane
+    marked `critical: true` in the plan is among them, when every lane this machine runs is, or when the imatrix the
+    sensitivity probe needs (probe route imatrix) cannot be computed."""
+    import pollard_preflight as PF
+    if PF.disabled():
+        out("      engine preflight: off (POLLARD_ENGINE_PREFLIGHT=0)")
+        return set()
+    have = have or machine()
+    lanes = [l for l in (st.lanes or []) if have.get(REQUIRES.get(l, "any"), False)]
+    gguf = str(c["f16"]) if c.get("f16") and os.path.isfile(str(c["f16"])) else None
+    hf = c["hf_dir"] if os.path.isfile(os.path.join(str(c.get("hf_dir") or ""), "config.json")) else None
+    ik_dir = None
+    if "gguf" in lanes:
+        from pollard_auto import find_ik_build
+        ik_dir = find_ik_build()
+    have_imatrix = bool(c.get("imatrix")) and os.path.exists(str(c["imatrix"]))
+    res = PF.run(lanes, gguf=gguf, hf_dir=hf, mmproj=PF.find_mmproj(gguf) if gguf else None,
+                 toolcall=toolcall_wanted(cfg, c) and not c.get("d3"), flagship=bool(ik_dir),
+                 imatrix=not have_imatrix, ik_dir=ik_dir, out=out,
+                 convert=not c.get("d3"),                # a d3 body converts through pollard-d3's own view
+                 mlx_shard=not cfg.get("remote_source"))  # a sparse mirror's shards are holes until read
+    held = set(res["failed_lanes"])
+    crit = {l for l in lanes if ((cfg.get("lanes") or {}).get(l) or {}).get("critical")}
+    imx = [r for r in res["rows"] if r["step"] == "imatrix" and not r["ok"]]
+    why = []
+    if held & crit:
+        why.append(f"critical lane(s) {', '.join(sorted(held & crit))} cannot run")
+    if lanes and held >= set(lanes):
+        why.append("no lane this machine runs can")
+    if imx and c.get("probe_route") == "imatrix" and not have_imatrix:
+        why.append("the sensitivity probe needs an imatrix and llama-imatrix cannot load this model")
+    if why:
+        raise PreflightFailed("engine preflight: " + "; ".join(why) + " -- fix shown above, nothing long has started")
+    for lane in sorted(held):
+        out(f"      HELD {lane}: an engine step it needs cannot run here (above); the other lanes carry on")
+    return held
 
 
 def fetch(c):
@@ -2560,6 +2615,10 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                     res = go_public(st, c, cfg, run_upload, statuses, out)
                 elif st.fn == "imatrix":
                     build_imatrix(c, cfg, out)
+                    res = "done"
+                elif st.fn == "engine_preflight":
+                    held = engine_preflight(st, c, cfg, have, out)
+                    failed_lanes.update(held)
                     res = "done"
                 elif st.fn == "publish_rung":
                     res = publish_rung(st, c, cfg, run_upload, out)

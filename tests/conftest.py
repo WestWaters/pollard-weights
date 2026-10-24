@@ -17,3 +17,11 @@ def _private_machine_locks(monkeypatch, tmp_path):
     monkeypatch.setenv("POLLARD_MACHINE_LOCK", str(tmp_path / ".pollard.lock"))
     monkeypatch.delenv("POLLARD_HEAVY_LOCK", raising=False)
     monkeypatch.delenv("POLLARD_HEAVY_LOCK_HELD", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_engine_preflight(monkeypatch):
+    """The engine preflight (pollard_preflight, prep/engines in a release, before the imatrix in `pollard --run`) loads
+    the real model with the real binaries. Tests that fake the pipeline have neither, so it is off unless a test turns
+    it back on (tests/test_engine_preflight.py)."""
+    monkeypatch.setenv("POLLARD_ENGINE_PREFLIGHT", "0")
