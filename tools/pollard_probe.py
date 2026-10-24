@@ -263,10 +263,13 @@ GROUP_ATTR = {"ffn": [("mlp", ("gate_proj", "up_proj", "down_proj"))],
 # llama-quantize keeps it F32 -- so it is deliberately NOT listed: it is neither scored nor pinned.
 # Nemotron-H LatentMoE (nemotron_h_moe) projects the hidden state into and out of the expert latent
 # with ffn_latent_down / ffn_latent_up around the routed experts: channel mixing, so 'ffn'.
+# Gemma 4 / Gemma 3n add a per-layer embedding (PLE) side branch to every block: inp_gate (n_embd -> 256) and proj
+# (256 -> n_embd), gating the block's slice of the per-layer token table. They mix channels, not positions: "ffn".
 GROUP_GGUF = {"ffn": ("ffn_gate", "ffn_up", "ffn_down",
                       "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
                       "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
-                      "ffn_latent_down", "ffn_latent_up"),
+                      "ffn_latent_down", "ffn_latent_up",
+                      "inp_gate", "proj"),
               "attn": ("attn_q", "attn_k", "attn_v", "attn_output",
                        "attn_qkv", "attn_gate",
                        "ssm_in", "ssm_out", "ssm_alpha", "ssm_beta", "ssm_x", "ssm_dt",
@@ -833,6 +836,112 @@ def _stream_sensitivity(model, chunks, dev, groups, layers, probe_bits, ladder_b
     return profile, noise
 
 
+#: the types a lookup table (per-layer token embedding) may take, high -> low, with the RTN bits each is probed at.
+#: No imatrix-only type: llama-imatrix never sees a get_rows table, so iq2_* would not build (q2_K stands in).
+TABLE_LADDER_BITS = [("q8_0", 8), ("q6_K", 6), ("q5_K", 5), ("iq4_xs", 4), ("iq3_s", 3), ("q2_K", 2)]
+
+
+def token_frequencies(text_path, tokenizer, vocab):
+    """{token id: share of the text's tokens}, from the model's own tokenizer (a tokenizer.json or a folder holding
+    one). The table rows a model reads are the tokens it sees: a row's quantization error costs in proportion to
+    how often it is read."""
+    from collections import Counter
+    from tokenizers import Tokenizer
+    tj = os.path.join(tokenizer, "tokenizer.json") if os.path.isdir(tokenizer) else tokenizer
+    tok = Tokenizer.from_file(tj)
+    text = open(text_path, encoding="utf-8", errors="replace").read()
+    c = Counter()
+    for i in range(0, len(text), 1 << 20):                   # bounded memory on a big corpus
+        c.update(tok.encode(text[i:i + (1 << 20)], add_special_tokens=False).ids)
+    n = sum(v for k, v in c.items() if k < vocab)
+    if not n:
+        raise SystemExit(f"{text_path}: no tokens inside the table's {vocab} rows")
+    return {k: v / n for k, v in c.items() if k < vocab}
+
+
+def _rows(t, lo, hi=None):
+    """Rows of a GGUF matrix as float32 [n, row]: [lo, hi), or the rows listed in `lo` (an index array) when hi is
+    None -- dequantized one slab at a time (a 2.8B-param table is 11 GB as float32)."""
+    import numpy as np
+    from gguf.quants import dequantize
+    d = t.data[lo] if hi is None else t.data[lo:hi]
+    if t.tensor_type.name == "F32":
+        return np.array(d, dtype=np.float32)
+    if t.tensor_type.name == "F16":
+        return np.asarray(d).astype(np.float32)
+    return dequantize(np.asarray(d), t.tensor_type).astype(np.float32)
+
+
+@torch.no_grad()
+def _table_sensitivity(gguf_path, imatrix_path, freq, table_name="per_layer_token_embd.weight", slab=2048):
+    """The cost of quantizing Gemma 4's per-layer token table, in the SAME units as every scored matmul (expected
+    error energy per token at the point the block consumes it), with no forward pass:
+
+        p_t,i = (rmsnorm(model_proj(e_t) / sqrt(n_embd))_i * w + sqrt(256) * T[t, i]) / sqrt(2)    (llama.cpp gemma4)
+        x_i   = gelu(inp_gate_i(h)) * p_t,i  ->  proj_i(x_i)
+
+    The imatrix holds E[x^2] for proj_i's input; E[p^2] comes from the table, the token embedding and model_proj over
+    the text's tokens, so E[gelu(gate)^2] ~= E[x^2] / E[p^2]. A table error d on row t moves x by gate * sqrt(128) * d,
+    so the cost at a type is  sum_t f_t sum_i,j E[gate^2]_ij * 128 * d_t,ij^2  with d the RTN error at that type's
+    bits -- weighted by how often each row is read (f_t, the text's token frequencies).
+
+    Returns {"params", "cost": {type: cost}, "rows_read", "layers"}, or None when the GGUF has no such table."""
+    import numpy as np
+    from gguf import GGUFReader
+    rd = GGUFReader(gguf_path)
+    by = {t.name: t for t in rd.tensors}
+    T = by.get(table_name)
+    if T is None:
+        return None
+    H, _ = _imatrix_stats(imatrix_path)
+    vocab, width = int(T.shape[1]), int(T.shape[0])
+    per = int(by["blk.0.proj.weight"].shape[0]) if "blk.0.proj.weight" in by else 256
+    layers = width // per
+    hp = []
+    for i in range(layers):
+        h = H.get(f"blk.{i}.proj.weight")
+        if h is None or len(h) != per:
+            raise SystemExit(f"{table_name}: the imatrix has no {per}-channel entry for blk.{i}.proj.weight -- the "
+                             "table's consumer is not calibrated, so its cost cannot be measured")
+        hp.append(np.asarray(h, dtype=np.float64))
+    hp = np.stack(hp)                                                         # [layers, per]
+    ids = np.array(sorted(freq), dtype=np.int64)
+    f = np.array([freq[i] for i in ids], dtype=np.float64)
+    E, MP, NW = by.get("token_embd.weight"), by.get("per_layer_model_proj.weight"), by.get("per_layer_proj_norm.weight")
+    n_embd = int(E.shape[0]) if E is not None else 0
+    # E[p^2] per (layer, channel) over the text's tokens
+    mp = torch.from_numpy(_rows(MP, 0, int(MP.shape[1]))) if MP is not None else None    # [layers*per, n_embd]
+    nw = torch.from_numpy(np.asarray(_dequant(NW), dtype=np.float32).reshape(-1)) if NW is not None else None
+    ep2 = np.zeros((layers, per))
+    for k in range(0, len(ids), slab):
+        sl = ids[k:k + slab]
+        row = torch.from_numpy(_rows(T, sl)).reshape(-1, layers, per)
+        p = row * math.sqrt(per)
+        if mp is not None and E is not None:
+            e = torch.from_numpy(_rows(E, sl)) * math.sqrt(n_embd)
+            q = (e @ mp.T / math.sqrt(n_embd)).reshape(-1, layers, per)
+            q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-6)
+            if nw is not None:
+                q = q * nw
+            p = p + q
+        p = p / math.sqrt(2.0)
+        ep2 += (torch.from_numpy(f[k:k + slab]).reshape(-1, 1, 1) * p.double().pow(2)).sum(0).numpy()
+    g2 = torch.from_numpy(hp / np.maximum(ep2, 1e-12)).float()                 # E[gelu(gate)^2], [layers, per]
+    cost = {ty: 0.0 for ty, _ in TABLE_LADDER_BITS}
+    for k in range(0, len(ids), slab):
+        sl = ids[k:k + slab]
+        W = torch.from_numpy(_rows(T, sl))
+        fw = torch.from_numpy(f[k:k + slab]).float().reshape(-1, 1, 1)
+        for ty, b in TABLE_LADDER_BITS:
+            d = (W - _rtn(W, b)).reshape(-1, layers, per)
+            cost[ty] += float((fw * g2 * 128.0 * d * d).sum())
+    for ty, c in cost.items():
+        if not math.isfinite(c):
+            raise SystemExit(f"non-finite table cost for {table_name} at {ty}; refusing to emit a profile")
+    return {"params": vocab * width, "cost": cost, "rows_read": int(len(ids)), "layers": layers,
+            "method": "imatrix-hessian + token frequency"}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -865,6 +974,10 @@ def main():
                          "box). The imatrix already IS E[x_j^2]; reuse it instead of re-measuring.")
     ap.add_argument("--gguf", help="source GGUF for --from-imatrix (f16 preferred; a quantized "
                                    "host works and is dequantized per tensor)")
+    ap.add_argument("--text", help="--from-imatrix: the calibration text, whose token frequencies weight a lookup "
+                                   "table's rows (Gemma 4's per-layer token embedding). Without it the table is "
+                                   "left unscored and pollard-fit keeps it pinned")
+    ap.add_argument("--tokenizer", help="--from-imatrix with --text: tokenizer.json, or the HF folder holding it")
     a = ap.parse_args()
 
     groups = [g.strip() for g in a.groups.split(",") if g.strip()]
@@ -878,11 +991,26 @@ def main():
               f"from-imatrix (no forward pass)", flush=True)
         profile, noise, layers = _imatrix_sensitivity(a.gguf, a.from_imatrix, groups,
                                                       a.probe_bits, LADDER_BITS)
+        tables = {}
+        if a.text and a.tokenizer:
+            from pollard_ngram import find_tables
+            from pollard_calc import read_gguf_meta
+            for name in find_tables(read_gguf_meta(a.gguf).get("_tensor_params") or {}):
+                if name != "per_layer_token_embd.weight":
+                    continue                                  # only the per-layer table has a measured consumer here
+                from gguf import GGUFReader
+                vocab = int({t.name: t for t in GGUFReader(a.gguf).tensors}[name].shape[1])
+                r = _table_sensitivity(a.gguf, a.from_imatrix, token_frequencies(a.text, a.tokenizer, vocab), name)
+                if r:
+                    tables[name] = r
+                    print(f"  table {name}: {r['params']/1e9:.2f}B params, {r['rows_read']} rows read by the text; "
+                          + ", ".join(f"{t} {c:.4g}" for t, c in r["cost"].items()), flush=True)
         out = a.out or (os.path.splitext(a.gguf)[0] + ".sensitivity.json")
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)   # a fresh workspace has no calibration/
         json.dump({**profile, "noise": noise, "probe": f"rtn{a.probe_bits}", "layers": layers,
                    "source": a.gguf, "method": "imatrix-hessian",
-                   "experts": EXPERT_WEIGHTING}, open(out, "w"), indent=2)
+                   "experts": EXPERT_WEIGHTING, **({"tables": tables} if tables else {})},
+                  open(out, "w"), indent=2)
         for g in groups:
             vals = [v for v in profile[g].values()]
             if vals:
