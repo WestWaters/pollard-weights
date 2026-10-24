@@ -72,7 +72,8 @@ EAGLE3_ARCHS = {"LlamaForCausalLMEagle3", "Eagle3LlamaForCausalLM", "Eagle3Specu
 #: drafter converts to the dflash arch and is told apart by its Markov tensors, so the kind is passed explicitly)
 GGUF_ARCH_KIND = {"dflash": "dflash", "eagle3": "eagle3"}
 #: licences that let Pollard redistribute a third party's drafter (re-quantized) under its own terms
-REDISTRIBUTABLE = {"mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "cc-by-4.0", "cc0-1.0", "unlicense"}
+REDISTRIBUTABLE = {"mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "cc-by-4.0", "cc0-1.0", "unlicense",
+                   "openmdw-1.1"}
 #: who publishes drafters people actually serve -- a tie-breaker, never a reason to accept an incompatible one
 KNOWN_ORGS = ("z-lab", "RedHatAI", "deepseek-ai", "yuhuili", "lmsys", "AngelSlim", "nvidia", "Tengyunw",
               "openbmb", "LiquidAI", "RadixArk")
@@ -256,7 +257,10 @@ def name_score(repo, target):
 
 
 def licence_of(info):
-    lic = ((info or {}).get("cardData") or {}).get("license")
+    card = (info or {}).get("cardData") or {}
+    lic = card.get("license")
+    if str(lic).lower() == "other" and card.get("license_name"):   # e.g. NVIDIA: license: other + openmdw-1.1
+        lic = card["license_name"]
     if not lic:
         for t in (info or {}).get("tags") or []:
             if str(t).startswith("license:"):
@@ -306,9 +310,57 @@ def simple_candidates(target, tcfg, fetch=None):
     return sorted(out, key=lambda x: -x["size_b"])                 # the biggest that is still < 1/3 drafts best
 
 
+#: a drafter kind named in a repo / file name (a drafter published as GGUF only carries no config.json)
+_NAME_KIND = (("dflash", "dflash"), ("dspark", "dspark"), ("eagle3", "eagle3"), ("eagle", "eagle3"))
+
+
+def kind_from_name(name):
+    n = str(name).lower()
+    return next((k for w, k in _NAME_KIND if w in n), None)
+
+
+def published_gguf(files):
+    """The GGUF a drafter repo publishes in place of an HF checkpoint (NVIDIA's Bolt-E4B-4GB-DFlash ships only
+    Nemotron-3.5-Bolt-E4B-DFlash-BF16.gguf): the highest-precision one, None when it has none."""
+    ggufs = [f for f in files if f.lower().endswith(".gguf") and "/" not in f and "mmproj" not in f.lower()]
+    if not ggufs:
+        return None
+    rank = ("bf16", "f16", "f32", "q8_0")
+    return sorted(ggufs, key=lambda f: next((i for i, r in enumerate(rank) if r in f.lower()), len(rank)))[0]
+
+
+def _local_files(d):
+    try:
+        return sorted(os.listdir(d))
+    except OSError:
+        return []
+
+
+def assess_gguf(rid, target, files, info, kind=None):
+    """A drafter published as a GGUF only (no config.json): the kind from its name, the file to start from, and
+    the licence from its card. Its shapes are the runtime's to check -- `measure` serves it against every target
+    rung, and a drafter that does not fit the target fails there with llama-server's own error."""
+    k = kind or kind_from_name(rid) or kind_from_name(published_gguf(files) or "")
+    if k is None:
+        return {"id": rid, "ok": False, "kind": None,
+                "problems": ["a GGUF-only repo whose name does not say which drafter kind it is"]}
+    lic = licence_of(info)
+    return {"id": rid, "kind": k, "ok": True, "problems": [],
+            "notes": [f"published as GGUF only ({published_gguf(files)}): shapes checked when measured"],
+            "license": lic, "gguf": True, "gguf_file": published_gguf(files),
+            "redistributable": (lic in REDISTRIBUTABLE) if lic else False,
+            "downloads": (info or {}).get("downloads", 0) or 0, "name_score": name_score(rid, target),
+            "derived": False, "org_known": rid.split("/")[0] in KNOWN_ORGS}
+
+
 def assess(rid, target, tcfg, fetch=None, kind=None, downloads=0, converter=None):
     cfg = repo_config(rid, fetch)
     if cfg is None:
+        info = repo_info(rid, fetch) if not os.path.isdir(rid) else {}
+        files = _local_files(rid) if os.path.isdir(rid) else [s.get("rfilename", "") for s in
+                                                              (info or {}).get("siblings") or []]
+        if published_gguf(files) and not _DERIVED.search(rid):   # the publisher's own GGUF, not someone's copy
+            return assess_gguf(rid, target, files, info, kind=kind)
         return {"id": rid, "ok": False, "problems": ["no config.json (a converted copy, or private)"], "kind": kind}
     k = kind or classify(cfg)
     if k is None:
@@ -488,7 +540,8 @@ def cmd_convert(a):
     drafter = a.drafter or (pick or {}).get("id")
     if not drafter:
         raise SystemExit("pass --drafter <repo-or-dir> or --from drafter.json (pollard-draft find --out)")
-    ddir = ws.fetch_source(drafter)
+    gfile = (pick or {}).get("gguf_file")
+    ddir = ws.fetch_source(drafter, allow_patterns=[gfile, "README.md", "LICENSE*"] if gfile else None)
     dcfg = repo_config(ddir) or {}
     kind = a.kind or (pick or {}).get("kind") or classify(dcfg) or "simple"
     simple_name = _basename(drafter) if kind == "simple" else None
@@ -500,6 +553,10 @@ def cmd_convert(a):
     meta["redistributable"] = (meta["license"] in REDISTRIBUTABLE) if meta["license"] else False
     meta.update(getattr(a, "meta", None) or {})                # a Pollard-trained head: its own licence + provenance
     rungs = [r.strip() for r in a.rungs.split(",") if r.strip()]
+    gfile = (pick or {}).get("gguf_file") or (published_gguf(_local_files(ddir)) if os.path.isdir(ddir) and
+                                              not dcfg else None)
+    if gfile:
+        return _convert_published_gguf(a, drafter, ddir, gfile, kind, key, out_dir, rungs, meta)
     if not a.no_gguf:
         conv, why = find_converter(ddir)
         if not conv:
@@ -538,6 +595,53 @@ def cmd_convert(a):
             record(key, dest, build_tag(kind, f"mlx-{a.mlx_bits}bit", simple_name), "mlx", kind, meta)
     print(f"   {len(draft_builds(key))} drafter rung(s) in the MANIFEST ({ws.model_dir(key)})")
     return 0
+
+
+def _convert_published_gguf(a, drafter, ddir, gfile, kind, key, out_dir, rungs, meta):
+    """A drafter published as a GGUF (no HF checkpoint to convert): that file IS the BF16 rung's source -- copied
+    in under Pollard's name (byte for byte) and llama-quantized to each rung, the way the converted ladder is.
+    There is no HF format to stage: the drafter's own repo publishes none."""
+    from pollard_calc import find_llama_bin
+    src = os.path.join(ddir, gfile)
+    if not os.path.isfile(src):
+        raise SystemExit(f"{drafter}: {gfile} was not fetched ({src})")
+    kind = gguf_kind(src) or kind
+    bf16 = os.path.join(out_dir, gguf_name(a.target, kind, "BF16"))
+    if not os.path.exists(bf16) or a.force:
+        try:
+            os.link(src, bf16)                               # same disk: no second copy of the bytes
+        except OSError:
+            shutil.copy2(src, bf16)
+    print(f"   {drafter} publishes {gfile}: used as published -> {bf16}")
+    qbin = find_llama_bin("llama-quantize")
+    if not qbin and any(r.upper() != "BF16" for r in rungs):
+        raise SystemExit("llama-quantize not found (install llama.cpp, or POLLARD_HOME/bin)")
+    meta = {**meta, "published_gguf": gfile}
+    for q in rungs:
+        tag = build_tag(kind, q.upper() if q.upper() == "BF16" else q)
+        if q.upper() == "BF16":
+            record(key, bf16, tag, "gguf", kind, meta)
+            continue
+        path = os.path.join(out_dir, gguf_name(a.target, kind, q))
+        if os.path.exists(path) and not a.force:
+            print(f"   [exists] {path}")
+        else:
+            cmd = [qbin, bf16, path, q]
+            print("   $ " + " ".join(map(str, cmd)))
+            r = subprocess.run(cmd)
+            if r.returncode != 0:
+                raise SystemExit(f"{tag}: exit {r.returncode}")
+        record(key, path, tag, "gguf", kind, {**meta, "via": bf16})
+    if "BF16" not in [x.upper() for x in rungs]:
+        record(key, bf16, build_tag(kind, "BF16"), "gguf", kind, {**meta, "publish": False})
+    print(f"   (no HF format: {drafter} publishes none)")
+    print(f"   {len(draft_builds(key))} drafter rung(s) in the MANIFEST ({ws_model_dir(key)})")
+    return 0
+
+
+def ws_model_dir(key):
+    import pollard_workspace as ws
+    return ws.model_dir(key)
 
 
 # ----------------------------------------------------------------------------- measure

@@ -581,3 +581,59 @@ def test_pollard_card_appends_the_speculative_section(tmp_path, monkeypatch):
                                              "--draft-repo", "PollardWeights/M-DRAFT"])
     C.main()
     assert "## Speculative decoding" not in out.read_text(), "no measured drafter -> no section"
+
+
+# ------------------------------------------------------------------ a drafter published as GGUF only
+
+def test_find_accepts_a_publishers_gguf_only_drafter_and_reads_license_name(home):
+    hub = {"nvidia/Bolt-E4B": {"config": {**QWEN4B}},
+           "nvidia/Bolt-E4B-4GB-DFlash": {"config": None, "license": "other",
+                                          "files": ["README.md", "Bolt-E4B-DFlash-BF16.gguf"]}}
+    fetch = fake_hub(hub)
+
+    def fetch2(path):                                     # NVIDIA's card: license: other + license_name
+        r = fetch(path)
+        if path == "/api/models/nvidia/Bolt-E4B-4GB-DFlash":
+            r["cardData"]["license_name"] = "openmdw-1.1"
+        return r
+    res = D.find("nvidia/Bolt-E4B", fetch=fetch2, drafter="nvidia/Bolt-E4B-4GB-DFlash")
+    p = res["pick"]
+    assert p and p["kind"] == "dflash" and p["gguf_file"] == "Bolt-E4B-DFlash-BF16.gguf"
+    assert p["license"] == "openmdw-1.1" and p["redistributable"] is True
+    # someone else's GGUF copy is still not a source
+    res = D.find("Qwen/Qwen3-4B", fetch=fake_hub(HUB), drafter="AtomicChat/Qwen3-4B-DFlash-GGUF")
+    assert res["pick"] is None
+
+
+def test_published_gguf_prefers_the_highest_precision_file():
+    assert D.published_gguf(["a-Q4_K_M.gguf", "a-BF16.gguf", "mmproj-a.gguf"]) == "a-BF16.gguf"
+    assert D.published_gguf(["README.md"]) is None
+
+
+def test_convert_a_published_gguf_drafter_links_it_and_quantizes_each_rung(home, monkeypatch):
+    ddir = home / "nv-dflash"
+    ddir.mkdir()
+    (ddir / "Bolt-E4B-DFlash-BF16.gguf").write_bytes(b"g" * 8)
+    pick = home / "drafter.json"
+    pick.write_text(json.dumps({"pick": {"id": str(ddir), "kind": "dflash", "license": "openmdw-1.1",
+                                         "gguf_file": "Bolt-E4B-DFlash-BF16.gguf"}}))
+    import pollard_calc
+    monkeypatch.setattr(pollard_calc, "find_llama_bin", lambda n, arch=None: "/bin/" + n)
+    ran = []
+
+    def fake_run(cmd, *a, **k):
+        ran.append(cmd)
+        Path(cmd[2]).write_bytes(b"q" * 3)
+
+        class R0:
+            returncode = 0
+        return R0()
+    monkeypatch.setattr(D.subprocess, "run", fake_run)
+    assert D.main(["convert", "--target", "nvidia/Bolt-E4B", "--from", str(pick)]) == 0
+    builds = {b["tag"]: b for b in D.draft_builds("nvidia/Bolt-E4B")}
+    assert set(builds) == {"DFlash-BF16", "DFlash-Q8_0", "DFlash-Q4_K_M"}, "no HF folder: none is published"
+    assert builds["DFlash-BF16"]["publish"] is False
+    bf16 = builds["DFlash-BF16"]["path"]
+    assert Path(bf16).read_bytes() == b"g" * 8, "the published file, byte for byte"
+    assert builds["DFlash-Q4_K_M"]["redistributable"] is True and builds["DFlash-Q4_K_M"]["via"] == bf16
+    assert [c[1] for c in ran] == [bf16, bf16] and [c[3] for c in ran] == ["Q8_0", "Q4_K_M"]
