@@ -25,11 +25,18 @@ the managed trees (runtime/llama.cpp, runtime/ik_llama.cpp) track upstream on th
   pollard-runtime --update --cuda-arch '107-real;100f-virtual'   # force the CUDA arch list (wins over detection)
   POLLARD_CUDA_ARCH=120a-real pollard-runtime --update   # arch to use when the GPU is hidden (also engines.json
                                                           # "cuda_arch"; else the arch seen when it was visible)
-  pollard-runtime --schedule daily         # launchd (macOS) / Task Scheduler (Windows), low priority
+  pollard-runtime --schedule daily         # launchd (macOS) / Task Scheduler (Windows, SYSTEM), low priority, -j cores/2
+  pollard-runtime --check                  # live vs upstream + how the last update ended ("update blocked: ...")
+
+The scheduled run (`--update all --scheduled daily|weekly`) never collides with a build: while the machine lock,
+a POLLARD_HEAVY_LOCK directory, a release / `pollard --run` / llama-* process or (Windows) a running SYSTEM release
+task is present it SKIPS and the next hourly attempt retries; it asks again right before the swap. A refused update
+(a patch that needs a rebase, a failed build) is recorded for --check and leaves no half-built .next behind.
 
 Pipelines call update_engine() themselves when a model's architecture is missing (POLLARD_AUTO_UPDATE=0
 turns that off), so a new family -- Qwen 3.8, Qwen 4 -- builds the day upstream supports it.
 """
+import contextlib as _contextlib
 import datetime as _dt
 import glob
 import json
@@ -750,18 +757,85 @@ def dirty_is_declared(tree):
     return have == {f: sorted(v) for f, v in want.items()} and _touched_files(live) == want_files
 
 
-def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None, cuda_arch=None):
+# ---- update status: what the last update did, for `pollard-runtime --check` ---------------------------------
+
+STATUS_FILE = os.path.join(REPO, "runtime", "update-status.json")
+
+
+def read_status(path=None):
+    try:
+        with open(path or STATUS_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_status(name, state, reason="", path=None, **extra):
+    """Record what an update of engine `name` ended as: live / current / blocked / failed / skipped / deferred.
+    `pollard-runtime --check` reads it back, so a refused nightly update is visible the next morning instead of
+    only in a log nobody opens."""
+    path = path or STATUS_FILE
+    d = read_status(path)
+    d[name] = {"state": state, "reason": reason, "when": _dt.datetime.now().isoformat(timespec="seconds"), **extra}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, indent=1)
+    except OSError as exc:
+        log(f"{name}: could not record the update status ({exc})")
+
+
+def status_line(name, st=None):
+    """One line on the last update of `name`, '' when none is recorded."""
+    s = (st if st is not None else read_status()).get(name) or {}
+    state, when = s.get("state"), (s.get("when") or "").replace("T", " ")[:16]
+    up = f" (upstream {s['upstream']}, {when})" if s.get("upstream") else (f" ({when})" if when else "")
+    if state == "blocked":
+        pats = s.get("patches") or []
+        what = ", ".join(pats) if pats else "a captured patch"
+        return (f"update blocked: {what} {'needs' if len(pats) <= 1 else 'need'} a rebase{up} -- "
+                "rebase it onto upstream and re-capture it, then rerun pollard-runtime --update")
+    if state == "failed":
+        return f"last update failed{up}: {s.get('reason', '')}"
+    if state in ("skipped", "deferred"):
+        return f"last scheduled update {state}{up}: {s.get('reason', '')}"
+    if state == "live":
+        return f"last update: live at {s.get('commit', '?')}{up}"
+    if state == "current":
+        return f"last update: already at upstream{up}"
+    return ""
+
+
+def _blocked_patch(entry):
+    """The patch name a reapply() block entry is about ('llama.cpp-qwen3omni-deepstack.patch is live ...')."""
+    first = (entry or "").split(" ", 1)[0]
+    return first[:-6] if first.endswith(".patch") else first
+
+
+def update_engine(name="llama.cpp", check=False, jobs=None, allow_drop=False, extra=None, cuda_arch=None, guard=None):
+    """Update one engine. `guard` (the scheduled run passes busy_reasons) is asked again right before the swap: a
+    release that started during the build must not have its binaries replaced under it."""
     e = ENGINES[name]
     tree = e["dir"]
     trust_trees(tree, tree + ".next", tree + ".prev")
+    ok = False
     try:
-        return _update_engine(name, check, jobs, allow_drop, extra, cuda_arch)
+        ok = _update_engine(name, check, jobs, allow_drop, extra, cuda_arch, guard)
+        return ok
     except GitOwnershipError as exc:
         log(f"{name}: NOT updating -- {exc}")
+        write_status(name, "failed", str(exc))
         return False
+    finally:
+        # A refused or failed update leaves nothing behind: a half-built .next is gigabytes on the box's
+        # already-full C: and nothing ever reuses it (every update clones fresh). .prev stays -- it is the rollback.
+        if not check and not ok and os.path.isdir(tree + ".next"):
+            log(f"{name}: removing the unswapped staging tree {tree}.next")
+            _rmtree(tree + ".next")
 
 
-def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
+def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch, guard=None):
     e = ENGINES[name]
     tree, url = e["dir"], e["url"]
     st = live_state(tree)
@@ -771,9 +845,14 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
         cur = st.get("commit") or ("binary-only tree" if st.get("present") else "not installed")
         log(f"{name}: live {cur} {st.get('date') or ''} | upstream {head} {hdate or ''}"
             + (" | UP TO DATE" if head and st.get("commit") and head.startswith(st["commit"][:7]) else ""))
+        line = status_line(name)
+        if line:
+            log(f"{name}: {line}")
         return True
+    up = {"upstream": head or "?"}
     if st.get("commit") and head and head.startswith(st["commit"][:7]) and not extra and not cuda_arch:
         log(f"{name}: already at upstream {head}")
+        write_status(name, "current", commit=st["commit"], **up)
         return True
     # Flags first, before any clone: a toolkit that cannot build for this GPU (Rubin on CUDA < 13.4)
     # is known now, not an hour into the build. A fresh tree has no cache, so `tree` and the staging
@@ -783,6 +862,7 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
                             configured=e.get("cuda_arch"))
     except CudaArchError as exc:
         log(f"{name}: NOT updating -- {exc}")
+        write_status(name, "failed", str(exc), **up)
         return False
     if st.get("dirty") and dirty_is_declared(tree):
         log(f"{name}: local changes are exactly the declared patches -- already in runtime-patches/, nothing new to capture")
@@ -792,6 +872,7 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
         log(f"{name}: captured local runtime work first -- {msg}")
         if meta is None and "no uncommitted" not in msg:
             log(f"{name}: refusing to update: {msg}")
+            write_status(name, "failed", f"could not capture local runtime work first: {msg}", **up)
             return False
     staging, prev = tree + ".next", tree + ".prev"
     _rmtree(staging)
@@ -806,6 +887,7 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
         r = _run(stp, timeout=1800)
         if r.returncode != 0:
             log(f"{name}: fetch failed ({' '.join(stp[-2:])}): {r.stderr.strip()[-300:]}")
+            write_status(name, "failed", f"fetch failed: {r.stderr.strip()[-200:]}", **up)
             return False
     live = [m for m in _patches_for(tree) if patch_is_live(tree, m)] if st.get("present") else _patches_for(tree)
     if live:
@@ -821,6 +903,7 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
         log(f"{name}: {n}")
     if block:
         log(f"{name}: NOT updating -- " + "; ".join(block) + " (rebase the patch, then rerun)")
+        write_status(name, "blocked", "; ".join(block), patches=[_blocked_patch(b) for b in block], **up)
         return False
     jobs = jobs or max(2, int((os.cpu_count() or 4) * 0.6))       # leave the machine usable (60/40)
     flags.update(extra or {})                      # --with K=V; carried into every later update via the cache
@@ -828,26 +911,37 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch):
     ok, msg = build(staging, flags, jobs)
     if not ok:
         log(f"{name}: {msg}")
+        write_status(name, "failed", msg.splitlines()[0] if msg else "build failed", **up)
         return False
     ok, msg = smoke(staging)
     log(f"{name}: smoke -- {msg}")
     if not ok:
+        write_status(name, "failed", f"smoke: {msg}", **up)
         return False
     if st.get("present"):
         lost = lost_archs(tree, staging)
         if lost and not allow_drop:
             log(f"{name}: NOT swapping -- the new build cannot load {lost[:10]} which the live one can. "
                 "Capture/rebase that support or pass --allow-drop.")
+            write_status(name, "failed", f"the new build cannot load {', '.join(lost[:10])} which the live one can", **up)
             return False
-    _rmtree(prev)
-    if st.get("present"):
-        os.replace(tree, prev)
-    os.replace(staging, tree)
+    if guard:
+        why = guard()
+        if why:
+            log(f"{name}: built, but NOT swapping -- {'; '.join(why)} started meanwhile; the next attempt rebuilds")
+            write_status(name, "deferred", f"built, not swapped: {'; '.join(why)}", **up)
+            return False
+    with _swap_hold(name, held=bool(guard)):
+        _rmtree(prev)
+        if st.get("present"):
+            os.replace(tree, prev)
+        os.replace(staging, tree)
     lock = {"engine": name, "commit": _git(tree, "rev-parse", "--short=9", "HEAD"), "date": _git(tree, "log", "-1", "--format=%cs"),
             "flags": flags, "built": _dt.datetime.now().isoformat(timespec="seconds"), "platform": sys.platform,
             "previous": st.get("commit") or ("binary-only" if st.get("present") else None)}
     json.dump(lock, open(os.path.join(REPO, "runtime", f"{name}.lock.json"), "w"), indent=1)
     log(f"{name}: LIVE at {lock['commit']} ({lock['date']}); previous kept at {prev}")
+    write_status(name, "live", commit=lock["commit"], previous=lock["previous"], **up)
     return True
 
 
@@ -866,42 +960,342 @@ def rollback(name):
     return True
 
 
+# ---- the scheduled update: never collides with a build ------------------------------------------------------
+
+TASK_NAME = "PollardRuntimeUpdate"
+#: the scheduled run starts at 04:30 and, while the machine is busy, tries again every hour for this many hours
+RETRY_HOURS = 8
+#: once a scheduled update has RUN (updated, current, blocked or failed -- anything but "busy, skipped"), the hourly
+#: retries are no-ops until this long has passed
+DUE_AFTER = {"daily": _dt.timedelta(hours=18), "weekly": _dt.timedelta(days=6)}
+#: the Windows box's own release tasks run as SYSTEM; any running one that starts something under a Pollard path
+#: means a release is on the machine
+SYSTEM_USERS = ("SYSTEM", "NT AUTHORITY\\SYSTEM")
+
+
+#: Pollard commands that never hold the machine (reports, the app, the card writer): everything else named pollard-*
+#: is a release step (toolcall, bench, calib, mlx ...) and makes the machine busy
+LIGHT_TOOLS = {"pollard-ls", "pollard-calc", "pollard-card", "pollard-recard", "pollard-doctor", "pollard-smoke",
+               "pollard-studio", "pollard-node", "pollard-stop", "pollard-setup", "pollard-onboard", "pollard-envmatch",
+               "pollard-ggufcheck", "pollard-ggufcompat", "pollard-hubcheck", "pollard-refcheck", "pollard-modelkind",
+               "pollard-archfp", "pollard-workspace"}
+
+
+def _base(tok):
+    return re.sub(r"\.(exe|py|bat|cmd)$", "", os.path.basename(tok.strip().strip('"').replace("\\", "/")).lower())
+
+
+def heavy_process(argv):
+    """What a process is when it is a Pollard heavy job (a release, `pollard --run`, a llama.cpp binary, another
+    engine update), else None. Judged by the program and the script it runs, never by an argument that merely
+    mentions a pollard path (`cd ~/pollard && ...`)."""
+    if not argv:
+        return None
+    b0 = _base(argv[0])
+    if b0.startswith("llama-"):
+        return b0
+    script, rest = argv[0], argv[1:]
+    if b0.startswith("python") or b0 in ("py", "pythonw"):
+        i = 0
+        while i < len(rest) and rest[i].startswith("-") and rest[i] != "-m":
+            i += 2 if rest[i] in ("-X", "-W") else 1      # interpreter options that take a value
+        if i < len(rest) and rest[i] == "-m":
+            i += 1
+        if i >= len(rest):
+            return None
+        script, rest = rest[i], rest[i + 1:]
+    b = _base(script).replace("_", "-")
+    if b in ("pollard-release", "pollard-auto"):
+        return b
+    if b == "pollard":
+        # `pollard --hf X --run`, `pollard release ...`; not "/Applications/Pollard Studio.app/..." split at its space
+        return b if rest and (rest[0].startswith("-") or rest[0].isalpha()) and "/" not in rest[0] else None
+    if b == "pollard-runtime":
+        return "pollard-runtime --update" if any(a.startswith("--update") for a in rest) and "--check" not in rest else None
+    if b.startswith("pollard-") and b not in LIGHT_TOOLS:
+        return b                                        # pollard-toolcall / -bench / -calib / -mlx ...: a release step
+    if "--hf" in rest and "--run" in rest:
+        return f"{_base(script)} (a --hf ... --run release)"   # the box's own release wrappers (clefnight_run.py)
+    if b.startswith("convert-") and b.endswith("-gguf"):
+        return f"{_base(script)} (a GGUF conversion)"
+    # anything else running out of an engine tree: renaming the tree under it breaks the run
+    marks = {f"runtime/{n}/" for n in ENGINES} | {os.path.abspath(e['dir']).replace(os.sep, '/').lower() + '/'
+                                                  for e in ENGINES.values()}
+    for tok in (script, *rest):
+        t = tok.strip('"').replace("\\", "/").lower()
+        if any(m in t for m in marks):
+            return f"{_base(script)} (runs from an engine tree)"
+    return None
+
+
+def _split_cmdline(cmd):
+    if not WIN:
+        return cmd.split()
+    import shlex
+    try:
+        return shlex.split(cmd, posix=False)
+    except ValueError:
+        return cmd.split()
+
+
+def list_processes():
+    """[(pid, ppid, argv)] of every process on the machine ([] when the listing fails)."""
+    if WIN:
+        r = _run('powershell -NoProfile -Command "Get-CimInstance Win32_Process | ForEach-Object { '
+                 "[string]$_.ProcessId + '|' + [string]$_.ParentProcessId + '|' + $_.CommandLine }\"", timeout=120)
+        rows = [ln.split("|", 2) for ln in (r.stdout or "").splitlines()]
+    else:
+        r = _run(["ps", "-A", "-o", "pid=,ppid=,args="], timeout=60)
+        rows = [ln.split(None, 2) for ln in (r.stdout or "").splitlines()]
+    out = []
+    for row in rows:
+        if len(row) == 3 and row[0].strip().isdigit() and row[1].strip().isdigit():
+            out.append((int(row[0]), int(row[1]), _split_cmdline(row[2].strip())))
+    return out
+
+
+def _ancestors(procs, pid):
+    parent = {p: pp for p, pp, _ in procs}
+    seen = {pid}
+    while parent.get(pid) and parent[pid] not in seen:
+        pid = parent[pid]
+        seen.add(pid)
+    return seen
+
+
+def running_release_tasks(text=None):
+    """Names of the box's running SYSTEM release tasks, from `schtasks /query /fo csv /v /nh` (or `text`).
+    Columns: 1 TaskName, 3 Status, 8 Task To Run, 14 Run As User."""
+    import csv
+    import io
+    if text is None:
+        if not WIN:
+            return []
+        text = _run("schtasks /query /fo csv /v /nh", timeout=120).stdout or ""
+    out = []
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) < 15 or row[3].strip() != "Running":
+            continue
+        tn, run, user = row[1].strip(), row[8], row[14].strip().upper()
+        if tn.lstrip("\\").lower() == TASK_NAME.lower() or tn.lower().startswith("\\microsoft\\"):
+            continue
+        if user in SYSTEM_USERS and "pollard" in run.lower() and tn not in out:
+            out.append(tn)
+    return out
+
+
+def heavy_lock_dirs():
+    """The shared heavy-lock directories this machine's jobs agree on: POLLARD_HEAVY_LOCK (os.pathsep-separated).
+    `--schedule` writes the scheduling shell's value into the task, which has no environment of its own."""
+    return [p for p in (os.environ.get("POLLARD_HEAVY_LOCK") or "").split(os.pathsep) if p.strip()]
+
+
+def _dir_lock_holder(path):
+    """'<owner line>' of a held heavy-lock directory, '' when free or its owner is dead (a stale lock)."""
+    if not os.path.isdir(path):
+        return ""
+    try:
+        who = open(os.path.join(path, "owner"), encoding="utf-8").read().strip()
+    except OSError:
+        return "?"                                     # just created, owner not written yet: held
+    try:
+        pid = int((who.split() or ["0"])[0])
+    except ValueError:
+        return who or "?"
+    return "" if pid > 0 and pid != os.getpid() and not _pid_alive(pid) else (who or "?")
+
+
+def _pid_alive(pid):
+    try:
+        if WIN:
+            return str(pid) in (_run(["tasklist", "/FI", f"PID eq {pid}"], timeout=10).stdout or "")
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def busy_reasons(procs=None, tasks_text=None):
+    """Why this machine must not have its engines swapped right now -> [] when it is free.
+
+    The machine lock ($POLLARD_HOME/.pollard.lock), the shared POLLARD_HEAVY_LOCK directories, a running release /
+    `pollard --run` / llama-* binary / other engine update (this process and its ancestors excepted), and on
+    Windows the box's running SYSTEM release tasks."""
+    why = []
+    try:
+        from pollard_workspace import running_job, pollard_home
+        job = running_job()
+        if job:
+            why.append(f"the machine lock {os.path.join(pollard_home(), '.pollard.lock')} is held by pid "
+                       f"{job.get('pid')} ({job.get('what', '?')})")
+    except Exception as exc:                                               # noqa: BLE001
+        log(f"guard: could not read the machine lock ({exc})")
+    for d in heavy_lock_dirs():
+        who = _dir_lock_holder(d)
+        if who:
+            why.append(f"the heavy-job lock {d} is held ({who})")
+    procs = list_processes() if procs is None else procs
+    mine = _ancestors(procs, os.getpid())
+    seen = set()
+    for pid, _pp, argv in procs:
+        if pid in mine:
+            continue
+        what = heavy_process(argv)
+        if what and what not in seen:
+            seen.add(what)
+            why.append(f"{what} is running (pid {pid})")
+    for tn in running_release_tasks(tasks_text):
+        why.append(f"the release task {tn} is running")
+    return why
+
+
+@_contextlib.contextmanager
+def _swap_hold(name, held=True):
+    """Hold the machine lock for the seconds the swap takes, so a release starting right then waits for it
+    instead of opening a half-renamed tree. Not taken (and not needed) by a manual update."""
+    path = None
+    if held:
+        try:
+            from pollard_workspace import pollard_home
+            path = os.environ.get("POLLARD_MACHINE_LOCK") or os.path.join(pollard_home(), ".pollard.lock")
+            if os.path.exists(path):
+                path = None
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"pid": os.getpid(), "what": f"pollard-runtime: swapping {name}"}, fh)
+        except OSError:
+            path = None
+    try:
+        yield
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def scheduled_update(names, when="daily", jobs=None, busy=None, now=None, status_path=None):
+    """What the scheduled task runs. Skips (and the next hourly attempt retries) while anything heavy is on the
+    machine; otherwise updates every engine exactly as `--update` does, re-checking the guard before each swap."""
+    busy = busy or busy_reasons
+    now = now or _dt.datetime.now()
+    st = read_status(status_path).get("_scheduled") or {}
+    try:
+        last = _dt.datetime.fromisoformat(st["ran"]) if st.get("ran") else None
+    except ValueError:
+        last = None
+    if last and now - last < DUE_AFTER.get(when, DUE_AFTER["daily"]):
+        log(f"scheduled update: already ran {last:%Y-%m-%d %H:%M} ({st.get('result', '?')}) -- next one is not due yet")
+        return True
+    why = busy()
+    if why:
+        log(f"scheduled update SKIPPED -- {'; '.join(why)}. The next hourly attempt retries "
+            f"(04:30 + {RETRY_HOURS} h window), else the next scheduled day.")
+        for n in names:
+            write_status(n, "skipped", "; ".join(why), path=status_path)
+        return True
+    ok = all([update_engine(n, jobs=jobs, guard=busy) for n in names])
+    states = {n: (read_status(status_path).get(n) or {}).get("state") for n in names}
+    if "deferred" in states.values():
+        return ok                                       # a release began mid-update: still due, retried next hour
+    write_status("_scheduled", "ran", path=status_path, ran=now.isoformat(timespec="seconds"),
+                 result="ok" if ok else ", ".join(f"{n} {s}" for n, s in states.items()))
+    return ok
+
+
+def scheduled_jobs():
+    """Compile jobs for the scheduled build: about half the cores, so the machine stays usable."""
+    return max(2, (os.cpu_count() or 4) // 2)
+
+
+def _baked_env():
+    """The environment the scheduled task needs and does not have: SYSTEM's ~ is not the user's (POLLARD_HOME), the
+    shared heavy lock is a shell variable, and launchd's PATH has no git/cmake."""
+    from pollard_workspace import pollard_home
+    env = {"POLLARD_HOME": pollard_home()}
+    for k in ("POLLARD_HEAVY_LOCK", "POLLARD_MACHINE_LOCK", "PATH"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    return env
+
+
+def windows_task_bat(when, py, me, jobs, logf, env):
+    """The .bat the Windows task runs: below-normal CPU (`start /low`), half the cores, appended to update.log."""
+    lines = ["@echo off", "rem written by pollard-runtime --schedule; rerun that to change it"]
+    lines += [f'set "{k}={v}"' for k, v in env.items()]
+    lines += [f'cd /d "{REPO}"',
+              f'start "" /low /b /wait "{py}" "{me}" --update all --scheduled {when} --jobs {jobs} >> "{logf}" 2>&1']
+    return "\r\n".join(lines) + "\r\n"
+
+
+def windows_task_command(when, bat):
+    """The schtasks line. A start date in the PAST (01/01/2026): a near-future /st on a new task fires on its own
+    (every box task re-ran at once on 2026-10-09). SYSTEM so it survives logoff and the son's console Ctrl+C;
+    hourly retries for RETRY_HOURS so a skip while a release runs is rescheduled, not lost."""
+    sc = "/sc weekly /d SUN" if when == "weekly" else "/sc daily"
+    tr = f'"\\"{bat}\\""' if " " in bat else f'"{bat}"'
+    return (f"schtasks /create /tn {TASK_NAME} /tr {tr} {sc} /st 04:30 /sd 01/01/2026 "
+            f"/ri 60 /du {RETRY_HOURS:02d}:00 /ru SYSTEM /rl HIGHEST /f")
+
+
+def launchd_plist(when, py, me, jobs, logf, env):
+    """The macOS LaunchAgent: 04:30 plus an attempt every hour of the retry window (Sunday only when weekly)."""
+    wd = "<key>Weekday</key><integer>0</integer>" if when == "weekly" else ""
+    cal = "".join(f"<dict>{wd}<key>Hour</key><integer>{h}</integer><key>Minute</key><integer>30</integer></dict>"
+                  for h in range(4, 4 + RETRY_HOURS))
+    envx = "".join(f"<key>{k}</key><string>{_xml(v)}</string>" for k, v in env.items())
+    args = "".join(f"<string>{_xml(x)}</string>" for x in
+                   (py, me, "--update", "all", "--scheduled", when, "--jobs", str(jobs)))
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.pollard.runtime-update</string>
+<key>ProgramArguments</key><array>{args}</array>
+<key>WorkingDirectory</key><string>{_xml(REPO)}</string>
+<key>EnvironmentVariables</key><dict>{envx}</dict>
+<key>StartCalendarInterval</key><array>{cal}</array>
+<key>Nice</key><integer>15</integer><key>LowPriorityIO</key><true/>
+<key>StandardOutPath</key><string>{_xml(logf)}</string><key>StandardErrorPath</key><string>{_xml(logf)}</string>
+</dict></plist>"""
+
+
+def _xml(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def schedule(when):
     me = os.path.abspath(__file__).replace("pollard_runtime_update.py", "pollard_runtime.py")
     py = sys.executable
+    logf = os.path.join(REPO, "runtime", "update.log")
+    jobs = scheduled_jobs()
     if sys.platform == "darwin":
         plist = os.path.expanduser("~/Library/LaunchAgents/com.pollard.runtime-update.plist")
         if when == "off":
             _run(["launchctl", "unload", plist]); os.path.exists(plist) and os.remove(plist)
             return log("schedule removed")
-        cal = "<dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>30</integer></dict>"
-        if when == "weekly":
-            cal = cal.replace("<dict>", "<dict><key>Weekday</key><integer>0</integer>")
-        logf = os.path.join(REPO, "runtime", "update.log")
-        open(plist, "w").write(f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.pollard.runtime-update</string>
-<key>ProgramArguments</key><array><string>{py}</string><string>{me}</string><string>--update</string><string>all</string></array>
-<key>WorkingDirectory</key><string>{REPO}</string>
-<key>StartCalendarInterval</key>{cal}
-<key>Nice</key><integer>15</integer><key>LowPriorityIO</key><true/>
-<key>StandardOutPath</key><string>{logf}</string><key>StandardErrorPath</key><string>{logf}</string>
-</dict></plist>""")
+        os.makedirs(os.path.dirname(logf), exist_ok=True)
+        open(plist, "w").write(launchd_plist(when, py, me, jobs, logf, _baked_env()))
         _run(["launchctl", "unload", plist]); r = _run(["launchctl", "load", plist])
-        return log(f"scheduled {when} at 04:30 via launchd ({plist}){'' if r.returncode == 0 else ' -- load failed: ' + r.stderr.strip()}")
+        return log(f"scheduled {when} at 04:30 (+ hourly retries for {RETRY_HOURS} h while busy) via launchd ({plist})"
+                   + ("" if r.returncode == 0 else " -- load failed: " + r.stderr.strip()))
     if WIN:
         if when == "off":
-            _run('schtasks /delete /tn PollardRuntimeUpdate /f'); return log("schedule removed")
-        sc = "/sc weekly /d SUN" if when == "weekly" else "/sc daily"
-        logf = os.path.join(REPO, "runtime", "update.log")
-        cmd = f'cmd /c ""{py}" "{me}" --update all >> "{logf}" 2>&1"'
-        r = _run(f'schtasks /create /tn PollardRuntimeUpdate /tr "{cmd}" {sc} /st 04:30 /f')
-        _run('powershell -NoProfile -Command "$t=Get-ScheduledTask PollardRuntimeUpdate; $t.Settings.Priority=7; '
+            _run(f"schtasks /delete /tn {TASK_NAME} /f"); return log("schedule removed")
+        bat = os.path.join(REPO, "runtime", "runtime-update.bat")
+        os.makedirs(os.path.dirname(bat), exist_ok=True)
+        with open(bat, "w", encoding="utf-8", newline="") as fh:
+            fh.write(windows_task_bat(when, py, me, jobs, logf, _baked_env()))
+        r = _run(windows_task_command(when, bat))
+        _run(f'powershell -NoProfile -Command "$t=Get-ScheduledTask {TASK_NAME}; $t.Settings.Priority=7; '
              "$t.Settings.ExecutionTimeLimit='PT6H'; Set-ScheduledTask -InputObject $t | Out-Null\"")
-        return log(f"scheduled {when} at 04:30 via Task Scheduler (below-normal priority)"
+        return log(f"scheduled {when} at 04:30 (+ hourly retries for {RETRY_HOURS} h while busy) via Task Scheduler as "
+                   f"SYSTEM, below-normal priority, -j{jobs}; run it now with: schtasks /run /tn {TASK_NAME}"
                    + ("" if r.returncode == 0 else f" -- {r.stderr.strip() or r.stdout.strip()}"))
-    log("scheduling: add a cron line: 30 4 * * * " + f"{py} {me} --update all")
+    log("scheduling: add a cron line: 30 4-11 * * * " + f"nice -n 15 {py} {me} --update all --scheduled {when} --jobs {jobs}")
 
 
 def auto_update_for(arch):
