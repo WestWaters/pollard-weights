@@ -204,7 +204,9 @@ CLEF_LINE = ("Needs llama.cpp with Pollard's `clef-omni` patch ([runtime-patches
 def test_card_names_the_pollard_patch_and_never_says_stock(tmp_path, monkeypatch, no_upstream):
     md = _card(tmp_path, monkeypatch, "clef-omni")
     assert f"**{CLEF_LINE}.**" in md
-    assert "pollard-runtime --update" in md and "git checkout b76b133" in md
+    # the by-hand build pins the base the shipped patch was captured on (rebased 8e5a58d, 2026-10-23)
+    base = json.loads((Path(gc.PATCH_DIR) / "llama.cpp-clef-omni.json").read_text())["base_commit"]
+    assert "pollard-runtime --update" in md and f"git checkout {base}" in md
     assert "git apply ../pollard-weights/runtime-patches/llama.cpp-clef-omni.patch" in md
     assert "Standard GGUF" not in md and "run in stock llama.cpp" not in md
     assert "any llama.cpp" not in md and "ollama run hf.co/" not in md

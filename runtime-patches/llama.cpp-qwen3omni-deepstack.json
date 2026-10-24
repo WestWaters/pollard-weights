@@ -3,9 +3,9 @@
  "tree_slug": "llama.cpp",
  "tree_path": "runtime/llama.cpp",
  "remote": "https://github.com/ggml-org/llama.cpp",
- "base_commit": "1623d8c",
- "base_describe": "",
- "base_date": "2026-10-10",
+ "base_commit": "8e5a58d",
+ "base_describe": "b11850-4-g8e5a58d",
+ "base_date": "2026-10-24",
  "files": [
   "conversion/qwen3vl.py",
   "tools/mtmd/mtmd.cpp"
@@ -15,5 +15,5 @@
   "thinker_config",
   "vision_config"
  ],
- "diff_bytes": 4305
+ "diff_bytes": 4332
 }

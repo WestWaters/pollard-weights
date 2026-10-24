@@ -3,9 +3,9 @@
  "tree_slug": "llama.cpp",
  "tree_path": "runtime/llama.cpp",
  "remote": "https://github.com/ggml-org/llama.cpp",
- "base_commit": "b76b133",
- "base_describe": "",
- "base_date": "2026-10-15",
+ "base_commit": "8e5a58d",
+ "base_describe": "b11850-4-g8e5a58d",
+ "base_date": "2026-10-24",
  "files": [
   "conversion/__init__.py",
   "conversion/clef.py",
@@ -36,5 +36,5 @@
   "result_norm",
   "self_kq_mask"
  ],
- "diff_bytes": 36195
+ "diff_bytes": 36215
 }
