@@ -1088,6 +1088,7 @@ SCREENS.doctor = () => `
       <div class="sp"></div>
       <div class="btns"><button class="btn gold" onclick="act('doctor')">RUN DOCTOR</button>
         <button class="btn" onclick="act('smoke')">PREFLIGHT SMOKE</button>
+        <button class="btn" onclick="act('preflight')">ENGINE PREFLIGHT</button>
         <button class="btn" onclick="act('setup')">LANE SETUP</button>
         <button class="btn" onclick="act('ggufcheck')">GGUF CHECK</button></div></div>
   </div>
