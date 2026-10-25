@@ -573,6 +573,10 @@ def main():
                          "right now, or a GPU/rack preset from pollard-calc's card table "
                          "(e.g. 'rubin', 'b300x8', 'nvl72')")
     ap.add_argument("--out", help="output path (default: <src>-pollard.gguf)")
+    ap.add_argument("--tag", help="the build's tag in the workspace MANIFEST (default: its base preset) -- a "
+                                  "quality-targeted rung is tagged by what it is, e.g. Q90-4.6GB")
+    ap.add_argument("--no-record", dest="record", action="store_false",
+                    help="do not record this build in the MANIFEST (a candidate a search may discard)")
     ap.add_argument("--imatrix", help="importance matrix from llama-imatrix -- required "
                                       "for IQ-type quality; does NOT decide the allocation")
     ap.add_argument("--sensitivity", help="measured sensitivity profile from "
@@ -876,7 +880,8 @@ def main():
     try:
         import pollard_workspace as ws
         bpw = round(os.path.getsize(out) * 8.0 / arch["total"], 2) if arch.get("total") else None
-        ws.record_build(a.gguf, "gguf", out, tag=base_preset, bpw=bpw)
+        if a.record:
+            ws.record_build(a.gguf, "gguf", out, tag=a.tag or base_preset, bpw=bpw)
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"\ndone: {out}")

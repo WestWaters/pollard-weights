@@ -29,6 +29,10 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
 lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
                                # the whole release stops before calibration (default: only that lane is held)
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
+  #   quality: [Q90, Q85]  quality-targeted rungs (pollard_qtarget): the SMALLEST measured-allocation build whose
+  #                        measured KLD / top-1 vs the f16 meet the class (Q90: KLD <= 0.08, top-1 >= 90; Q85: KLD <=
+  #                        0.2, top-1 >= 85), named <M>-Pollard-<class>-<size>GB.gguf; needs free-after-upload
+  #   ladder: [Q6_K, flagship]  only these size-targeted labels (drop the ones the quality rungs replace)
   mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
   mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}

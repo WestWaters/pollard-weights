@@ -806,6 +806,13 @@ rungs:
   - match: ["Q2_K*", "IQ2_*", "IQ1_*", "*2bit*", "*int2*", "*-2.0bpw", "*-2.5bpw"]
     kld_max: 0.5
     top1_min: 75
+  # quality-targeted rungs (pollard_qtarget, <class>-<size>GB): gated on the class they were searched for
+  - match: ["Q90-*GB"]
+    kld_max: 0.08
+    top1_min: 90
+  - match: ["Q85-*GB"]
+    kld_max: 0.2
+    top1_min: 85
   # the trellis flagship is ik_llama-only BY DESIGN -- the gate checks it says so, not that it isn't
   - match: ["*_KT*", "*KT-*", "PollardMix*"]
     runtime: ik_llama

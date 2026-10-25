@@ -354,9 +354,79 @@ def _wanted_rungs(a):
     return {w.upper() if w.lower() != "flagship" else "flagship" for w in want} or None
 
 
+#: the budget range a quality rung searches, as fractions of the f16 (the size-targeted ladder spans 0.20 - 0.42)
+QUALITY_RANGE = (0.15, 0.45)
+
+
+def _build_quality(a, cls, pts, f16_gb, hi_gb=None):
+    """One QUALITY-targeted rung (pollard_qtarget): the smallest measured-allocation build whose measured KLD / top-1
+    against the f16 meet `cls`, found by building + measuring candidates. Returns the winner's projected GB, or None."""
+    import pollard_qtarget as QT
+    kld_max, top1_min = QT.QUALITY_CLASSES[cls]
+    held = _heldout_for(a)
+    lo, hi = QUALITY_RANGE[0] * f16_gb, hi_gb or QUALITY_RANGE[1] * f16_gb
+    print(f"   {cls}: the smallest build with KLD <= {kld_max} and top-1 >= {top1_min}% (measured vs the f16 on "
+          f"{os.path.basename(held) if held else '?'}), searched between ~{lo:.1f} and ~{hi:.1f} GB")
+    if not a.run:
+        return None
+    if not held:
+        sys.exit(f"   {cls}: a quality rung is measured on held-out text -- pass --heldout (pollard-calib --held-out)")
+    import pollard_verify as V
+    binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
+
+    def build(ram):
+        out = _rung_out(a.gguf, f"{cls}-candidate-{ram:g}")
+        cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0", "--out", out, "--no-record"]
+        if a.imatrix: cmd += ["--imatrix", a.imatrix]
+        if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]
+        if binq: cmd += ["--llama-quantize", binq]
+        _run(cmd, True)
+        return out
+
+    def measure(path):
+        return V.measure_gguf(path, a.gguf, held, ngl=str(a.ngl) if str(a.ngl) != "auto" else "auto")
+
+    def discard(path):
+        for f in (path, path + ".tensor-types.txt"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    res = QT.search(pts, cls, build, measure, lo=lo, hi=hi, discard=discard, top_passes=hi_gb is not None)
+    if not res.get("path"):
+        print(f"   {cls}: not reachable below ~{hi:.1f} GB -- no quality rung of this class")
+        return None
+    tag = QT.rung_tag(cls, res["path"])
+    final = _rung_out(a.gguf, tag)
+    os.replace(res["path"], final)
+    if os.path.exists(res["path"] + ".tensor-types.txt"):
+        os.replace(res["path"] + ".tensor-types.txt", final + ".tensor-types.txt")
+    m = res["measured"]
+    try:
+        import pollard_workspace as ws
+        arch = analyse(gguf_to_config(read_gguf_meta(a.gguf), a.gguf))
+        bpw = round(os.path.getsize(final) * 8.0 / arch["total"], 2) if arch.get("total") else None
+        ws.record_build(a.gguf, "gguf", final, tag=tag, bpw=bpw, ppl=m.get("ppl"))
+    except Exception as e:                                     # noqa: BLE001
+        print(f"   (warning: could not record {tag} in the workspace manifest: {e})")
+    print(f"   {cls} -> {os.path.basename(final)}: KLD {m['kld']:.4f}  top-1 {m['top1']:.2f}%  PPL {m.get('ppl')}  "
+          f"({len(res['tried'])} candidate(s) built + measured)")
+    return res["gb"]
+
+
 def _build_ladder(a, ik_flagship):
     pts = ladder_points(a.gguf, a.imatrix, a.sensitivity)
     f16_gb = os.path.getsize(a.gguf) / 1e9
+    want_q = [w for w in (_wanted_rungs(a) or ()) if w in ("Q90", "Q85")]
+    if want_q:                                   # quality-targeted rungs: strictest class first, each below the last
+        print(f"   1) quality-targeted rungs ({', '.join(want_q)}):")
+        hi = None
+        for cls in sorted(want_q, key=lambda k: -int(k[1:])):
+            got = _build_quality(a, cls, pts, f16_gb, hi_gb=hi)
+            hi = got or hi
+        if not (_wanted_rungs(a) - set(want_q)):
+            return
     picks = pick_ladder(pts, f16_gb, ik_flagship)
     print(f"   1) the publish ladder ({', '.join(picks) or 'nothing reachable'}):")
     for label, (ram, preset, gb) in picks.items():
