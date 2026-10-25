@@ -374,13 +374,27 @@ def _build_quality(a, cls, pts, f16_gb, hi_gb=None):
     import pollard_verify as V
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
 
+    import shutil as _sh
+    proj = {round(r, 2): g for r, _, g in pts}
+
     def build(ram):
         out = _rung_out(a.gguf, f"{cls}-candidate-{ram:g}")
+        need = proj.get(round(ram, 2), 0.0) * 1.1 + 1.0
+        free = _sh.disk_usage(os.path.dirname(out) or ".").free / 1e9
+        if free < need:
+            sys.exit(f"   {cls}: candidate --ram {ram:g} needs ~{need:.1f} GB of disk, {free:.1f} GB free -- held "
+                     "(a full disk truncates the GGUF without an error)")
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0", "--out", out, "--no-record"]
         if a.imatrix: cmd += ["--imatrix", a.imatrix]
         if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]
         if binq: cmd += ["--llama-quantize", binq]
         _run(cmd, True)
+        try:                                     # a truncated write (disk full) reads back short, not as an error
+            from gguf import GGUFReader
+            GGUFReader(out)
+        except Exception as e:                   # noqa: BLE001
+            discard(out)
+            sys.exit(f"   {cls}: candidate {os.path.basename(out)} is not a complete GGUF ({e}) -- disk full?")
         return out
 
     def measure(path):
