@@ -53,6 +53,7 @@ def test_sliced_encode_is_byte_identical_to_the_one_shot(tmp_path, monkeypatch, 
 
 def test_only_plain_reads_are_sliced(tmp_path, monkeypatch):
     p = _table(tmp_path)
+    monkeypatch.setattr(M, "SLICE_MIN_BYTES", 0)
     q = M.StreamedQuantize({}, "search")
     with q:
         w = mx.load(p)["table"]
@@ -61,6 +62,16 @@ def test_only_plain_reads_are_sliced(tmp_path, monkeypatch):
         assert q.file_source(w.T) is None, "a transposed one neither"
         assert q.file_source(w.astype(mx.bfloat16)) is not None, "a same-dtype cast still reads the file as stored"
     assert mx.load is not None and q.loads == [], "mx.load restored, registry dropped"
+
+
+def test_the_registry_never_holds_the_arrays(tmp_path, monkeypatch):
+    p = _table(tmp_path)
+    monkeypatch.setattr(M, "SLICE_MIN_BYTES", 0)
+    q = M.StreamedQuantize({}, "search")
+    with q:
+        mx.load(p)
+        assert q.loads and all(not isinstance(x, mx.array) for e in q.loads for x in e), \
+            "file, key, shape, Load ids -- an evaluated tensor is never kept alive by the registry"
 
 
 def test_encode_routes_big_plain_tables_to_the_sliced_path(tmp_path, monkeypatch):
