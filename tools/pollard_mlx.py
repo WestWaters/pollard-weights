@@ -653,6 +653,32 @@ SEARCH_GB = 0.35
 _WRITTEN = None
 
 
+#: a source tensor bigger than this is never evaluated whole: when it is a plain read of one safetensors tensor (a
+#: lookup table -- Gemma 4's 2.8B-param per-layer embedding is 5.6 GB in bf16), its rows are read from the file and
+#: encoded SLICE_BYTES at a time. Affine quantization works row by row, so the bytes are the same as the one-shot encode
+SLICE_MIN_BYTES = 1 << 30
+SLICE_BYTES = 256 << 20
+#: encode_affine's row chunk (weights) in the streamed build -- the sliced encode keeps its slices a multiple of it
+ENCODE_CHUNK_ELEMS = 1 << 22
+_NODE_RE = re.compile(r'\[label ="([^"]+)"')
+_ST_NP = {"BF16": "uint16", "F16": "float16", "F32": "float32"}
+
+
+def _direct_load_id(w):
+    """The Load node id when `w` is a plain read of one stored tensor (its graph: one Load, optionally an AsType that
+    keeps the dtype), else None."""
+    import io
+    import mlx.core as mx
+    buf = io.StringIO()
+    mx.export_to_dot(buf, w)
+    dot = buf.getvalue()
+    ops = _NODE_RE.findall(dot)
+    loads = [int(x) for x in _LOAD_RE.findall(dot)]
+    if len(loads) != 1 or any(o not in ("Load", "AsType") for o in ops) or ops.count("AsType") > 1:
+        return None
+    return loads[0]
+
+
 class StreamedQuantize(RangeSearchQuantize):
     """While active, mx.quantize is MLX's own -- lazy -- and, for --range search, its outputs are placeholders: the
     writer (StreamWriter) replaces each with encode_affine's answer when it reaches that tensor."""
@@ -660,9 +686,36 @@ class StreamedQuantize(RangeSearchQuantize):
     def __init__(self, importance=None, method="search"):
         super().__init__(importance, method)
         self.pending = {}                      # id(placeholder) -> (job, index, placeholder)
+        self.loads = []                        # (safetensors file, {key: array}) of every mx.load while active
+        self.stats.setdefault("sliced", 0)
+
+    def file_source(self, w):
+        """(file, key, offset, numpy dtype, shape) of the stored tensor `w` reads, when it is a plain read of one."""
+        lid = _direct_load_id(w)
+        if lid is None:
+            return None
+        import pollard_stream as S
+        for f, arrays in self.loads:
+            for k, arr in arrays.items():
+                if tuple(arr.shape) != tuple(w.shape) or lid not in _load_ids(arr):
+                    continue
+                hdr, base = S.st_header(f)
+                info = hdr.get(k)
+                if not info or info.get("dtype") not in _ST_NP or tuple(info.get("shape") or ()) != tuple(w.shape):
+                    return None
+                return f, k, base + info["data_offsets"][0], _ST_NP[info["dtype"]], tuple(info["shape"])
+        return None
 
     def __enter__(self):
         import mlx.core as mx
+        self._orig_load = mx.load
+
+        def load(file, *a, **k):
+            out = self._orig_load(file, *a, **k)
+            if str(file).endswith(".safetensors") and isinstance(out, dict):
+                self.loads.append((str(file), out))
+            return out
+        mx.load = load
         self._orig = mx.quantize
 
         def quantize(w, group_size=None, bits=None, mode="affine", **kw):
@@ -707,15 +760,67 @@ class StreamedQuantize(RangeSearchQuantize):
             job["out"] = None
         return out
 
+    def __exit__(self, *exc):
+        import mlx.core as mx
+        if getattr(self, "_orig_load", None) is not None:
+            mx.load = self._orig_load
+        self.loads = []
+        return super().__exit__(*exc)
+
+    def encode_sliced(self, job, src):
+        """encode()'s answer for a big stored tensor, never holding it whole: its rows read from the file SLICE_BYTES
+        at a time (numpy memmap), each slice encoded exactly as encode() encodes its rows, the outputs assembled. The
+        packed weights come back as numpy (the writer writes bytes; no second copy)."""
+        import mlx.core as mx
+        import numpy as np
+        f, key, off, npdt, shape = src
+        w, gs, b = job["w"], job["gs"], job["bits"]
+        K = shape[-1]
+        rows = 1
+        for d in shape[:-1]:
+            rows *= d
+        mm = np.memmap(f, dtype=npdt, mode="r", offset=off, shape=(rows, K))
+        inner = max(1, ENCODE_CHUNK_ELEMS // max(1, K))    # encode_affine's own row chunk: slices are a multiple of it
+        step = max(inner, (SLICE_BYTES // (K * mm.itemsize)) // inner * inner)
+        packed = np.empty((rows, K * b // 32), dtype=np.uint32)
+        ss, bs = [], []
+        orig = self._orig
+        for r0 in range(0, rows, step):
+            r1 = min(rows, r0 + step)
+            raw = np.ascontiguousarray(mm[r0:r1])
+            wc = mx.array(raw).view(mx.bfloat16) if npdt == "uint16" else mx.array(raw)
+            wc = wc.astype(w.dtype) if wc.dtype != w.dtype else wc
+            init = (lambda q0, q1, wc=wc: orig(wc[q0:q1], gs, b)[1:])
+            p_, s_, b_ = encode_affine(wc, b, gs, imp=job["imp"], method=self.method, xp=mx, init=init,
+                                       max_elems=ENCODE_CHUNK_ELEMS)
+            packed[r0:r1] = p_.reshape(r1 - r0, -1)
+            s_, b_ = s_.astype(w.dtype), b_.astype(w.dtype)
+            mx.eval(s_, b_)
+            ss.append(s_)
+            bs.append(b_)
+            del raw, wc, p_
+        del mm
+        s = mx.concatenate(ss, 0).reshape(*shape[:-1], K // gs)
+        bb = mx.concatenate(bs, 0).reshape(*shape[:-1], K // gs)
+        mx.eval(s, bb)
+        self.stats["sliced"] += 1
+        return packed.reshape(*shape[:-1], K * b // 32), s, bb
+
     def encode(self, job):
         import mlx.core as mx
         w, gs, b = job["w"], job["gs"], job["bits"]
+        imp = job.get("imp")
+        if w.nbytes > SLICE_MIN_BYTES and (imp is None or getattr(imp, "size", 0) == w.shape[-1]):
+            src = self.file_source(w)
+            if src is not None:
+                return self.encode_sliced(job, src)
         mx.eval(w)                                         # the source tensor (an expert stack) once, then by rows
         K = w.shape[-1]
         w2 = w.reshape(-1, K)
         orig = self._orig
         init = (lambda r0, r1: orig(w2[r0:r1], gs, b)[1:])  # MLX's own answer, chunk by chunk
-        packed, s, bb = encode_affine(w, b, gs, imp=job["imp"], method=self.method, xp=mx, init=init)
+        packed, s, bb = encode_affine(w, b, gs, imp=job["imp"], method=self.method, xp=mx, init=init,
+                                      max_elems=ENCODE_CHUNK_ELEMS)
         out = (mx.array(packed), s.astype(w.dtype), bb.astype(w.dtype))
         mx.eval(*out)
         return out
@@ -905,7 +1010,10 @@ def plan_build(model_dir, low=4, high=8, method="search", encoded=False, avg_bit
     worst, wname, src_bytes, out_bytes = 0.0, None, 0, 0.0
     for g, (n, b, cnt) in groups.items():
         src_bytes += b
-        work = b * (2 if cnt > 1 else 1) + n * max(high, 8) / 8
+        if cnt == 1 and b > SLICE_MIN_BYTES:               # a big stored table: encoded slice by slice (encode_sliced)
+            work = min(b, SLICE_BYTES) * 4 + n * max(high, 8) / 8
+        else:
+            work = b * (2 if cnt > 1 else 1) + n * max(high, 8) / 8
         out_bytes += n * ((avg_bits or low) + 0.5) / 8 if b // max(n, 1) >= 2 and n >= 4096 else b
         if work > worst:
             worst, wname = work, g
