@@ -116,12 +116,12 @@ def disk_reserve_gb(path=None, total_bytes=None, platform=None):
     if (platform or sys.platform) != "darwin":
         return margin
     if total_bytes is None and path is not None:
-        import shutil
+        import pollard_stream as S
         p = os.path.abspath(str(path))
         while not os.path.exists(p) and os.path.dirname(p) != p:
             p = os.path.dirname(p)
         try:
-            total_bytes = shutil.disk_usage(p).total
+            total_bytes = S.disk_usage(p).total
         except OSError:
             total_bytes = 0
     return max(margin, MAC_DISK_FLOOR_GB, MAC_DISK_FLOOR_FRAC * (total_bytes or 0) / 1e9)
@@ -233,12 +233,11 @@ def decode_to_float(model_dir, out, log=print):
     """A BF16 copy of an already-quantized checkpoint, for a converter that reads float weights: every encoded linear
     decoded (pollard_stream's readers -- the same decode the streamed lanes use), every other tensor byte-for-byte,
     side files copied, the quantization config dropped. The disk it needs is checked first."""
-    import shutil
     import pollard_stream as S
     src = S.Source(model_dir)
     need = sum((S._prod(src.shape(k)) * 2 if src.encoding(k) else src.nbytes(k)) for k in src.logical)
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-    free = shutil.disk_usage(os.path.dirname(os.path.abspath(out)) or ".").free
+    free = S.disk_usage(os.path.dirname(os.path.abspath(out)) or ".").free
     if free < need + (2 << 30):
         raise SystemExit(f"ERROR: decoding the quantized source to BF16 for MLX needs {need / 1e9:.1f} GB at {out} "
                          f"and {free / 1e9:.1f} GB is free. Free the space, or start from the float release "
@@ -922,7 +921,6 @@ def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
     floor, or whose output does not fit the disk. A remote-source `mirror` on the same disk counts its cache as free:
     what the rung needs is evicted from it here, before the first byte is written (a build whose source tensors are
     all cached never fetches, so the writer alone would never make room)."""
-    import shutil
     import pollard_stream as S
     floor = float(os.environ.get("POLLARD_MIN_FREE_GB", 2.0))
     free = S.free_ram_gb()
@@ -939,7 +937,7 @@ def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
     parent = os.path.dirname(os.path.abspath(out_dir)) or "."
     while not os.path.exists(parent) and os.path.dirname(parent) != parent:
         parent = os.path.dirname(parent)
-    disk = shutil.disk_usage(parent).free / 1e9
+    disk = S.disk_usage(parent).free / 1e9
     same_disk = mirror is not None and os.stat(parent).st_dev == os.stat(mirror.dir).st_dev
     cache = mirror.reclaimable_bytes() / 1e9 if same_disk else 0.0
     if disk + cache < plan["out_gb"] + 1.0:
@@ -950,7 +948,7 @@ def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
     want = plan["out_gb"] * 1.1 + plan.get("largest_gb", 0.0) + (mirror.floor_gb() if same_disk else 3.0)
     if same_disk and disk < want and cache:
         freed = mirror.make_room(want)
-        disk = shutil.disk_usage(parent).free / 1e9
+        disk = S.disk_usage(parent).free / 1e9
         log(f"   disk: {freed / 1e9:.1f} GB of the mirror's cache evicted for the rung ({disk:.1f} GB free now)")
 
 
@@ -1237,9 +1235,9 @@ class RemoteMirror:
             pass
         self.pinned, self.by_load, self.reserve_gb = set(), {}, None   # None: the floor (floor_gb)
         self.fetched, self.evicted = 0, 0
-        import shutil
-        self.free_bytes = lambda: shutil.disk_usage(self.dir).free
-        self.total_bytes = lambda: shutil.disk_usage(self.dir).total
+        import pollard_stream as S
+        self.free_bytes = lambda: S.disk_usage(self.dir).free
+        self.total_bytes = lambda: S.disk_usage(self.dir).total
 
     def floor_gb(self):
         """The least free disk this cache ever leaves (disk_reserve_gb of the mirror's volume)."""
