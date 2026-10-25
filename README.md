@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#)
 [![Core deps](https://img.shields.io/badge/core%20deps-stdlib-brightgreen.svg)](#)
-[![Output lanes](https://img.shields.io/badge/output%20lanes-5-orange.svg)](#output-lanes--one-allocation-pick-your-runtime)
+[![Output lanes](https://img.shields.io/badge/output%20lanes-7-orange.svg)](#output-lanes--one-allocation-pick-your-runtime)
 [![GPU](https://img.shields.io/badge/GPU-optional-brightgreen.svg)](#)
 
 ![pollard-calc prediction vs an independent public benchmark](assets/benchmarks/k3_validation.png)
@@ -31,9 +31,12 @@ the model runs, so `--ram` is the *target's* budget, not the build machine's
 (`--ram auto` only when they're the same). The 16GB examples below are just a
 common demo, not a ceiling.
 
-**One measured allocation, five output lanes** — GGUF (llama.cpp/Ollama/LM Studio),
-GPTQ (vLLM/SGLang), MLX (Apple), EXL3 (exllamav3), and MX/NVFP4 (Blackwell / Vera Rubin) — pick
-the runtime, keep the allocation.
+**One measured allocation, seven output lanes** — GGUF (llama.cpp/Ollama/LM Studio; trellis
+flagship on ik_llama.cpp), MLX (Apple), GPTQ (vLLM/SGLang), MX (NVFP4 / MXFP4 / FP8 / MXFP6 and
+measured mixes, Blackwell / Vera Rubin), EXL3 (exllamav3), EXLR8 (one trellis encode, every rung a
+manifest), and DRAFT (a speculative-decoding drafter matched to the quantized target) — pick the
+runtime, keep the allocation. Every lane ships the whole model (vision / audio towers included), and
+every lane lands in one repo per model.
 
 ## How it works
 
@@ -44,12 +47,16 @@ flowchart LR
     ALLOC --> GPTQ["GPTQ · vLLM / SGLang"]
     ALLOC --> MLX["MLX · Apple Silicon"]
     ALLOC --> EXL3["EXL3 · exllamav3"]
-    ALLOC --> MX["MX / NVFP4 · Blackwell / Rubin FP4"]
+    ALLOC --> MX["MX · NVFP4 / MXFP4 / FP8 / MXFP6<br/>Blackwell / Rubin"]
+    ALLOC --> EXLR8["EXLR8 · GR8 / reference decode"]
+    ALLOC --> DRAFT["DRAFT · speculative drafter<br/>llama.cpp / vLLM / SGLang / MLX"]
     GGUF --> V["pollard-verify<br/>(real-reconstruction gate)"]
     GPTQ --> V
     MLX --> V
     EXL3 --> V
     MX --> V
+    EXLR8 --> V
+    DRAFT --> V
     V --> WS["~/pollard workspace<br/>(organized + MANIFEST)"]
 ```
 
@@ -110,7 +117,7 @@ for AI models, and for the memory tiers under them (`notes/beyond-models.md`).
 |---|---|
 | 📊 **Calculate before you download** | `pollard-calc` — will this model fit your RAM, and how fast? Byte-economics from the config alone (pure stdlib, no GPU). |
 | 🎯 **Measured allocation** | `pollard-sensitivity` measures which tensors matter (per-model KL), then allocates bits to minimize KL at your size — not a flat bit-width. |
-| 🛣️ **Five output lanes** | one allocation → **GGUF · GPTQ · MLX · EXL3 · MX/NVFP4**. Pick the runtime, keep the allocation. |
+| 🛣️ **Seven output lanes** | one allocation → **GGUF · MLX · GPTQ · MX · EXL3 · EXLR8 · DRAFT**. Pick the runtime, keep the allocation. `pollard release` builds every lane as a ladder into one repo per model. |
 | 🩹 **Preconditioning** | `pollard-hf-smooth` (SmoothQuant — makes low-bit *work*) and `pollard-abliterate` (uncensor) compose across every lane. |
 | ✅ **Real-reconstruction gate** | `pollard-verify` checks decode-vs-source + the assembled forward. Never trusts a proxy metric. |
 | 🩺 **Model doctor** | `pollard-doctor` — diagnose, predict low-bit break risk, or repair any model on any lane. |
@@ -167,12 +174,14 @@ its own fast path. Pick by where the model will actually run:
 
 | Lane | Build with | Format | Reach for it when |
 |---|---|---|---|
-| **GGUF** — llama.cpp / ik_llama.cpp | `pollard-fit`, `pollard-automap` | trellis mix to ~1-bit (IQ1_KT) | single node (and RPC clusters); you want the **smallest** build. The flagship — runs in stock llama.cpp / Ollama / LM Studio. |
+| **GGUF** — llama.cpp / ik_llama.cpp | `pollard --ladder`, `pollard-fit`, `pollard-automap` | full ladder (Q6_K · IQ4_XS · IQ3_S · 2-bit) + the IQ*_KT trellis flagship to ~1-bit; mmproj for vision / audio | single node (and RPC clusters); you want the **smallest** build. The ladder runs in stock llama.cpp / Ollama / LM Studio; the trellis flagship runs on ik_llama.cpp (`pollard-ggufcheck` says which). |
 | **vLLM / SGLang** | `pollard-export` | GPTQ 4/8-bit `dynamic` mix (Marlin) | **GPU-cluster serving** where every token counts — vLLM's tensor-parallel over your fast interconnect. Then `vllm serve …-Pollard-GPTQ --quantization gptq`. |
 | **GPTQ** — torch / HF | `pollard-gptq` | INT3/INT4 error-feedback (full-Hessian) | GPU low-bit with the reconstruction lever an imatrix can't do (recovers ~46% of round-to-nearest's 4-bit error). |
 | **MLX** — Apple Silicon | `pollard-mlx` | mixed 4/8-bit | running on a Mac (Metal); mixed-precision at Apple-native speed. |
 | **EXL3** — exllamav3 | `pollard-exl3` | trellis, low-bit | the exllamav3 runtime. **The Pollard method beats EXL3 on EXL3's own allocator, atoms, and kernel** — Qwen2.5-3B @4bpw: Pollard **8.670** vs EXL3 out-of-box **8.699**, untuned; and smoothed 4bpw ≈ 8bpw quality at half the size. `pollard --format exl3` runs the gold recipe (smoothing + Calib 3.0) by default. |
-| **MX (FP4)** — Blackwell / Rubin / vLLM | `pollard-mx` | NVFP4 (MXFP4 experimental), optional FP8 KV (`--kv-fp8`) | Blackwell and Vera Rubin FP4 tensor cores via vLLM's compressed-tensors path (same formats on both; Rubin serves from the `vllm/vllm-openai:cu134-nightly` image). MoE routers stay unquantized; `--moe-protect-attn-only` keeps every expert NVFP4 so one MoE backend covers the model. Rubin support is upstream-nightly and not yet run by Pollard on Rubin hardware. |
+| **MX (FP4 / FP6 / FP8)** — Blackwell / Rubin / vLLM | `pollard-mx` | NVFP4 (default), MXFP4 (experimental upstream), pure FP8 W8A8 / FP8_DYNAMIC, MXFP6 E2M3 / E3M2, and measured mixes (`--mix <bpw>`: FP8 / MXFP6 / FP4 per fused layer); optional FP8 KV (`--kv-fp8`) | Blackwell and Vera Rubin FP4 tensor cores via vLLM's compressed-tensors path (same formats on both; Rubin serves from the `vllm/vllm-openai:cu134-nightly` image). MoE routers stay unquantized; `--moe-protect-attn-only` keeps every expert NVFP4 so one MoE backend covers the model. Rubin support is upstream-nightly and not yet run by Pollard on Rubin hardware. FP8 also runs on Hopper / Ada FP8 cores. MXFP6 E3M2 and every mix are written in the Quark OCP-MX layout vLLM main loads; uniform E2M3 is written as compressed-tensors (vLLM support pending upstream). |
+| **EXLR8** — GR8 / reference decode | `pollard-exlr8` | ONE trellis encode at K = 2..6 (E4M3 codebook, EXLR8 v2 records); every rung (2.5 / 3 / 3.25 / 4 / 5 / 6 bpw) is a manifest chosen by an exact knapsack on the measured sensitivity | one download, many sizes. GR8 serves GLM-5.3 on DGX Spark; any other model runs through the reference decode (`--decode` → bf16 HF checkpoint for transformers / vLLM). |
+| **DRAFT** — speculative decoding | `pollard-draft` | the best published DFlash / DSpark / EAGLE-3 drafter (or a same-family small model), GGUF Q8_0 / Q4_K_M + its HF folder | faster decoding with the target's own output. Measured as tokens per target pass against the quantized rungs people actually run; llama.cpp, vLLM, SGLang, MLX (dflash-mlx / mlx-lm). |
 
 **Low-bit note:** for the trellis/error-feedback lanes (EXL3, GPTQ) at low bit,
 run `pollard-hf-smooth` on the fp16 model first — it migrates massive-activation
@@ -475,7 +484,9 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 |---|---|
 | `pollard-fit` · `pollard-automap` · `pollard-fit-dit` | GGUF (memory-fit mix; MoE recipe; any-arch pure-Python) |
 | `pollard-export` · `pollard-gptq` | GPTQ (vLLM/SGLang; full-Hessian error-feedback) |
-| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors: NVFP4/MXFP4 (Blackwell/Rubin) + W4A16/W8A16 INT (any vLLM GPU) |
+| `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors / Quark: NVFP4 / MXFP4 / FP8 / MXFP6 E2M3 / E3M2 + measured mixes (Blackwell/Rubin) + W4A16/W8A16 INT (any vLLM GPU) |
+| `pollard-exlr8` · `pollard-draft` | EXLR8 (one encode, every rung a manifest; GR8 / reference decode) · DRAFT (speculative drafter matched to the quantized target) |
+| `pollard release` | Every lane of a model as a ladder, gated and carded, into one repo per model |
 
 **Precondition — compose across every lane**
 | Command | What it does |
