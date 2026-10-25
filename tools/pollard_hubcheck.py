@@ -29,6 +29,21 @@ def git_blob_sha1(path):
     return h.hexdigest()
 
 
+def file_record(path, git_max=64 << 20):
+    """{size, sha256, git_sha1} of a local file, read ONCE: what `mismatches` checks the Hub against (a recorded
+    entry) and what --free-after-upload records as confirmed. The git blob id -- the hash the Hub gives a small file
+    stored in git, not LFS -- only for files up to `git_max` bytes (the Hub keeps bigger ones in LFS)."""
+    size = os.path.getsize(path)
+    h = hashlib.sha256()
+    g = hashlib.sha1(f"blob {size}\0".encode()) if size <= git_max else None
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+            if g is not None:
+                g.update(chunk)
+    return {"size": size, "sha256": h.hexdigest(), "git_sha1": g.hexdigest() if g is not None else None}
+
+
 def _lfs_sha(f):
     lfs = getattr(f, "lfs", None)
     if not lfs:

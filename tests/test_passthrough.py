@@ -295,6 +295,32 @@ def test_pollard_ladder_plans_passthrough_rungs(tmp_path, monkeypatch, capsys):
     assert "pollard-automap" not in text                                         # no requantize-all flagship
 
 
+def test_passthrough_rungs_are_written_to_the_workspace_not_beside_the_source(tmp_path, monkeypatch):
+    """The Bolt release (2026-10-24): `pollard --gguf <vendor GGUF in downloads/> --ladder --rung PT75` wrote the 38 GB
+    rung next to the source, outside the workspace. A rung goes to $POLLARD_HOME/models/<gguf>/ -- the folder
+    pollard-fit writes every other --gguf build to, whose MANIFEST records it."""
+    import pollard_auto
+    import pollard_workspace as ws
+    src = _gguf_py_quantized(tmp_path)                        # a vendor GGUF outside the workspace
+    imf = tmp_path / "x.imatrix"
+    _write_imatrix(imf, {"blk.0.ffn_up.weight": np.ones(H)})
+    home = tmp_path / "home"
+    monkeypatch.setenv("POLLARD_HOME", str(home))
+    ran = []
+    monkeypatch.setattr(pollard_auto, "_run", lambda cmd, do_run, cwd=None: ran.append([str(x) for x in cmd]) or True)
+    monkeypatch.setattr(sys, "argv", ["pollard", "--gguf", str(src), "--ladder", "--imatrix", str(imf),
+                                      "--rung", "PT75"])
+    pollard_auto.main()
+    fit = [c for c in ran if "--passthrough" in c and c[c.index("--passthrough") + 1] == "on"]
+    assert len(fit) == 1
+    out = fit[0][fit[0].index("--out") + 1]
+    assert out == os.path.join(ws.model_dir(str(src)), "q8-src-PT75.gguf")
+    assert out.startswith(str(home) + os.sep) and os.path.dirname(out) != str(tmp_path)
+    assert not os.path.isdir(ws.model_dir(str(src))), "a plan writes nothing"
+    made = pollard_auto._rung_out(str(src), "PT50", create=True)  # a real build: the folder exists for llama-quantize
+    assert os.path.isdir(os.path.dirname(made)) and made.endswith("q8-src-PT50.gguf")
+
+
 def test_fit_plan_only_on_gguf_py_source(tmp_path, monkeypatch, capsys):
     import pollard_fit
     src = _gguf_py_quantized(tmp_path)
