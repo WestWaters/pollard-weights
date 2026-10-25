@@ -963,6 +963,14 @@ def evaluate_gate(metrics, th, missing="fail"):
             if v is None and tc_nm and key.startswith("toolcall"):
                 row(human, None, f"{op} {want}", tc_policy == "skip", tc_why)
                 continue
+            if (v is None and key == "toolcall_retention_min" and metrics.get("toolcall_ref_status") == "not-measured"
+                    and metrics.get("toolcall_pass") is not None):
+                # no reference to retain against: the rung's own absolute tool-call verdict stands in (what
+                # pollard-toolcall reports), with the reason on the row -- never a silent pass
+                row(human, None, f"{op} {want}", metrics["toolcall_pass"] is True,
+                    f"reference not measured ({metrics.get('toolcall_ref_reason')}): absolute success "
+                    + ("PASS" if metrics["toolcall_pass"] else "FAIL"))
+                continue
             if v is None:
                 row(human, None, f"{op} {want}", missing == "skip", "not measured")
                 continue
@@ -1031,6 +1039,10 @@ def metrics_from_results(results, rung):
         m["toolcall_cross_backend"] = True
     if tc.get("pass") is not None:
         m["toolcall_pass"] = bool(tc["pass"])
+    if tc.get("retention") is None and tc.get("ref_note") and tc.get("status") == "measured":
+        # the RUNG was measured but its reference could not be served here (the bf16 bigger than this machine's
+        # RAM): pollard-toolcall judges such a rung on its absolute success rate, and so does the gate
+        m["toolcall_ref_status"], m["toolcall_ref_reason"] = "not-measured", tc.get("ref_note")
     if tc.get("retention") is not None:
         m["toolcall_retention"] = float(tc["retention"])
     elif tc.get("rate") is not None and tc.get("ref_rate"):          # a --quick run: rate / f16 rate
