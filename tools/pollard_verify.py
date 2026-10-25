@@ -37,6 +37,11 @@ threshold with no number to check FAILS unless the file says `missing: skip` -- 
 a verified one. The verdict is stamped on the build in the MANIFEST and in results.json, so pollard-card
 shows "verified" and pollard release refuses to upload a rung that did not pass.
 
+REPORT-ONLY QUALITY NUMBERS (the default): KLD, top-1, tool-call pass / retention, task retention and EXL3's
+end-to-end agreement (`report_only` in gates.yaml) are measured, checked and carded with their pass / fail label, but
+never block. What blocks is the complete model, the file loading, coherence, runtime (and a decision model's board,
+a drafter's checks). `strict: true` in the gates file or --strict makes the report-only thresholds block too.
+
 DECISION-ONLY models (the graph ends in a decision head, no per-token logits: clef / clef-omni, a d3 readout GGUF)
 have no KLD / PPL: the gguf lane records them "not applicable: decision-only model" instead of running
 llama-perplexity, and gates the rung on its decision board (pollard-decision --ref --results: agreement + option KL,
@@ -751,6 +756,11 @@ DEFAULT_GATES = """\
 # Resolution: `default`, then `lanes.<lane>`, then every `rungs` entry whose `match` patterns hit the
 # rung tag (fnmatch, case-insensitive), in order -- later entries override earlier ones.
 # A threshold with no measured number FAILS the rung (missing: fail); `missing: skip` relaxes that.
+# REPORT-ONLY by default: the quality numbers in `report_only` (KLD, top-1, tool calls, task retention, EXL3's
+# end-to-end agreement) are measured, checked against these thresholds and carded with that pass / fail label, but
+# they never hold a rung back. What blocks: the complete model (pollard-complete), the file loading, coherence,
+# runtime, the decision board of a decision-only model and the drafter checks. `strict: true` here (or
+# pollard-verify --strict) makes the report-only thresholds block as well.
 #   kld_max          mean KLD vs the f16/bf16 source (nats/token)       pollard-verify / pollard-bench
 #   top1_min         top-1 agreement with the source, percent            pollard-verify / pollard-bench
 #   retention_min    task retention vs f16, percent (overall)            pollard-taskeval --results
@@ -770,6 +780,8 @@ DEFAULT_GATES = """\
 #   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
 #   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
 missing: fail
+strict: false
+report_only: [kld_max, top1_min, toolcall_retention_min, toolcall_pass, retention_min, e2e_acc_min]
 default:
   kld_max: 0.5
   top1_min: 75
@@ -948,13 +960,29 @@ def complete_check(model, source, lane):
     return res
 
 
-def evaluate_gate(metrics, th, missing="fail"):
-    """{pass, checks: [{check, value, want, ok, why}]} -- one row per threshold, PASS only if every
-    row passes. A threshold whose number was never measured fails under missing: fail."""
+#: the quality thresholds that are measured and carded but, unless the gates are strict, never hold a rung back
+REPORT_ONLY = ("kld_max", "top1_min", "toolcall_retention_min", "toolcall_pass", "retention_min", "e2e_acc_min")
+
+
+def gate_policy(gates, strict=False):
+    """(report_only keys, strict) for a gates file: `report_only` from the file (the built-in list when it names
+    none), `strict: true` in the file or --strict on the command line makes them block like every other check."""
+    ro = gates.get("report_only")
+    ro = REPORT_ONLY if ro is None else ([ro] if isinstance(ro, str) else list(ro))
+    return tuple(ro), bool(strict or gates.get("strict") is True)
+
+
+def evaluate_gate(metrics, th, missing="fail", report_only=(), strict=False):
+    """{pass, checks: [{check, key, value, want, ok, blocking, why}]} -- one row per threshold. PASS when every
+    BLOCKING row passes: a row whose threshold is in `report_only` keeps its ok / FAIL label (the card shows it) but
+    blocks only when `strict`. A threshold whose number was never measured fails under missing: fail."""
     checks = []
+    cur = [None]
 
     def row(name, value, want, ok, why=""):
-        checks.append({"check": name, "value": value, "want": want, "ok": bool(ok), "why": why})
+        key = cur[0]
+        checks.append({"check": name, "key": key, "value": value, "want": want, "ok": bool(ok),
+                       "blocking": bool(strict or key not in report_only), "why": why})
     # a rung pollard-toolcall explicitly recorded as NOT MEASURED (no server for its lane here, GPU not free, too
     # big) is held to `toolcall_not_measured`: skip by default (owner, 2026-10-16) -- the rung publishes and the card
     # says "tool calls: not measured (<reason>)"; `fail` holds it back. The reason is on the row either way.
@@ -962,6 +990,7 @@ def evaluate_gate(metrics, th, missing="fail"):
     tc_policy = th.get("toolcall_not_measured", "skip")
     tc_why = f"not measured: {metrics.get('toolcall_reason') or 'no reason recorded'}"
     for key, want in th.items():
+        cur[0] = key
         if key in _CHECKS:
             mkey, op, human = _CHECKS[key]
             v = metrics.get(mkey)
@@ -1015,11 +1044,14 @@ def evaluate_gate(metrics, th, missing="fail"):
                     continue
                 row("runtime", v, want, ok, "" if ok else
                     f"a rung published as {want} needs '{v}' -- the card and the runtime would disagree")
+    cur[0] = "complete"
     if metrics.get("complete") is not None:            # never a text-only rung, whatever the thresholds say
         lost = metrics.get("complete_missing") or []
         row("complete model", metrics["complete"], "every component of the source", metrics["complete"] is True,
             "" if metrics["complete"] else "missing: " + "; ".join(lost))
-    return {"pass": all(c["ok"] for c in checks), "checks": checks}
+    below = [c["check"] for c in checks if not c["ok"] and not c["blocking"]]
+    return {"pass": all(c["ok"] for c in checks if c["blocking"]), "checks": checks, "strict": bool(strict),
+            "report_only_failed": below}
 
 
 def metrics_from_results(results, rung):
@@ -1119,9 +1151,11 @@ def print_gate(rung, res):
     for c in res["checks"]:
         v = c["value"]
         v = f"{v:.4g}" if isinstance(v, float) else str(v)
-        print(f"   [{'ok  ' if c['ok'] else 'FAIL'}] {c['check']:<34} {v:>10}  (want {c['want']})"
-              + (f"  {c['why']}" if c["why"] else ""))
-    print(f"   gate: {'PASS' if res['pass'] else 'FAIL'}")
+        lbl = "ok  " if c["ok"] else ("FAIL" if c.get("blocking", True) else "fail")
+        print(f"   [{lbl}] {c['check']:<34} {v:>10}  (want {c['want']})"
+              + (f"  {c['why']}" if c["why"] else "") + ("" if c["ok"] or c.get("blocking", True) else
+                                                         "  -- report-only, does not block (--strict to block)"))
+    print(f"   gate: {'PASS' if res['pass'] else 'FAIL'}" + (" (strict)" if res.get("strict") else ""))
 
 
 def main():
@@ -1143,6 +1177,9 @@ def main():
                     help="gate only on numbers already in --results (no model is run)")
     ap.add_argument("--gate", nargs="?", const="", default=None, metavar="GATES_YAML",
                     help="apply the publish gate (thresholds file; bare --gate = the built-in defaults)")
+    ap.add_argument("--strict", action="store_true",
+                    help="with --gate: the report-only quality thresholds (KLD, top-1, tool calls, retention, EXL3 "
+                         "end-to-end) block the rung too, like `strict: true` in the gates file")
     ap.add_argument("--rung", help="the rung's tag for the gate patterns and --results (default: the file name)")
     ap.add_argument("--results", help="results.json: read what other tools measured, write what this run measured")
     ap.add_argument("--coherence", action="store_true", help="gguf: also run pollard-bench's coherence gate")
@@ -1243,7 +1280,7 @@ def main():
             measured["e2e_acc"] = acc
             ok = acc >= a.e2e_min_acc
             print(f"   next_tok_acc={acc:.4f}  ppl={ppl:.2f}  [{'OK' if ok else 'FAIL'} vs min {a.e2e_min_acc}]")
-            if not ok:
+            if not ok and a.gate is None:              # under --gate, e2e_acc_min decides (report-only unless strict)
                 fails += 1
                 print("   !! assembled forward is broken even if per-tensor checks passed "
                       "(per-tensor correct is necessary, not sufficient).")
@@ -1330,7 +1367,8 @@ def main():
         th = thresholds_for(gates, rung, lane, kinds)
         if dec_only:
             th = decision_only_thresholds(th, gates, rung)
-        gate_res = evaluate_gate(metrics, th, gates.get("missing", "fail"))
+        report_only, strict = gate_policy(gates, a.strict)
+        gate_res = evaluate_gate(metrics, th, gates.get("missing", "fail"), report_only, strict)
         gate_res.update({"rung": rung, "lane": lane, "gates": os.path.basename(a.gate) if a.gate else "built-in",
                          "thresholds": th, "kinds": kinds})
         print_gate(rung, gate_res)
@@ -1341,7 +1379,9 @@ def main():
             try:
                 ws.merge_results(a.results, rung, {"verified": {"pass": gate_res["pass"], "gates": gate_res["gates"],
                                                                 "failed": [c["check"] for c in gate_res["checks"]
-                                                                           if not c["ok"]]}})
+                                                                           if not c["ok"] and c["blocking"]],
+                                                                "report_only_failed": gate_res["report_only_failed"],
+                                                                "strict": strict}})
             except OSError as e:
                 print(f"HELD: {e}", flush=True)
                 sys.exit(EXIT_HELD)

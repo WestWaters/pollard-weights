@@ -28,9 +28,11 @@ at the root -- so `llama-server -hf <repo>:<TAG>` works as it always has -- and 
 a subfolder per rung: MLX/<rung>/, GPTQ/<rung>/, MX/<rung>/, EXL3/<bpw>/, EXLR8/<bpw>/, and the drafter in DRAFT/ (its
 GGUF rungs + its HF folder). ONE card covers every lane: the rung table per lane with the measured numbers and
 Tool-ready, and per lane the exact `hf download --include "<LANE>/<rung>/*"` + serve command. Every lane's card step
-regenerates it as that lane lands. The repo is created PRIVATE and the last step makes it public only once every
-lane that ships this run is uploaded and the file list (README, every rung in its folder, the mmproj) checks out.
-Repos published before this (<M>-Pollard-MLX and friends) are left as they are.
+regenerates it as that lane lands. The repo is created PUBLIC (`private: true` in the plan keeps it private). The
+card goes up FIRST: as soon as a rung is measured and has passed, the card is rebuilt from the rungs built and passed
+so far and uploaded, and the rung's files follow it. The last step checks the file list (README, every rung in its
+folder, the mmproj) of every lane that shipped this run. Repos published before this (<M>-Pollard-MLX and friends)
+are left as they are.
 
 How it runs -- and why:
   * pollard-smoke preflight FIRST, before anything is spent; then the engine preflight (prep/engines,
@@ -45,7 +47,11 @@ How it runs -- and why:
     already shows built AND verified is never rebuilt -- so the Mac can do MLX and the box the CUDA lanes,
     each re-running the same plan.
   * every rung goes through `pollard-verify --gate` (gates.yaml); a rung that fails is not carded and not
-    uploaded. The cards are pollard-card per lane, --verified-only, from the numbers this run measured.
+    uploaded. The quality numbers (KLD, top-1, tool calls, retention, EXL3 end-to-end) are REPORT-ONLY by default:
+    measured and carded with their pass / fail label, never blocking. What blocks: the complete model, the file
+    loading, coherence, runtime. `strict_gates: true` in the plan (pollard-verify --strict) or `strict: true` in the
+    gates file makes the quality thresholds block too. The cards are pollard-card, --verified-only, from the numbers
+    this run measured.
   * nothing is uploaded unless the plan says `upload: true` AND the command line says --upload.
   * --free-after-upload (with --upload): for a box whose free disk is smaller than a lane's whole ladder. Each rung
     is built -> measured -> gated -> uploaded on its own, and its LOCAL file is deleted only once the Hub holds that
@@ -86,13 +92,17 @@ preset: text                   # text | vlm | decision | d3 | moe -- fills anyth
                                # decision model -- decision_config.json d3-code-readout-v1 -- picks d3 itself)
 ngl: 0                         # GPU layers for llama.cpp steps. 0 = CPU (shared GPU boxes); auto = what fits
 upload: false                  # publishing needs this AND --upload on the command line
+private: false                 # false = the repo is created PUBLIC and the card goes up with the first rung;
+                               # true = create (and keep) it private -- flip it yourself
 gates: null                    # gates.yaml for pollard-verify --gate (null = the built-in defaults)
+strict_gates: false            # true = pollard-verify --strict: KLD / top-1 / tool calls / retention BLOCK a rung
+                               # (default: measured + carded with their pass / fail label, never blocking)
 trust_remote_code: false       # true = consent to run the checkpoint's own .py files (only used where no native class fits)
 hf_weights: null               # the checkpoint the HF lanes read (dir or repo id) when the --hf folder holds no weights
 max_ram_gb: null               # cap the streamed HF lanes' RAM (null = 85% of what is free)
 remote_source: null            # ssh://user@host/<dir>?python=..&key=..: the MLX lane reads the source through a sparse
                                # local mirror at --hf (tensors fetched as read, cached within the free disk)
-reclaim_mirror: true           # once the repo is public, remove its $POLLARD_HOME/mirror/<model> source mirror if
+reclaim_mirror: true           # once the release is checked, remove its $POLLARD_HOME/mirror/<model> source mirror if
                                # every build from it is confirmed on the Hub (size + sha256); false = keep it
 calib:
   profile: auto                # pollard-calib --profile (auto = from pollard-modelkind)
@@ -301,7 +311,8 @@ def _ctx(cfg, src):
         "gguf_dir": gdir, "f16": os.path.join(gdir, f"{base}-f16.gguf"),
         "exlr8_store": os.path.join(mdir, "exlr8-store"),
         "state": os.path.join(mdir, "release-state.json"), "release_dir": os.path.join(mdir, "release"),
-        "ngl": str(cfg.get("ngl", 0)), "gates": cfg.get("gates"),
+        "ngl": str(cfg.get("ngl", 0)), "gates": cfg.get("gates"), "strict_gates": cfg.get("strict_gates") is True,
+        "upload_plan": cfg.get("upload") is True and not cfg.get("_rungs_only"),
         "imatrix": cfg.get("imatrix"), "free": bool(cfg.get("_free_after_upload")),
         "org": cfg.get("org", "PollardWeights"), "hf_repo": hf_repo,
         "trc": "on" if cfg.get("trust_remote_code") is True or str(cfg.get("trust_remote_code")).lower() in
@@ -363,7 +374,7 @@ def lane_key(c, lane):
 
 
 def _verify_gate(c):
-    return ["--gate"] + ([c["gates"]] if c["gates"] else [])
+    return ["--gate"] + ([c["gates"]] if c["gates"] else []) + (["--strict"] if c.get("strict_gates") else [])
 
 
 PROBE_ROUTES = ("auto", "hf", "imatrix")
@@ -651,8 +662,7 @@ def gguf_rung_steps(cfg, c, builds):
                               ok_codes=(0, 1)))                        # a FAIL is a number for the gate, not a crash
         if c.get("d3"):                                    # the readout board vs bf16 IS this rung's gate
             steps.append(d3_gate_step(cfg, c, "gguf", tag, path, res))
-            if c.get("free"):
-                steps.append(_publish_rung_step(c, "gguf", tag, path))
+            steps += _after_gate(c, "gguf", tag, path)
             continue
         if m.get("decision") or c.get("decision_only"):     # decision-only: the board IS the fidelity number
             steps.append(Step(id=f"{rid}/decision", lane="gguf", rung=tag, kind="measure", requires="any",
@@ -663,8 +673,7 @@ def gguf_rung_steps(cfg, c, builds):
         steps.append(Step(id=f"{rid}/verify", lane="gguf", rung=tag, kind="verify", requires="any", out=path,
                           cmd=["pollard-verify", "--lane", "gguf", "--model", path, "--ref", c["f16"],
                                "--eval", c["heldout"], "--ngl", c["ngl"], "--coherence"] + _verify_gate(c) + common))
-        if c.get("free"):
-            steps.append(_publish_rung_step(c, "gguf", tag, path))
+        steps += _after_gate(c, "gguf", tag, path)
     return steps
 
 
@@ -760,6 +769,23 @@ def card_upload(step, c, run_upload, out=print):
     from huggingface_hub import HfApi
     HfApi().upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=step.repo)
     return "done"
+
+
+def _rung_card_step(c, lane, tag, path):
+    """Without --free-after-upload the rungs upload with their lane, but the card does not wait for that: right after
+    this rung is measured and passed, the card is rebuilt from the rungs passed so far and uploaded."""
+    repo = repo_name(c["org"], c["src"])
+    return Step(id=f"{lane}/{tag}/card", lane=lane, rung=tag, kind="upload", requires="any", fn="rung_card",
+                out=path, repo=repo, desc=f"card with this rung's numbers -> https://huggingface.co/{repo} (the rung "
+                                          "follows with its lane's upload)")
+
+
+def _after_gate(c, lane, tag, path):
+    """What follows a rung's gate: --free-after-upload = publish it (card first, then the rung); else, when the plan
+    uploads, the card refresh."""
+    if c.get("free"):
+        return [_publish_rung_step(c, lane, tag, path)]
+    return [_rung_card_step(c, lane, tag, path)] if c.get("upload_plan") else []
 
 
 def _publish_rung_step(c, lane, tag, path):
@@ -1010,6 +1036,8 @@ def lane_steps(cfg, c, lane):
                 st = _publish_rung_step(c, lane, tag, out)
                 st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
                 steps.append(st)
+            else:
+                steps += _after_gate(c, lane, tag, out)
             continue
         if tool:
             steps.append(Step(id=f"{rid}/toolcall", lane=lane, rung=tag, kind="measure", requires=REQUIRES[lane],
@@ -1033,6 +1061,8 @@ def lane_steps(cfg, c, lane):
             st = _publish_rung_step(c, lane, tag, out)
             st["default"] = lc.get("default") is not None and rung_tag(lane, lc["default"]) == tag
             steps.append(st)
+        else:
+            steps += _after_gate(c, lane, tag, out)
     return steps
 
 
@@ -1184,7 +1214,7 @@ def public_step(cfg, c, lanes):
     repo = repo_name(cfg.get("org", "PollardWeights"), c["src"])
     return Step(id="release/public", lane="release", kind="finalize", requires="any", fn="go_public", repo=repo,
                 lanes=list(lanes), desc=f"every lane that ships this run is on {repo} and its file list checks out "
-                                        "-> make the repo public (it is created private)")
+                                        "(the repo is public from its first upload unless the plan says private)")
 
 
 def plan_steps(cfg, src, only=None):
@@ -1427,10 +1457,68 @@ def _lane_builds(c, lane, repo):
             and (os.path.exists(b.get("path", "")) or b.get("uploaded") == repo)]
 
 
+def repo_private(cfg):
+    """The plan's `private:` -- False (the default) = the repo is public from its first upload."""
+    return cfg.get("private") is True
+
+
+def open_repo(api, repo, cfg, out=print):
+    """Create the ONE repo the way the plan says: PUBLIC by default, private only with `private: true`. A repo an
+    older Pollard created private (it flipped repos public only at the very end) is made public here, at its first
+    upload of this run, unless the plan asks for private."""
+    private = repo_private(cfg)
+    api.create_repo(repo, repo_type="model", exist_ok=True, private=private)
+    if private:
+        return True
+    try:
+        api.update_repo_settings(repo_id=repo, private=False)
+    except AttributeError:                                       # older huggingface_hub
+        try:
+            api.update_repo_visibility(repo, private=False)
+        except Exception as e:                                   # noqa: BLE001
+            out(f"      ({repo}: could not confirm it is public: {e})")
+    except Exception as e:                                       # noqa: BLE001
+        out(f"      ({repo}: could not confirm it is public: {e})")
+    return False
+
+
+def release_card_cmd(cfg, c):
+    """The ONE card over every lane the plan enables (what each lane's card step writes)."""
+    return card_cmd(cfg, c, [l for l in LANES if ((cfg.get("lanes") or {}).get(l) or {}).get("enabled")])
+
+
+def push_card(api, repo, c, cfg, out=print):
+    """The card goes up FIRST: rebuilt from the rungs built and passed so far (pollard-card --verified-only, the
+    numbers measured so far) and uploaded as README.md -- before the rung that triggered it."""
+    run_cmd(release_card_cmd(cfg, c))
+    card = os.path.join(c["release_dir"], "README.md")
+    if not os.path.exists(card):
+        raise RuntimeError(f"pollard-card wrote no card at {card}")
+    api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo)
+    out(f"      card: README.md -> https://huggingface.co/{repo} (the rungs measured and passed so far)")
+
+
+def rung_card(step, c, cfg, run_upload, out=print):
+    """A rung just measured and passed: its card goes up now, ahead of the lane's upload of the rung itself."""
+    if not run_upload:
+        out("      (not uploading the card: uploads are off)")
+        return "held"
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    try:
+        api = hf_api(cfg)
+        open_repo(api, step.repo, cfg, out)
+        push_card(api, step.repo, c, cfg, out)
+    except Exception as e:                                       # noqa: BLE001
+        # never holds the rung back: the lane's own card + upload step puts the card up before the rungs anyway
+        out(f"      card not uploaded yet ({type(e).__name__}: {e}) -- the lane's upload puts it up before the rungs")
+        return "card not uploaded"
+    return "done"
+
+
 def upload(step, c, cfg, run_upload):
-    """Publish the verified rungs of one lane + the (combined) card into the ONE repo: GGUF files at the root, a
-    directory lane as <LANE>/<rung>/, the drafter in DRAFT/. Refuses a lane with no verified rung, and checks the repo
-    afterwards: a lane whose files are not all there -- or a repo without its README -- is not published."""
+    """Publish the verified rungs of one lane + the (combined) card into the ONE repo: the card FIRST, then the GGUF
+    files at the root, a directory lane as <LANE>/<rung>/, the drafter in DRAFT/. Refuses a lane with no verified rung,
+    and checks the repo afterwards: a lane whose files are not all there -- or a repo without its README -- raises."""
     from pollard_card import rung_subfolder
     lane, repo = step.lane, step.repo
     builds = _lane_builds(c, lane, repo)
@@ -1445,7 +1533,8 @@ def upload(step, c, cfg, run_upload):
         return "held"
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")          # Xet write tokens expire mid-transfer
     api = hf_api(cfg)
-    api.create_repo(repo, repo_type="model", exist_ok=True, private=True)   # public only once complete
+    open_repo(api, repo, cfg)
+    api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo)   # the card first, then the rungs
     F = lane_folder(lane)
     if lane == "draft":
         for b in builds:
@@ -1473,7 +1562,6 @@ def upload(step, c, cfg, run_upload):
         for b in builds:
             if b.get("uploaded") != repo:
                 api.upload_folder(folder_path=b["path"], path_in_repo=f"{F}/{rung_subfolder(b, lane)}", repo_id=repo)
-    api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo)
     missing = (lane_expect(c, lane, builds, repo) | {"README.md"}) - set(api.list_repo_files(repo))
     if missing:
         raise RuntimeError(f"{repo} is missing {sorted(missing)} after upload -- not live")
@@ -1482,17 +1570,17 @@ def upload(step, c, cfg, run_upload):
 
 
 def go_public(step, c, cfg, run_upload, statuses, out=print):
-    """The last step: the repo was created private and stays private until EVERY lane that ships this run is
-    uploaded and the whole file list (README, each lane's rungs in its folder, the mmproj) is on the Hub. A lane
-    whose upload failed keeps it private; a lane that built nothing (held / failed / not this machine) ships
-    nothing and does not block."""
+    """The last step: the repo has been public since its first upload (open_repo; `private: true` keeps it private),
+    so there is nothing to flip -- this checks that EVERY lane that shipped this run is on the Hub with its whole file
+    list (README, each lane's rungs in its folder, the mmproj), then reclaims the source mirror. A lane whose upload
+    failed fails it; a lane that built nothing (held / failed / not this machine) ships nothing and does not count."""
     if not run_upload:
         out("      (not publishing: uploads are off)")
         return "held"
     ups = {l: statuses.get(f"{l}/upload") for l in (step.lanes or [])}
     bad = sorted(l for l, v in ups.items() if v == "failed")
     if bad:
-        raise RuntimeError(f"{step.repo} stays private: the {', '.join(bad)} upload failed")
+        raise RuntimeError(f"{step.repo}: the {', '.join(bad)} upload failed")
     shipped = [l for l, v in ups.items() if v == "done"]
     if not shipped:
         out(f"      (nothing shipped this run -- {step.repo} stays as it is)")
@@ -1502,7 +1590,7 @@ def go_public(step, c, cfg, run_upload, statuses, out=print):
                 if b.get("lane") == l and b.get("streamed_unverified") and b.get("verified") is not True
                 for p in b["streamed_unverified"][:1]]
     if stranded:
-        raise RuntimeError(f"{step.repo} stays private: it holds streamed shards of a rung that did not pass its gate "
+        raise RuntimeError(f"{step.repo} holds streamed shards of a rung that did not pass its gate "
                            f"({', '.join(sorted({os.path.dirname(p) for p in stranded}))}) -- verify it or remove that "
                            "folder, then re-run")
     api = hf_api(cfg)
@@ -1512,12 +1600,9 @@ def go_public(step, c, cfg, run_upload, statuses, out=print):
     files = set(api.list_repo_files(step.repo))
     missing = want - files
     if missing:
-        raise RuntimeError(f"{step.repo} stays private: missing {sorted(missing)}")
-    try:
-        api.update_repo_settings(repo_id=step.repo, private=False)
-    except AttributeError:                                       # older huggingface_hub
-        api.update_repo_visibility(step.repo, private=False)
-    out(f"      PUBLIC: https://huggingface.co/{step.repo}  ({', '.join(shipped)}; {len(files)} files checked)")
+        raise RuntimeError(f"{step.repo} is missing {sorted(missing)}")
+    vis = "PRIVATE (private: true in the plan)" if repo_private(cfg) else "PUBLIC"
+    out(f"      {vis}: https://huggingface.co/{step.repo}  ({', '.join(shipped)}; {len(files)} files checked)")
     reclaim_after_public(c, cfg, step.repo, api, out)
     return "done"
 
@@ -1744,14 +1829,17 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         _keep(key, b, "not verified (measure / verify / gate failed or did not run) -- not published"
               + (f"; its {len(streamed)} streamed shard(s) stay on "
                  + ("their staging branch (not main) until the rung is verified" if staged else
-                    "the PRIVATE repo, which will not go public until they are verified or removed")
+                    "the repo's MAIN branch (streamed there by an older Pollard) until they are verified or "
+                    "removed -- the release's last step fails on them")
                  if streamed else ""), out)
         return "kept: not verified"
     if not run_upload:
         raise RuntimeError("--free-after-upload needs uploading on (`upload: true` + --upload)")
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     api = hf_api(cfg)
-    api.create_repo(repo, repo_type="model", exist_ok=True, private=True)   # public only once complete
+    open_repo(api, repo, cfg, out)
+    if not b.get("uploaded"):
+        push_card(api, repo, c, cfg, out)        # the card with this rung's numbers goes up first, the rung after it
     if lane == "gguf":
         name = b.get("name") or os.path.basename(b["path"])
         try:                                     # pollard-ggufcheck before it leaves: the card states the runtime
@@ -1821,7 +1909,7 @@ def publish_rung(step, c, cfg, run_upload, out=print):
 def discard_streamed(path, out=print):
     """A streamed rung that will never ship (its build or its gate failed): every staging branch its shards sit on is
     deleted and the registry with it -- main never held them. Shards streamed onto main by an older Pollard (no
-    branch) are left alone: they keep the repo private (go_public) until someone removes them."""
+    branch) are left alone: the release's last step (go_public) fails on them until someone removes them."""
     import pollard_stream as PS
     streamed = PS.read_streamed(path) if os.path.isdir(str(path)) else {}
     revs = PS.staged_revisions(streamed)
@@ -2480,7 +2568,7 @@ def is_heavy(st):
         return False
     if st.id in LIGHT_PREP or st.fn == "fetch":
         return False
-    return st.fn not in ("upload", "publish_rung", "card_upload", "go_public")
+    return st.fn not in ("upload", "publish_rung", "card_upload", "rung_card", "go_public")
 
 
 class _ExecutionState:
@@ -2602,7 +2690,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 # lane went out), and an unverified shard must not be on the branch people download
                 rev = PS.staging_branch(sub)
                 stream_env = dict(os.environ, **{PS.SHARD_UPLOAD_ENV: json.dumps(
-                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub, "revision": rev})})
+                    {"out": os.path.abspath(st.out), "repo": repo, "path_in_repo": sub, "revision": rev,
+                     "private": repo_private(cfg)})})
                 streamed.add((st.lane, st.rung))
                 out(f"{head}: ~{need:.1f} GB > {free:.1f} GB free -- STREAMING: each shard written -> uploaded to "
                     f"{repo}@{rev}/{sub}/ -> confirmed -> freed before the next (main gets it only once verified)")
@@ -2688,6 +2777,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                     res = taskeval_rung(st, c, run_upload, out)
                 elif st.fn == "card_upload":
                     res = card_upload(st, c, run_upload, out)
+                elif st.fn == "rung_card":
+                    res = rung_card(st, c, cfg, run_upload, out)
                 elif st.kind == "measure" and (st.lane, st.rung) in streamed and "pollard-toolcall" in str(st.cmd[0]):
                     res = _toolcall_not_measured(st, "the rung was streamed to the Hub shard by shard while it was built "
                                                      "(bigger than the free disk); the tool-call probe needs it on disk")

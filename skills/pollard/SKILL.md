@@ -374,17 +374,21 @@ line. No drafter published: `pollard-draft train` prints the speculators (Apache
   and still publishes (`toolcall_not_measured: skip`).
 - **Smallest first.** Build and upload the GGUF ladder smallest rung first — flagship, IQ2, IQ3_S, IQ4_XS, Q6_K —
   one rung at a time (`pollard --rung <TAG>`, or `--free-after-upload`), then the other lanes.
-- **Public as soon as the first rung lands.** `pollard release` creates the repo private and flips it in its last
-  step (`release/public`, once every lane is up). The owner's rule is earlier: once the first rung is uploaded and
-  the card (README.md) is on the Hub, make it public
-  (`HfApi().update_repo_settings("<Org>/<M>-Pollard", private=False)`); later rungs and lanes land in the public
-  repo with the card regenerated each time.
+- **Public from the start, card first.** `pollard release` creates the repo PUBLIC (a repo an older Pollard left
+  private is made public at its first upload). As soon as a rung is measured and has passed, the card is rebuilt
+  from the rungs built and passed so far and uploaded as README.md, and the rung's files follow it
+  (`--free-after-upload`: inside the rung's publish step; otherwise a `<lane>/<rung>/card` step right after its
+  gate, the rungs following with the lane's upload). The last step (`release/public`) only checks each shipped
+  lane's file list -- nothing to flip. `private: true` in the plan creates the repo private and keeps it private.
 - **Cards carry real measured numbers.** `pollard-card --verified-only` per rung: KLD, top-1, PPL, tool calls, size,
   runtime. Nothing estimated; a number this machine cannot measure is written as "not measured (reason)".
-- **Quality numbers are reported, never block.** KLD / top-1 / PPL go on the card. The built-in `recipes/gates.yaml`
-  thresholds would hold a rung back, so give the release a per-model gates file (`gates:` in the plan) that keeps
-  only the real blockers: complete model, loads in its runtime (`runtime:` from ggufcheck), coherence, tool-call
-  retention for agent models. Drop `kld_max` / `top1_min`. Ship the normal ladder; don't replace rungs.
+- **Quality numbers are reported, never block.** This is the default: `recipes/gates.yaml` lists KLD (`kld_max`),
+  top-1 (`top1_min`), tool calls (`toolcall_retention_min`, `toolcall_pass`), task retention (`retention_min`) and
+  EXL3's `e2e_acc_min` under `report_only` -- measured, checked against the band and carded with that label
+  ("yes (below band: mean KLD)"), never holding a rung back. What blocks: the complete model (pollard-complete),
+  the file loading in its runtime (`runtime:` from ggufcheck), coherence. `strict: true` in a gates file,
+  `strict_gates: true` in the plan or `pollard-verify --strict` makes the thresholds block. Ship the normal ladder;
+  don't replace rungs.
 - **Quality-target rungs are an option, not a replacement.** `pollard --gguf <f16> --ladder --rung Q90 --run` (or
   `lanes.gguf.quality: [Q90, Q85]`) builds the smallest measured-allocation rung whose KLD / top-1 meet the class
   (Q90: KLD <= 0.08 and top-1 >= 90%; Q85: KLD <= 0.2 and top-1 >= 85%), named `<M>-Pollard-Q90-<size>GB.gguf`. Add
@@ -402,7 +406,10 @@ min (pollard-taskeval), translation retention, tool-call pass (pollard-toolcall)
 (stock vs ik_llama from the tensor types -- an `IQ4_XS` whose attn_v got IQ4_K is ik-only and FAILS a `runtime:
 stock` gate) and coherence. An unmeasured threshold FAILS. Every lane is measured on the same scale (mean KLD + top-1
 vs the source): gguf via llama-perplexity, mlx via mlx_lm, gptq/mx via transformers; exl3 is gated on its assembled
-forward. `pollard-verify --print-gates` = the defaults (`recipes/gates.yaml`). Non-zero exit = do not publish.
+forward. The quality thresholds in `report_only` (KLD, top-1, tool calls, retention, EXL3 e2e) are measured and
+labelled pass / fail on the card but block only under `--strict` / `strict: true`; complete model, runtime and
+coherence always block. `pollard-verify --print-gates` = the defaults (`recipes/gates.yaml`). Non-zero exit = do
+not publish.
 
 ### MLX range search (`pollard-mlx --range search|minmax`)
 Default `search`: each group-of-64's scale/bias is chosen by GPQ's shrink-grid search + weighted LS refit,

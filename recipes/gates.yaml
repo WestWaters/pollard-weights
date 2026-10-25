@@ -2,6 +2,11 @@
 # Resolution: `default`, then `lanes.<lane>`, then every `rungs` entry whose `match` patterns hit the
 # rung tag (fnmatch, case-insensitive), in order -- later entries override earlier ones.
 # A threshold with no measured number FAILS the rung (missing: fail); `missing: skip` relaxes that.
+# REPORT-ONLY by default: the quality numbers in `report_only` (KLD, top-1, tool calls, task retention, EXL3's
+# end-to-end agreement) are measured, checked against these thresholds and carded with that pass / fail label, but
+# they never hold a rung back. What blocks: the complete model (pollard-complete), the file loading, coherence,
+# runtime, the decision board of a decision-only model and the drafter checks. `strict: true` here (or
+# pollard-verify --strict) makes the report-only thresholds block as well.
 #   kld_max          mean KLD vs the f16/bf16 source (nats/token)       pollard-verify / pollard-bench
 #   top1_min         top-1 agreement with the source, percent            pollard-verify / pollard-bench
 #   retention_min    task retention vs f16, percent (overall)            pollard-taskeval --results
@@ -21,6 +26,8 @@
 #   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
 #   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
 missing: fail
+strict: false
+report_only: [kld_max, top1_min, toolcall_retention_min, toolcall_pass, retention_min, e2e_acc_min]
 default:
   kld_max: 0.5
   top1_min: 75

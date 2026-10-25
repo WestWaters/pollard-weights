@@ -1,6 +1,7 @@
 """A rung bigger than the free disk (Bolt int8 GPTQ / FP8, ~75 GB) is not "held: disk": its safetensors shards are
 written ONE at a time, each uploaded -> confirmed on the Hub (size + sha256) -> freed before the next; the index goes
-up last; the repo stays private until the whole rung and lane check out; a shard whose upload fails or does not land
+up last; the repo is public from the start (`private: true` keeps it private) and an unverified shard
+never reaches main; a shard whose upload fails or does not land
 intact is KEPT and the build stops. The rung can still be read (verify) -- its tensors come back by range request.
 Fakes only: no Hub, no model."""
 from __future__ import annotations
@@ -164,7 +165,7 @@ def test_each_shard_is_uploaded_confirmed_and_freed_before_the_next(tmp_path, hu
     idx = json.load(open(out / "model.safetensors.index.json"))
     assert set(idx["weight_map"].values()) == set(reg), "the index maps the final, already-uploaded names"
     assert not any(p.endswith("index.json") for p in hub.log), "the index is NOT uploaded by the writer"
-    assert hub.private["O/M-Pollard"] is True
+    assert hub.private["O/M-Pollard"] is False, "public from the start (no `private` in the spec)"
     # the rung is still readable: tensors come back from the Hub by range
     src = PS.Source(str(out))
     for k, a in arrs.items():
@@ -272,7 +273,7 @@ def test_a_rung_bigger_than_the_disk_streams_instead_of_holding(model, inputs, h
     assert not os.path.exists(out), "the rest of the rung freed once everything is confirmed"
 
 
-def test_a_streamed_rung_that_fails_its_gate_keeps_the_repo_private(model, inputs, hub, monkeypatch):
+def test_a_streamed_rung_on_main_that_fails_its_gate_fails_the_last_step(model, inputs, hub, monkeypatch):
     cfg = _gptq_plan(inputs)
     c = R._ctx(dict(cfg, _free_after_upload=True), model)
     out = os.path.join(ws.model_dir(c["smooth_dir"], create=True), "Tiny-1B-Pollard-GPTQ-int8")
@@ -284,11 +285,11 @@ def test_a_streamed_rung_that_fails_its_gate_keeps_the_repo_private(model, input
     st = R._publish_rung_step(c, "gptq", "int8", out)
     assert R.publish_rung(st, c, cfg, True, out=lambda *_: None) == "kept: not verified"
     b = ws.find_build(out)[1]
-    assert b["streamed_unverified"] and "PRIVATE" in b["kept"]
+    assert b["streamed_unverified"] and "MAIN branch" in b["kept"]
     assert os.path.isdir(out), "nothing deleted -- not the local files, not the shards on the Hub"
     assert any(k[1].startswith("GPTQ/int8/model-") for k in hub.blobs)
     pub = R.public_step(cfg, c, ["gptq"])
-    with pytest.raises(RuntimeError, match="stays private"):
+    with pytest.raises(RuntimeError, match="did not pass its gate"):
         R.go_public(pub, c, cfg, True, {"gptq/upload": "done"}, out=lambda *_: None)
 
 

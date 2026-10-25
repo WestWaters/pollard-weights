@@ -176,3 +176,76 @@ def test_tool_calls_not_measured_publish_by_default_and_fail_stays_available():
     shipped = (Path(V.__file__).resolve().parents[1] / "recipes" / "gates.yaml")
     if shipped.exists():
         assert V.load_gates(str(shipped))["default"]["toolcall_not_measured"] == "skip"
+
+
+# ------------------------------------------------- quality numbers are report-only by default (owner, 2026-10-25)
+
+def _gate_cli(monkeypatch, *args):
+    monkeypatch.setattr(sys, "argv", ["pollard-verify", *args])
+    try:
+        V.main()
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def test_a_rung_over_the_kld_band_publishes_by_default_and_blocks_under_strict(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))
+    key, q4 = _manifest_build(tmp_path, "IQ4_XS")
+    res = tmp_path / "results.json"
+    # IQ4_XS's band: KLD <= 0.08, top-1 >= 90 -- this rung misses both, tool calls too; it loads, is coherent, stock
+    ws.merge_results(str(res), "IQ4_XS", {"kld": 0.31, "top1": 81.0, "coherence": "PASS",
+                                          "toolcall": {"status": "measured", "pass": False, "retention": 40.0}})
+    monkeypatch.setattr(V, "gguf_runtime", lambda p: "stock")
+    common = ["--model", q4, "--rung", "IQ4_XS", "--results", str(res), "--no-measure"]
+    assert _gate_cli(monkeypatch, *common, "--gate") == 0, "report-only: measured, carded, not blocking"
+    b = ws.read_manifest(key)["builds"][0]
+    assert b["verified"] is True and b["gate"]["strict"] is False
+    v = json.load(open(res))["IQ4_XS"]["verified"]
+    assert v["pass"] is True and v["failed"] == []
+    assert {"mean KLD", "top-1 agreement %", "tool-call retention %"} <= set(v["report_only_failed"])
+    assert "report-only, does not block" in capsys.readouterr().out
+    cell = C.verified_cell(dict(b, name="M-Pollard-IQ4_XS.gguf"), {})
+    assert cell.startswith(" yes (below band:") and "mean KLD" in cell, "the card keeps the pass / fail label"
+
+    assert _gate_cli(monkeypatch, *common, "--gate", "--strict") == 1, "--strict: the thresholds block"
+    b = ws.read_manifest(key)["builds"][0]
+    assert b["verified"] is False
+    assert "mean KLD" in json.load(open(res))["IQ4_XS"]["verified"]["failed"]
+
+    strict = tmp_path / "strict-gates.yaml"
+    strict.write_text(V.DEFAULT_GATES.replace("\nstrict: false\n", "\nstrict: true\n"))
+    assert _gate_cli(monkeypatch, *common, "--gate", str(strict)) == 1, "strict: true in the gates file blocks too"
+    assert ws.read_manifest(key)["builds"][0]["verified"] is False
+
+
+def test_what_still_blocks_by_default_complete_coherence_runtime(tmp_path, monkeypatch):
+    g = V.load_gates(None)
+    ro, strict = V.gate_policy(g)
+    assert strict is False and set(ro) == {"kld_max", "top1_min", "toolcall_retention_min", "toolcall_pass",
+                                           "retention_min", "e2e_acc_min"}
+    th = V.thresholds_for(g, "IQ4_XS", "gguf")
+    good = {"kld": 0.5, "top1": 70.0, "coherence": "PASS", "runtime": "stock"}
+    assert V.evaluate_gate(good, th, report_only=ro)["pass"]
+    assert not V.evaluate_gate(dict(good, complete=False, complete_missing=["mmproj"]), th, report_only=ro)["pass"], \
+        "an incomplete model still blocks"
+    assert not V.evaluate_gate(dict(good, coherence="FAIL"), th, report_only=ro)["pass"]
+    assert not V.evaluate_gate(dict(good, runtime="ik_llama"), th, report_only=ro)["pass"]
+    assert not V.evaluate_gate(good, th, report_only=ro, strict=True)["pass"]
+    exl3 = V.thresholds_for(g, "EXL3-4.0bpw", "exl3")
+    assert V.evaluate_gate({"e2e_acc": 0.1, "kld": 0.9, "top1": 50.0}, exl3, report_only=ro)["pass"], \
+        "EXL3's end-to-end agreement is report-only too"
+
+
+def test_an_incomplete_model_still_blocks_at_the_cli(tmp_path, monkeypatch):
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))
+    src, out = tmp_path / "M", tmp_path / "M-Pollard-MLX-4bit"
+    src.mkdir(); out.mkdir()
+    res = tmp_path / "results.json"
+    ws.merge_results(str(res), "MLX-4bit", {"kld": 0.01, "top1": 99.0})
+    monkeypatch.setattr(V, "complete_check", lambda m, s, lane: {"ok": False, "missing": ["vision tower"]})
+    code = _gate_cli(monkeypatch, "--lane", "mlx", "--model", str(out), "--source", str(src), "--rung", "MLX-4bit",
+                     "--results", str(res), "--no-measure", "--gate")
+    assert code == 1
+    v = json.load(open(res))["MLX-4bit"]["verified"]
+    assert v["pass"] is False and v["failed"] == ["complete model"]

@@ -445,8 +445,8 @@ class _Local:
 
 
 def hf_headers(url, extra=None):
-    """Request headers for a Hub URL: the user's token when one is set, so a PRIVATE repo (pollard release keeps a
-    repo private until every lane has landed) can still be read. Never sent anywhere but huggingface.co."""
+    """Request headers for a Hub URL: the user's token when one is set, so a PRIVATE repo (a release plan with
+    `private: true`, or one an older Pollard kept private until every lane landed) can still be read. Never sent anywhere but huggingface.co."""
     h = {"User-Agent": "pollard-ggufcheck", **(extra or {})}
     if str(url).startswith("https://huggingface.co/"):
         tok = os.environ.get("HF_TOKEN")
