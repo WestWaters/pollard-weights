@@ -120,11 +120,11 @@ def test_free_mode_builds_the_ladder_one_rung_at_a_time(model, inputs):
     c, _, steps = R.plan_steps(plan(inputs), model, {"gguf"})
     got = [s.id for s in steps]
     builds = [s for s in steps if s.id.startswith("gguf/ladder-")]
-    assert [s.rung for s in builds] == ["Q6_K", "IQ4_XS", "IQ3_S", "IQ2", "flagship"]
+    assert [s.rung for s in builds] == ["flagship", "IQ2", "IQ3_S", "IQ4_XS", "Q6_K"]   # smallest first
     for s in builds:
         assert s.cmd[s.cmd.index("--rung") + 1] == s.rung and s.disk_gb > 0
         assert got[got.index(s.id) + 1] == f"gguf/rungs-{s.rung}", "each rung is gated + published before the next"
-    assert got.index("gguf/ladder-flagship") < got.index("gguf/card") < got.index("gguf/upload")
+    assert got.index("gguf/ladder-Q6_K") < got.index("gguf/card") < got.index("gguf/upload")
     assert "--runtime-from-repo" in next(s for s in steps if s.id == "gguf/card").cmd
 
 

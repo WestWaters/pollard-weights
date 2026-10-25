@@ -126,3 +126,15 @@ def test_one_candidate_on_disk_at_a_time_and_the_winner_is_rebuilt():
 def test_quality_build_checks_disk_and_a_complete_gguf():
     src = (Path(__file__).parents[1] / "tools" / "pollard_auto.py").read_text()
     assert "a full disk truncates the GGUF without an error" in src and "GGUFReader(out)" in src
+
+
+def test_release_ladder_builds_smallest_first_or_in_the_plans_order(tmp_path, monkeypatch):
+    import pollard_release as R
+    f16 = tmp_path / "m-f16.gguf"
+    f16.write_bytes(b"\0" * 1000)
+    monkeypatch.setattr(R, "_size_gb", lambda p: 66.0)
+    monkeypatch.setattr(R, "_is_moe_gguf", lambda p: False)
+    c = {"f16": str(f16), "imatrix": None, "gguf_lane": {}}
+    assert [lb for lb, _ in R.gguf_ladder_labels(c)] == ["flagship", "IQ2", "IQ3_S", "IQ4_XS", "Q6_K"]
+    c["gguf_lane"] = {"ladder": ["iq3_s", "flagship", "Q6_K"]}
+    assert [lb for lb, _ in R.gguf_ladder_labels(c)] == ["IQ3_S", "flagship", "Q6_K"]

@@ -1091,9 +1091,12 @@ def gguf_ladder_labels(c):
     if _is_moe_gguf(c["f16"]):                     # the measured prune x bit-mix rung, at the 2-bit rung's bytes
         labels.append((MOE_TAG, next(f for lb, _, f in LADDER if lb == MOE_BUDGET_LABEL) * f16_gb * 1.05))
     gl = c.get("gguf_lane") or {}
-    if gl.get("ladder") is not None:               # `lanes.gguf.ladder:` -- only these size-targeted labels
-        keep = {str(x).upper() if str(x).lower() != "flagship" else "flagship" for x in gl["ladder"]}
-        labels = [(lb, gb) for lb, gb in labels if (lb.upper() if lb != "flagship" else lb) in keep]
+    norm = lambda x: str(x).upper() if str(x).lower() != "flagship" else "flagship"   # noqa: E731
+    if gl.get("ladder") is not None:               # `lanes.gguf.ladder:` -- only these labels, in the plan's order
+        keep = [norm(x) for x in gl["ladder"]]
+        labels = sorted([(lb, gb) for lb, gb in labels if norm(lb) in keep], key=lambda x: keep.index(norm(x[0])))
+    else:                                          # smallest first: flagship / 2-bit, then up to Q6_K
+        labels.sort(key=lambda x: (x[1], x[0] != "flagship"))
     import pollard_qtarget as QT
     for q in gl.get("quality") or []:              # `lanes.gguf.quality:` -- quality-targeted rungs (pollard_qtarget)
         cls = QT.parse_class(q)
