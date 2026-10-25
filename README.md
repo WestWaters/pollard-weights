@@ -486,7 +486,7 @@ outputs default into the [workspace](#where-your-builds-go--the-workspace) unles
 | `pollard-export` · `pollard-gptq` | GPTQ (vLLM/SGLang; full-Hessian error-feedback) |
 | `pollard-mlx` · `pollard-exl3` · `pollard-mx` | MLX (Apple) · EXL3 (exllamav3) · compressed-tensors / Quark: NVFP4 / MXFP4 / FP8 / MXFP6 E2M3 / E3M2 + measured mixes (Blackwell/Rubin) + W4A16/W8A16 INT (any vLLM GPU) |
 | `pollard-exlr8` · `pollard-draft` | EXLR8 (one encode, every rung a manifest; GR8 / reference decode) · DRAFT (speculative drafter matched to the quantized target) |
-| `pollard release` | Every lane of a model as a ladder, gated and carded, into one repo per model |
+| `pollard release` | Every lane of a model as a ladder into one public repo per model: the card with each rung's measured numbers goes up as soon as the rung is measured, the rung right after it. Quality numbers (KLD, top-1, tool calls) are reported, not blocking; complete model, runtime and coherence block (`--strict` makes the thresholds block too) |
 
 **Precondition — compose across every lane**
 | Command | What it does |

@@ -896,9 +896,36 @@ def gate_verdict(b, results):
     return None
 
 
+def gate_below(b, results):
+    """The report-only checks this rung did NOT meet (pollard-verify's default, non-strict gate: measured and labelled
+    here, never blocking) -- from the MANIFEST gate record, else results.json. [] when none or no gate ran."""
+    g = b.get("gate") if isinstance(b, dict) else None
+    if isinstance(g, dict) and "pass" in g:
+        if g.get("report_only_failed") is not None:
+            return list(g["report_only_failed"])
+        return [c.get("check") for c in g.get("checks") or [] if not c.get("ok") and c.get("blocking") is False]
+    v = _rung_result(results, b).get("verified")
+    return list(v.get("report_only_failed") or []) if isinstance(v, dict) else []
+
+
+def gate_strict(builds, results):
+    """True when any rung's gate ran strict (every threshold blocking) -- the card's note then says so."""
+    for b in builds:
+        g = b.get("gate") if isinstance(b, dict) else None
+        v = _rung_result(results, b).get("verified")
+        if (isinstance(g, dict) and g.get("strict")) or (isinstance(v, dict) and v.get("strict")):
+            return True
+    return False
+
+
 def verified_cell(b, results):
     v = gate_verdict(b, results)
-    return " -- |" if v is None else (" yes |" if v else " **no** |")
+    if v is None:
+        return " -- |"
+    if not v:
+        return " **no** |"
+    below = gate_below(b, results)
+    return f" yes (below band: {', '.join(below)}) |" if below else " yes |"
 
 
 D3_FORMAT = "d3-code-readout-v1"
@@ -1609,10 +1636,16 @@ def main():
         out += ["", "_Verified = the rung passed `pollard-d3 gate`: through its own runtime it picks the same option as "
                 "bf16 on at least 90% of the typed decisions with a mean option KL of at most 0.05, and it ships the "
                 "readout and decision config byte-exact (pollard-complete). A rung that failed is not published._"]
+    elif has_v and gate_strict(builds, results):
+        out += ["", "_Verified = the rung passed `pollard-verify --gate --strict`: its KLD / top-1 against the source "
+                "and every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
+                "and met._"]
     elif has_v:
-        out += ["", "_Verified = the rung passed `pollard-verify --gate`: its KLD / top-1 against the source and "
-                "every other threshold in the gate file (retention, tool calls, runtime, coherence) were measured "
-                "and met. A rung that failed is not published._"]
+        out += ["", "_Verified = the rung passed `pollard-verify --gate`: it is the complete model (every tower, "
+                "projector and processor file of the source), it loads, and it passes the coherence and runtime "
+                "checks. Its KLD / top-1, tool-call and retention numbers are measured and shown here as they are; "
+                "\"below band\" names a number outside the gate file's band for its bit width -- reported, not "
+                "blocking._"]
     if has_tc and not decision:
         out += ["", tool_ready_note(builds, results)]
     if has_tps:

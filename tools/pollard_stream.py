@@ -1661,7 +1661,7 @@ def collect_input_amax(model, calib=None, nsamples=128, seqlen=2048, device="cpu
 
 
 #: pollard release sets this for ONE build of a rung bigger than the free disk: json {"out", "repo", "path_in_repo",
-#: "revision"}. Every safetensors shard written into exactly `out` is uploaded to <repo>/<path_in_repo>/ on the branch
+#: "revision", "private"}. Every safetensors shard written into exactly `out` is uploaded to <repo>/<path_in_repo>/ on the branch
 #: `revision` (the rung's STAGING branch, pollard-staging-<rung>: never the repo's main branch, which may already be
 #: public), confirmed there (size + sha256), recorded in pollard-streamed.json (with its header, so the rung can still
 #: be READ -- verify streams it back from that branch with range requests) and deleted before the next shard is
@@ -1732,7 +1732,9 @@ def stream_shard(out, path, spec, api=None, log=print):
     hdr, base = st_header(path)
     api = api or _hf_api()
     rev = spec.get("revision")
-    api.create_repo(spec["repo"], repo_type="model", exist_ok=True, private=True)   # public only once complete
+    # public from the start (pollard release: `private: true` in the plan keeps it private); the shard itself goes to
+    # the rung's staging branch, so main never holds an unverified byte
+    api.create_repo(spec["repo"], repo_type="model", exist_ok=True, private=spec.get("private") is True)
     if rev:                                     # the rung's staging branch: main (maybe public) never sees it unverified
         api.create_branch(spec["repo"], branch=rev, exist_ok=True)
         api.upload_file(path_or_fileobj=path, path_in_repo=rp, repo_id=spec["repo"], revision=rev)

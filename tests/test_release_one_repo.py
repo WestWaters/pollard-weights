@@ -1,7 +1,7 @@
 """ONE Hugging Face repo per model (owner, 2026-10-16): PollardWeights/<M>-Pollard holds every lane -- GGUF rungs and
 the mmproj at the root, MLX/ GPTQ/ MX/ EXL3/ EXLR8/ in their own folders with a subfolder per rung, the drafter in
-DRAFT/ -- under ONE card. The repo is created private and made public only when every lane that ships this run has
-landed and the file list checks out. Fakes only: no model, no Hub."""
+DRAFT/ -- under ONE card. The repo is created PUBLIC (owner, 2026-10-25; `private: true` keeps it private), the card
+goes up before the rungs, and the last step checks every shipped lane's file list. Fakes only: no model, no Hub."""
 from __future__ import annotations
 
 import json
@@ -93,7 +93,7 @@ def test_every_lane_goes_to_the_one_repo_and_shares_one_card(model):
     assert card[card.index("--lane") + 1] == "gguf" and card[card.index("--out") + 1].endswith("README.md")
     also = [card[i + 1] for i, x in enumerate(card) if x == "--also"]
     assert also == ["mlx", "gptq", "mx", "exl3", "exlr8", "draft"]
-    assert steps[-1].id == "release/public" and steps[-1].lanes == lanes, "public only after every lane"
+    assert steps[-1].id == "release/public" and steps[-1].lanes == lanes, "the file-list check after every lane"
 
 
 def _dir_build(c, lane, tag, sub):
@@ -116,7 +116,8 @@ def test_directory_lanes_upload_into_their_folder_never_the_root(model, hub):
     sub = C.rung_subfolder(ws.find_build(out)[1], "mlx")
     assert ("folder", f"MLX/{sub}") in hub.calls and ("folder", "") not in hub.calls, "the root is the GGUF lane's"
     assert f"MLX/{sub}/config.json" in hub.files[REPO] and "README.md" in hub.files[REPO]
-    assert hub.private[REPO] is True, "created private"
+    assert hub.private[REPO] is False, "created public"
+    assert hub.calls[0] == ("file", "README.md"), "the card goes up before the rungs"
 
 
 def test_free_mode_publishes_a_directory_rung_into_its_folder(model, hub):
@@ -156,24 +157,26 @@ def _public(c, cfg, lanes, statuses, hub):
     return R.go_public(st, c, cfg, True, statuses, out=lambda *_: None)
 
 
-def test_public_only_when_every_shipped_lane_landed_and_the_file_list_checks_out(model, hub):
+def test_last_step_checks_the_file_list_and_never_touches_visibility(model, hub):
     cfg = R.load_plan(None)
     c = R._ctx(cfg, model)
     out = _dir_build(c, "mlx", "4bit", "4bit")
     sub = C.rung_subfolder(ws.find_build(out)[1], "mlx")
     hub.files[REPO] = {"README.md"}
-    hub.private[REPO] = True
-    with pytest.raises(RuntimeError, match="stays private: missing"):
+    hub.private[REPO] = False                                  # public since its first upload
+    with pytest.raises(RuntimeError, match="is missing"):
         _public(c, cfg, ["mlx"], {"mlx/upload": "done"}, hub)
-    assert hub.private[REPO] is True
     hub.files[REPO].add(f"MLX/{sub}/config.json")
     with pytest.raises(RuntimeError, match="gptq upload failed"):
         _public(c, cfg, ["mlx", "gptq"], {"mlx/upload": "done", "gptq/upload": "failed"}, hub)
-    assert hub.private[REPO] is True
     # a lane that built nothing (held, failed build, another machine's lane) ships nothing and does not block
     assert _public(c, cfg, ["mlx", "gptq", "mx"], {"mlx/upload": "done", "gptq/upload": "skipped: upstream failed",
                                                     "mx/upload": "skipped: needs cuda"}, hub) == "done"
     assert hub.private[REPO] is False
+    # a no-op on visibility: a repo kept private (private: true) is still private after it
+    hub.private[REPO] = True
+    assert _public(c, dict(cfg, private=True), ["mlx"], {"mlx/upload": "done"}, hub) == "done"
+    assert hub.private[REPO] is True
 
 
 def test_nothing_shipped_or_uploads_off_leaves_the_repo_alone(model, hub):
@@ -234,3 +237,113 @@ def test_hub_reads_carry_the_token_only_to_huggingface(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_x")
     assert gc.hf_headers("https://huggingface.co/P/M/resolve/main/a.gguf")["Authorization"] == "Bearer hf_x"
     assert "Authorization" not in gc.hf_headers("https://example.com/a.gguf")
+
+
+# ---------------------------------------------------------------- public from the start, the card first (2026-10-25)
+
+def _fake_card(monkeypatch, c, seen=None):
+    """pollard-card stands in: writes the README the card step would."""
+    def run(cmd, ok_codes=(0,), env=None):
+        assert cmd[0] == "pollard-card" and "--verified-only" in cmd
+        os.makedirs(c["release_dir"], exist_ok=True)
+        Path(c["release_dir"], "README.md").write_text("card")
+        if seen is not None:
+            seen.append(cmd)
+    monkeypatch.setattr(R, "run_cmd", run)
+
+
+def _gguf_rung(c, tag):
+    rdir = ws.model_dir(c["f16"], create=True)
+    p = os.path.join(rdir, f"Tiny-1B-Pollard-{tag}.gguf")
+    Path(p).write_bytes(b"GGUF" + tag.encode())
+    ws.record_build(c["f16"], "gguf", p, tag=tag)
+    ws.record_gate(p, {"pass": True})
+    return p
+
+
+def test_the_repo_is_public_from_the_first_rung_and_the_card_goes_up_before_it(model, hub, monkeypatch):
+    cfg = R.load_plan(None)
+    cfg.update({"upload": True, "_free_after_upload": True})
+    c = R._ctx(cfg, model)
+    import pollard_ggufcompat as gc
+    monkeypatch.setattr(gc, "runtime_of", lambda path: ("stock", {}))
+    cards = []
+    _fake_card(monkeypatch, c, cards)
+    first = _gguf_rung(c, "Q6_K")
+    assert R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", first), c, cfg, True, out=lambda *_: None) == "done"
+    assert hub.private[REPO] is False, "public on the first rung, not at the end"
+    assert hub.calls[:2] == [("file", "README.md"), ("file", "Tiny-1B-Pollard-Q6_K.gguf")], "card first, then the rung"
+    second = _gguf_rung(c, "IQ4_XS")
+    assert R.publish_rung(R._publish_rung_step(c, "gguf", "IQ4_XS", second), c, cfg, True, out=lambda *_: None) == "done"
+    assert hub.calls[2:4] == [("file", "README.md"), ("file", "Tiny-1B-Pollard-IQ4_XS.gguf")], "card refreshed first"
+    assert len(cards) == 2, "the card is rebuilt from the rungs passed so far, once per rung"
+    # the last step: nothing to flip, only the file-list check
+    hub.private[REPO] = "untouched"
+    assert _public(c, cfg, ["gguf"], {"gguf/upload": "done"}, hub) == "done"
+    assert hub.private[REPO] == "untouched", "go_public no longer changes visibility"
+
+
+def test_private_true_creates_it_private_and_keeps_it_private(model, hub, monkeypatch):
+    cfg = R.load_plan(None)
+    cfg.update({"upload": True, "_free_after_upload": True, "private": True})
+    c = R._ctx(cfg, model)
+    import pollard_ggufcompat as gc
+    monkeypatch.setattr(gc, "runtime_of", lambda path: ("stock", {}))
+    _fake_card(monkeypatch, c)
+    p = _gguf_rung(c, "Q6_K")
+    assert R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", p), c, cfg, True, out=lambda *_: None) == "done"
+    assert hub.private[REPO] is True
+    assert _public(c, cfg, ["gguf"], {"gguf/upload": "done"}, hub) == "done"
+    assert hub.private[REPO] is True, "never flipped"
+
+
+def test_a_repo_an_older_pollard_left_private_goes_public_at_its_first_upload(model, hub):
+    cfg = R.load_plan(None)
+    hub.files[REPO], hub.private[REPO] = set(), True
+    R.open_repo(hub.api(), REPO, cfg, out=lambda *_: None)
+    assert hub.private[REPO] is False
+    hub.private[REPO] = True
+    R.open_repo(hub.api(), REPO, dict(cfg, private=True), out=lambda *_: None)
+    assert hub.private[REPO] is True
+
+
+def test_without_free_mode_each_rung_uploads_its_card_right_after_its_gate(model, hub, monkeypatch):
+    cfg = R.load_plan(None)
+    cfg["upload"] = True
+    c, lanes, steps = R.plan_steps(cfg, model, only=["mlx"])
+    ids = [s.id for s in steps]
+    rung_cards = [s for s in steps if s.fn == "rung_card"]
+    assert rung_cards, "a card step per rung"
+    for st in rung_cards:
+        assert ids[ids.index(st.id) - 1] == f"mlx/{st.rung}/verify", "right after the rung's gate"
+        assert not R.is_heavy(st)
+    assert ids.index("mlx/upload") > max(ids.index(s.id) for s in rung_cards), "the rungs follow with the lane upload"
+    _fake_card(monkeypatch, c)
+    st = rung_cards[0]
+    assert R.rung_card(st, c, cfg, False, out=lambda *_: None) == "held", "uploads off: nothing goes up"
+    assert R.rung_card(st, c, cfg, True, out=lambda *_: None) == "done"
+    assert hub.calls == [("file", "README.md")] and hub.private[REPO] is False
+    # a plan that does not upload gets no card steps
+    cfg2 = R.load_plan(None)
+    assert not [s for s in R.plan_steps(cfg2, model, only=["mlx"])[2] if s.fn == "rung_card"]
+
+
+def test_strict_gates_in_the_plan_passes_strict_to_every_verify(model):
+    cfg = R.load_plan(None)
+    verifies = [s for s in R.plan_steps(cfg, model, only=["mlx"])[2] if s.kind == "verify"]
+    assert verifies and not any("--strict" in s.cmd for s in verifies), "report-only by default"
+    cfg["strict_gates"] = True
+    verifies = [s for s in R.plan_steps(cfg, model, only=["mlx"])[2] if s.kind == "verify"]
+    assert all("--strict" in s.cmd for s in verifies)
+
+
+def test_a_card_that_cannot_be_built_never_holds_the_rung_back(model, hub, monkeypatch):
+    cfg = R.load_plan(None)
+    cfg["upload"] = True
+    c, _, steps = R.plan_steps(cfg, model, only=["mlx"])
+
+    def boom(cmd, ok_codes=(0,), env=None):
+        raise RuntimeError("exit 2")
+    monkeypatch.setattr(R, "run_cmd", boom)
+    st = next(s for s in steps if s.fn == "rung_card")
+    assert R.rung_card(st, c, cfg, True, out=lambda *_: None) == "card not uploaded"
