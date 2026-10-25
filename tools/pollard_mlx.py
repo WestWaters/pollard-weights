@@ -262,7 +262,16 @@ def decode_to_float(model_dir, out, log=print):
     return out
 
 
-def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
+#: Gemma 4 / Gemma 3n per-layer embedding side paths: per_layer_input_gate (n_embd -> 256) and per_layer_projection
+#: (256 -> n_embd) in every block, per_layer_model_projection once. Small (a few MB each) and they carry the whole
+#: per-layer token signal into the residual -- GGUF pins them at q6_K; at a 2-bit MLX body they collapsed E4B
+PLE_SIDE_RE = re.compile(r"(^|\.)per_layer_(input_gate|projection|model_projection)$")
+#: a per-layer token lookup table (Gemma 4's embed_tokens_per_layer): measured cheap to crush (GGUF E4B: q2_K vs
+#: q8_0 changed KLD by 0.010 at 2 GB less), so a low rung may take it down with --table-bits
+TABLE_RE = re.compile(r"(^|\.)embed_tokens_per_layer$")
+
+
+def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None, table_bits=None, attn_min=None):
     """Per-module bit-width for MLX (returns a {'bits','group_size'} dict, or False to skip).
     Mirrors the Pollard policy: attn follows the attn profile; the FFN/expert body follows ffn;
     MoE router (`.gate`, not `gate_proj`) and shared experts are pinned HIGH; embeddings kept HIGH.
@@ -276,8 +285,12 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
         return {"bits": globals()["HIGH"], "group_size": gsize}
     if VISION_RE.search(path):
         return {"bits": vision_bits or globals()["HIGH"], "group_size": gsize}
+    if table_bits and TABLE_RE.search(path):            # a per-layer token table: the rung's measured choice
+        return {"bits": table_bits, "group_size": gsize}
     if "embed" in path or path.endswith("lm_head"):    # embed_tokens (llama) OR embedding (Spark2_5, tied)
         return {"bits": HIGH, "group_size": gsize}      # vocab carriers: keep high
+    if PLE_SIDE_RE.search(path):                        # the per-layer embedding's way into each block: held high
+        return {"bits": max(HIGH, 6), "group_size": gsize}
     if is_moe and (re.search(r"\.(mlp|block_sparse_moe|feed_forward)\.gate$", path)
                    or "shared_expert" in path):
         return {"bits": HIGH, "group_size": gsize}      # router + shared: selection integrity
@@ -287,7 +300,10 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None):
     if li is None or li not in alloc:
         return {"bits": LOW, "group_size": gsize}
     if "self_attn" in path or re.search(r"\.(mixer|conv)\.(q_proj|k_proj|v_proj|o_proj|in_proj|out_proj)$", path):
-        return {"bits": alloc[li]["attn"], "group_size": gsize}   # NemotronH Mamba2 / LFM2 short-conv token mixers
+        b = alloc[li]["attn"]                                      # NemotronH Mamba2 / LFM2 short-conv token mixers
+        if attn_min and re.search(r"\.(v_proj|o_proj)$", path):  # attention v / o never under the rung's floor
+            b = max(b, attn_min)
+        return {"bits": b, "group_size": gsize}
     if ("mlp" in path or "block_sparse_moe" in path or "experts" in path or "latent_proj" in path
             or "feed_forward" in path):
         return {"bits": alloc[li]["ffn"], "group_size": gsize}
@@ -1820,6 +1836,13 @@ def main():
     ap.add_argument("--focus-layers", help="force these layers to HIGH (8-bit) regardless of the profile, "
                     "e.g. '3,4,8' or '3-8,16' -- steer the budget to layers you care about")
     ap.add_argument("--group-size", type=int, default=64, help="MLX quant group size (default 64)")
+    ap.add_argument("--table-bits", type=int, choices=sorted(MLX_BITS), default=None,
+                    help="bits for a per-layer token lookup table (Gemma 4's embed_tokens_per_layer; default: kept "
+                         "with the embeddings, HIGH). A low rung spends its bytes on the body instead -- the table "
+                         "measured cheap to crush")
+    ap.add_argument("--attn-min-bits", type=int, choices=sorted(MLX_BITS), default=None,
+                    help="floor for attention v_proj / o_proj in every layer (a low rung's 2-bit body otherwise "
+                         "takes them down in its cold layers)")
     ap.add_argument("--vision-bits", type=int, default=None,
                     help="bits for a vision/audio tower inside the checkpoint (default: 8, same as "
                          "embeddings). The modality PROJECTOR is always held high regardless. "
@@ -1941,7 +1964,7 @@ def main():
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
         if rs is not None:
             rs.note(path, module)                          # the next mx.quantize is this module's weight
-        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high)
+        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high, a.table_bits, a.attn_min_bits)
 
     import contextlib, shutil
     import pollard_workspace as ws

@@ -981,6 +981,9 @@ def lane_steps(cfg, c, lane):
                    "--bits", str(int(rung)), "--out", out]
             if c.get("imatrix"):                         # the range search weighted by activations, as GGUF's
                 cmd += ["--imatrix", os.path.abspath(str(c["imatrix"]))]
+            # per-rung pollard-mlx flags from the plan: lanes.mlx.rung_args: {2: [--table-bits, 2, ...]}
+            ra = (lc.get("rung_args") or {})
+            cmd += [str(x) for x in (ra.get(rung) or ra.get(str(rung)) or ra.get(int(rung)) or [])]
             src = c["hf_dir"]
         elif lane == "gptq":
             cmd = ["pollard-export", "--model", c["smooth_dir"], "--sensitivity", c["sens_smooth"],
