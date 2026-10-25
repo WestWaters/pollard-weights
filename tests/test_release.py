@@ -38,7 +38,7 @@ def test_template_parses_and_presets_merge():
     assert cfg["preset"] == "text" and cfg["upload"] is False and cfg["ngl"] == 0
     assert cfg["lanes"]["mlx"]["rungs"] == [2, 3, 4, 5, 6, 8]
     assert cfg["lanes"]["gptq"]["rungs"] == [2, 3, 4, 8]
-    assert cfg["lanes"]["mx"]["rungs"] == ["nvfp4", "mxfp4", "fp8", "mxfp6_e2m3", "mxfp6_e3m2", "mix4.5", "mix5", "mix5.5"]
+    assert cfg["lanes"]["mx"]["rungs"] == ["mxfp4", "nvfp4", "mix4.5", "mix5", "mix5.5", "mxfp6_e2m3", "mxfp6_e3m2", "fp8"]
     assert cfg["lanes"]["draft"]["enabled"] is False
     moe = R.load_plan(None, "moe")
     assert moe["lanes"]["gptq"]["rungs"] == [4, 8] and moe["lanes"]["mx"]["moe_protect_attn_only"] is True

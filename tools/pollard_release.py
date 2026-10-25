@@ -126,14 +126,14 @@ lanes:                         # any lane may add `critical: true`: if the engin
   #   ladder: [Q6_K, flagship]  only these size-targeted labels (drop the ones the quality rungs replace)
   mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
-  mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}
+  mx:   {enabled: true, rungs: [mxfp4, nvfp4, mix4.5, mix5, mix5.5, mxfp6_e2m3, mxfp6_e3m2, fp8], default: nvfp4}
   exl3: {enabled: true, rungs: [2.5, 3.0, 4.0, 5.0, 6.0], default: 4.0}
   #   recipe_choice: auto (default) = the default rung is converted smoothed / raw x Calib 3.0 / exllamav3's own
   #   calibration, each measured by KLD through exllamav3 on the held-out text; the winner is that rung and every
   #   other rung builds the same way. pollard | raw-calib | smooth-default | plain pin one (no A/B).
   # one encode at every width, each rung a manifest over it (GR8's format; dense decoder layers -- MoE experts not yet)
   exlr8: {enabled: true, rungs: [2.5, 3.0, 3.25, 4.0, 5.0, 6.0], default: 4.0, widths: [2, 3, 4, 5, 6]}
-  draft: {enabled: false, drafter: auto, rungs: [Q8_0, Q4_K_M], targets: all, limit: 0, max_tokens: 128,
+  draft: {enabled: false, drafter: auto, rungs: [Q4_K_M, Q8_0], targets: all, limit: 0, max_tokens: 128,
           prefer_own: false, train: {kind: eagle3, rung: Q4_K_M, taps: rung, samples: null, max_steps: null}}
                                # speculative drafter (pollard-draft): drafter = auto (search the Hub) or a repo id;
                                # measured against `targets` (all = every GGUF rung of this release, or a list of tags).
@@ -216,6 +216,10 @@ def load_plan(path=None, preset=None):
         raise SystemExit(f"unknown preset '{name}' -- choose from {sorted(PRESETS)}")
     cfg = deep_merge(deep_merge(_yaml(TEMPLATE), PRESETS[name]), user)
     cfg["preset"] = name
+    # the lanes whose rung order the PLAN wrote (`rungs:` / `ladder:`): built in that order; every other lane's rungs
+    # (the template's / the preset's) are built and uploaded smallest first (order_rungs)
+    cfg["_explicit_order"] = sorted(l for l, lc in ((user.get("lanes") or {}).items())
+                                    if isinstance(lc, dict) and ("rungs" in lc or "ladder" in lc))
     return cfg
 
 
@@ -801,7 +805,7 @@ def draft_steps(cfg, c, lc):
     find = ["pollard-draft", "find", "--target", c["src"], "--target-dir", c["hf_dir"], "--out", found]
     if lc.get("drafter") not in (None, "auto"):
         find += ["--drafter", str(lc["drafter"])]
-    rungs = ",".join(str(r) for r in lc.get("rungs") or ["Q8_0", "Q4_K_M"])
+    rungs = ",".join(str(r) for r in order_rungs(cfg, "draft", lc.get("rungs") or ["Q4_K_M", "Q8_0"]))
     conv = ["pollard-draft", "convert", "--target", c["src"], "--target-dir", c["hf_dir"], "--from", found,
             "--key", c["src"], "--rungs", rungs, "--skip-if-trained"]
     tc = lc.get("train") or {}
@@ -958,7 +962,7 @@ def lane_steps(cfg, c, lane):
                           cmd=["pollard-exlr8", "--model", c["smooth_dir"], "--store", c["exlr8_store"], "--calib",
                                c["calib"], "--widths", widths, "--encode-only"] + hf_flags(c), out=c["exlr8_store"],
                           desc="encode every matrix once at each width (LDLQ + tail-biting Viterbi, E4M3 codebook)"))
-    rungs = list(lc.get("rungs") or [])
+    rungs = order_rungs(cfg, lane, lc.get("rungs") or [])
     ab_rung = None
     if lane == "exl3" and rungs and str(lc.get("recipe_choice", "auto")) == "auto":
         # the recipe A/B (pollard_exl3.run_ab) runs on ONE rung -- the default, else the first -- and its winner is
@@ -1455,6 +1459,16 @@ def lane_expect(c, lane, builds, repo):
     return out
 
 
+def _build_bytes(b):
+    """On-disk bytes of a build (file or folder); a freed one (already on the Hub) sorts first -- nothing to send."""
+    p = b.get("path") or ""
+    if os.path.isfile(p):
+        return os.path.getsize(p)
+    if os.path.isdir(p):
+        return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs)
+    return 0
+
+
 def _lane_builds(c, lane, repo):
     import pollard_workspace as ws
     return [b for b in ws.read_manifest(lane_key(c, lane)).get("builds", [])
@@ -1677,7 +1691,7 @@ def upload(step, c, cfg, run_upload):
     and checks the repo afterwards: a lane whose files are not all there -- or a repo without its README -- raises."""
     from pollard_card import rung_subfolder
     lane, repo = step.lane, step.repo
-    builds = _lane_builds(c, lane, repo)
+    builds = sorted(_lane_builds(c, lane, repo), key=_build_bytes)   # smallest first
     card = os.path.join(step.out, "README.md")
     if not builds:
         raise RuntimeError(f"no verified {lane} rung to publish")
@@ -1808,17 +1822,37 @@ def _size_gb(path):
 _MX_BITS = {"nvfp4": 4.5, "mxfp4": 4.25, "fp8": 8.0, "fp8_dynamic": 8.0, "mxfp6_e2m3": 6.25, "mxfp6_e3m2": 6.25}
 
 
-def _rung_gb(lane, rung, hf_dir):
-    """Estimated size of one directory-lane rung: the bf16 checkpoint scaled by the rung's bits, plus 10%."""
+#: drafter GGUF rungs (pollard-draft), bits per weight -- for the build / upload order only
+_GGUF_BITS = {"Q2_K": 2.6, "Q3_K_M": 3.9, "Q4_0": 4.5, "Q4_K_S": 4.6, "Q4_K_M": 4.85, "Q5_K_M": 5.7, "Q6_K": 6.6,
+              "Q8_0": 8.5, "F16": 16.0, "BF16": 16.0}
+
+
+def rung_bits(lane, rung):
+    """Expected average bits per weight of one rung (mlx / gptq bits, exl3 / exlr8 bpw, an MX format or mix, a drafter
+    GGUF type). An estimate for ordering and disk planning, not a claim about the build."""
     r = str(rung).lower()
     if lane == "mx":
-        bits = mx_mix_bpw(rung) if mx_mix_bpw(rung) is not None else _MX_BITS.get(r, 8.0)
-    else:
-        try:
-            bits = float(rung)
-        except ValueError:
-            bits = 8.0
-    return _size_gb(hf_dir) * bits / 16.0 * 1.1
+        return mx_mix_bpw(rung) if mx_mix_bpw(rung) is not None else _MX_BITS.get(r, 8.0)
+    if lane == "draft":
+        return _GGUF_BITS.get(str(rung).upper(), 8.0)
+    try:
+        return float(rung)
+    except ValueError:
+        return 8.0
+
+
+def order_rungs(cfg, lane, rungs):
+    """The order a lane's rungs are built and published in: the plan's own order when the plan lists them, else
+    smallest first (owner, 2026-10-24: "we always do the smallest first") -- ties keep the listed order."""
+    rungs = list(rungs)
+    if lane in ((cfg or {}).get("_explicit_order") or ()):
+        return rungs
+    return sorted(rungs, key=lambda r: rung_bits(lane, r))
+
+
+def _rung_gb(lane, rung, hf_dir):
+    """Estimated size of one directory-lane rung: the bf16 checkpoint scaled by the rung's bits, plus 10%."""
+    return _size_gb(hf_dir) * rung_bits(lane, rung) / 16.0 * 1.1
 
 
 def disk_free_gb(path):
