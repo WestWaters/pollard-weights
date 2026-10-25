@@ -100,3 +100,29 @@ def test_release_labels_quality_rungs_and_filters_the_ladder(tmp_path, monkeypat
 def test_fit_tag_and_no_record_flags_exist():
     src = (Path(__file__).parents[1] / "tools" / "pollard_fit.py").read_text()
     assert '"--tag"' in src and '"--no-record"' in src and "tag=a.tag or base_preset" in src
+
+
+def test_one_candidate_on_disk_at_a_time_and_the_winner_is_rebuilt():
+    live, peak, builds = set(), [0], []
+
+    def build(ram):
+        gb = next(g for r, _, g in POINTS if r == ram)
+        p = f"/tmp/cand-{gb:.2f}.gguf"
+        live.add(p)
+        builds.append(gb)
+        peak[0] = max(peak[0], len(live))
+        return p
+
+    def measure(path):
+        gb = float(path.rsplit("-", 1)[1][:-5])
+        return {"kld": 0.05, "top1": 92.0} if gb >= 4.6 - 1e-9 else {"kld": 0.5, "top1": 70.0}
+
+    res = QT.search(POINTS, "Q90", build, measure, discard=live.discard, log=lambda *a: None, max_steps=10)
+    assert peak[0] == 1, "never two candidates on the disk"
+    assert res["path"] in live and len(live) == 1, "only the winner remains, rebuilt at its budget"
+    assert builds[-1] == res["gb"], "the winner is the last file built (rebuilt when a later candidate failed)"
+
+
+def test_quality_build_checks_disk_and_a_complete_gguf():
+    src = (Path(__file__).parents[1] / "tools" / "pollard_auto.py").read_text()
+    assert "a full disk truncates the GGUF without an error" in src and "GGUFReader(out)" in src

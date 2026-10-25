@@ -92,15 +92,18 @@ def search(points, cls, build, measure, lo=None, hi=None, tol_gb=TOL_GB, max_ste
         mid = (lo_i + 1 + hi_i) // 2
         if mid == hi_i:
             mid = hi_i - 1
+        if discard and best and best.get("path"):
+            discard(best["path"])            # ONE candidate on disk at a time: the winner is rebuilt at the end
+            best["path"] = None
         path, m, ok = attempt(mid)
         if ok:
-            if discard and best:
-                discard(best["path"])
             best, hi_i = {"path": path, "ram": grid[mid][0], "gb": grid[mid][1], "measured": m}, mid
         else:
             if discard:
                 discard(path)
             lo_i = mid
+    if best and not best.get("path"):
+        best["path"] = build(best["ram"])     # deterministic: the same budget gives the same file it measured
     return {**(best or {"path": None}), "tried": tried, "class": cls}
 
 
