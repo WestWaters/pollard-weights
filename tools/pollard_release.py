@@ -1872,6 +1872,16 @@ def _protected_paths(c):
     return {os.path.normcase(os.path.abspath(str(k).rstrip("/\\"))) for k in keep if k}
 
 
+# what huggingface_hub's upload_folder never sends (its DEFAULT_IGNORE_PATTERNS): a git folder and the local-dir
+# download / upload cache `.cache/huggingface/` (`hf download --local-dir` leaves one in a checkpoint folder). The
+# intact check, the free step and the relay staging skip them too -- otherwise a rung whose every real file is on the
+# Hub reads "not intact (.cache/huggingface/.gitignore: not on the Hub)" and is kept (E4B MLX/2bit, 2026-10-25).
+def _hub_skipped(rel):
+    """True for a path (relative to the uploaded folder) that upload_folder leaves out by default."""
+    p = "/" + rel.replace(os.sep, "/").strip("/") + "/"
+    return "/.git/" in p or "/.cache/huggingface/" in p
+
+
 def _local_files(path):
     """{path relative to the build (its file name for a one-file build): full path} of every file a build has on disk
     now -- a streamed rung's shard registry (pollard_stream.STREAMED) is the build's own bookkeeping, not counted."""
@@ -1882,8 +1892,9 @@ def _local_files(path):
     for root, _, files in os.walk(path):
         for f in files:
             full = os.path.join(root, f)
-            if f != PS.STREAMED:
-                out[os.path.relpath(full, path).replace(os.sep, "/")] = full
+            rel = os.path.relpath(full, path).replace(os.sep, "/")
+            if f != PS.STREAMED and not _hub_skipped(rel):
+                out[rel] = full
     return out
 
 
@@ -1963,6 +1974,8 @@ def _local_pairs(path, path_in_repo):
         for f in files:
             full = os.path.join(root, f)
             rel = os.path.relpath(full, path).replace(os.sep, "/")
+            if _hub_skipped(rel):                # upload_folder never sends it -- not part of the rung
+                continue
             pairs.append((f"{path_in_repo}/{rel}" if path_in_repo else rel, full))
     return sorted(pairs)
 
@@ -2465,7 +2478,7 @@ class RelayApi:
         for r, _, fs in os.walk(local):
             for f in fs:
                 rel = os.path.relpath(os.path.join(r, f), local).replace(os.sep, "/")
-                if any(fnmatch(rel, p) for p in ignore or ()):
+                if _hub_skipped(rel) or any(fnmatch(rel, p) for p in ignore or ()):
                     continue
                 items.append((rel, os.path.join(r, f), "/".join(x for x in (prefix.strip("/"), rel) if x)))
         return sorted(items)
