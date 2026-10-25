@@ -316,7 +316,10 @@ def _quantize_dry(binary, gguf, ftype="Q4_K_M"):
 
 
 def _mtmd(binary, gguf, mmproj):
-    rc, out = _run([binary, "-m", gguf, "--mmproj", mmproj, "-ngl", "0", "-c", "256", "-t", _threads()],
+    # --jinja: the model's own chat template, the way every Pollard llama.cpp step serves it. Without it mtmd-cli falls
+    # back to llama.cpp's built-in template list, and a template it does not know (Gemma 4 / Nemotron-3.5-Bolt-E4B)
+    # aborts at start-up -- "this custom template is not supported, try using --jinja" -- on a model that runs fine.
+    rc, out = _run([binary, "-m", gguf, "--mmproj", mmproj, "--jinja", "-ngl", "0", "-c", "256", "-t", _threads()],
                    timeout=LOAD_TIMEOUT, stdin="/quit\n", cpu=True)
     if rc == 0 and "chat mode" in out.lower():
         return True, "loads the model + mmproj on CPU"
