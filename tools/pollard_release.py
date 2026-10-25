@@ -109,6 +109,10 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
 lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
                                # the whole release stops before calibration (default: only that lane is held)
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
+  #   quality: [Q90, Q85]  quality-targeted rungs (pollard_qtarget): the SMALLEST measured-allocation build whose
+  #                        measured KLD / top-1 vs the f16 meet the class (Q90: KLD <= 0.08, top-1 >= 90; Q85: KLD <=
+  #                        0.2, top-1 >= 85), named <M>-Pollard-<class>-<size>GB.gguf; needs free-after-upload
+  #   ladder: [Q6_K, flagship]  only these size-targeted labels (drop the ones the quality rungs replace)
   mlx:  {enabled: true, rungs: [2, 3, 4, 5, 6, 8], default: 4}      # default = the rung also at the repo root
   gptq: {enabled: true, rungs: [2, 3, 4, 8], default: 4}
   mx:   {enabled: true, rungs: [nvfp4, mxfp4, fp8, mxfp6_e2m3, mxfp6_e3m2, mix4.5, mix5, mix5.5], default: nvfp4}
@@ -311,6 +315,7 @@ def _ctx(cfg, src):
         if cfg.get(plan_key):
             ctx[key] = os.path.abspath(str(cfg[plan_key]))
     ctx["given_f16"] = bool(cfg.get("f16"))
+    ctx["gguf_lane"] = dict((cfg.get("lanes") or {}).get("gguf") or {})     # ladder: / quality: (gguf_ladder_labels)
     try:                                                 # a d3 decision model: gated on its readout, not on text
         import pollard_d3 as D3
         ctx["d3"] = D3.decision_config(hf_dir) is not None
@@ -1050,10 +1055,20 @@ def gguf_ladder_labels(c):
             return [(lb, b / 1e9 * 1.02) for lb, b in pt.ladder_targets(ts, imatrix_ok=bool(c.get("imatrix")))]
     except Exception:                                              # noqa: BLE001 -- unreadable: the f16 ladder
         pass
-    from pollard_auto import LADDER, MOE_BUDGET_LABEL, MOE_TAG
+    from pollard_auto import LADDER, MOE_BUDGET_LABEL, MOE_TAG, QUALITY_RANGE
     labels = [(label, frac * f16_gb * 1.05) for label, _, frac in list(LADDER) + [("flagship", (), 0.20)]]
     if _is_moe_gguf(c["f16"]):                     # the measured prune x bit-mix rung, at the 2-bit rung's bytes
         labels.append((MOE_TAG, next(f for lb, _, f in LADDER if lb == MOE_BUDGET_LABEL) * f16_gb * 1.05))
+    gl = c.get("gguf_lane") or {}
+    if gl.get("ladder") is not None:               # `lanes.gguf.ladder:` -- only these size-targeted labels
+        keep = {str(x).upper() if str(x).lower() != "flagship" else "flagship" for x in gl["ladder"]}
+        labels = [(lb, gb) for lb, gb in labels if (lb.upper() if lb != "flagship" else lb) in keep]
+    import pollard_qtarget as QT
+    for q in gl.get("quality") or []:              # `lanes.gguf.quality:` -- quality-targeted rungs (pollard_qtarget)
+        cls = QT.parse_class(q)
+        if not cls:
+            raise SystemExit(f"lanes.gguf.quality: {q!r} -- choose from {sorted(QT.QUALITY_CLASSES)}")
+        labels.append((cls, QUALITY_RANGE[1] * f16_gb * 1.05))    # the candidate at the top of its search range
     return labels
 
 
