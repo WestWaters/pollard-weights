@@ -661,7 +661,7 @@ SLICE_BYTES = 256 << 20
 #: encode_affine's row chunk (weights) in the streamed build -- the sliced encode keeps its slices a multiple of it
 ENCODE_CHUNK_ELEMS = 1 << 22
 _NODE_RE = re.compile(r'\[label ="([^"]+)"')
-_ST_NP = {"BF16": "uint16", "F16": "float16", "F32": "float32"}
+_ST_NP = {"BF16": "uint16", "F16": "float16", "F32": "float32", "U32": "uint32"}
 
 
 def _direct_load_id(w):
@@ -679,6 +679,45 @@ def _direct_load_id(w):
     return loads[0]
 
 
+def register_loads(loads, file, arrays):
+    """Note what one mx.load returned -- (file, key, shape, its Load node ids) per array, NOT the arrays: holding them
+    would keep every tensor alive once evaluated, which is exactly what a streamed step exists to avoid."""
+    # every tensor a table / slice decision could be about (a quantized table's packed weight is a quarter of the
+    # table's bf16 bytes): metadata only, so the threshold just bounds the export_to_dot calls
+    big = {k: a for k, a in arrays.items() if int(a.nbytes) > min(SLICE_MIN_BYTES, GATHER_MIN_BYTES) // 16}
+    for k, a in big.items():
+        loads.append((str(file), k, tuple(a.shape), frozenset(_load_ids(a))))
+
+
+def stored_tensor(w, loads):
+    """(file, key, offset, numpy dtype, shape) of the stored safetensors tensor `w` is a plain read of (one Load, at most
+    a same-dtype AsType), looked up among `loads` (register_loads) by its Load node; else None."""
+    lid = _direct_load_id(w)
+    if lid is None:
+        return None
+    import pollard_stream as S
+    for f, k, shape, ids in loads:
+        if shape == tuple(w.shape) and lid in ids:
+            hdr, base = S.st_header(f)
+            info = hdr.get(k)
+            if not info or info.get("dtype") not in _ST_NP or tuple(info.get("shape") or ()) != tuple(w.shape):
+                return None
+            return f, k, base + info["data_offsets"][0], _ST_NP[info["dtype"]], tuple(info["shape"])
+    return None
+
+
+def stored_rows(src, ids):
+    """Rows `ids` (sorted unique ints) of a stored tensor, read from its file (numpy memmap) -> mx.array."""
+    import mlx.core as mx
+    import numpy as np
+    f, _, off, npdt, shape = src
+    rows = int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+    mm = np.memmap(f, dtype=npdt, mode="r", offset=off, shape=(rows, shape[-1]))
+    raw = np.ascontiguousarray(mm[np.asarray(ids, dtype=np.int64)])
+    del mm
+    return mx.array(raw).view(mx.bfloat16) if npdt == "uint16" else mx.array(raw)
+
+
 class StreamedQuantize(RangeSearchQuantize):
     """While active, mx.quantize is MLX's own -- lazy -- and, for --range search, its outputs are placeholders: the
     writer (StreamWriter) replaces each with encode_affine's answer when it reaches that tensor."""
@@ -691,20 +730,7 @@ class StreamedQuantize(RangeSearchQuantize):
 
     def file_source(self, w):
         """(file, key, offset, numpy dtype, shape) of the stored tensor `w` reads, when it is a plain read of one."""
-        lid = _direct_load_id(w)
-        if lid is None:
-            return None
-        import pollard_stream as S
-        for f, arrays in self.loads:
-            for k, arr in arrays.items():
-                if tuple(arr.shape) != tuple(w.shape) or lid not in _load_ids(arr):
-                    continue
-                hdr, base = S.st_header(f)
-                info = hdr.get(k)
-                if not info or info.get("dtype") not in _ST_NP or tuple(info.get("shape") or ()) != tuple(w.shape):
-                    return None
-                return f, k, base + info["data_offsets"][0], _ST_NP[info["dtype"]], tuple(info["shape"])
-        return None
+        return stored_tensor(w, self.loads)
 
     def __enter__(self):
         import mlx.core as mx
@@ -713,7 +739,7 @@ class StreamedQuantize(RangeSearchQuantize):
         def load(file, *a, **k):
             out = self._orig_load(file, *a, **k)
             if str(file).endswith(".safetensors") and isinstance(out, dict):
-                self.loads.append((str(file), out))
+                register_loads(self.loads, file, out)
             return out
         mx.load = load
         self._orig = mx.quantize
@@ -1072,6 +1098,52 @@ def preflight_build(plan, out_dir, max_ram_gb=None, log=print, mirror=None):
 # towers, talkers and code2wav are never evaluated.
 
 
+class _KVRef:
+    """Record-pass stand-in for what block `i` of row `b` hands later blocks (Gemma 4: its K/V and offset, consumed by
+    the KV-shared layers). Replaced by the real value when the block that reads it runs."""
+    __slots__ = ("b", "i", "field")
+
+    def __init__(self, b, i, field):
+        self.b, self.i, self.field = b, i, field
+
+    def __add__(self, other):                          # `offset + trimmed_prefix` on a record pass: still a reference
+        return self
+
+
+def _block_returns_state(blk):
+    """Does this decoder block return (h, shared_kv, offset) -- Gemma 4's KV-sharing blocks -- rather than h?"""
+    import inspect
+    try:
+        return "shared_kv" in inspect.signature(type(blk).__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _swap_refs(x, state):
+    """`x` (a recorded argument) with every _KVRef replaced by the real value it stands for."""
+    if isinstance(x, _KVRef):
+        return state[(x.b, x.i)][0 if x.field == "kvs" else 1]
+    if isinstance(x, tuple):
+        return tuple(_swap_refs(y, state) for y in x)
+    if isinstance(x, list):
+        return [_swap_refs(y, state) for y in x]
+    if isinstance(x, dict):
+        return {k: _swap_refs(v, state) for k, v in x.items()}
+    return x
+
+
+def _refs_in(x, out):
+    if isinstance(x, _KVRef):
+        out.add((x.b, x.i))
+    elif isinstance(x, (tuple, list)):
+        for y in x:
+            _refs_in(y, out)
+    elif isinstance(x, dict):
+        for y in x.values():
+            _refs_in(y, out)
+    return out
+
+
 class _Tap:
     """Stands in for one decoder block: records its call (record), passes the hidden state through, or hands the
     final hidden state to the model's head (final). Attribute reads go to the real block (is_attention_layer, ...)."""
@@ -1114,6 +1186,78 @@ def _lazy_load(path, engine):
     return load_model(Path(path), lazy=True)[0]
 
 
+#: a lookup table the streamed verify gathers by row instead of holding whole: an embedding bigger than this that is
+#: not the model's (possibly tied) input embedding -- Gemma 4's per-layer table (5.6 GB of bf16)
+GATHER_MIN_BYTES = 1 << 30
+
+
+def _is_gathered_table(name, nbytes):
+    leaf = name.rsplit(".", 1)[-1]
+    return nbytes > GATHER_MIN_BYTES and "embed" in leaf and leaf not in ("embed_tokens", "wte", "tok_embeddings")
+
+
+def _rows_of(ids_rows):
+    import numpy as np
+    return np.unique(np.concatenate([np.asarray(r, dtype=np.int64) for r in ids_rows])) if ids_rows else \
+        np.zeros((0,), np.int64)
+
+
+class _GatheredTable:
+    """Stands in for a big nn.Embedding / nn.QuantizedEmbedding during a streamed verify: only the rows of the token ids
+    the verify feeds are read from the file (stored_rows), and lookups are remapped onto them. The module's own
+    __call__ does the arithmetic, so the result is the full table's for those ids."""
+
+    def __init__(self, module, srcs, ids, vocab):
+        import mlx.core as mx
+        import numpy as np
+        self.module = module
+        self.ids = np.asarray(ids, dtype=np.int64)
+        remap = np.zeros((vocab,), dtype=np.int32)
+        remap[self.ids] = np.arange(len(self.ids), dtype=np.int32)
+        self.remap = mx.array(remap)
+        self.saved = {}
+        for name, src in srcs.items():
+            self.saved[name] = module[name]
+            module[name] = stored_rows(src, self.ids)
+        mx.eval(*[module[n] for n in srcs])
+
+    def __call__(self, x):
+        return self.module(self.remap[x])
+
+    def __getattr__(self, k):
+        return getattr(self.module, k)
+
+
+def gather_lookup_tables(model, loads, rows, log=print):
+    """Swap every big lookup table of `model` (see _is_gathered_table) for a _GatheredTable over the token ids in
+    `rows`. Returns the swapped (parent, attr, gathered) triples; a table whose params are not plain stored reads is
+    left as it is."""
+    import mlx.nn as nn
+    ids = _rows_of(rows)
+    swapped = []
+    for name, mod in list(model.named_modules()):
+        if not isinstance(mod, (nn.Embedding, nn.QuantizedEmbedding)):
+            continue
+        w = mod["weight"]
+        if not _is_gathered_table(name, int(w.nbytes) * (1 if not isinstance(mod, nn.QuantizedEmbedding) else 2)):
+            continue
+        keys = ["weight"] + [k for k in ("scales", "biases") if isinstance(mod, nn.QuantizedEmbedding) and
+                             mod.get(k) is not None]
+        srcs = {k: stored_tensor(mod[k], loads) for k in keys}
+        if any(v is None for v in srcs.values()):
+            log(f"   {name}: not a plain stored read -- held whole")
+            continue
+        parent = model
+        *path, attr = name.split(".")
+        for p_ in path:
+            parent = parent[int(p_)] if isinstance(parent, list) else parent[p_]
+        g = _GatheredTable(mod, srcs, ids, int(w.shape[0]))
+        parent[attr] = g
+        swapped.append((parent, attr, g))
+        log(f"   {name}: {len(ids)} of {w.shape[0]} rows read from the file (a lookup table is never held whole)")
+    return swapped
+
+
 def _materialize(x):
     import mlx.core as mx
     if isinstance(x, mx.array):
@@ -1135,21 +1279,36 @@ class StreamedLM:
         self.path, self.engine, self.log = path, engine, log
         self.guard = guard or MemoryGuard(log=log)
         self.mirror = RemoteMirror.of(path, log) if os.path.isdir(str(path)) else None
-        with (self.mirror.hook() if self.mirror is not None else contextlib.nullcontext()):
-            self.model = _lazy_load(path, engine)
+        import mlx.core as mx
+        self.loads, orig_load = [], mx.load
+
+        def load(file, *a, **k):
+            out = orig_load(file, *a, **k)
+            if str(file).endswith(".safetensors") and isinstance(out, dict):
+                register_loads(self.loads, file, out)
+            return out
+        mx.load = load
+        try:
+            with (self.mirror.hook() if self.mirror is not None else contextlib.nullcontext()):
+                self.model = _lazy_load(path, engine)
+        finally:
+            mx.load = orig_load
         self.lm, self.layers = _decoder(self.model)
         self.mode, self.calls, self.h, self.final, self.start = None, {}, {}, {}, 0
+        self.stateful = bool(self.layers) and _block_returns_state(self.layers[0])   # Gemma 4: (h, kvs, offset)
 
     def tap(self, i, x, args, kw):
+        state = self.stateful
         if self.mode == "record":
             if i == 0:
                 self.h[self.b] = _materialize(x)
-            self.calls[(self.b, i)] = (_materialize(list(args)), _materialize(dict(kw)))
-            return x
+            self.calls[(self.b, i)] = (_materialize(list(args)), _materialize(dict(kw)))   # a _KVRef passes through
+            return (x, _KVRef(self.b, i, "kvs"), _KVRef(self.b, i, "offset")) if state else x
         if self.mode == "final" and i == len(self.layers) - 1:
             h = self.final[self.b]
-            return h[:, self.start:] if self.start else h   # norm + head are per position: only the scored ones
-        return x
+            h = h[:, self.start:] if self.start else h   # norm + head are per position: only the scored ones
+            return (h, None, None) if state else h
+        return (x, None, None) if state else x
 
     def _forward(self, ids):
         import mlx.core as mx
@@ -1166,6 +1325,8 @@ class StreamedLM:
         import mlx.core as mx
         from mlx.utils import tree_flatten, tree_map
         self.rows = rows
+        if self.mirror is None:                            # big lookup tables: only the rows these ids read
+            gather_lookup_tables(self.model, self.loads, rows, self.log)
         mir = self.mirror
         if mir is not None:                                # embeddings / final norm / head: kept for the whole run
             blockdeps = set()
@@ -1179,6 +1340,11 @@ class StreamedLM:
                 self.b = b
                 self._forward(ids)                         # taps only: no block runs, the logits are never evaluated
             self.mode = None
+            self.kv, self.kv_wanted = {}, set()
+            if self.stateful:
+                for a_, k_ in self.calls.values():
+                    _refs_in(a_, self.kv_wanted)
+                    _refs_in(k_, self.kv_wanted)
             for i, blk in enumerate(orig):
                 deps = mir.deps(*[v for _, v in tree_flatten(blk.parameters())]) if mir is not None else set()
                 if deps:
@@ -1187,8 +1353,22 @@ class StreamedLM:
                     mx.eval(p)                             # stack never sit beside the rest of the block's stacks
                 for b in range(len(rows)):
                     args, kw = self.calls.pop((b, i))
-                    self.h[b] = blk(self.h[b], *args, **kw)
+                    if self.stateful:                      # the K/V a later KV-shared block reads: kept only if read
+                        args, kw = _swap_refs(args, self.kv), _swap_refs(kw, self.kv)
+                        h, kvs, off = blk(self.h[b], *args, **kw)
+                        if (b, i) in self.kv_wanted:
+                            self.kv[(b, i)] = (_materialize(kvs), off)
+                        self.h[b] = h
+                    else:
+                        self.h[b] = blk(self.h[b], *args, **kw)
                     mx.eval(self.h[b])
+                if self.stateful:                          # K/V no later block reads any more: dropped
+                    later = set()
+                    for (bb, j), (a_, k_) in self.calls.items():
+                        _refs_in(a_, later)
+                        _refs_in(k_, later)
+                    for key in [k for k in self.kv if k not in later]:
+                        del self.kv[key]
                 blk.update(tree_map(lambda _: mx.array([]), blk.parameters()))
                 if deps:
                     mir.done(deps)
@@ -1236,6 +1416,9 @@ def plan_verify(source, rung=None, length=1024, chunks=16, vocab=None):
             g = re.sub(r"\.experts\.\d+\.", ".experts.*.", k)
             biggest = max(biggest, b)
             blocks[(g, -1)] = blocks.get((g, -1), 0) + b
+        elif "embed" in k and len(src.shape(k)) == 2 and _is_gathered_table(k[:-len(".weight")] if
+                                                                          k.endswith(".weight") else k, b):
+            outer += min(b, (chunks * 2 * length) * b // max(1, src.shape(k)[0]))   # the rows the chunks read
         elif "embed" in k or k.endswith("lm_head.weight"):
             outer += b
             embed = max(embed, b) if "embed" in k else embed
