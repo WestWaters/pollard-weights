@@ -272,10 +272,13 @@ def test_the_repo_is_public_from_the_first_rung_and_the_card_goes_up_before_it(m
     first = _gguf_rung(c, "Q6_K")
     assert R.publish_rung(R._publish_rung_step(c, "gguf", "Q6_K", first), c, cfg, True, out=lambda *_: None) == "done"
     assert hub.private[REPO] is False, "public on the first rung, not at the end"
-    assert hub.calls[:2] == [("file", "README.md"), ("file", "Tiny-1B-Pollard-Q6_K.gguf")], "card first, then the rung"
+    files = [x for x in hub.calls if not str(x[1]).startswith("pollard/")]   # the results sidecars ride after each rung
+    assert files[:2] == [("file", "README.md"), ("file", "Tiny-1B-Pollard-Q6_K.gguf")], "card first, then the rung"
+    assert any(str(x[1]).startswith("pollard/results-gguf.") for x in hub.calls), "the rung's numbers as a sidecar"
     second = _gguf_rung(c, "IQ4_XS")
     assert R.publish_rung(R._publish_rung_step(c, "gguf", "IQ4_XS", second), c, cfg, True, out=lambda *_: None) == "done"
-    assert hub.calls[2:4] == [("file", "README.md"), ("file", "Tiny-1B-Pollard-IQ4_XS.gguf")], "card refreshed first"
+    files = [x for x in hub.calls if not str(x[1]).startswith("pollard/")]
+    assert files[2:4] == [("file", "README.md"), ("file", "Tiny-1B-Pollard-IQ4_XS.gguf")], "card refreshed first"
     assert len(cards) == 2, "the card is rebuilt from the rungs passed so far, once per rung"
     # the last step: nothing to flip, only the file-list check
     hub.private[REPO] = "untouched"
