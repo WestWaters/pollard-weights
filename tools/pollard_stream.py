@@ -2241,11 +2241,18 @@ def verify_memory(bb, nrows, seqlen, budget_gb, device="cpu", block=256, log=pri
         f"and the budget is {budget_gb:.1f} GB -- raise --max-ram-gb or run it on CUDA (--device cuda)")
 
 
+def disk_usage(path):
+    """shutil.disk_usage of `path`: the one place the streamed lanes read the disk (pollard_mlx's build preflight, remote
+    mirror and reserve, pollard_verify's reference logits and this module's hidden-state memmap), so a test sets the
+    free space with one monkeypatch instead of depending on the machine it runs on."""
+    import shutil
+    return shutil.disk_usage(path)
+
+
 def _state_store(nrows_scored, hid):
     """A float32 memmap for the source's final hidden states (scored positions only) in the workspace cache, and its
     path: the source pass writes it, the rung pass reads it -- the two passes never sit in memory together."""
     import numpy as np
-    import shutil
     import tempfile
     try:
         import pollard_workspace as ws
@@ -2253,7 +2260,7 @@ def _state_store(nrows_scored, hid):
     except Exception:                                                     # noqa: BLE001
         d = tempfile.gettempdir()
     need = int(nrows_scored) * int(hid) * 4
-    free = shutil.disk_usage(d).free
+    free = disk_usage(d).free
     if free < need + 1e9:
         raise OutOfMemoryBudget(f"disk: the source's final hidden states need {need / 1e9:.2f} GB at {d} (+1 GB "
                                 f"margin) and {free / 1e9:.2f} GB is free")

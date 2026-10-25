@@ -54,6 +54,17 @@ def test_writer_and_verify_no_longer_hardcode_3gb():
     assert "+ 3.0" not in w and "floor_gb()" in w
 
 
+def test_the_streamed_lanes_read_the_disk_through_one_helper():
+    """pollard_stream.disk_usage is the one place: a test sets the disk there, never the machine's real free space."""
+    for name in ("pollard_mlx.py", "pollard_stream.py"):
+        src = (ROOT / "tools" / name).read_text()
+        assert src.count("shutil.disk_usage(") == (1 if name == "pollard_stream.py" else 0), name
+    v = (ROOT / "tools" / "pollard_verify.py").read_text()
+    for fn in ("def ref_disk_room(", "def _ref_store("):
+        body = v[v.index(fn):v.index("\ndef ", v.index(fn) + 1)]
+        assert "shutil.disk_usage(" not in body and "S.disk_usage(" in body, fn
+
+
 # ---------------------------------------------------------------------------------------- a simulated disk
 
 def _src(tmp_path, n=6, size=1 << 16):
@@ -89,6 +100,15 @@ class Disk:
         self.written += n
         f = self.start - self.written + self.m.evicted - self.swap(self.reads)
         self.low = f if self.low is None else min(self.low, f)
+
+
+@pytest.fixture(autouse=True)
+def _roomy_disk(monkeypatch):
+    """The machine's own free disk is never what these tests read: every free-disk read of the streamed lanes goes
+    through pollard_stream.disk_usage, set here to 1 TB free (the cache's first fetches, before a test attaches its
+    simulated Disk); a test that wants a tight disk patches it again or sets the mirror's free_bytes."""
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(S, "disk_usage", lambda p: usage(2_000 * 10**9, 1_000 * 10**9, 1_000 * 10**9))
 
 
 @pytest.fixture
@@ -212,7 +232,6 @@ def test_full_disk_state_write_still_evicts(mirror, monkeypatch):
 # --------------------------------------------------------------------------- the verify's own writes
 
 def test_reference_logits_get_room_from_the_mirror_then_results_are_written(mirror, tmp_path, monkeypatch):
-    import shutil
     import pollard_verify as V
     m, ks = mirror, _keys(mirror)
     m.ensure(ks)
@@ -221,7 +240,7 @@ def test_reference_logits_get_room_from_the_mirror_then_results_are_written(mirr
     R = M.disk_reserve_gb(total_bytes=0)
     du = collections.namedtuple("du", "total used free")
     base = {"free": R * GB + 1000}
-    monkeypatch.setattr(shutil, "disk_usage", lambda p: du(0, 0, int(base["free"] + m.evicted)))
+    monkeypatch.setattr(S, "disk_usage", lambda p: du(0, 0, int(base["free"] + m.evicted)))
     m.free_bytes = lambda: int(base["free"] + m.evicted)
     ref = tmp_path / "home" / "cache" / "verify-ref-x.npy"
     ref.parent.mkdir(parents=True)

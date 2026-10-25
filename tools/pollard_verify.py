@@ -385,15 +385,14 @@ def ref_disk_room(cache, nbytes, mirror=None, log=print):
     """Before the source's reference logits (`nbytes`) are written at `cache`: room for them over the disk reserve
     (pollard_mlx.disk_reserve_gb). A remote mirror's cache on the same disk is evicted for it first; still short ->
     OutOfMemoryBudget (the step is held, nothing half-written)."""
-    import shutil
     import pollard_mlx as M
     import pollard_stream as S
     d = os.path.dirname(os.path.abspath(cache))
     reserve = M.disk_reserve_gb(d)
-    free = shutil.disk_usage(d).free
+    free = S.disk_usage(d).free
     if free < nbytes + reserve * 1e9 and mirror is not None and os.stat(d).st_dev == os.stat(mirror.dir).st_dev:
         freed = mirror.make_room(reserve + nbytes / 1e9)
-        free = shutil.disk_usage(d).free
+        free = S.disk_usage(d).free
         log(f"   disk: {freed / 1e9:.1f} GB of the mirror's cache evicted for the reference logits")
     if free < nbytes + reserve * 1e9:
         raise S.OutOfMemoryBudget(f"disk: the reference logits need {nbytes / 1e9:.2f} GB at {d} over the "
@@ -516,12 +515,11 @@ def _ref_store(cache, offs, vocab, log=print):
     """A float16 memmap for the source's scored logits, written as `<cache>.partial.npy` (renamed when complete): the
     reference of 16 x 1024 scored positions at a 150k vocabulary is ~5 GB -- never held in RAM, checked for room."""
     import numpy as np
-    import shutil
+    import pollard_stream as S
     need = int(offs[-1]) * int(vocab) * 2
     d = os.path.dirname(os.path.abspath(cache)) or "."
-    free = shutil.disk_usage(d).free
+    free = S.disk_usage(d).free
     if free < need + 2e9:
-        import pollard_stream as S
         raise S.OutOfMemoryBudget(f"disk: the reference logits need {need / 1e9:.2f} GB at {d} (+2 GB margin) and "
                                   f"{free / 1e9:.2f} GB is free")
     return np.lib.format.open_memmap(cache + ".partial.npy", mode="w+", dtype=np.float16,

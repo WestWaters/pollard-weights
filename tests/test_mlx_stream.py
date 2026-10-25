@@ -30,11 +30,25 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 import pollard_mlx as M  # noqa: E402
 
 
+#: The disk these tests run on: 1 TB free of 2 TB, whatever the machine has (the tiny checkpoints write a few MB).
+#: Every free-disk read of the streamed lanes goes through pollard_stream.disk_usage, so this one patch sets it --
+#: in this process (the fixture below) and in the pollard-mlx subprocesses (_build).
+ROOMY_DISK = (2_000_000_000_000, 1_000_000_000_000, 1_000_000_000_000)
+
+
+def _roomy_disk(path):
+    import collections
+    return collections.namedtuple("usage", "total used free")(*ROOMY_DISK)
+
+
 @pytest.fixture(autouse=True)
 def _volume_floor_off(monkeypatch):
     """The disk floor's 10%-of-the-volume part is this machine's, not the code under test here (a dev Mac's volume can
-    be far bigger than its free disk); test_mlx_disk_reserve tests the floor itself."""
+    be far bigger than its free disk); test_mlx_disk_reserve tests the floor itself. The free disk is the machine's
+    too: the 10 GB macOS floor held every streamed step on a Mac with less than that free, so it is set here."""
+    import pollard_stream as S
     monkeypatch.setattr(M, "MAC_DISK_FLOOR_FRAC", 0.0)
+    monkeypatch.setattr(S, "disk_usage", _roomy_disk)
 
 
 def _st(path, tensors):
@@ -470,9 +484,17 @@ def tiny(tmp_path_factory):
     return out
 
 
+#: pollard-mlx in a subprocess, on the tests' disk (ROOMY_DISK) instead of the machine's
+_LAUNCH = ("import collections, sys\n"
+           "import pollard_stream as S, pollard_mlx as M\n"
+           f"S.disk_usage = lambda p: collections.namedtuple('usage', 'total used free')(*{ROOMY_DISK!r})\n"
+           "sys.argv = ['pollard-mlx'] + sys.argv[1:]\n"
+           "M.main()\n")
+
+
 def _build(src, out, *extra):
     env = dict(os.environ, PYTHONPATH=str(ROOT / "tools"), HF_HUB_OFFLINE="1")
-    r = subprocess.run([sys.executable, str(ROOT / "tools" / "pollard_mlx.py"), "--model", str(src), "--out", str(out)]
+    r = subprocess.run([sys.executable, "-c", _LAUNCH, "--model", str(src), "--out", str(out)]
                        + list(extra), capture_output=True, text=True, env=env, timeout=900)
     return r
 
@@ -635,7 +657,6 @@ def test_build_preflight_counts_the_mirrors_cache_as_disk_and_evicts_it(tmp_path
     the rung needs before the build starts (a build whose source is all cached never fetches, so never evicts)."""
     _local_remote(monkeypatch)
     import collections
-    import shutil
     import pollard_stream as S
     monkeypatch.setattr(S, "free_ram_gb", lambda: 64.0)
     src = _lfm_like(tmp_path, experts=4, inter=2048, hidden=256)
@@ -647,7 +668,7 @@ def test_build_preflight_counts_the_mirrors_cache_as_disk_and_evicts_it(tmp_path
     assert cache == sum(n for _, _, n in m.entries.values()) and cache > 0
     base = 10e9                                               # what the disk has besides the cache
     du = collections.namedtuple("du", "total used free")
-    monkeypatch.setattr(shutil, "disk_usage", lambda p: du(0, 0, int(base + m.evicted)))
+    monkeypatch.setattr(S, "disk_usage", lambda p: du(0, 0, int(base + m.evicted)))
     m.free_bytes = lambda: int(base + m.evicted)
     plan = {"peak_gb": 1.0, "largest": "x", "largest_gb": 0.0, "out_gb": (base - 1e9 + cache * 0.5) / 1e9}
     out = str(tmp_path / "rung")
