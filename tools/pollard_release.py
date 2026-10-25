@@ -116,6 +116,7 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
+card_args: []                  # extra pollard-card flags for this model (e.g. [--params, 7.996B, --mmproj, mmproj-X.gguf])
 lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
                                # the whole release stops before calibration (default: only that lane is held)
   gguf: {enabled: true}        # the publish ladder + flagship, built the Pollard way (pollard --ladder)
@@ -1195,6 +1196,7 @@ def card_cmd(cfg, c, lanes):
                                  "(sources, revisions and licences in the shipped .sources.json)"]
     if c.get("free"):
         card += ["--runtime-from-repo"]                  # freed rungs are read from their published copy
+    card += [str(x) for x in (cfg.get("card_args") or [])]   # e.g. --params / --mmproj a config-only mirror cannot give
     return card
 
 
@@ -1487,15 +1489,166 @@ def release_card_cmd(cfg, c):
     return card_cmd(cfg, c, [l for l in LANES if ((cfg.get("lanes") or {}).get(l) or {}).get("enabled")])
 
 
+#: where each machine's measured numbers meet in the ONE repo: pollard/results-<lane>.<host>.json =
+#: {"lane", "host", "results": <reports/results-<lane>.json>, "builds": [the lane's MANIFEST builds]}
+SIDECAR_DIR = "pollard"
+SIDECAR_RE = re.compile(r"^pollard/results-([a-z0-9]+)\.([A-Za-z0-9_.-]+)\.json$")
+#: the repo folder of each non-root lane (the GGUF lane lives at the root)
+_LANE_DIR = {"mlx": "MLX", "gptq": "GPTQ", "mx": "MX", "exl3": "EXL3", "exlr8": "EXLR8", "draft": "DRAFT"}
+
+
+def host_name(cfg=None):
+    """This machine's name in its sidecars: the plan's `host:`, else the short hostname."""
+    h = (cfg or {}).get("host") or platform.node().split(".")[0] or "host"
+    return re.sub(r"[^A-Za-z0-9_-]", "-", str(h)).lower()
+
+
+def lane_sidecar(c, lane, host):
+    """This machine's sidecar document for one lane: its results and its MANIFEST builds of that lane."""
+    import pollard_workspace as ws
+    try:
+        res = json.load(open(results_path(c, lane), encoding="utf-8"))
+    except (OSError, ValueError):
+        res = {}
+    builds = [b for b in ws.read_manifest(lane_key(c, lane)).get("builds", []) if b.get("lane") == lane]
+    return {"lane": lane, "host": host, "results": res, "builds": builds}
+
+
+def push_sidecar(api, repo, c, cfg, lane, out=print):
+    """Best-effort: this machine's numbers for `lane` as pollard/results-<lane>.<host>.json in the repo, so any machine
+    that writes the card next keeps them. Never raises."""
+    host = host_name(cfg)
+    try:
+        doc = lane_sidecar(c, lane, host)
+        if not doc["results"] and not doc["builds"]:
+            return False
+        d = os.path.join(c["mdir"], "reports")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"sidecar-{lane}.{host}.json")
+        json.dump(doc, open(p, "w", encoding="utf-8"), indent=1)
+        api.upload_file(path_or_fileobj=p, path_in_repo=f"{SIDECAR_DIR}/results-{lane}.{host}.json", repo_id=repo)
+        out(f"      sidecar: {SIDECAR_DIR}/results-{lane}.{host}.json ({len(doc['results'])} result(s), "
+            f"{len(doc['builds'])} build(s))")
+        return True
+    except Exception as e:                                       # noqa: BLE001 -- never holds a rung back
+        out(f"      sidecar for {lane} not uploaded ({type(e).__name__}: {e}) -- the next one carries it")
+        return False
+
+
+def _on_hub(b, lane, files):
+    """Is this build's file / folder in the repo listing?"""
+    from pollard_card import rung_subfolder
+    n = b.get("uploaded_as") or b.get("name") or os.path.basename(str(b.get("path", "")))
+    if lane == "gguf":
+        return n in files
+    if lane == "draft":
+        return any(f.startswith("DRAFT/") and (n in f or (b.get("tag") or "~") in f) for f in files)
+    sub = b.get("uploaded_as") or f"{_LANE_DIR.get(lane, lane.upper())}/{rung_subfolder(b, lane)}"
+    return any(f.startswith(sub.rstrip("/") + "/") for f in files)
+
+
+def hub_sidecars(api, repo, files, out=print):
+    """{lane: {"results": {...}, "builds": [...]}} merged over every pollard/results-*.json in the repo. An
+    unreadable sidecar is skipped with a warning (its rungs show as numbers pending)."""
+    merged = {}
+    for f in sorted(x for x in files if SIDECAR_RE.match(x)):
+        try:
+            p = api.hf_hub_download(repo_id=repo, filename=f) if hasattr(api, "hf_hub_download") else None
+            if p is None:
+                from huggingface_hub import hf_hub_download
+                p = hf_hub_download(repo_id=repo, filename=f)
+            d = json.load(open(p, encoding="utf-8"))
+        except Exception as e:                                   # noqa: BLE001
+            out(f"      (sidecar {f} unreadable: {type(e).__name__}: {e})")
+            continue
+        lane = d.get("lane") or SIDECAR_RE.match(f).group(1)
+        m = merged.setdefault(lane, {"results": {}, "builds": []})
+        m["results"].update(d.get("results") or {})
+        m["builds"] += [b for b in d.get("builds") or [] if isinstance(b, dict)]
+    return merged
+
+
+def pending_rows(card_text, files):
+    """Rungs in the repo that the card does not name (no numbers anywhere yet): the 'numbers pending' section."""
+    rungs = sorted({"/".join(f.split("/")[:2]) + "/" for f in files
+                    if f.split("/")[0] in set(_LANE_DIR.values()) - {"DRAFT"} and f.count("/") >= 2}
+                   | {f for f in files if f.endswith(".gguf") and "/" not in f and not f.startswith("mmproj")})
+    missing = [r for r in rungs if r not in card_text]
+    if not missing:
+        return card_text, []
+    rows = ["", "## Also on the Hub (numbers pending)", "",
+            "These rungs are published; their measured numbers land in this card once the machine that built them "
+            "has put its results sidecar in the repo.", "", "| File / folder | Numbers |", "|---|---|"]
+    rows += [f"| `{m}` | numbers pending |" for m in missing]
+    cut = card_text.find("\n## Credits")
+    text = (card_text[:cut] + "\n".join(rows) + "\n" + card_text[cut:]) if cut >= 0 else \
+        card_text + "\n".join(rows) + "\n"
+    return text, missing
+
+
+@contextlib.contextmanager
+def merged_lane_files(c, cfg, side, files):
+    """For the length of one card build: this machine's results + MANIFESTs overlaid with every other machine's
+    sidecar (results merged, builds added -- the other machines' only where the Hub holds them). Restored after."""
+    import pollard_workspace as ws
+    saved = {}
+
+    def keep(p):
+        if p not in saved:
+            saved[p] = open(p, "rb").read() if os.path.exists(p) else None
+
+    try:
+        for lane, s_ in side.items():
+            p = results_path(c, lane)
+            keep(p)
+            try:
+                mine = json.load(open(p, encoding="utf-8"))
+            except (OSError, ValueError):
+                mine = {}
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            json.dump(dict(s_["results"], **mine), open(p, "w", encoding="utf-8"), indent=2)   # this machine wins
+            key = lane_key(c, lane)
+            mp = os.path.join(ws.model_dir(key, create=True), "MANIFEST.json")
+            keep(mp)
+            man = ws.read_manifest(key) or {}
+            have = {b.get("name") for b in man.get("builds", [])}
+            add = [b for b in s_["builds"] if b.get("lane") == lane and b.get("name") not in have
+                   and _on_hub(b, lane, files)]
+            if add:
+                man = dict(man, model=man.get("model") or key, builds=list(man.get("builds", [])) + add)
+                json.dump(man, open(mp, "w", encoding="utf-8"), indent=2)
+        yield
+    finally:
+        for p, data in saved.items():
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                open(p, "wb").write(data)
+
+
 def push_card(api, repo, c, cfg, out=print):
-    """The card goes up FIRST: rebuilt from the rungs built and passed so far (pollard-card --verified-only, the
-    numbers measured so far) and uploaded as README.md -- before the rung that triggered it."""
-    run_cmd(release_card_cmd(cfg, c))
+    """The card goes up FIRST, and it UPDATES what the repo shows rather than replacing it: rebuilt from the union of
+    this machine's rungs built and passed so far, every other machine's numbers in the repo's pollard/results-*.json
+    sidecars, and the rungs actually on the Hub (one with no numbers anywhere is listed 'numbers pending'). Every
+    lane any machine has published keeps its rows."""
+    try:
+        files = set(api.list_repo_files(repo))
+    except Exception:                                            # noqa: BLE001 -- a new repo: nothing to merge
+        files = set()
+    side = hub_sidecars(api, repo, files, out) if files else {}
+    lanes = [l for l in LANES if ((cfg.get("lanes") or {}).get(l) or {}).get("enabled") or l in side]
+    with merged_lane_files(c, cfg, side, files):
+        run_cmd(card_cmd(cfg, c, lanes))
     card = os.path.join(c["release_dir"], "README.md")
     if not os.path.exists(card):
         raise RuntimeError(f"pollard-card wrote no card at {card}")
+    text, missing = pending_rows(open(card, encoding="utf-8").read(), files)
+    if missing:
+        open(card, "w", encoding="utf-8").write(text)
     api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo)
-    out(f"      card: README.md -> https://huggingface.co/{repo} (the rungs measured and passed so far)")
+    out(f"      card: README.md -> https://huggingface.co/{repo} (every lane's rungs so far"
+        + (f"; {len(missing)} with numbers pending" if missing else "") + ")")
 
 
 def rung_card(step, c, cfg, run_upload, out=print):
@@ -1839,7 +1992,10 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     api = hf_api(cfg)
     open_repo(api, repo, cfg, out)
     if not b.get("uploaded"):
-        push_card(api, repo, c, cfg, out)        # the card with this rung's numbers goes up first, the rung after it
+        try:                                     # the card with this rung's numbers goes up first, the rung after it
+            push_card(api, repo, c, cfg, out)
+        except Exception as e:                   # noqa: BLE001 -- never holds the rung back
+            out(f"      card not uploaded yet ({type(e).__name__}: {e}) -- the next rung's card carries it")
     if lane == "gguf":
         name = b.get("name") or os.path.basename(b["path"])
         try:                                     # pollard-ggufcheck before it leaves: the card states the runtime
@@ -1903,6 +2059,7 @@ def publish_rung(step, c, cfg, run_upload, out=print):
     if _free_local(c, key, b, out):
         b["freed"] = "uploaded + confirmed on the Hub"
         ws.update_build(key, b["path"], {"freed": b["freed"]})
+    push_sidecar(api, repo, c, cfg, lane, out)   # this machine's numbers in the repo, best-effort
     return "done"
 
 
