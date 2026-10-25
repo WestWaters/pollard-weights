@@ -444,7 +444,7 @@ def test_release_draft_lane_order_and_cards(model):
         assert ["--also", "draft"] == card[card.index("draft") - 1:card.index("draft") + 1]
     assert by["draft/card"].cmd == by["gguf/card"].cmd
     conv = by["draft/convert"].cmd
-    assert conv[conv.index("--rungs") + 1] == "Q8_0,Q4_K_M"
+    assert conv[conv.index("--rungs") + 1] == "Q4_K_M,Q8_0"   # smallest first
     # off by default: no draft step, no draft flag on cards
     _, _, plain = R.plan_steps(R.load_plan(None), model)
     assert not any(s.lane == "draft" for s in plain)

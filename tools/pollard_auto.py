@@ -457,6 +457,7 @@ def _build_ladder(a, ik_flagship):
     if want is not None:
         picks = {k: v for k, v in picks.items() if k.upper() in want}
         print(f"      --rung: building {', '.join(picks) or 'no ladder rung'} this run")
+    picks = dict(sorted(picks.items(), key=lambda kv: kv[1][2]))      # smallest first (owner, 2026-10-24)
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, (ram, preset, gb) in picks.items():
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", str(ram), "--reserve", "0"]
