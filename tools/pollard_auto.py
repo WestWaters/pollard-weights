@@ -463,9 +463,14 @@ def _passthrough_source(gguf):
         return None
 
 
-def _rung_out(gguf, label):
+def _rung_out(gguf, label, create=False):
+    """Where a ladder rung built from `gguf` goes: the workspace's folder for that GGUF ($POLLARD_HOME/models/<gguf>/,
+    the folder pollard-fit writes every other --gguf build to and whose MANIFEST records it) -- never beside the
+    source. A vendor GGUF sits in downloads/ or anywhere the user put it; the Bolt passthrough ladder wrote its
+    38 GB rungs next to C:\\pollard\\downloads\\bolt-24gb-gguf\\...-24GB.gguf (2026-10-24)."""
+    import pollard_workspace as ws
     stem = os.path.splitext(os.path.basename(gguf))[0]
-    return os.path.join(os.path.dirname(os.path.abspath(gguf)) or ".", f"{stem}-{label}.gguf")
+    return os.path.join(ws.model_dir(gguf, create=create), f"{stem}-{label}.gguf")
 
 
 def _build_ladder_passthrough(a, tensors):
@@ -490,7 +495,7 @@ def _build_ladder_passthrough(a, tensors):
     binq = _bin_in(a.bin, "llama-quantize") if a.bin else None
     for label, target in rungs:
         cmd = ["pollard-fit", "--gguf", a.gguf, "--ram", f"{(target + 1) / 0.85e9:.9f}", "--reserve", "0",
-               "--passthrough", "on", "--out", _rung_out(a.gguf, label)]
+               "--passthrough", "on", "--out", _rung_out(a.gguf, label, create=a.run)]
         if a.imatrix: cmd += ["--imatrix", a.imatrix]
         if a.sensitivity: cmd += ["--sensitivity", a.sensitivity]
         if binq: cmd += ["--llama-quantize", binq]
@@ -622,7 +627,7 @@ def _moe_rung(a):
     em = os.path.join(here, f"{stem}.moe.errmap.json")
     sens = os.path.join(here, f"{stem}.moe.sensitivity.json")
     lb = os.path.join(here, f"{stem}.moe.lowbit.json")
-    out = _rung_out(a.gguf, MOE_TAG)
+    out = _rung_out(a.gguf, MOE_TAG, create=a.run)
     rep = out + ".moefit.json"
     f16_gb = os.path.getsize(a.gguf) / 1e9 if os.path.exists(a.gguf) else 0.0
     gb = _moe_budget_gb(a, f16_gb)

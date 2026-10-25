@@ -1594,29 +1594,69 @@ def _protected_paths(c):
     return {os.path.normcase(os.path.abspath(str(k).rstrip("/\\"))) for k in keep if k}
 
 
-def _freeable(c, b):
-    """A build file this release made: under the workspace model dirs, or the automap flagship mix the ladder
-    wrote next to the f16. Anything else (an input, a file someone put there) is left alone."""
+def _local_files(path):
+    """{path relative to the build (its file name for a one-file build): full path} of every file a build has on disk
+    now -- a streamed rung's shard registry (pollard_stream.STREAMED) is the build's own bookkeeping, not counted."""
+    import pollard_stream as PS
+    if os.path.isfile(path):
+        return {os.path.basename(path): path}
+    out = {}
+    for root, _, files in os.walk(path):
+        for f in files:
+            full = os.path.join(root, f)
+            if f != PS.STREAMED:
+                out[os.path.relpath(full, path).replace(os.sep, "/")] = full
+    return out
+
+
+def _freeable(c, key, b):
+    """(True, "") when --free-after-upload may delete this rung, else (False, why). Decided by what the release
+    RECORDED, never by where the file sits (the Bolt passthrough ladder's rungs were written beside the vendor GGUF in
+    downloads/ and were kept, 38 GB, as "not a file this release built", 2026-10-24): the path is a build output in
+    this release's MANIFEST (`key`), its upload is recorded there as confirmed on the Hub by size + sha256
+    (`confirmed_files`, hashed from these bytes), and every file at the path still has the recorded size. An input of
+    the release (the vendor GGUF / f16, the HF folder, calibration, imatrix, profiles) -- or a folder holding one --
+    is never freed, whatever a MANIFEST entry says."""
     import pollard_workspace as ws
-    path = os.path.normcase(os.path.abspath(str(b.get("path", "")).rstrip("/\\")))
-    if not path or path in _protected_paths(c):
-        return False
-    roots = [ws.model_dir(c["src"]), ws.model_dir(c["f16"]), ws.model_dir(c["hf_dir"]),
-             ws.model_dir(c["smooth_dir"]), c["mdir"]]
-    if any(path.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots):
-        return True
-    # the flagship mix lives next to the f16: as automap wrote it (<stem>-mix.gguf) or under its published name
-    # once canonical_gguf renamed it (<M>-Pollard-<TAG>.gguf)
-    name = os.path.basename(path)
-    return bool(b.get("flagship")) and os.path.dirname(path) == os.path.normcase(
-        os.path.dirname(os.path.abspath(c["f16"]))) and (
-        path.endswith("-mix.gguf") or name.startswith(os.path.normcase(f"{c['name']}-Pollard-")))
+    raw = str(b.get("path", "")).rstrip("/\\")
+    if not raw:
+        return False, "no path recorded"
+    path = os.path.normcase(os.path.abspath(raw))
+    prot = _protected_paths(c)
+    if path in prot:
+        return False, "an input of this release"
+    if any(p.startswith(path + os.sep) for p in prot):
+        return False, "holds an input of this release"
+    for k in ("f16", "hf_dir", "src", "smooth_dir", "imatrix", "calib", "heldout"):
+        try:
+            if c.get(k) and os.path.exists(str(c[k])) and os.path.samefile(raw, str(c[k])):
+                return False, "the same file as an input of this release"
+        except OSError:
+            pass
+    entry = next((x for x in ws.read_manifest(key).get("builds", [])
+                  if os.path.normcase(os.path.abspath(str(x.get("path", "")).rstrip("/\\"))) == path
+                  and x.get("lane") == b.get("lane")), None)
+    if entry is None:
+        return False, "not a build output recorded in this release's MANIFEST"
+    conf = entry.get("confirmed_files") or {}
+    if not entry.get("uploaded") or not conf:
+        return False, "no upload confirmed by size + sha256 recorded for it"
+    now = _local_files(raw)
+    if set(now) != set(conf):
+        extra = sorted(set(now) - set(conf))
+        return False, ("files the upload did not confirm: " + ", ".join(extra[:3])) if extra else \
+            "files missing since the upload was confirmed"
+    for rel, full in now.items():
+        if os.path.getsize(full) != int(conf[rel]["size"]):
+            return False, f"{rel} changed size since the upload was confirmed"
+    return True, ""
 
 
-def _free_local(c, b, out=print):
+def _free_local(c, key, b, out=print):
     path = b.get("path", "")
-    if not _freeable(c, b):
-        out(f"      (kept {path}: not a file this release built)")
+    ok, why = _freeable(c, key, b)
+    if not ok:
+        out(f"      (kept {path}: {why})")
         return False
     if os.path.isdir(path):
         shutil.rmtree(path)
@@ -1741,7 +1781,12 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         elif not b.get("uploaded"):
             api.upload_folder(folder_path=b["path"], path_in_repo=dest, repo_id=repo)
     b["uploaded_as"] = dest
-    pairs = [(rp, lp) for rp, lp in _local_pairs(b["path"], dest) if os.path.basename(lp) != PS.STREAMED]
+    import pollard_hubcheck as H
+    local = [(rp, lp) for rp, lp in _local_pairs(b["path"], dest) if os.path.basename(lp) != PS.STREAMED]
+    # every local file hashed ONCE (size + sha256 + git blob id): the Hub is checked against these numbers, and they
+    # are what the MANIFEST records as confirmed -- the free step deletes only the files that still match them
+    recs = {lp: H.file_record(lp) for _, lp in local}
+    pairs = [(rp, recs[lp]) for rp, lp in local]
     pairs += [(e["path_in_repo"], {"size": e["size"], "sha256": e["sha256"], "git_sha1": e.get("git_sha1")})
               for e in streamed.values()]
     bad = remote_mismatches(api, repo, pairs)
@@ -1750,22 +1795,24 @@ def publish_rung(step, c, cfg, run_upload, out=print):
         raise RuntimeError(f"{dest} is not intact in {repo} after the upload ({bad[0]}) -- keeping the local copy")
     b["uploaded"] = repo
     b.pop("kept", None)
+    base = b["path"] if os.path.isdir(b["path"]) else os.path.dirname(b["path"])
+    b["confirmed_files"] = {os.path.relpath(lp, base).replace(os.sep, "/"): {
+        "size": recs[lp]["size"], "sha256": recs[lp]["sha256"], "path_in_repo": rp} for rp, lp in local}
     if streamed:
         b["bytes"] = int(_size_gb(b["path"]) * 1e9) + sum(int(e["size"]) for e in streamed.values())
-    import pollard_hubcheck as H
     # what the Hub holds for it (size + sha256 / git blob id): pollard-ls --clean-mirrors checks the Hub against
     # this once the local copy is freed
     rec = H.records(api, repo, [rp for rp, _ in pairs])
     if rec and len(rec) == len(pairs):
         b["hub_files"] = rec
-    fields = ("uploaded", "uploaded_as", "runtime", "runtime_arch", "bytes", "hub_files")
+    fields = ("uploaded", "uploaded_as", "runtime", "runtime_arch", "bytes", "hub_files", "confirmed_files")
     out(f"      uploaded {dest} -> https://huggingface.co/{repo} (size + hash confirmed on the Hub)")
     if not ws.update_build(key, b["path"], {k: b[k] for k in fields if k in b}, remove=("kept",)):
         # the upload is confirmed but the MANIFEST no longer has this build to say so: freeing the file now would
         # leave nothing on this machine recording where the rung went -- keep it
         out(f"      KEPT {b.get('path')} -- uploaded, but its MANIFEST entry is gone, so the upload is not recorded")
         return "kept: upload not recorded"
-    if _free_local(c, b, out):
+    if _free_local(c, key, b, out):
         b["freed"] = "uploaded + confirmed on the Hub"
         ws.update_build(key, b["path"], {"freed": b["freed"]})
     return "done"

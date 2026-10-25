@@ -212,14 +212,27 @@ def test_the_smoothed_copy_not_fitting_holds_only_its_lanes(model, inputs, monke
     assert st["prep/smoke"] == "done", "the release itself goes on"
 
 
-def test_flagship_and_fit_outputs_are_freeable_inputs_are_not(model, inputs):
+def test_freeable_is_what_the_manifest_recorded_and_confirmed_not_where_it_sits(model, inputs):
+    """The flagship mix beside the f16, a rung in the workspace: freeable only once the MANIFEST records it as a build
+    output with a confirmed upload (size + sha256) -- and an input never, whatever an entry says."""
     c, _, _ = R.plan_steps(plan(inputs), model, {"gguf"})
+    key = c["f16"]
     mix = os.path.join(os.path.dirname(c["f16"]), "Tiny-1B-f16-mix.gguf")
-    assert R._freeable(c, {"path": mix, "flagship": True})
-    assert not R._freeable(c, {"path": mix}), "only a recorded flagship next to the f16"
-    assert not R._freeable(c, {"path": c["f16"], "flagship": True})
-    assert not R._freeable(c, {"path": inputs["imatrix"]})
-    assert R._freeable(c, {"path": os.path.join(ws.model_dir(c["f16"]), "x.gguf")})
+    rung = os.path.join(ws.model_dir(key, create=True), "x.gguf")
+    for p in (mix, rung):
+        Path(p).write_bytes(b"GGUF" * 8)
+        assert not R._freeable(c, key, {"path": p, "lane": "gguf"})[0], "not recorded yet"
+        ws.record_build(key, "gguf", p, tag="T")
+        assert "no upload confirmed" in R._freeable(c, key, {"path": p, "lane": "gguf"})[1]
+        ws.update_build(key, p, {"uploaded": "o/r", "confirmed_files": {
+            os.path.basename(p): {"size": 32, "sha256": _sha(p), "path_in_repo": os.path.basename(p)}}})
+        assert R._freeable(c, key, {"path": p, "lane": "gguf"}) == (True, "")
+    for k in ("f16", "imatrix"):
+        p = inputs[k]
+        ws.record_build(key, "gguf", p, tag="X", extra={"uploaded": "o/r", "confirmed_files": {
+            os.path.basename(p): {"size": os.path.getsize(p), "sha256": _sha(p)}}})
+        ok, why = R._freeable(c, key, {"path": p, "lane": "gguf"})
+        assert not ok and "input" in why
 
 
 def test_pollard_auto_rung_filter():
