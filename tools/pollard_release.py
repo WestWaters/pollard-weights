@@ -3032,7 +3032,7 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 out(f"      NOT MEASURED: {short}")
                 statuses[st.id] = "done"
                 state[st.id] = {"status": "done", "not_measured": short, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                save_state(c["state"], state)
+                save_entry(c["state"], st.id, state[st.id])
                 continue
             if short:
                 out(f"      HELD: memory -- {short}")
