@@ -385,6 +385,8 @@ def _verify_gate(c):
 PROBE_ROUTES = ("auto", "hf", "imatrix")
 #: imatrix chunks when the plan does not say: the full Calib 3.0 corpus is ~9k chunks of 512, hours on a big model
 IMATRIX_CHUNKS = 1000
+#: llama-imatrix --output-frequency: a partial save every N chunks -- what a handed-back / retried run resumes from
+IMATRIX_SAVE_EVERY = 10
 
 
 def transformers_loadable(hf_dir):
@@ -2259,9 +2261,8 @@ def build_imatrix(c, cfg, out=print):
     ngl = imatrix_ngl(cfg, c, host)
     base = [binim, "-m", host, "-f", c["calib"], "-o", imx + ".partial", "--output-format", "dat"]
     base += _imatrix_shape(host) or ["-c", "512", "-b", "512", "-ub", "512"]
-    chunks = cfg.get("imatrix_chunks", IMATRIX_CHUNKS)
-    if chunks:
-        base += ["--chunks", str(int(chunks))]
+    chunks = int(cfg.get("imatrix_chunks", IMATRIX_CHUNKS) or 0)
+    base += ["--output-frequency", str(IMATRIX_SAVE_EVERY)]          # a partial on disk every N chunks: resumable
     if os.environ.get("POLLARD_THREADS"):
         base += ["-t", os.environ["POLLARD_THREADS"], "-tb", os.environ["POLLARD_THREADS"]]
     try:                                                          # chat-template tokens in the corpus stay tokens
@@ -2269,19 +2270,100 @@ def build_imatrix(c, cfg, out=print):
             base += ["--parse-special"]
     except Exception:                                             # noqa: BLE001
         pass
+    key = imatrix_run_key(host, c["calib"], base, chunks)
     for attempt in ([ngl, "0"] if ngl != "0" else ["0"]):
-        if os.path.exists(imx + ".partial"):
-            os.remove(imx + ".partial")
-        out(f"      $ {_fmt_cmd(base + ['-ngl', attempt])}")
+        # what an earlier run of THIS imatrix (same host, corpus, shape) already computed is kept and resumed: a GPU
+        # run handed back, a CPU retry or a killed step continues from its last partial save instead of chunk 0
+        done, keep = imatrix_resume_point(imx, key, chunks, out)
+        cmd = base + ["-ngl", attempt]
+        if done:
+            cmd += ["--in-file", keep, "--chunk", str(done)]
+        if chunks:
+            cmd += ["--chunks", str(chunks - done)]
+        _write_json(imx + ".partial.run.json", key)
+        out(f"      $ {_fmt_cmd(cmd)}")
         try:
-            run_cmd(base + ["-ngl", attempt])
+            run_cmd(cmd)
         except RuntimeError as e:
             out(f"      llama-imatrix -ngl {attempt}: {e}" + (" -- retrying on the CPU" if attempt != "0" else ""))
             continue
         if os.path.exists(imx + ".partial"):
             os.replace(imx + ".partial", imx)
+            for f in (keep, imx + ".partial.run.json", imx + ".resume.run.json"):
+                if f and os.path.exists(f):
+                    os.remove(f)
             return imx
     raise RuntimeError(f"llama-imatrix produced no imatrix at {imx}")
+
+
+def imatrix_run_key(host, calib, base, chunks):
+    """What makes two llama-imatrix runs the same computation: the host GGUF, the corpus (size + mtime), the shape
+    flags and the chunk budget. A partial is resumed only by a run with the same key."""
+    def st(p):
+        try:
+            s = os.stat(p)
+            return [os.path.abspath(p), s.st_size, int(s.st_mtime)]
+        except OSError:
+            return [os.path.abspath(str(p)), None, None]
+    shape = [x for i, x in enumerate(base) if base[i - 1] in ("-c", "-b", "-ub") or x in ("-c", "-b", "-ub")]
+    return {"host": st(host), "calib": st(calib), "shape": shape, "chunks": chunks}
+
+
+def imatrix_chunks_done(path):
+    """Chunks a legacy .dat imatrix holds (its trailing m_last_chunk), 0 when it is not one / unreadable / cut short."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            (n,) = struct.unpack("<i", f.read(4))
+            if not 0 < n < 1_000_000:
+                return 0
+            for _ in range(n):
+                (ln,) = struct.unpack("<i", f.read(4))
+                f.seek(ln, 1)
+                _ncall, nval = struct.unpack("<ii", f.read(8))
+                f.seek(4 * nval, 1)
+            b = f.read(4)
+            return struct.unpack("<i", b)[0] if len(b) == 4 else 0
+    except (OSError, struct.error):
+        return 0
+
+
+def imatrix_resume_point(imx, key, chunks, out=print):
+    """(chunks done, kept file) for the next llama-imatrix attempt. A `.partial` an earlier attempt saved for the
+    same run key moves aside to `<imatrix>.resume.dat` (llama-imatrix rewrites `.partial` from its first save) and is
+    loaded with --in-file; its counts carry on, so the saves that follow are cumulative. A partial of another run is
+    dropped; (0, None) = start at chunk 0."""
+    part, keep = imx + ".partial", imx + ".resume.dat"
+    if os.path.exists(part):
+        prev = _read_json(part + ".run.json")
+        n = imatrix_chunks_done(part)
+        if prev == key and n > imatrix_chunks_done(keep) and (not chunks or n < chunks):
+            os.replace(part, keep)
+            os.replace(part + ".run.json", imx + ".resume.run.json")
+        else:
+            os.remove(part)
+    if os.path.exists(keep) and _read_json(imx + ".resume.run.json") == key:
+        n = imatrix_chunks_done(keep)
+        if n > 0 and (not chunks or n < chunks):
+            out(f"      llama-imatrix: resuming from chunk {n}" + (f" of {chunks}" if chunks else "") +
+                f" ({os.path.basename(keep)}, kept from the earlier run)")
+            return n, keep
+    for f in (keep, imx + ".resume.run.json"):
+        if os.path.exists(f):
+            os.remove(f)
+    return 0, None
+
+
+def _read_json(p):
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
+def _write_json(p, doc):
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
 
 
 # ------------------------------------------------------------------------------- memory preflight (MLX on a Mac)
