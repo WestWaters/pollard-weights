@@ -712,3 +712,77 @@ def test_the_moe_ladder_plans_the_measured_rung(tmp_path, monkeypatch):
     assert au[au.index("--screen-eval") + 1] != au[au.index("--eval") + 1]
     assert ran[0][ran[0].index("-o") + 1].endswith(".moe.imatrix.gguf")       # GGUF: per-expert counts
     assert A._heldout_for(a).endswith("release-calib.heldout.txt")
+
+
+# ------------------------------------------------------------------------------------------------ failed measurements
+
+_NO_KLD = {"mean_kld": None, "median_kld": None, "p99_kld": None, "top1": None, "ppl": None,
+           "ref_ppl": None}
+
+
+def test_lowbit_refuses_to_store_a_failed_reference_measurement(tmp_path, monkeypatch):
+    """llama-perplexity produces no KLD when it crashes (OOM, a build it cannot load) -- mean_kld is None.
+    Recording that as 0.0 inflates every class cost by the reference build's own KL and, since the state file
+    is rewritten after every probe and a re-run skips what it holds, poisons every later run too. A failed
+    measurement must stop the run, not persist."""
+    pytest.importorskip("gguf")
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((4, 8, 256)) * 0.02).astype(np.float32)
+    src = _write_gguf(tmp_path / "src.gguf", {"blk.0.ffn_up_exps.weight": W.astype(np.float16)})
+    ev = tmp_path / "eval.txt"
+    ev.write_text("held out text\n")
+
+    monkeypatch.setattr(M, "_base_logits", lambda *a, **k: str(tmp_path / "base.kld"))
+    monkeypatch.setattr(M, "_gguf_ok", lambda p: os.path.exists(p))
+
+    def quantize(quantize, s, imatrix, out, lines, requant, threads=None):
+        Path(out).write_bytes(b"GGUF")                                  # the probe build the caller removes
+        return None
+
+    monkeypatch.setattr(M, "_quantize", quantize)
+    monkeypatch.setattr(M, "_kld", lambda *a, **k: dict(_NO_KLD))       # the run that failed
+    out = tmp_path / "lowbit.json"
+    with pytest.raises(SystemExit, match="KLD"):
+        M.lowbit(src, "im.gguf", str(ev), str(out), types=["iq1_s"], workdir=str(tmp_path / "w"))
+    assert not out.exists() or json.loads(out.read_text()).get("ref_kl") != 0.0
+
+
+def test_auto_screen_drops_a_prune_candidate_whose_damage_was_not_measured(tmp_path, monkeypatch):
+    """A pruned build llama-perplexity cannot score is dropped from the screen, not ranked at zero damage:
+    (pkl or 0.0) used to make a failed measurement the cheapest candidate in the room."""
+    E = 4
+    em = _expert_em(E=E)
+    imx = {"blk.0.ffn_up_exps.weight": (np.ones((E, 256), dtype=np.float32),
+                                        np.array([10.0, 8.0, 4.0, 1.0]))}
+    (tmp_path / "src.gguf").write_bytes(b"GGUF")
+    ev = tmp_path / "eval.txt"
+    ev.write_text("held out text\n")
+
+    monkeypatch.setattr(M, "_gguf_experts", lambda p: (E, 2))
+    monkeypatch.setattr(M, "_quantized_source", lambda p: False)
+    monkeypatch.setattr(M, "read_imatrix", lambda p: (imx, "gguf"))
+    monkeypatch.setattr(M, "_base_logits", lambda *a, **k: str(tmp_path / "base.kld"))
+    monkeypatch.setattr(M, "_gguf_ok", lambda p: os.path.exists(p))
+    monkeypatch.setattr(M, "_prune_gguf",
+                        lambda src, K, klp, sp, out, log=print: Path(out).write_bytes(b"GGUF") or out)
+    monkeypatch.setattr(M, "slice_imatrix",
+                        lambda imatrix, keep, out: Path(out).write_bytes(b"GGUF"))
+
+    def kld(perplexity, model, eval_path, base, ngl=99, chunks=None):
+        if os.path.basename(str(model)).startswith("p50-"):              # this pruned build's run fails
+            return dict(_NO_KLD)
+        return {**_NO_KLD, "mean_kld": 0.42, "p99_kld": 0.9, "top1": 90.0, "ppl": 12.0}
+
+    monkeypatch.setattr(M, "_kld", kld)
+    monkeypatch.setattr(M, "build",
+                        lambda gguf_path, imatrix, p, out, quantize="llama-quantize", threads=None,
+                               log=print, allow_requantize=False: Path(out).write_bytes(b"GGUF") or {})
+    monkeypatch.setattr(M, "_toolgate", lambda *a, **k: {"tool_status": "not-measured"})
+
+    rep = M.auto(str(tmp_path / "src.gguf"), "im.gguf", em, SENS, {}, budget_bytes=1 << 62,
+                 prunes=(0.25, 0.5), screen_eval=str(ev), judge_eval=str(ev),
+                 workdir=str(tmp_path / "w"), toolcall=False, log=lambda *a: None)
+    p50 = [r for r in rep["candidates"] if r["prune"] == 0.5]
+    assert p50 and all(not r.get("feasible") for r in p50)
+    assert all(r["prune_kl"] is None for r in p50)
+    assert rep["winner"]["prune"] == 0.25
