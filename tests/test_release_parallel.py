@@ -143,6 +143,30 @@ def test_state_entries_from_concurrent_executes_are_never_lost(tmp_path):
     assert len(R.load_state(path)) == 40
 
 
+def test_an_unmeasurable_mlx_serve_step_merges_into_state_instead_of_overwriting_it(tmp_path, monkeypatch):
+    """An mlx-serve step that cannot be measured here used to write release-state.json back from the snapshot
+    taken when execute() started -- while every other step writes through save_entry, which re-reads the file
+    and merges, precisely because the parallel scheduler's build slots and measure queue share it. A stale
+    wholesale write drops a 'done' entry another slot recorded in between, and that step re-runs next release."""
+    path = str(tmp_path / "release-state.json")
+
+    def short(st, c, cfg):
+        # between this execute's load_state and its own step write, a parallel slot records its step
+        R.save_entry(path, "other-slot/step", {"status": "done"})
+        return "mlx_lm.server with the whole rung needs ~400.0 GB of RAM and 1.0 GB is usable here"
+
+    monkeypatch.setattr(R, "memory_short", short)
+    monkeypatch.setattr(R, "gpu_returned", lambda: False)
+    st = S(id="mlx/4bit/toolcall", lane="mlx", rung="4bit", kind="measure", requires="any",
+           cmd=["pollard-toolcall", "--gguf", "x"], mem="mlx-serve")
+    c = {"mdir": str(tmp_path), "state": path}
+    statuses = R.execute([st], c, {}, run=True, have={"any": True}, out=lambda *_: None)
+    assert statuses["mlx/4bit/toolcall"] == "done"
+    on_disk = R.load_state(path)
+    assert on_disk["mlx/4bit/toolcall"]["status"] == "done"
+    assert on_disk["other-slot/step"]["status"] == "done", "the parallel slot's record was overwritten"
+
+
 def test_rung_chains_group_build_and_expand_and_keep_lane_steps():
     ch = {(l, r): [s.id for s in ss] for l, r, ss in R.rung_chains(_plan())}
     assert ch[("gguf", "Q6_K")] == ["gguf/ladder-Q6_K", "gguf/rungs-Q6_K"]
