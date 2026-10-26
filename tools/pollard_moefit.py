@@ -908,7 +908,12 @@ def lowbit(gguf_path, imatrix, eval_path, out, types=LOWBIT_TYPES, granularity="
         err = _quantize(quantize, gguf_path, imatrix, probe, [], requant, threads)
         if err:
             raise SystemExit(f"reference build failed:\n{err}")
-        state["ref_kl"] = _kld(perplexity, probe, eval_path, base, ngl, chunks)["mean_kld"] or 0.0
+        ref_kl = _kld(perplexity, probe, eval_path, base, ngl, chunks)["mean_kld"]
+        if ref_kl is None:
+            os.remove(probe)
+            raise SystemExit("the reference build ran but llama-perplexity produced no mean KLD (crash/OOM?) "
+                             "-- 0.0 would inflate every measured class cost, so nothing is recorded")
+        state["ref_kl"] = ref_kl
         os.remove(probe)
         save()
     ref = float(state["ref_kl"])
@@ -1178,6 +1183,11 @@ def auto(src, imatrix, em, sens, lb, budget_bytes, prunes=(0.0, 0.10, 0.25, 0.40
         models[p] = (model, im, emp, lbp, K, tag)
         for one in (True, False):
             row = {"prune": p, "keep": K, "experts": n_exp, "tag": tag, "allow_1bit": one, "prune_kl": pkl}
+            if pkl is None:
+                row.update(feasible=False, why="prune damage could not be measured (no mean KLD) "
+                                             "-- dropped from the screen, not scored 0")
+                cands.append(row)
+                continue
             if _min_bytes(emp, one, head=head, embd=embd) > budget_bytes:
                 row.update(feasible=False)
                 cands.append(row)
@@ -1191,7 +1201,7 @@ def auto(src, imatrix, em, sens, lb, budget_bytes, prunes=(0.0, 0.10, 0.25, 0.40
             n1 = sum(v for q, v in pl["hist"].get(ROLE_EXPERT, {}).items() if q in TYPES_1BIT)
             row.update(feasible=True, predicted=pl["predicted_kld"], plan=pl, bytes=pl["bytes"],
                        expert_bpw=pl["bpw_role"].get(ROLE_EXPERT), n_1bit=n1,
-                       score=(pkl or 0.0) + pl["predicted_kld"])
+                       score=pkl + pl["predicted_kld"])
             cands.append(row)
         log(f"   {tag}  keep {K}/{n_exp}  prune KL {pkl if pkl is not None else '-'}  " + "  ".join(
             f"{'1bit' if r['allow_1bit'] else 'no1bit'}: " + (f"pred {r['predicted']:.4f} score {r['score']:.4f}"
