@@ -1,5 +1,5 @@
 diff --git a/conversion/__init__.py b/conversion/__init__.py
-index 35e73b4..8d7730b 100644
+index de3e97863..de232442b 100644
 --- a/conversion/__init__.py
 +++ b/conversion/__init__.py
 @@ -46,6 +46,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
@@ -10,7 +10,7 @@ index 35e73b4..8d7730b 100644
      "CodeShellForCausalLM": "codeshell",
      "CogVLMForCausalLM": "cogvlm",
      "Cohere2MoeForCausalLM": "command_r",
-@@ -320,6 +321,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+@@ -321,6 +322,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
  MMPROJ_MODEL_MAP: dict[str, str] = {
      "AudioFlamingo3ForConditionalGeneration": "ultravox",
      "ClefModel": "clef",
@@ -19,7 +19,7 @@ index 35e73b4..8d7730b 100644
      "Cohere2VisionForConditionalGeneration": "command_r",
      "PplxDeciderModel": "pplx_decider",
 diff --git a/conversion/clef.py b/conversion/clef.py
-index b793d92..e6696ec 100644
+index b793d92c8..e6696ecba 100644
 --- a/conversion/clef.py
 +++ b/conversion/clef.py
 @@ -4,7 +4,7 @@ import json
@@ -154,10 +154,10 @@ index b793d92..e6696ec 100644
 +class ClefOmniMmprojModel(Qwen3OmniMmprojModel):
 +    pass
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index f941106..dcfda3a 100644
+index babc8bba4..0d50916f1 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
-@@ -590,6 +590,7 @@ class MODEL_ARCH(IntEnum):
+@@ -601,6 +601,7 @@ class MODEL_ARCH(IntEnum):
      QWEN35MOE        = auto()
      CLEF             = auto()
      VLLM_DECISION2   = auto()
@@ -165,7 +165,7 @@ index f941106..dcfda3a 100644
      QWEN4EXP         = auto()
      PHI2             = auto()
      PHI3             = auto()
-@@ -1414,6 +1415,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+@@ -1432,6 +1433,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
      MODEL_ARCH.QWEN35MOE:        "qwen35moe",
      MODEL_ARCH.CLEF:             "clef",
      MODEL_ARCH.VLLM_DECISION2:   "vllm-decision2",
@@ -173,7 +173,7 @@ index f941106..dcfda3a 100644
      MODEL_ARCH.QWEN4EXP:         "qwen4exp",
      MODEL_ARCH.PHI2:             "phi2",
      MODEL_ARCH.PHI3:             "phi3",
-@@ -3239,6 +3241,53 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+@@ -3264,6 +3266,53 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
          MODEL_TENSOR.DECISION_QUERY_MLP,
          MODEL_TENSOR.DECISION_SCORER_OUT,
      ],
@@ -228,10 +228,10 @@ index f941106..dcfda3a 100644
          MODEL_TENSOR.TOKEN_EMBD,
          MODEL_TENSOR.OUTPUT_NORM,
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index a364174..84ab814 100644
+index 06fc56bb2..1bb36cf99 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -44,6 +44,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+@@ -45,6 +45,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
      { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
      { LLM_ARCH_CLEF,             "clef"             },
      { LLM_ARCH_VLLM_DECISION2,   "vllm-decision2"   },
@@ -239,8 +239,16 @@ index a364174..84ab814 100644
      { LLM_ARCH_QWEN4EXP,         "qwen4exp"         },
      { LLM_ARCH_PHI2,             "phi2"             },
      { LLM_ARCH_PHI3,             "phi3"             },
+@@ -1368,6 +1369,7 @@ bool llama_arch_supports_save(llm_arch arch) {
+         case LLM_ARCH_STEP35:
+         case LLM_ARCH_CLEF: // the head tensors are not saved
+         case LLM_ARCH_VLLM_DECISION2:
++        case LLM_ARCH_CLEF_OMNI:
+             return false;
+         default:
+             return true;
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index cdf978f..88085b7 100644
+index 7996bdc30..b32f477a6 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -49,6 +49,7 @@ enum llm_arch {
@@ -251,23 +259,11 @@ index cdf978f..88085b7 100644
      LLM_ARCH_QWEN4EXP,
      LLM_ARCH_PHI2,
      LLM_ARCH_PHI3,
-diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
-index 2135b82..338d2cf 100644
---- a/src/llama-model-saver.cpp
-+++ b/src/llama-model-saver.cpp
-@@ -23,6 +23,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
-         case LLM_ARCH_STEP35:
-         case LLM_ARCH_CLEF: // the head tensors are not saved
-         case LLM_ARCH_VLLM_DECISION2:
-+        case LLM_ARCH_CLEF_OMNI:
-             return false;
-         default:
-             return true;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 65c42f8..1bd928b 100644
+index 1de65c728..b98b72a8f 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -342,6 +342,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+@@ -344,6 +344,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
              return new llama_model_clef(params);
          case LLM_ARCH_VLLM_DECISION2:
              return new llama_model_vllm_decision2(params);
@@ -276,7 +272,7 @@ index 65c42f8..1bd928b 100644
          case LLM_ARCH_QWEN4EXP:
              return new llama_model_qwen4exp(params);
          case LLM_ARCH_MISTRAL3:
-@@ -2817,6 +2819,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2819,6 +2821,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
          case LLM_ARCH_LLADA_MOE:
          case LLM_ARCH_RND1:
          case LLM_ARCH_CLEF:
@@ -284,7 +280,7 @@ index 65c42f8..1bd928b 100644
              {
                  res = nullptr;
              } break;
-@@ -3669,6 +3672,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -3673,6 +3676,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_QWEN35:
          case LLM_ARCH_QWEN35MOE:
          case LLM_ARCH_CLEF:
@@ -294,7 +290,7 @@ index 65c42f8..1bd928b 100644
              return LLAMA_ROPE_TYPE_IMROPE;
 diff --git a/src/models/clef-omni.cpp b/src/models/clef-omni.cpp
 new file mode 100644
-index 0000000..9372456
+index 000000000..9372456ed
 --- /dev/null
 +++ b/src/models/clef-omni.cpp
 @@ -0,0 +1,108 @@
@@ -407,7 +403,7 @@ index 0000000..9372456
 +    ggml_build_forward_expand(gf, cur);
 +}
 diff --git a/src/models/clef.cpp b/src/models/clef.cpp
-index 6f87209..d31da9e 100644
+index 6f8720913..d31da9e98 100644
 --- a/src/models/clef.cpp
 +++ b/src/models/clef.cpp
 @@ -5,9 +5,7 @@
@@ -696,10 +692,10 @@ index 6f87209..d31da9e 100644
 +    return cur;
  }
 diff --git a/src/models/models.h b/src/models/models.h
-index bdcc1a4..72c5b0d 100644
+index 37dbacdb9..e92374eb5 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -2549,12 +2549,8 @@ struct llama_model_qwen35 : public llama_model_base {
+@@ -2620,12 +2620,8 @@ struct llama_model_qwen35 : public llama_model_base {
  };
  
  
@@ -714,7 +710,7 @@ index bdcc1a4..72c5b0d 100644
      struct attn {
          ggml_tensor * wq = nullptr;
          ggml_tensor * bq = nullptr;
-@@ -2603,6 +2599,7 @@ struct llama_model_clef : public llama_model_qwen35 {
+@@ -2674,6 +2670,7 @@ struct llama_model_clef : public llama_model_qwen35 {
      ggml_tensor * proj_option_context  = nullptr;
      ggml_tensor * proj_option_lexical  = nullptr;
      ggml_tensor * scales               = nullptr; // prior scale, joint scale, residual gate
@@ -722,7 +718,7 @@ index bdcc1a4..72c5b0d 100644
      ggml_tensor * scorer               = nullptr;
      ggml_tensor * scorer_b             = nullptr;
      ggml_tensor * scorer_out           = nullptr;
-@@ -2610,11 +2607,33 @@ struct llama_model_clef : public llama_model_qwen35 {
+@@ -2681,11 +2678,33 @@ struct llama_model_clef : public llama_model_qwen35 {
  
      class input_decision;
  
@@ -758,7 +754,7 @@ index bdcc1a4..72c5b0d 100644
          ggml_tensor * build_layer_attn(
          llm_graph_input_attn_no_cache * inp_attn,
                      ggml_tensor * cur,
-@@ -2626,16 +2645,22 @@ struct llama_model_clef : public llama_model_qwen35 {
+@@ -2697,16 +2716,22 @@ struct llama_model_clef : public llama_model_qwen35 {
                      ggml_tensor * cur,
                              int   il);
  
@@ -790,10 +786,10 @@ index bdcc1a4..72c5b0d 100644
  
      std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 1e0b755..68542ea 100644
+index 8b8ab6e5d..8966c1893 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
-@@ -769,6 +769,7 @@ static bool moe_mandatory(const llm_arch arch) {
+@@ -853,6 +853,7 @@ static bool moe_mandatory(const llm_arch arch) {
          case LLM_ARCH_QWEN3MOE:
          case LLM_ARCH_QWEN3NEXT:
          case LLM_ARCH_QWEN3VLMOE:
@@ -801,7 +797,7 @@ index 1e0b755..68542ea 100644
          case LLM_ARCH_QWEN35MOE:
          case LLM_ARCH_QWEN4EXP:
          case LLM_ARCH_PHIMOE:
-@@ -869,7 +870,7 @@ static bool arch_supported(const llm_arch arch) {
+@@ -954,7 +955,7 @@ static bool arch_supported(const llm_arch arch) {
      if (arch == LLM_ARCH_PLM) {
          return false; // TODO tensor shapes
      }

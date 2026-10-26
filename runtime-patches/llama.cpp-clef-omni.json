@@ -3,16 +3,15 @@
  "tree_slug": "llama.cpp",
  "tree_path": "runtime/llama.cpp",
  "remote": "https://github.com/ggml-org/llama.cpp",
- "base_commit": "8e5a58d",
- "base_describe": "b11850-4-g8e5a58d",
- "base_date": "2026-10-24",
+ "base_commit": "8b28c2394",
+ "base_describe": "b11898",
+ "base_date": "2026-10-26",
  "files": [
   "conversion/__init__.py",
   "conversion/clef.py",
   "gguf-py/gguf/constants.py",
   "src/llama-arch.cpp",
   "src/llama-arch.h",
-  "src/llama-model-saver.cpp",
   "src/llama-model.cpp",
   "src/models/clef-omni.cpp",
   "src/models/clef.cpp",
@@ -36,5 +35,5 @@
   "result_norm",
   "self_kq_mask"
  ],
- "diff_bytes": 36215
+ "diff_bytes": 36091
 }
