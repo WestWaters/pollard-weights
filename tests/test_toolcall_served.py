@@ -290,8 +290,7 @@ def test_a_call_the_server_parser_dropped_is_unparsed_not_prose():
 
 
 @pytest.mark.parametrize("candidate,reference", [
-    ("error", "error"), ("error", "zero"), ("good", "error"),
-    ("partial", "good"), ("good", "partial"), ("partial", None),
+    ("error", "error"), ("error", "zero"), ("partial", "good"), ("partial", None),
 ])
 def test_server_errors_fail_the_gate_without_recording_a_measurement(
         monkeypatch, tmp_path, capsys, candidate, reference):
@@ -341,6 +340,58 @@ def test_server_errors_fail_the_gate_without_recording_a_measurement(
     assert not verify.evaluate_gate(metrics, {"toolcall_retention_min": 90})["pass"]
     assert any(r["failure"] == "server-error" for r in json.loads(out.read_text())["rows"] +
                (json.loads(out.read_text())["ref_rows"] or []))
+
+
+@pytest.mark.parametrize("reference", ["error", "partial"])
+def test_a_reference_that_gets_no_reply_leaves_the_rungs_own_numbers(monkeypatch, tmp_path, reference):
+    """Nanbeige4.3-33B (2026-10-27): the Q8_0 reference paged on the box until 60/60 probes timed out, and the
+    flagship's own 54/60 was recorded as status=error with every number cleared (#193 treated a reference
+    outage like a rung outage). The rung was measured; only the comparison was not."""
+    import io
+    import urllib.error
+    counts = Counter()
+
+    def urlopen(req, **kwargs):
+        side = "reference" if req.full_url.startswith("http://reference/") else "candidate"
+        counts[side] += 1
+        if side == "reference" and (reference == "error" or counts[side] < len(TC._balanced(1))):
+            raise urllib.error.URLError("timed out")
+        body = json.loads(req.data)
+        p = next(p for p in TC.SUITE if p["prompt"] == body["messages"][-1]["content"])
+        out = reply(content="Sure.") if p["expect"] is None else reply([
+            (p["expect"]["name"], {k: _concrete(v) for k, v in p["expect"]["args"].items()})])
+        return io.BytesIO(json.dumps(out).encode())
+
+    monkeypatch.setattr(TC.urllib.request, "urlopen", urlopen)
+    res = tmp_path / "results.json"
+    with pytest.raises(SystemExit) as exc:
+        TC.main(["--backend", "url", "--url", "http://candidate", "--ref-backend", "url",
+                 "--ref-url", "http://reference", "--limit", "1", "--results", str(res)])
+    assert exc.value.code == 0                                   # gated on the rung's absolute rate
+    tc = json.loads(res.read_text())["served"]["toolcall"]
+    assert tc["status"] == "measured" and tc["pass"] is True
+    assert tc["rate"] == 1.0 and tc["exact"] == 1.0              # the rung's numbers, kept
+    assert tc.get("ref_rate") is None and tc.get("retention") is None
+    assert "reference not measured" in tc["ref_note"]
+
+
+def test_an_unservable_reference_is_not_retried_on_every_rung(monkeypatch, tmp_path):
+    """Each rung of a ladder used to re-serve the same unservable reference (hours of timeouts per rung):
+    once it got no reply on this machine it is not measured again until --refresh-ref."""
+    cache = tmp_path / "reference.json"
+    monkeypatch.setattr(TC, "_ref_cache_path", lambda *a: str(cache))
+    error = TC.grade_reply({"error": "server-error: TimeoutError('timed out')"}, PROBE["s01"])
+    good = TC.grade_reply(reply([("get_weather", {"city": "Tokyo", "unit": "celsius"})]), PROBE["s01"])
+    assert TC.is_transport_failure(error) and "timed out" in str(error.get("detail", "")).lower()
+    runs = []
+    monkeypatch.setattr(TC, "run_model", lambda *a, **k: (runs.append(1), ([error], {"backend": "gguf"}))[1])
+    assert TC.run_ref_cached("reference.gguf", "0")[0] == [error]
+    with pytest.raises(TC.NotMeasured, match="not servable on this machine"):
+        TC.run_ref_cached("reference.gguf", "0")
+    assert len(runs) == 1                                        # the second rung did not serve it again
+    monkeypatch.setattr(TC, "run_model", lambda *a, **k: (runs.append(1), ([good], {"backend": "gguf"}))[1])
+    assert TC.run_ref_cached("reference.gguf", "0", refresh=True)[0] == [good]
+    assert len(runs) == 2
 
 
 def test_real_zero_capability_completions_still_pass_with_a_reference(monkeypatch, tmp_path):
