@@ -1841,6 +1841,15 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
     backend, _ = effective_backend(backend, server, ref)        # key the cache on what actually runs
     key = suite_hash(probes, f"{fingerprint(ref)}:{max_tokens}:{no_think}:{backend}")
     path = _ref_cache_path(ref, key)
+    unservable = path + ".unservable.json"
+    if not refresh and os.path.isfile(unservable):
+        # this reference already timed out on this machine (a base too big to serve here): every later rung
+        # would wait hours on it again, so it is not measured -- `--refresh-ref` tries it once more
+        try:
+            why = json.load(open(unservable, encoding="utf-8")).get("reason", "")
+        except (ValueError, OSError):
+            why = ""
+        raise NotMeasured(f"not servable on this machine ({why or 'its probes got no reply'}); --refresh-ref retries it")
     if not refresh and os.path.isfile(path):
         try:
             d = json.load(open(path, encoding="utf-8"))
@@ -1851,6 +1860,16 @@ def run_ref_cached(ref, ngl, threads=None, server=None, max_tokens=0, no_think=F
             pass
     rows, meta = run_model(ref, ngl, threads, server, max_tokens, no_think, probes, backend=backend)
     if any(is_transport_failure(r) for r in rows):
+        err = transport_error(rows, "reference", MAX_TRANSPORT_SHARE)
+        timed_out = [r for r in rows if is_transport_failure(r)]
+        # only TIMEOUTS mean "too slow to serve here" (a base paging on this machine); a refused connection
+        # or a 500 is a passing outage and is retried next time, as before
+        if err and timed_out and all("timed out" in str(r.get("detail", "")).lower() for r in timed_out):
+            try:
+                os.makedirs(os.path.dirname(unservable), exist_ok=True)
+                json.dump({"reason": err, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}, open(unservable, "w", encoding="utf-8"))
+            except OSError:
+                pass
         return rows, meta                                      # an outage is not a reusable reference measurement
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2072,10 +2091,15 @@ def main_full(a):
                                         or (a.ref_fallback if ref_note else None) or a.ref or a.ref_url).rstrip("/\\"))
         print_board(f"{ref_name}  (reference, {BACKEND_SERVER.get(ref_backend, ref_backend)})", rs, ref_rows,
                     a.verbose)
-        err = transport_error(ref_rows, "reference", share)
-        if err:
-            errors.append(err)
-        if not errors:
+        ref_err = transport_error(ref_rows, "reference", share)
+        if ref_err:
+            # the reference could not be served here (a base too big for this machine pages until every probe
+            # times out): only the COMPARISON is unmeasured -- the rung's own numbers stand and the gate is its
+            # absolute success rate, as with no reference at all (#193 wiped the rung's numbers here)
+            print(f"\n  reference not measured ({ref_err}): the gate is the rung's absolute success rate")
+            ref_note = "; ".join(x for x in (ref_note, f"reference not measured: {ref_err}") if x)
+            rs, ref_rows = None, None
+        elif not errors:
             ret = retention_ci(rows, ref_rows)
         if ret[0] is not None:
             print(f"\n  RETENTION {100 * ret[0]:.1f}%  (95% paired-bootstrap CI {100 * ret[1]:.1f}-{100 * ret[2]:.1f}%)"
@@ -2084,7 +2108,7 @@ def main_full(a):
             if cross_backend(backend, ref_backend):
                 print(f"  (cross-backend: rung via {BACKEND_SERVER.get(backend, backend)}, reference via "
                       f"{BACKEND_SERVER.get(ref_backend, ref_backend)} -- part of any gap is the server, not the quant)")
-        elif not errors:
+        elif not errors and rs is not None:
             print("\n  (the reference passes no probe: nothing to retain -- retention is undefined)")
     elif ref_note:
         print(f"\n  no reference measured ({ref_note}): the gate is the absolute success rate")
