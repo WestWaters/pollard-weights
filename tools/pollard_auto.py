@@ -896,6 +896,10 @@ def _hf_to_gguf(a):
     conv = _find_convert(hf_dir)
     here = os.path.abspath(a.output) if a.output else os.path.dirname(os.path.abspath(hf_dir)) or "."
     out = os.path.join(here, os.path.basename(hf_dir.rstrip("/\\")) + "-f16.gguf")
+    if a.run:
+        # the converter only writes into an existing folder: a first release of a new model (Qwen3-ASR-1.7B,
+        # 2026-10-28) had no --output dir yet, so the f16 and the mmproj were never written
+        os.makedirs(here, exist_ok=True)
     import pollard_d3 as D3
     if D3.decision_config(hf_dir) is not None:
         # a d3 decision model: the body converts as Qwen3.5 (its tensors are stored as a bare Qwen3_5Model), with
