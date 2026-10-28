@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("torch")                     # pollard_probe imports torch; CI's lean env has none
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import pollard_probe as P  # noqa: E402
 
