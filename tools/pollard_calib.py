@@ -314,6 +314,11 @@ class Renderer:
                 if self.ct is not None:
                     tpl = self.ct.source
                     self.why = f"{model}'s own chat template (jinja2, no tokenizer)"
+        if (self.tok is not None or self.ct is not None) and not self._renders_text():
+            # an audio-only template (Qwen3-ASR's chat_template.json places audio and drops every text part):
+            # every record would render to the same empty turns and the domain collapses to one sample
+            self.tok, self.ct = None, None
+            self.why = f"generic ChatML ({model}'s chat template does not render message text: an audio-only template)"
         self.rinfo = resolve_reasoning(reasoning, model, tpl)
         # the tool-call syntax the template writes (pollard-modelkind): used when the template itself does not
         # render an assistant's tool_calls back, so the trace still carries the call the way the model writes it
@@ -324,6 +329,15 @@ class Renderer:
                 self.tool_family = toolcall_info(model or None, tpl or None).get("family", "none")
             except (Exception, SystemExit):                      # noqa: BLE001
                 self.tool_family = "none"
+
+    def _renders_text(self):
+        """Whether the template writes a message's text at all (an audio-only template renders nothing)."""
+        probe = [{"role": "user", "content": "UZQXPROBE"}, {"role": "assistant", "content": "AZQXPROBE"}]
+        try:
+            out = self._apply(probe)
+        except Exception:                                        # noqa: BLE001 -- judged per record later, as before
+            return True
+        return out is None or ("UZQXPROBE" in out or "AZQXPROBE" in out)
 
     # -- template plumbing
     def kwargs(self, thinking):
