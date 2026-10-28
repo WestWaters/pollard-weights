@@ -52,13 +52,45 @@ if "--device" in sys.argv[1:-1] and sys.argv[sys.argv.index("--device") + 1] == 
 import torch, torch.nn.functional as F
 
 
+#: Qwen's own omni / ASR checkpoints name the text stack `thinker.model.*` (Qwen3-ASR-1.7B); transformers' classes
+#: expect `model.language_model.*`. Without this map the decoder loads as RANDOM weights and the load still
+#: "succeeds" -- every number measured on it would be noise.
+THINKER_KEY_MAP = {r"^thinker\.model\.": "model.language_model.", r"^thinker\.audio_tower\.": "model.audio_tower.",
+                   r"^thinker\.lm_head\.": "lm_head."}
+
+
+def _decoder_missing(info):
+    """Text-decoder weights a load left uninitialised (decoder layers, embeddings, the head)."""
+    return [k for k in (info or {}).get("missing_keys", [])
+            if ".layers." in k and "audio" not in k and "vision" not in k
+            or k.endswith("embed_tokens.weight") or k.endswith("lm_head.weight")]
+
+
+def _load_checked(cls, model_id, dtype, kw):
+    """`cls.from_pretrained`, refusing a model whose text decoder did not load (random weights). A checkpoint in
+    Qwen's `thinker.*` naming is retried through THINKER_KEY_MAP."""
+    model, info = cls.from_pretrained(model_id, dtype=dtype, output_loading_info=True, **kw)
+    missing = _decoder_missing(info)
+    if missing and any(str(k).startswith("thinker.") for k in info.get("unexpected_keys", [])):
+        model, info = cls.from_pretrained(model_id, dtype=dtype, output_loading_info=True,
+                                          key_mapping=THINKER_KEY_MAP, **kw)
+        missing = _decoder_missing(info)
+    if missing:
+        raise ValueError(f"{len(missing)} text-decoder weights did not load and would be random "
+                         f"(e.g. {missing[0]}); refusing to measure them")
+    return model
+
+
 def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
     """This tool's OWN loader -- model tooling does not depend on a shared/brain-side one.
 
     AutoModelForCausalLM refuses a vision-language config outright ("Unrecognized configuration
     class Qwen2VLConfig for this kind of AutoModel"), so fall back to the vision-language auto
-    classes: a VL model's text stack quantizes like any other. Both failures are reported if
-    neither works, not just the last one.
+    classes: a VL model's text stack quantizes like any other. Audio-in LLMs (Qwen3-ASR,
+    granite-speech) and other any-to-text models register only as multimodal / speech-seq2seq
+    classes; their text decoder is what the GGUF lane quantizes too (the audio tower ships as the
+    mmproj), so they load through those and are probed the same way. Every failure is reported if
+    none works, not just the last one.
 
     Pass `device_map=` to shard across GPU+CPU+disk; accelerate owns placement after that, so
     `device` is ignored in that case.
@@ -76,18 +108,19 @@ def load_backbone(model_id, dtype=None, device="cpu", eval_mode=True, **kw):
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, **kw)
     except ValueError as text_only_err:
         model, errs = None, [f"AutoModelForCausalLM: {text_only_err}"]
-        for _n in ("AutoModelForImageTextToText", "AutoModelForVision2Seq"):
+        for _n in ("AutoModelForImageTextToText", "AutoModelForVision2Seq", "AutoModelForMultimodalLM",
+                   "AutoModelForSpeechSeq2Seq"):
             _c = getattr(_tf, _n, None)
             if _c is None:
                 continue
             try:
-                model = _c.from_pretrained(model_id, dtype=dtype, **kw)
+                model = _load_checked(_c, model_id, dtype, kw)
                 break
             except Exception as e:
                 errs.append(f"{_n}: {e}")
         if model is None:
-            raise SystemExit(f"could not load {model_id!r} as a causal LM or a vision-language "
-                             "model:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
+            raise SystemExit(f"could not load {model_id!r} as a causal LM, a vision-language or a speech/"
+                             "multimodal LM:\n  " + "\n  ".join(str(e)[:160] for e in errs)) from None
     if kw.get("device_map") is None:            # accelerate already placed a dispatched model
         model = model.to(device)
     return model.eval() if eval_mode else model
