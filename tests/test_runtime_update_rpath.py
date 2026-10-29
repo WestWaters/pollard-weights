@@ -46,4 +46,7 @@ def test_the_build_uses_relative_rpaths_so_the_rename_to_live_keeps_them_valid(t
 
     monkeypatch.setattr(U, "_run", lambda s, **k: (seen.append(s), R())[1])
     U.build(str(tmp_path), {"GGML_METAL": "ON"}, 2)
-    assert "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON" in seen[0]
+    assert "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON" in seen[0]                 # Linux ($ORIGIN)
+    if sys.platform == "darwin":                                           # macOS ignores the above
+        assert "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" in seen[0]
+        assert "-DCMAKE_INSTALL_RPATH=@loader_path" in seen[0]
