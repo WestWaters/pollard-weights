@@ -466,7 +466,11 @@ def build(tree, flags, jobs):
         # relative rpaths ($ORIGIN / @loader_path): the tree is built as <tree>.next and then RENAMED live; an
         # absolute build rpath kept pointing at .next, so on macOS every binary failed to load libllama-common
         # after the swap (2026-10-28, 2e0d86beb) while the pre-swap smoke had passed
-        steps = [["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON", *defs],
+        # macOS ignores CMAKE_BUILD_RPATH_USE_ORIGIN (ELF only): there the binaries are built with the install rpath
+        # @loader_path -- every binary and dylib sits in build/bin, so they find each other after the rename
+        rel = (["-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON", "-DCMAKE_INSTALL_RPATH=@loader_path"]
+               if sys.platform == "darwin" else [])
+        steps = [["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON", *rel, *defs],
                  ["cmake", "--build", "build", "--config", "Release", "-j", str(jobs)]]
     for i, s in enumerate(steps):
         r = _run(s, cwd=tree, timeout=4 * 3600)
