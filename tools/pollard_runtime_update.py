@@ -463,7 +463,10 @@ def build(tree, flags, jobs):
         bld = pre + f"cmake --build build --config Release -j {jobs}"
         steps = [cfg, bld]
     else:
-        steps = [["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", *defs],
+        # relative rpaths ($ORIGIN / @loader_path): the tree is built as <tree>.next and then RENAMED live; an
+        # absolute build rpath kept pointing at .next, so on macOS every binary failed to load libllama-common
+        # after the swap (2026-10-28, 2e0d86beb) while the pre-swap smoke had passed
+        steps = [["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON", *defs],
                  ["cmake", "--build", "build", "--config", "Release", "-j", str(jobs)]]
     for i, s in enumerate(steps):
         r = _run(s, cwd=tree, timeout=4 * 3600)
@@ -518,6 +521,11 @@ def configured_cuda_arch_problem(tree):
     return ""
 
 
+#: a binary that cannot load its own libraries (macOS dyld / Linux ld.so / Windows): never a successful start
+LOADER_ERROR = re.compile(r"Library not loaded|dyld\[|image not found|error while loading shared libraries|"
+                          r"cannot open shared object file|was not found|0xc0000135", re.I)
+
+
 def smoke(tree):
     d = bin_dir(tree)
     if not d:
@@ -532,7 +540,8 @@ def smoke(tree):
         out = (r.stdout or "") + (r.stderr or "")
         # The question is "does it start", not "does it implement --version": llama-quantize has no
         # --version and answers with its usage and exit 1. A crash or a missing DLL prints neither.
-        if r.returncode != 0 and not re.search(r"usage|version|build", out, re.I):
+        # a loader failure names the library's path (".../build/bin/...") -- that is not a start
+        if LOADER_ERROR.search(out) or (r.returncode != 0 and not re.search(r"usage|version|build", out, re.I)):
             bad.append(f"{b} did not start (exit {r.returncode}): {out.strip()[-160:]}")
     return (not bad), ("; ".join(bad) if bad else f"{len(KEY_BINS)} binaries answer --version")
 
@@ -951,6 +960,16 @@ def _update_engine(name, check, jobs, allow_drop, extra, cuda_arch, guard=None):
         if st.get("present"):
             os.replace(tree, prev)
         os.replace(staging, tree)
+        # the binaries must still start from where they now live (a path baked in at build time breaks here)
+        ok, msg = smoke(tree)
+        if not ok:
+            os.replace(tree, staging)
+            if st.get("present"):
+                os.replace(prev, tree)
+            log(f"{name}: smoke FAILED after the swap -- {msg}; the previous build is live again")
+            write_status(name, "failed", f"smoke after swap: {msg}", **up)
+            _rmtree(staging)
+            return False
     lock = {"engine": name, "commit": _git(tree, "rev-parse", "--short=9", "HEAD"), "date": _git(tree, "log", "-1", "--format=%cs"),
             "flags": flags, "built": _dt.datetime.now().isoformat(timespec="seconds"), "platform": sys.platform,
             "previous": st.get("commit") or ("binary-only" if st.get("present") else None)}
