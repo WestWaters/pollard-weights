@@ -567,6 +567,37 @@ def hf_flags(c, device=True):
     return out
 
 
+def write_mmproj(c, out=print):
+    """The mmproj for a GGUF lane built from a given f16 -- pollard's own export (bf16, every tower the checkpoint
+    holds), written into the gguf folder under the f16's name. True when there is nothing to export or it landed."""
+    import types
+    import pollard_auto as PA
+    os.makedirs(c["gguf_dir"], exist_ok=True)
+    have = [f for f in os.listdir(c["gguf_dir"]) if f.startswith("mmproj") and f.endswith(".gguf")]
+    if have:
+        out(f"      mmproj already there: {have[0]}")
+        return True
+    if not _tower_components(c["hf_dir"]):
+        out("      no vision / audio tower in the checkpoint: nothing to export")
+        return True
+    target = os.path.join(c["gguf_dir"], os.path.basename(c["f16"]))
+    try:
+        conv = PA._find_convert(c["hf_dir"])
+    except SystemExit as e:
+        out(f"      mmproj: {str(e).strip()}")
+        return False
+    PA._emit_mmproj(types.SimpleNamespace(run=True), conv, c["hf_dir"], target)
+    return any(f.startswith("mmproj") and f.endswith(".gguf") for f in os.listdir(c["gguf_dir"]))
+
+
+def _tower_components(hf_dir):
+    try:
+        import pollard_complete as PC
+        return {k: v for k, v in PC.inventory(str(hf_dir))["components"].items() if k != "speech_out"}
+    except Exception:                                # noqa: BLE001
+        return {}
+
+
 def hf_lanes_access(c):
     """(True, "") when the streamed HF lanes can build this checkpoint, else (False, the exact reason). Decided from
     config.json + the safetensors index (pollard_stream.static_backbone): nothing is built, no code runs."""
@@ -924,17 +955,22 @@ def lane_steps(cfg, c, lane):
                                   "gguf", "--fill"],
                              desc="every vision / audio tower in an mmproj, speech output and side weights as "
                                   "source-precision sidecars -- never a text-only GGUF repo")]
+        # A given f16 skips the HF conversion, and that conversion is what writes the mmproj: LFM3-Audio/-Omni
+        # (2026-10-28) went out as language model only. The towers are exported beside the f16 the same way.
+        mm = ([Step(id="gguf/mmproj", lane="gguf", kind="build", requires="any", fn="mmproj", out=c["gguf_dir"],
+                    desc="every vision / audio tower and speech output of the source -> mmproj beside the given f16")]
+              if c.get("given_f16") and _has_weights(c["hf_dir"]) else [])
         if not c.get("free"):
-            return [Step(id="gguf/ladder", lane="gguf", kind="build", requires="any", cmd=cmd, out=c["f16"],
+            return mm + [Step(id="gguf/ladder", lane="gguf", kind="build", requires="any", cmd=cmd, out=c["f16"],
                          desc="convert -> imatrix -> measured publish ladder (+ IQ*_KT flagship where ik_llama builds)"),
                     Step(id="gguf/rungs", lane="gguf", kind="expand", requires="any")] + complete
         # one rung at a time: build -> measure + gate -> upload -> free, so the peak disk is ONE rung, not the ladder
-        steps = []
+        steps = list(mm)
         for label, gb in gguf_ladder_labels(c):
             steps.append(Step(id=f"gguf/ladder-{label}", lane="gguf", rung=label, kind="build", requires="any",
                               cmd=cmd + ["--rung", label], out=None, disk_gb=gb,
                               desc=f"the {label} rung of the measured publish ladder"))
-            if complete and len(steps) == 1:             # the first build wrote the mmproj: check before any upload
+            if complete and len(steps) == 1 + len(mm):   # the first build wrote the mmproj: check before any upload
                 steps += complete
             steps.append(Step(id=f"gguf/rungs-{label}", lane="gguf", kind="expand", requires="any"))
         return steps
@@ -3059,6 +3095,8 @@ def execute(steps, c, cfg, run=False, run_upload=False, redo=(), stop_on_fail=Fa
                 elif st.fn == "imatrix":
                     build_imatrix(c, cfg, out)
                     res = "done"
+                elif st.fn == "mmproj":
+                    res = "done" if write_mmproj(c, out) else "failed"
                 elif st.fn == "engine_preflight":
                     held = engine_preflight(st, c, cfg, have, out)
                     failed_lanes.update(held)

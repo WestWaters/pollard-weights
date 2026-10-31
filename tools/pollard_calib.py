@@ -68,6 +68,9 @@ PROFILES = {
     "translation": {"translation": 4, "multilingual": 2, "chat": 1, "prose": 1},
     "agent":       {"agent": 4, "chat": 2, "code": 1, "math": 1},
     "code":        {"code": 3, "codechat": 3, "chat": 1, "math": 1},
+    # speech LMs (LFM3-Audio / Omni): they speak and listen in many languages, and an English agent mix left their
+    # low rungs slurring non-English TTS (2026-10-29) -- the languages carry the weight, tool calls stay in
+    "speech":      {"multilingual": 3, "translation": 2, "agent": 2, "chat": 1},
 }
 PROFILE_CHOICES = sorted(PROFILES) + ["auto"]
 
@@ -1138,5 +1141,15 @@ def main():
               "`datasets` on the box for full-scale real-data coverage.", file=sys.stderr)
 
 
+def _cli():
+    """The console entry. Once every output is written and flushed, leave without interpreter teardown: the streamed
+    datasets reads leave pyarrow's thread pool behind, and its join at shutdown deadlocks -- every LFM3 release
+    (2026-10-28) sat on a finished calib for half an hour until it was killed."""
+    rc = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc if isinstance(rc, int) else 0)
+
+
 if __name__ == "__main__":
-    main()
+    _cli()

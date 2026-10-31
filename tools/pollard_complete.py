@@ -38,8 +38,12 @@ COMPONENTS = (
                          r"|whisper_encoder|audio_embed)\.", re.I)),
     ("projector", re.compile(r"(^|\.)(multi_modal_projector|mm_projector|mm_proj|mlp1|sound_projection"
                              r"|audio_projection|vision_projection|modality_projector|connector)\.", re.I)),
-    ("speech_out", re.compile(r"^(talker|code2wav|token2wav|speech_decoder|vocoder|mimi)\.", re.I)),
+    ("speech_out", re.compile(r"^(talker|code2wav|token2wav|speech_decoder|vocoder|mimi|depthformer|depth_embeddings"
+                              r"|depth_linear|codebook_embedding|mask_embedding)\.?", re.I)),
 )
+#: Liquid's audio layout (LFM2/LFM3-Audio/-Omni) names its towers bare: `encoder.*` is the audio encoder and `mlp.*`
+#: its projector -- read that way only beside a depthformer, so a text model's own `encoder.` is never claimed
+LIQUID_AUDIO = (("audio", re.compile(r"^encoder\.")), ("projector", re.compile(r"^mlp\.")))
 
 #: files a runtime needs to feed the non-text inputs (and the chat template that places them)
 PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json",
@@ -103,12 +107,20 @@ def inventory(src):
     {"components": {name: {key: shape}}, "processor_files": [...], "side_weights": {file: [keys]}}"""
     base = _base_dir(src)
     shards = _weight_shards(base)
-    comps = {}
+    comps, bare = {}, {}
     for p in shards:
         for k, info in _st_keys(p).items():
             c = component_of(k)
             if c:
                 comps.setdefault(c, {})[k] = info.get("shape")
+            else:
+                bare[k] = info.get("shape")
+    if any(k.startswith("depthformer.") for k in comps.get("speech_out", {})):
+        for k, shape in bare.items():
+            for name, rx in LIQUID_AUDIO:
+                if rx.match(k):
+                    comps.setdefault(name, {})[k] = shape
+                    break
     files = sorted({f for d in (base, src) for f in os.listdir(d)
                     if os.path.isfile(os.path.join(d, f)) and (f in PROCESSOR_FILES or PROCESSOR_CODE_RE.match(f))})
     shard_names = {os.path.basename(p) for p in shards}
@@ -169,7 +181,8 @@ def _gguf_encoders(path):
     names = [t.name for t in rd.tensors]
     vision = flags.get("clip.has_vision_encoder", any(n.startswith("v.") for n in names))
     audio = flags.get("clip.has_audio_encoder", any(n.startswith("a.") for n in names))
-    return vision, audio
+    speech_out = any(n.startswith("a.gen.") for n in names)   # LFM3: depthformer + codec decoder inside the mmproj
+    return vision, audio, speech_out
 
 
 def check(src, out, lane):
@@ -186,17 +199,21 @@ def check(src, out, lane):
         mmproj = [os.path.join(r, f) for r, _, fs in os.walk(out) for f in fs
                   if f.startswith("mmproj") and f.endswith(".gguf")]
         enc = [e for e in (_gguf_encoders(p) for p in mmproj) if e is not None]
-        has_v = any(v for v, _ in enc)
-        has_a = any(a for _, a in enc)
+        has_v = any(e[0] for e in enc)
+        has_a = any(e[1] for e in enc)
+        has_gen = any(e[2] for e in enc)
         if mmproj and not enc:                      # gguf-py missing: trust the file is there, say so
             has_v = has_a = True
+            has_gen = False
             carried.append("mmproj present (encoders not read: gguf-py not installed)")
         for name, ok in (("vision", has_v), ("audio", has_a), ("projector", has_v or has_a)):
             if name in comps:
                 (carried if ok else missing).append(
                     f"{name}: {len(comps[name])} tensors -> " + ("mmproj" if ok else
                                                                  "no mmproj-*.gguf declaring this encoder"))
-        if "speech_out" in comps:
+        if "speech_out" in comps and has_gen:
+            carried.append(f"speech_out: {len(comps['speech_out'])} tensors -> mmproj (a.gen.*)")
+        elif "speech_out" in comps:
             keys = comps["speech_out"]
             lost = [k for k in keys if k not in out_keys]
             (missing if lost else carried).append(

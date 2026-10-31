@@ -241,6 +241,22 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     `tables` entry), the table is allocated like every other tensor instead -- its own cost per type, its bytes in
     the budget (they are in the file), walking TABLE_LADDER down from q8_0 only where that is the cheapest KL per
     byte. It is still read lazily from the SSD at run time. `auto` without a measurement keeps the q8_0 pin."""
+    # Conv/attention hybrids take one of two measured plans (LFM3-Audio / -Omni / -1.7B, 2026-10-29..31):
+    #  3-bit rungs -- the exact plan: mixers counted at the base type, attention floored there, the rest re-allocated
+    #                 (KLD 0.226 -> 0.073, speech back to f16 level);
+    #  4-bit and up -- the bulk planned as before (mixers outside the knapsack, which leaves the FFNs their q5_K/q6_K)
+    #                 and attention raised a step on top: the exact plan's leaner FFNs dropped Spanish sentences on 2 of
+    #                 6 seeds; this one dropped none, matched the old rung in every language, KLD 0.034 -> 0.013, +2.7%.
+    if arch.get("hybrid") and arch.get("attn_layers") and not arch.get("_hybrid_pass"):
+        args = (ram_gb, reserve_gb, sensitivity, allow_1bit, tiers, emb_imatrix_ok, disk, want_pinned)
+        exact = plan_allocation(dict(arch, _hybrid_pass="exact"), *args)
+        bulk = [t for pat, t in exact[0] if ".ffn_" in pat]
+        base = max(set(bulk), key=bulk.count) if bulk else None
+        if base and BPW[base] >= BPW["iq4_xs"]:
+            return plan_allocation(dict(arch, _hybrid_pass="bulk", mixers={}, attn_layers=[],
+                                        _real_attn=list(arch["attn_layers"])), *args)
+        return exact
+
     budget = ram_gb * 0.85 - reserve_gb
     if budget <= 0:
         sys.exit(f"ERROR: RAM budget {ram_gb}GB minus {reserve_gb}GB activation "
@@ -250,7 +266,14 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
     bulk_pl = (arch["expert_params"] * arch["n_experts"] if arch["kind"] == "moe"
                else (arch.get("dense_ffn_params") or 0))
     attn_pl = arch.get("attn_params") or 0
-    other = max(0, total - bulk_pl * layers - attn_pl * layers)   # emb + output + norms
+    # a conv/attention hybrid has attention on only some blocks: count (and allocate) those, not every block
+    attn_layers = set(arch.get("attn_layers") or range(layers))
+    # a hybrid's own token mixer (LFM shortconv in/out, an SSM's projections): a real share of the weights (12.6% of
+    # LFM3) that llama-quantize writes at the rung's type -- left in `other` it was budgeted at the embedding type and
+    # the rung came out 6% under its budget. Each block's mixer is its own item, weighted like that block's FFN.
+    mixers = {int(i): v for i, v in (arch.get("mixers") or {}).items()}
+    mixer_pl = {i: sum(p for _, p in v) for i, v in mixers.items()}
+    other = max(0, total - bulk_pl * layers - attn_pl * len(attn_layers) - sum(mixer_pl.values()))
     disk_params = (disk or {}).get("params") or 0
     if disk_params:                                    # the table lives on the SSD, not in the RAM budget
         other = max(0, other - disk_params)
@@ -315,9 +338,12 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
         else:
             items.append((bulk_pl, max(ffn_imp.get(i, 1.0), 1e-9)))
             meta.append(("bulk", [f.format(layer=i) for f in bulk_frag]))
-        if attn_pl > 0:
+        if attn_pl > 0 and i in attn_layers:
             items.append((attn_pl, max(attn_imp.get(i, 1.0), 1e-9)))
             meta.append(("attn", [rf"blk\.{i}\.attn_.*"]))
+        if mixer_pl.get(i):
+            items.append((mixer_pl[i], max((gu_imp if granular else ffn_imp).get(i, 1.0), 1e-9)))
+            meta.append(("mixer", [re.escape(n) for n, _ in mixers[i]]))
 
     # Embeddings/output kept at EMB_FLOOR (measured: keeping them high wins; they
     # carry the whole vocab). Reserve their size, allocate FFN+attn over the rest;
@@ -396,6 +422,77 @@ def plan_allocation(arch, ram_gb, reserve_gb, sensitivity=None, allow_1bit=False
             sys.exit(f"ERROR: cannot fit {total/1e9:.1f}B into {budget:.1f}GB even at "
                      f"the floor. pollard-calc will tell you the streaming tier.{hint}")
     types, alloc_gb = res
+    from collections import Counter
+    # Hybrid mixers are COUNTED, not contested: bidding them against the FFNs (by the FFN's sensitivity) bought the
+    # early shortconv projections q5_K out of the FFNs' bits and cost LFM3-Audio/-Omni their Japanese long-form speech
+    # at IQ4_XS (2026-10-30). They are pinned at the base type the bulk settles on -- what llama-quantize would give
+    # them anyway -- and everything else is allocated again into the budget that leaves.
+    mix_j = [j for j, (kind, _) in enumerate(meta) if kind == "mixer"]
+    if mix_j:
+        tot = sum(it[1] for it in items if len(it) < 3) or 1.0
+        free = [it if len(it) > 2 else (it[0], it[1], {t: it[1] / tot * noise[t] for t in ladder}, list(ladder))
+                for it in items]
+        tried = {}
+        for _ in range(4):                    # the base can move once the mixers' bytes are settled: to a fixpoint
+            bulk_now = [t for (kind, _), t in zip(meta, types[:len(meta)]) if kind == "bulk"]
+            mix_t = Counter(bulk_now).most_common(1)[0][0] if bulk_now else types[mix_j[0]]
+            if mix_t in tried:                # settled -- or flipping between two bases at a starved budget, where
+                low_t = min(tried, key=lambda t: BPW[t])          # the cheaper pin is the one that stays in budget
+                items, (types, alloc_gb) = tried[low_t]
+                break
+            pin = [(it[0], it[1], it[2], [mix_t]) if j in mix_j else it for j, it in enumerate(free)]
+            res_m = _alloc_klaware(pin, budget - emb_gb - pinned_gb, noise, ladder)
+            if res_m is None:
+                break
+            tried[mix_t] = (pin, res_m)
+            types, alloc_gb = res_m
+            items = pin
+        if items is not free and any(kind == "mixer" for kind, _ in meta):
+            src += f" + hybrid mixers pinned at {items[mix_j[0]][3][0]}"
+    # Hybrid attention floor. On a conv/attention hybrid the few attention blocks carry every long-range
+    # dependency, and a sensitivity read from text (the imatrix route above all) rates them cheap: LFM3-Audio-2B's
+    # IQ3_S put all eleven at iq2_xxs and moved the bits into those blocks' FFNs. Measured 2026-10-29/30 on
+    # LFM3-Audio / -Omni / -1.7B (pollard-audioeval, 18 languages, several seeds):
+    #   3-bit rungs: attention at the rung's own base type, the rest re-allocated around it -- KLD 0.226 -> 0.073,
+    #                speech back to f16 level (holding the extra FFN bits instead measured worse);
+    #   4-bit and up: attention ONE step above the base, and the floor ADDS its bytes instead of taking them from
+    #                the FFNs -- paying with the early FFNs made Omni cut sentences short; added, KLD 0.038 -> 0.016
+    #                with no sentence dropped over six seeds (+2.7% size).
+    real_attn = set(arch.get("_real_attn") or arch.get("attn_layers") or [])
+    if arch.get("hybrid") and real_attn and len(real_attn) < layers:
+        from collections import Counter
+        attn_of = lambda pats: int(pats[0].split("\\.")[1]) if pats and pats[0].startswith("blk") else -1
+        bulk_now = [t for (kind, _), t in zip(meta, types[:len(meta)]) if kind == "bulk"]
+        base_now = Counter(bulk_now).most_common(1)[0][0] if bulk_now else None
+        if base_now and BPW[base_now] >= BPW["iq4_xs"]:
+            floor_t = ladder[max(0, ladder.index(base_now) - 1)]
+            low = [j for j, ((kind, pats), t) in enumerate(zip(meta, types[:len(meta)]))
+                   if kind == "attn" and attn_of(pats) in real_attn and BPW[t] < BPW[floor_t]]
+            if low:
+                types = list(types)
+                for j in low:
+                    if not arch.get("_size_probe"):   # the ladder sizes a rung by its plan, then the floor rides on top
+                        alloc_gb += items[j][0] * (BPW[floor_t] - BPW[types[j]]) / 8 / 1e9
+                    types[j] = floor_t
+                src += (f" + hybrid attention floor ({len(low)} attention block(s) raised to {floor_t}, "
+                        "bytes added, nothing else lowered)")
+        elif base_now:
+            floor_t = base_now
+            low = [j for j, ((kind, _), t) in enumerate(zip(meta, types[:len(meta)]))
+                   if kind == "attn" and BPW[t] < BPW[floor_t]]
+            if low:
+                floor_lad = [t for t in ladder if BPW[t] >= BPW[floor_t]]
+                tot = sum(it[1] for it in items if len(it) < 3) or 1.0
+                # every item as (params, importance, cost per type, own ladder): the same units _alloc_klaware
+                # uses (importance share x noise), so only the floored items' ladders change, never anyone's weight
+                fl_items = [(it[0], it[1], it[2], floor_lad) if len(it) > 2 and j in low else it if len(it) > 2 else
+                            (it[0], it[1], {t: it[1] / tot * noise[t] for t in ladder},
+                             floor_lad if j in low else list(ladder))
+                            for j, it in enumerate(items)]
+                res2 = _alloc_klaware(fl_items, budget - emb_gb - pinned_gb, noise, ladder)
+                if res2 is not None:
+                    types, alloc_gb = res2
+                    src += f" + hybrid attention floor ({len(low)} attention block(s) held at >= {floor_t})"
     gb = alloc_gb + emb_gb + pinned_gb
     table_types = types[n_meta:]
     types = types[:n_meta]

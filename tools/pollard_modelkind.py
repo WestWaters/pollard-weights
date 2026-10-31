@@ -1862,6 +1862,11 @@ def calib_profile(kind: dict, name: str = "") -> tuple:
         return "translation", f"name '{base}' reads as a translation model"
     if _CODER_NAME.search(base):
         return "code", f"name '{base}' reads as a code model"
+    mods = kind.get("modalities") or []
+    if "audio" in mods or "speech_out" in mods:
+        # a speech model listens and speaks in many languages: an English agent mix left LFM3-Audio's 4-bit rung
+        # slurring Japanese and Korean TTS; the speech mix (multilingual-weighted, tool calls kept) fixed it
+        return "speech", "listens / speaks (" + "/".join(m for m in mods if m in ("audio", "speech_out")) + ")"
     if kind.get("agentic"):
         return "agent", "chat template drives tool calls"
     return "general", "no stronger signal than a general chat/base model"
@@ -1927,6 +1932,18 @@ def classify(model) -> dict:
                 elif have.get(m, 0) < 2:
                     why.append(f"{m}: encoder-free -- projection weights, no tower "
                                f"(needs the mmproj alongside the model)")
+    # The weights say so too: a checkpoint whose towers the config names in no standard way (Liquid's LFM3-Audio:
+    # bare encoder. / mlp. / depthformer.) still listens and speaks -- pollard-complete reads the tensor names.
+    if os.path.isdir(model):
+        try:
+            import pollard_complete as PC
+            comps = PC.inventory(str(model))["components"]
+            for m, c in (("audio", "audio"), ("speech_out", "speech_out")):
+                if c in comps and m not in modalities:
+                    modalities.append(m)
+                    why.append(f"{m}: {len(comps[c])} {c} tensors in the checkpoint")
+        except Exception:                                    # noqa: BLE001
+            pass
     vision = "image" in modalities
     for m in modalities:
         why.append(f"{m} signals in the template/config/architecture")
