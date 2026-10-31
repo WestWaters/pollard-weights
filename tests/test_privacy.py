@@ -98,13 +98,14 @@ def test_text_sidecars_and_home_folder(tmp_path):
 def test_safe_api_scrubs_before_it_sends(tmp_path, monkeypatch):
     p = str(tmp_path / "m.gguf")
     write_gguf(p, [("quantize.imatrix.file", "str", f"{HOMEISH}/M.imatrix")], [("t", b"\x01" * 64)])
-    import huggingface_hub
+    import types
     sent = []
 
     class Stub:
         def upload_file(self, *a, **k):
             sent.append(k["path_or_fileobj"])
-    monkeypatch.setattr(huggingface_hub, "HfApi", Stub)
+    # a stand-in hub module: the core CI shapes do not install huggingface_hub, and nothing here may touch the network
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=Stub))
     PV.SafeApi().upload_file(path_or_fileobj=p, path_in_repo="m.gguf", repo_id="o/r")
     assert sent == [p] and PV.gguf_leaks(p) == []
 
