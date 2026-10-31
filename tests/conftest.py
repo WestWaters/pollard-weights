@@ -1,5 +1,20 @@
 """Shared test isolation."""
-import pytest
+import os
+import tempfile
+
+# No test reaches the real Hugging Face Hub, however a mock is written. Set before anything imports huggingface_hub
+# (it reads these once, at import): offline mode, and an empty HF home so no stored login token is found either.
+# 2026-10-31: a wrapper that bypassed the tests' HfApi stub let the release tests create a real public repo
+# (PollardWeights/Tiny-1B-Pollard) with the developer's own token.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+os.environ.pop("HF_TOKEN", None)
+os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+os.environ["HF_HOME"] = tempfile.mkdtemp(prefix="pollard-tests-hf-")
+
+import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
