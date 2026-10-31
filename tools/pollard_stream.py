@@ -1717,8 +1717,8 @@ def _record_streamed(out, fn, entry):
 
 
 def _hf_api():
-    from huggingface_hub import HfApi
-    return HfApi()
+    from pollard_privacy import SafeApi
+    return SafeApi()
 
 
 def stream_shard(out, path, spec, api=None, log=print):
