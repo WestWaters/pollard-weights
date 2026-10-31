@@ -787,6 +787,11 @@ const ADV_SECTIONS = [
     why: "Optional, and measured rather than assumed: abliterate reports what it changed, and "
        + "pollard-kl is how you check it changed only that.",
     tools: ["pollard_abliterate"] },
+  { title: "PUBLISHING", icon: "check",
+    why: "Every upload already runs through it: llama.cpp writes the imatrix and calibration paths into a GGUF's "
+       + "metadata, so a published file would show your home folder. privacy checks or scrubs any file or folder "
+       + "by hand -- GGUF headers, .imatrix files and sidecars, tensor data untouched.",
+    tools: ["pollard_privacy"] },
 ];
 
 SCREENS.advanced = () => `

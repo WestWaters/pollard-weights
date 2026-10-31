@@ -1919,8 +1919,8 @@ def main():
     print(f"wrote model card -> {a.out}  ({len(builds)} file(s), lanes: {','.join(lanes)})")
     if a.upload:
         try:
-            from huggingface_hub import HfApi
-            HfApi().upload_file(path_or_fileobj=a.out, path_in_repo="README.md",
+            from pollard_privacy import SafeApi
+            SafeApi().upload_file(path_or_fileobj=a.out, path_in_repo="README.md",
                                 repo_id=a.upload, repo_type="model")
             print(f"uploaded card -> https://huggingface.co/{a.upload}")
         except Exception as e:

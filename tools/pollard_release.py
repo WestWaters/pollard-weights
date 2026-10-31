@@ -804,8 +804,8 @@ def card_upload(step, c, run_upload, out=print):
     if not run_upload:
         out("      (not uploading the card: uploads are off)")
         return "held"
-    from huggingface_hub import HfApi
-    HfApi().upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=step.repo)
+    from pollard_privacy import SafeApi
+    SafeApi().upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=step.repo)
     return "done"
 
 
@@ -1556,8 +1556,12 @@ _LANE_DIR = {"mlx": "MLX", "gptq": "GPTQ", "mx": "MX", "exl3": "EXL3", "exlr8": 
 
 
 def host_name(cfg=None):
-    """This machine's name in its sidecars: the plan's `host:`, else the short hostname."""
-    h = (cfg or {}).get("host") or platform.node().split(".")[0] or "host"
+    """This machine's name in its sidecars: the plan's `host:`, else a stable tag hashed from the hostname -- a published
+    file name must not carry it ("marbits-mac-mini" names its owner); the hash still tells two machines apart."""
+    h = (cfg or {}).get("host")
+    if not h:
+        import hashlib
+        h = "host-" + hashlib.sha256((platform.node() or "host").encode()).hexdigest()[:8]
     return re.sub(r"[^A-Za-z0-9_-]", "-", str(h)).lower()
 
 
@@ -2682,6 +2686,8 @@ class RelayApi:
 
     def upload_folder(self, folder_path, path_in_repo, repo_id, ignore_patterns=None, **kw):
         import pollard_workspace as ws
+        import pollard_privacy as PV
+        PV.guard([folder_path], self.out)              # scrubbed here, before it is copied to the relay
         ignore = list(ignore_patterns or [])
         pats = [ws.STAGING_MARK] + ignore
         self._upload(folder_path, path_in_repo, repo_id, lambda stage: (
@@ -2689,6 +2695,8 @@ class RelayApi:
             f"ignore_patterns={pats!r}))"), ignore)
 
     def upload_file(self, path_or_fileobj, path_in_repo, repo_id, **kw):
+        import pollard_privacy as PV
+        PV.guard([path_or_fileobj], self.out)
         name = os.path.basename(path_or_fileobj)
         self._upload(path_or_fileobj, path_in_repo, repo_id, lambda stage: (
             f"str(api.upload_file(path_or_fileobj={stage + '/' + name!r}, path_in_repo={path_in_repo!r}, "
@@ -2750,8 +2758,8 @@ def hf_api(cfg):
     """HfApi() here, or the --upload-via relay (another machine's login) when the plan names one."""
     if cfg.get("upload_via"):
         return RelayApi(str(cfg["upload_via"]))
-    from huggingface_hub import HfApi
-    return HfApi()
+    from pollard_privacy import SafeApi          # nothing published carries this machine's local paths
+    return SafeApi()
 
 
 def sweep_staging(cfg, c, out=print, relay=None):

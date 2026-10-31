@@ -157,8 +157,9 @@ def main():
     ap.add_argument("--upload", action="store_true", help="publish them (default: write locally only)")
     a = ap.parse_args()
 
-    from huggingface_hub import HfApi, hf_hub_download
-    api = HfApi()
+    from huggingface_hub import hf_hub_download
+    from pollard_privacy import SafeApi
+    api = SafeApi()
     sys.path.insert(0, HERE)
     import pollard_workspace as ws
 
