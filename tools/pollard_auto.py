@@ -312,7 +312,9 @@ def ladder_points(gguf, imatrix=None, sensitivity=None, step=0.1):
     from pollard_calc import imatrix_covered_tensors
     from pollard_ngram import disk_plan
     meta = read_gguf_meta(gguf)
-    arch = analyse(gguf_to_config(meta, gguf))
+    # _size_probe: a hybrid's attention floor adds its bytes ON TOP of a rung's plan; counted here it would pull the
+    # 4-bit rung onto a smaller budget and starve the FFNs that measured as keeping its speech intact
+    arch = dict(analyse(gguf_to_config(meta, gguf)), _size_probe=True)
     covered = imatrix_covered_tensors(imatrix) if imatrix else None
     emb_ok = bool(covered) and {"token_embd.weight", "output.weight"} <= covered
     disk = disk_plan(meta, "auto", "auto")             # a measured table is allocated, else pinned at q8_0
@@ -1526,7 +1528,7 @@ def main():
                          "'auto' = only when the majors differ; 'off' = always use the current env.")
     ap.add_argument("--imatrix", help="importance matrix (auto-generated from Calib 3.0 if omitted)")
     ap.add_argument("--calib", help="calibration corpus for auto-imatrix (else Calib 3.0 auto-built)")
-    ap.add_argument("--calib-profile", default="auto", choices=["auto", "general", "translation", "agent", "code"],
+    ap.add_argument("--calib-profile", default="auto", choices=["auto", "general", "translation", "agent", "code", "speech"],
                     help="pollard-calib domain mix for the auto-built corpus. 'auto' (default) picks it from "
                          "pollard-modelkind: agentic -> agent, coder -> code, translator -> translation, else general")
     ap.add_argument("--ngl", default="auto",

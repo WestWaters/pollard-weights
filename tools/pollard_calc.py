@@ -426,6 +426,21 @@ def _read_one_gguf(path):
     return meta, total_params, dcounts
 
 
+_MIXER_RE = re.compile(r"^blk\.(\d+)\.(?!attn_|ffn_)([a-z0-9_.]+)\.weight$")
+
+
+def _mixer_tensors(tparams):
+    """{layer: [(tensor, params)]} -- a block's big matrices that are neither attention nor FFN: a hybrid's token
+    mixer (LFM2/LFM3 shortconv in/out projections, an SSM's in/out). Norms and the small conv kernel are left out;
+    llama-quantize keeps those as they are."""
+    out = {}
+    for n, p in tparams.items():
+        m = _MIXER_RE.match(n)
+        if m and "norm" not in m.group(2) and not m.group(2).endswith("conv") and p >= (1 << 20):
+            out.setdefault(int(m.group(1)), []).append((n, int(p)))
+    return out
+
+
 def read_gguf_meta(path):
     """Shard-aware GGUF metadata reader. Reads the arch KV from shard 1 and sums
     the tensor param count AND file bytes across ALL shards, so multi-shard models
@@ -579,6 +594,12 @@ def gguf_to_config(meta, path):
         "_gguf_file_bytes": meta.get("_total_file_bytes", os.path.getsize(path)),
         "_tensor_param_sum": meta.get("_tensor_param_sum"),
         "_shard_count": meta.get("_shard_count", 1),
+        # blocks that carry real attention, read from the tensor table: a conv/attention hybrid (LFM2/LFM3:
+        # shortconv blocks, attention every other block) has attn_q on only some of them
+        "_attn_layers": sorted({int(n.split(".")[1]) for n in (meta.get("_tensor_params") or {})
+                                if n.startswith("blk.") and n.endswith(".attn_q.weight")
+                                and n.split(".")[1].isdigit()}),
+        "_mixers": _mixer_tensors(meta.get("_tensor_params") or {}),
     }
     # per-layer lists (0 on layers without that block, e.g. Nemotron-H's Mamba layers): the widest layer
     for k in ("num_attention_heads", "num_key_value_heads", "intermediate_size", "num_experts",
@@ -718,6 +739,16 @@ def analyse(cfg):
         n_full = len(lt) - n_linear
     hybrid = bool(n_linear) or any(k in cfg for k in
                   ("mamba_ssm_dtype", "linear_conv_kernel_dim", "linear_num_key_heads"))
+    # attention on only SOME blocks (from a GGUF's tensor table): a conv/SSM hybrid whatever its config calls it
+    attn_layers = cfg.get("_attn_layers") or []
+    mixers = {}
+    if attn_layers and len(attn_layers) < layers:
+        hybrid = True
+        if not n_full:
+            n_full, n_linear = len(attn_layers), layers - len(attn_layers)
+        mixers = cfg.get("_mixers") or {}
+    else:
+        attn_layers = []
     # Multi-token prediction: emits >1 token per weight-read pass -> the RAM-bandwidth
     # "ceiling" is really a floor for these models.
     mtp = first(cfg, "mtp_num_hidden_layers", "num_nextn_predict_layers",
@@ -729,6 +760,8 @@ def analyse(cfg):
         "shared": shared, "expert_params": expert_params,
         "dense_ffn_params": dense_ffn_params,     # per-layer FFN bulk (for dense allocation)
         "attn_params": attn,                      # per-layer attention (q,k,v,o) -- its own group
+        "attn_layers": attn_layers,               # hybrid: the blocks that have attention ([] = every block)
+        "mixers": mixers,                         # hybrid: {layer: [(tensor, params)]} of its non-attention mixer
         "dense_layers": dense_layers,
         "multimodal": multimodal, "hybrid": hybrid,
         "n_linear": n_linear, "n_full": n_full, "mtp": mtp, "n_kv_layers": n_kv_layers,

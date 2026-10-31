@@ -366,3 +366,66 @@ def test_streamed_mx_of_the_omni_is_complete_and_leaves_the_talker_alone(omni):
     src, o = S.Source(omni["omni"]), S.Source(out)
     k = "talker.model.layers.0.self_attn.q_proj.weight"
     assert np.array_equal(o.read_raw(k)[1], src.read_raw(k)[1]), "the talker is copied, not quantized"
+
+
+# ------------------------------------------------------------------------------------------------ Liquid audio layout
+
+LIQUID = {"lfm.embed_tokens.weight": ("BF16", (64, 16)), "lfm.layers.0.conv.in_proj.weight": ("BF16", (48, 16)),
+          "encoder.layers.0.self_attn.linear_q.weight": ("BF16", (16, 16)),
+          "mlp.0.weight": ("BF16", (16, 16)),
+          "depthformer.layers.0.self_attn.qkv_proj.weight": ("BF16", (48, 16)),
+          "depth_embeddings.0.weight": ("BF16", (32, 16)), "depth_linear.weight": ("BF16", (16, 16)),
+          "codebook_embedding.weight": ("BF16", (32, 16))}
+
+
+def _liquid(tmp_path, tensors=LIQUID):
+    d = tmp_path / "lfm3audio"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"architectures": ["Lfm3AudioForConditionalGeneration"],
+                                               "model_type": "lfm3_audio"}))
+    _st(d / "model.safetensors", tensors)
+    return str(d)
+
+
+def test_liquid_audio_layout_is_never_read_as_text_only(tmp_path):
+    """LFM3-Audio-2B shipped without its mmproj (2026-10-28): its bare `encoder.` / `mlp.` / `depthformer.` names
+    matched no tower pattern, so the gate reported a text-only source and passed."""
+    comps = PC.inventory(_liquid(tmp_path))["components"]
+    assert set(comps) == {"audio", "projector", "speech_out"}
+    assert len(comps["speech_out"]) == 4 and "encoder.layers.0.self_attn.linear_q.weight" in comps["audio"]
+    out = tmp_path / "gguf"
+    out.mkdir()
+    (out / "m-IQ3_S.gguf").write_bytes(b"")
+    res = PC.check(str(tmp_path / "lfm3audio"), str(out), "gguf")
+    assert not res["ok"] and {m.split(":")[0] for m in res["missing"]} == {"audio", "projector", "speech_out"}
+
+
+def test_an_mmproj_with_the_speech_output_covers_the_depthformer(tmp_path):
+    gguf = pytest.importorskip("gguf")
+    src = _liquid(tmp_path)
+    out = tmp_path / "gguf"
+    out.mkdir()
+    w = gguf.GGUFWriter(str(out / "mmproj-lfm3-BF16.gguf"), "clip")
+    w.add_bool("clip.has_audio_encoder", True)
+    w.add_tensor("a.blk.0.attn_q.weight", np.zeros((4, 4), np.float32))
+    w.add_tensor("a.gen.code.blk.0.attn_q.weight", np.zeros((4, 4), np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    res = PC.check(src, str(out), "gguf")
+    assert res["ok"], res["missing"]
+    assert any(c.startswith("speech_out") and "mmproj" in c for c in res["carried"])
+
+
+def test_a_text_models_own_encoder_is_not_claimed(tmp_path):
+    comps = PC.inventory(_liquid(tmp_path, {"encoder.layers.0.weight": ("BF16", (16, 16)),
+                                            "decoder.layers.0.weight": ("BF16", (16, 16))}))["components"]
+    assert comps == {}
+
+
+def test_modelkind_reads_a_speech_model_from_its_weights_and_calibrates_for_speech(tmp_path):
+    from pollard_modelkind import classify
+    k = classify(_liquid(tmp_path))
+    assert "audio" in k["modalities"] and "speech_out" in k["modalities"]
+    assert k["calib_profile"] == "speech"
