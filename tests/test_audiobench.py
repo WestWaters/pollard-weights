@@ -60,3 +60,35 @@ def test_asr_run_end_to_end_with_a_stub(tmp_path, monkeypatch):
     res = B.run_asr(a)
     assert res["metric"] == "wer" and res["value"] == 0.0 and res["clips"] == 2 and res["speakers"] == 2
     assert json.load(open(tmp_path / "r.json"))["rows"][0]["hyp"].startswith("Is there")
+
+
+def test_language_codes_of_speech_sets():
+    assert B._iso({"language_id": "cmn"}) == "zh" and B._iso({"language_id": "jpn"}) == "ja"
+    assert B._iso({}) == "en" and B._iso({"language_id": "deu"}) == "de"
+
+
+def test_tts_run_scores_the_judges_transcripts(tmp_path, monkeypatch):
+    rows = [{"id": "a", "text": "Get the trust fund to the bank early.", "lang": "en", "speaker": "v1"},
+            {"id": "b", "text": "The cat sat on the mat today.", "lang": "en", "speaker": "v2"}]
+    with open(tmp_path / "manifest.jsonl", "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    spoken = {}
+
+    def synth(family, model, text, out, *a, **k):
+        spoken[out] = text
+        open(out, "wb").write(b"RIFF")
+        return True
+    heard = {"Get the trust fund to the bank early.": "get the trust fund to the bank early",
+             "The cat sat on the mat today.": "the cat sat on a mat today"}          # one word wrong in seven
+    monkeypatch.setattr(B, "synth_audiocpp", synth)
+    monkeypatch.setattr(B, "whisper_transcribe", lambda m, wav, lang="en": heard[spoken[wav]])
+    a = types.SimpleNamespace(set=str(tmp_path), limit=None, lang=None, keep=str(tmp_path / "wav"), clone=False,
+                              audiocpp_family="ming3_tts", model="rung.gguf", backend=None, language="en", voice=None,
+                              gguf=None, mmproj=None, ngl="0", bin=None, judge_whisper="ggml-large-v3.bin",
+                              out=str(tmp_path / "r.json"))
+    os.makedirs(a.keep, exist_ok=True)
+    res = B.run_tts(a)
+    assert res["metric"] == "wer" and res["failed"] == 0 and res["clips"] == 2
+    assert abs(res["value"] - round(100 * 1 / 15, 2)) < 1e-9          # 1 edit over 8 + 7 reference words
+    assert res["judge"].startswith("whisper-large-v3")
