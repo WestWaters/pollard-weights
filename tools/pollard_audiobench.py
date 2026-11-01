@@ -298,9 +298,12 @@ def _llama_bin(name, hint=None):
     return shutil.which(name) or name
 
 
-def transcribe_llama(gguf, mmproj, audio, system=None, prompt="Transcribe the audio.", ngl="99", bin_dir=None):
+def transcribe_llama(gguf, mmproj, audio, system=None, prompt="Transcribe the audio.", ngl="99", bin_dir=None,
+                     jinja=False):
+    """`jinja`: render the model's own chat template (granite-speech's is one llama.cpp's built-in list does not know --
+    without it llama-mtmd-cli aborts and every transcript comes back empty)."""
     cmd = [_llama_bin("llama-mtmd-cli", bin_dir), "-m", gguf, "--mmproj", mmproj, "--audio", audio, "-p", prompt,
-           "-n", "256", "--temp", "0", "-ngl", str(ngl)]
+           "-n", "256", "--temp", "0", "-ngl", str(ngl)] + (["--jinja"] if jinja else [])
     if system:
         cmd += ["-sys", system]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
@@ -417,7 +420,8 @@ def run_asr(a):
         if a.audiocpp_family:
             hyps.append(transcribe_audiocpp(a.audiocpp_family, a.model, wav, a.backend))
         else:
-            hyps.append(transcribe_llama(a.gguf, a.mmproj, wav, a.system, ngl=a.ngl, bin_dir=a.bin))
+            hyps.append(transcribe_llama(a.gguf, a.mmproj, wav, a.system, prompt=a.prompt or "Transcribe the audio.",
+                                         ngl=a.ngl, bin_dir=a.bin, jinja=a.jinja))
         if (i + 1) % 50 == 0:
             print(f"   {i + 1}/{len(manifest)}", flush=True)
     rows = score_rows(manifest, hyps, lang)
@@ -460,6 +464,9 @@ def main(argv=None):
     s.add_argument("--gguf", help="llama.cpp rung (with --mmproj)")
     s.add_argument("--mmproj")
     s.add_argument("--system", help="system prompt the model's card prescribes for ASR (e.g. 'Perform ASR in English.')")
+    s.add_argument("--prompt", help="the user turn the model's card prescribes (granite-speech: 'can you transcribe the "
+                                    "speech into a written format?'); default 'Transcribe the audio.'")
+    s.add_argument("--jinja", action="store_true", help="render the model's own chat template (needed for custom ones)")
     s.add_argument("--audiocpp-family", help="an audio.cpp ASR family instead (with --model)")
     s.add_argument("--model")
     s.add_argument("--backend")
