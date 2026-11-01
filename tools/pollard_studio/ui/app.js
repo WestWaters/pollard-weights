@@ -781,8 +781,9 @@ const ADV_SECTIONS = [
        + "scores real task accuracy on the build, serve-eval A/Bs a SERVED endpoint against its "
        + "reference so you measure what users will actually hit. kvbench measures the KV-cache "
        + "formats themselves -- KLD and speed from 8K to 64K context. audioeval is the speech "
-       + "model's bench: does each rung still speak and listen, per language, worst language first.",
-    tools: ["pollard_probes", "pollard_serve_eval", "pollard_kvbench", "pollard_audioeval"] },
+       + "model's bench: does each rung still speak and listen, per language, worst language first. audiobench "
+       + "scores a rung on the makers' own sets -- LibriSpeech, FLEURS, open ESB -- the leaderboard's way.",
+    tools: ["pollard_probes", "pollard_serve_eval", "pollard_kvbench", "pollard_audioeval", "pollard_audiobench"] },
   { title: "BEHAVIOUR", icon: "brain",
     why: "Optional, and measured rather than assumed: abliterate reports what it changed, and "
        + "pollard-kl is how you check it changed only that.",
