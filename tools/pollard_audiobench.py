@@ -11,6 +11,9 @@ makers' question, on their data and with their scoring.
     pollard-audiobench fetch --set esb:earnings22 --n 200 --out sets/earnings22
     pollard-audiobench asr --gguf rung.gguf --mmproj mmproj.gguf --set sets/ls-clean --out r.json
     pollard-audiobench asr --audiocpp-family citrinet_asr --model rung.gguf --set sets/fleurs-ja --lang ja
+    pollard-audiobench fetch --set seedtts-en --n 200 --out sets/seedtts-en        # speech output (Seed-TTS protocol)
+    pollard-audiobench tts --audiocpp-family ming3_tts --model rung.gguf --set sets/seedtts-en \\
+        --judge-whisper ggml-large-v3.bin --language en
 
 Scoring follows the Open ASR Leaderboard: Whisper's EnglishTextNormalizer for English, its BasicTextNormalizer for
 other languages, character error rate for Chinese / Japanese / Korean / Thai, corpus-level WER (total edits / total
@@ -43,6 +46,12 @@ SETS = {
     "librispeech-other": ("openslr/librispeech_asr", "other/test/0000.parquet", "en"),
 }
 ESB_OPEN = {"ami", "earnings22", "voxpopuli"}          # gated / non-commercial ESB sets are left out on purpose
+#: speech-output sets (k2-fsa/TTS_eval_datasets, Apache-2.0): Seed-TTS test-en, LibriSpeech-PC test-clean (the F5-TTS
+#: cross-sentence list), MiniMax multilingual (24 languages); each item has the text to speak and a voice prompt
+TTS_REPO = "k2-fsa/TTS_eval_datasets"
+TTS_SETS = {"seedtts-en": ("seedtts_test_en.jsonl", "seedtts_testset.tar.gz"),
+            "librispeech-pc": ("librispeech_pc_test_clean.jsonl", "librispeech_pc_testset.tar.gz"),
+            "minimax": ("minimax_multilingual_24.jsonl", "minimax_multilingual_24.tar.gz")}
 
 
 # ------------------------------------------------------------------------------------------------ text + scoring
@@ -178,7 +187,50 @@ def _parquet_rows(repo, path_in_repo):
     return pq.read_table(p).to_pylist()
 
 
-def fetch(set_name, n, out, log=print):
+def _iso(item):
+    """A TTS item's language as a short code (MiniMax names it; the English sets do not)."""
+    lid = str(item.get("language_id") or item.get("language") or "en").lower()
+    return {"arb": "ar", "cmn": "zh", "yue": "yue", "jpn": "ja", "kor": "ko", "eng": "en"}.get(lid, lid[:2])
+
+
+def fetch_tts(set_name, n, out, with_prompts=False, log=print):
+    """Texts to speak (and, with_prompts, their voice prompts) from a speech-output set; MiniMax takes :<language>."""
+    from huggingface_hub import hf_hub_download
+    base, _, want = set_name.partition(":")
+    jl, tgz = TTS_SETS[base]
+    items = [json.loads(l) for l in open(hf_hub_download(TTS_REPO, jl, repo_type="dataset"), encoding="utf-8")
+             if l.strip()]
+    if want:
+        items = [i for i in items if want.lower() in (str(i.get("language_name", "")).lower(),
+                                                       str(i.get("language_id", "")).lower(), _iso(i))]
+    for i in items:
+        i["speaker"] = os.path.basename(str(i.get("ref_audio", i["id"]))).split(".")[0]
+    pick = spread(items, n, lambda i: i["speaker"])
+    os.makedirs(out, exist_ok=True)
+    if with_prompts:
+        need = {os.path.basename(i["ref_audio"]): i for i in pick if i.get("ref_audio")}
+        with tarfile.open(hf_hub_download(TTS_REPO, tgz, repo_type="dataset"), "r:gz") as tf:
+            for mem in tf:
+                nm = os.path.basename(mem.name)
+                if nm in need and mem.isfile():
+                    dst = os.path.join(out, "prompts", os.path.splitext(nm)[0] + ".wav")
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if not os.path.exists(dst):
+                        _to_wav(tf.extractfile(mem).read(), dst, nm.rsplit(".", 1)[-1])
+    with open(os.path.join(out, "manifest.jsonl"), "w", encoding="utf-8") as f:
+        for i in pick:
+            row = {"id": i["id"], "text": i["text"], "lang": _iso(i), "speaker": i["speaker"]}
+            if with_prompts and i.get("ref_audio"):
+                row.update(prompt=os.path.join("prompts", os.path.splitext(os.path.basename(i["ref_audio"]))[0] + ".wav"),
+                           prompt_text=i.get("ref_text", ""))
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    log(f"{set_name}: {len(pick)} items from {len({i['speaker'] for i in pick})} voices -> {out}")
+    return pick
+
+
+def fetch(set_name, n, out, log=print, with_prompts=False):
+    if set_name.split(":")[0] in TTS_SETS:
+        return fetch_tts(set_name, n, out, with_prompts, log)
     os.makedirs(out, exist_ok=True)
     rows = []
     if set_name in SETS:
@@ -266,6 +318,76 @@ def transcribe_audiocpp(family, model, audio, backend=None):
     return clean_transcript(r.stdout) if r.returncode == 0 else ""
 
 
+def whisper_transcribe(model_bin, wav, lang="en"):
+    """The Seed-TTS judge: Whisper-large-v3, here through whisper.cpp (whisper-cli) so it runs on Metal / CPU."""
+    exe = shutil.which("whisper-cli") or "whisper-cli"
+    r = subprocess.run([exe, "-m", model_bin, "-f", wav, "-l", (lang or "en").split("_")[0], "-nt", "-np"],
+                       capture_output=True, text=True, timeout=900)
+    return " ".join(l.strip() for l in r.stdout.splitlines() if l.strip()) if r.returncode == 0 else ""
+
+
+def synth_audiocpp(family, model, text, out, backend=None, language=None, voice=None, prompt=None, prompt_text=None):
+    exe = shutil.which("audiocpp_cli") or os.path.join(os.environ.get("POLLARD_AUDIOCPP_BIN", ""), "audiocpp_cli")
+    req = {"id": "s", "text": text}
+    if language:
+        req["language"] = language
+    if voice:
+        req["voice"] = voice
+    task = "tts"
+    if prompt:
+        task = "clone"
+        req.update(voice_ref=os.path.abspath(prompt), reference_text=prompt_text or "")
+    with tempfile.TemporaryDirectory() as td:
+        rq = os.path.join(td, "r.json")
+        json.dump({"requests": [req]}, open(rq, "w"))
+        r = subprocess.run([exe, "--task", task, "--family", family, "--model", model, "--backend",
+                            backend or ("metal" if sys.platform == "darwin" else "cpu"), "--request-sequence", rq,
+                            "--out-dir", td], capture_output=True, text=True, timeout=900)
+        got = os.path.join(td, "s.wav")
+        if r.returncode == 0 and os.path.exists(got):
+            shutil.move(got, out)
+            return True
+    return False
+
+
+def synth_llama(gguf, mmproj, text, out, lang="en", seed=7, ngl="99", bin_dir=None):
+    cmd = [_llama_bin("llama-tts", bin_dir), "-m", gguf, "-mm", mmproj, "-p", text, "--tts-lang", lang,
+           "--seed", str(seed), "-ngl", str(ngl), "--output", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    return r.returncode == 0 and os.path.exists(out)
+
+
+def run_tts(a):
+    """Seed-TTS protocol: the rung speaks each item, Whisper-large-v3 transcribes it, WER (CER for zh/ja/ko) vs the
+    text, with a 95% interval resampled by voice."""
+    manifest = [json.loads(l) for l in open(os.path.join(a.set, "manifest.jsonl"), encoding="utf-8") if l.strip()]
+    if a.limit:
+        manifest = manifest[: a.limit]
+    lang = a.lang or (manifest[0].get("lang") if manifest else "en")
+    hyps, failed = [], 0
+    with tempfile.TemporaryDirectory() as td:
+        for i, m in enumerate(manifest):
+            wav = os.path.join(a.keep or td, re.sub(r"[^A-Za-z0-9_.-]", "_", m["id"]) + ".wav")
+            prompt = os.path.join(a.set, m["prompt"]) if a.clone and m.get("prompt") else None
+            if a.audiocpp_family:
+                ok = synth_audiocpp(a.audiocpp_family, a.model, m["text"], wav, a.backend, a.language, a.voice,
+                                    prompt, m.get("prompt_text"))
+            else:
+                ok = synth_llama(a.gguf, a.mmproj, m["text"], wav, m.get("lang") or "en", ngl=a.ngl, bin_dir=a.bin)
+            failed += not ok
+            hyps.append(whisper_transcribe(a.judge_whisper, wav, m.get("lang") or lang) if ok else "")
+            if (i + 1) % 25 == 0:
+                print(f"   {i + 1}/{len(manifest)}", flush=True)
+    rows = score_rows(manifest, hyps, lang)
+    res = dict(report(rows, lang), set=os.path.basename(os.path.normpath(a.set)), lang=lang, failed=failed,
+               judge="whisper-large-v3 (whisper.cpp)", model=os.path.basename(a.gguf or a.model or ""))
+    print(f"{res['set']}: {res['metric'].upper()} {res['value']}%  (95% CI {res['ci95'][0]}-{res['ci95'][1]}, "
+          f"{res['clips']} items, {res['speakers']} voices, {failed} failed to synthesize)")
+    if a.out:
+        json.dump(dict(res, rows=rows), open(a.out, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+    return res
+
+
 def score_rows(manifest, hyps, lang=None):
     rows = []
     for m, h in zip(manifest, hyps):
@@ -315,6 +437,24 @@ def main(argv=None):
     f.add_argument("--set", required=True, help="librispeech-clean | librispeech-other | fleurs:<code> | esb:<set>")
     f.add_argument("--n", type=int, default=500)
     f.add_argument("--out", required=True)
+    f.add_argument("--with-prompts", action="store_true", help="speech-output sets: extract the voice prompts too")
+    t = sub.add_parser("tts", help="speak a fetched speech-output set with a rung, judge it with Whisper-large-v3")
+    t.add_argument("--set", required=True)
+    t.add_argument("--judge-whisper", required=True, help="whisper.cpp ggml-large-v3.bin (the Seed-TTS judge)")
+    t.add_argument("--audiocpp-family")
+    t.add_argument("--model")
+    t.add_argument("--gguf", help="llama.cpp TTS rung (llama-tts, with --mmproj)")
+    t.add_argument("--mmproj")
+    t.add_argument("--language", help="audio.cpp request language")
+    t.add_argument("--voice", help="audio.cpp voice preset")
+    t.add_argument("--clone", action="store_true", help="use each item's voice prompt (zero-shot cloning families)")
+    t.add_argument("--backend")
+    t.add_argument("--lang")
+    t.add_argument("--limit", type=int)
+    t.add_argument("--ngl", default="99")
+    t.add_argument("--bin")
+    t.add_argument("--keep", help="keep the generated wavs here")
+    t.add_argument("--out")
     s = sub.add_parser("asr", help="transcribe a fetched set with a rung and score it the leaderboard's way")
     s.add_argument("--set", required=True)
     s.add_argument("--gguf", help="llama.cpp rung (with --mmproj)")
@@ -330,7 +470,13 @@ def main(argv=None):
     s.add_argument("--out")
     a = ap.parse_args(argv)
     if a.cmd == "fetch":
-        fetch(a.set, a.n, a.out)
+        fetch(a.set, a.n, a.out, with_prompts=a.with_prompts)
+    elif a.cmd == "tts":
+        if not (a.gguf and a.mmproj) and not (a.audiocpp_family and a.model):
+            raise SystemExit("tts: --gguf + --mmproj (llama-tts), or --audiocpp-family + --model")
+        if a.keep:
+            os.makedirs(a.keep, exist_ok=True)
+        run_tts(a)
     else:
         if not (a.gguf and a.mmproj) and not (a.audiocpp_family and a.model):
             raise SystemExit("asr: --gguf + --mmproj, or --audiocpp-family + --model")
