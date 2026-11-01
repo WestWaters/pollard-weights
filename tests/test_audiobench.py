@@ -53,13 +53,20 @@ def test_asr_run_end_to_end_with_a_stub(tmp_path, monkeypatch):
         for r in rows:
             f.write(json.dumps(r) + "\n")
     said = {"a.wav": "Is there not a meridian everywhere?", "b.wav": "At once the goat gave a leap."}
-    monkeypatch.setattr(B, "transcribe_llama", lambda g, m, audio, *a, **k: said[os.path.basename(audio)])
+    seen = []
+
+    def stub(g, m, audio, *a, **k):
+        seen.append((k.get("prompt"), k.get("jinja")))
+        return said[os.path.basename(audio)]
+    monkeypatch.setattr(B, "transcribe_llama", stub)
     a = types.SimpleNamespace(set=str(tmp_path), limit=None, lang=None, audiocpp_family=None, model=None, backend=None,
                               gguf="rung.gguf", mmproj="mm.gguf", system=None, ngl="0", bin=None,
+                              prompt="can you transcribe the speech into a written format?", jinja=True,
                               out=str(tmp_path / "r.json"))
     res = B.run_asr(a)
     assert res["metric"] == "wer" and res["value"] == 0.0 and res["clips"] == 2 and res["speakers"] == 2
     assert json.load(open(tmp_path / "r.json"))["rows"][0]["hyp"].startswith("Is there")
+    assert seen[0] == ("can you transcribe the speech into a written format?", True)    # the card's prompt reaches the CLI
 
 
 def test_language_codes_of_speech_sets():
