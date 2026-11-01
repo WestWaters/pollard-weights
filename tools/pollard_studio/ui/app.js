@@ -759,7 +759,7 @@ const ADV_SECTIONS = [
        + "the whole model -- every tower, projector, talker and processor file of the source -- never text only.",
     tools: ["pollard_mlx", "pollard_mx", "pollard_exl3", "pollard_exl3_band", "pollard_exlr8",
             "pollard_export", "pollard_vllm", "pollard_draft", "pollard_draft_train", "pollard_stream",
-            "pollard_complete"] },
+            "pollard_complete", "pollard_audiocpp"] },
   { title: "FOUNDATION MODELS", icon: "layers",
     why: "Make your own model, the way the labs make their small open ones: a fresh architecture, or a smaller "
        + "model carved out of a bigger one (depth and width pruning measured on your text), then pretraining "
