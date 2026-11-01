@@ -2,6 +2,7 @@
 row-width fallback, classes, the scorers' parsing, and the measured plan -> exact rules. No audio.cpp binaries."""
 from __future__ import annotations
 
+import json
 import os
 import struct
 import sys
@@ -114,15 +115,36 @@ def test_plan_refuses_unmeasured_classes_and_infeasible_budgets():
         A.plan(cls, {c: {"q2_k": 0.0} for c in cls}, 1.0)
 
 
-def test_card_lists_every_rung_with_its_measured_numbers():
-    rungs = [{"file": "M-Pollard-6.4.gguf", "bytes": 1_390_600_000, "delta": 0.0397},
-             {"file": "M-Pollard-8.0.gguf", "bytes": 1_576_900_000, "delta": 0.0248}]
-    stock = {"bytes": 1_742_280_896, "delta": 0.0253}
-    md = A.card_md("PollardWeights/M-Pollard", "ming3_tts", "inclusionAI/M", rungs, stock, texts=24, judge="citrinet")
-    assert "base_model: inclusionAI/M" in md and "--family ming3_tts" in md
-    assert md.index("M-Pollard-6.4.gguf") < md.index("M-Pollard-8.0.gguf")          # smallest first
-    assert "-20%" in md and "-9%" in md and "+0.0248" in md and "24 sentences" in md
-    assert "/Users/" not in md
+def test_pollard_card_renders_an_audiocpp_ladder(tmp_path, monkeypatch):
+    """The audio.cpp lane's card comes from pollard-card, the template every Pollard repo uses: its hero, its size
+    table, its rung guide and files table -- with audio.cpp's numbers and run commands, not llama.cpp's."""
+    import subprocess
+    monkeypatch.setenv("POLLARD_HOME", str(tmp_path / "home"))
+    import pollard_workspace as ws
+    files = []
+    for label, size in (("6.4bpw", 1391), ("8.0bpw", 1577)):
+        f = tmp_path / f"M-tts-0.5B-Pollard-{label}.gguf"
+        hdr = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)                 # a valid, empty GGUF header (audio.cpp's own)
+        f.write_bytes(hdr + b"\0" * size)
+        ws.record_build("org/M-tts-0.5B", "audiocpp", str(f), tag=label)
+        files.append(f)
+    rungs = [{"file": files[0].name, "delta": 0.0397}, {"file": files[1].name, "delta": 0.0248}]
+    res = A.card_results(rungs, {"bytes": 1742, "delta": 0.0253}, 2998, "ming3_tts", "tts", 24, "citrinet")
+    rp = tmp_path / "r.json"
+    rp.write_text(json.dumps(res))
+    out = tmp_path / "README.md"
+    tools = os.path.join(os.path.dirname(__file__), "..", "tools")
+    subprocess.run([sys.executable, os.path.join(tools, "pollard_card.py"), "--model", "org/M-tts-0.5B",
+                    "--lane", "audiocpp", "--results", str(rp), "--repo", "PollardWeights/M-tts-0.5B-Pollard",
+                    "--out", str(out), "--params", "0.5B", "--license", "apache-2.0",
+                    "--pipeline-tag", "text-to-speech"],
+                   check=True, env=dict(os.environ, POLLARD_HOME=str(tmp_path / "home")), capture_output=True)
+    md = out.read_text()
+    assert "library_name: gguf" in md and "audio.cpp" in md and "Pollard shrank this model for audio.cpp" in md
+    assert "## Which file should I choose?" in md and "## Available files" in md and "## How to run" in md
+    assert "| file | size | error vs source | vs audio.cpp q8_0 |" in md
+    assert "+0.0397" in md and "+0.0248" in md and "audiocpp_cli --task tts --family ming3_tts" in md
+    assert "llama-server" not in md and "/Users/" not in md
 
 
 def test_publish_goes_through_safeapi(tmp_path, monkeypatch):

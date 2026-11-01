@@ -12,6 +12,7 @@ encoders, codecs, vocoders, convs, norms). What nobody publishes is a MEASURED m
             audio.cpp itself -- ASR: transcript character error vs the source model's own transcripts; TTS:
             synthesize fixed sentences, transcribe them with a fixed ASR model, character error vs the text plus
             the |log| duration ratio vs the source audio (catches silence and runaway generation)
+  publish   the card from pollard-card (the template every Pollard repo uses) and the upload, through SafeApi
   plan      Pollard's exact budgeted allocation (pollard_exlr8.knapsack) over the measured costs; refuses to plan
             a class it has no measurement for -- never a guessed bit width
   build     audiocpp_gguf with the plan as exact-name rules (no wildcards)
@@ -296,34 +297,18 @@ def rules_for(cls, choice):
 
 # ------------------------------------------------------------------------------------------------ card + publish
 
-def card_md(repo, family, base_model, rungs, stock=None, task="tts", texts=None, judge=None):
-    """The repo card: what runs it, then every rung with its MEASURED numbers. `rungs` / `stock` are `score` results
-    (bytes, delta, source_roundtrip) plus the rung's file name and label."""
-    name = repo.split("/")[-1]
+def card_results(rungs, stock=None, src_bytes=None, family=None, task="tts", texts=None, judge=None, note=None):
+    """pollard-card's results for an audio.cpp ladder: each rung's measured error, plus the references it was
+    measured against (`_audio`). `rungs` / `stock` are `score` results with the rung's file name."""
     metric = ("TTS round trip: the rung speaks held-out sentences, a fixed ASR model transcribes them -- character "
               "error vs the text plus |log| duration drift vs the source model's audio"
               if task == "tts" else "character error of the rung's transcripts vs the source model's")
-    lines = [f"---\nbase_model: {base_model}\nlibrary_name: audio.cpp\ntags:\n- audio.cpp\n- gguf\n- pollard\n---", "",
-             f"# {name}", "",
-             f"Measured-allocation GGUF builds of [{base_model}](https://huggingface.co/{base_model}) for "
-             f"[audio.cpp](https://github.com/0xShug0/audio.cpp), made with "
-             f"[Pollard Weights](https://github.com/WestWaters/pollard-weights): every class of tensors was pushed "
-             f"low on its own and scored by the model's own output, and the bits went where the damage was.", "",
-             f"Run with `audiocpp_cli --family {family} --model <file>.gguf ...` (audio.cpp v0.9.3 or newer).", "",
-             "| file | size | vs audio.cpp q8_0 | error vs source | notes |", "|---|---:|---:|---:|---|"]
-    ordered = sorted(rungs, key=lambda r: r["bytes"])
-    for i, r in enumerate(ordered):
-        rel = f"{100 * (r['bytes'] / stock['bytes'] - 1):+.0f}%" if stock else "--"
-        note = "smallest" if i == 0 else ("largest" if i == len(ordered) - 1 else "")
-        lines.append(f"| `{r['file']}` | {r['bytes'] / 1e6:.0f} MB | {rel} | {r['delta']:+.4f} | {note} |")
-    if stock:
-        lines.append(f"| audio.cpp q8_0 (reference, not in this repo) | {stock['bytes'] / 1e6:.0f} MB | -- | "
-                     f"{stock['delta']:+.4f} | |")
-    lines += ["", f"_Error vs source: {metric}"
-              + (f", on {texts} sentences the allocation never saw" if texts else "")
-              + (f"; judge: {judge}" if judge else "") + ". Lower is better; 0 = the source model's own output._",
-              "", "Every number above is measured, report-only, on the rung that is in this repo."]
-    return "\n".join(lines) + "\n"
+    out = {r["file"]: {"audio_err": round(float(r["delta"]), 4)} for r in rungs}
+    out["_audio"] = {"family": family, "task": task, "metric": metric, "texts": texts, "judge": judge,
+                     "src_bytes": src_bytes, "src_label": "bf16",
+                     "stock_bytes": (stock or {}).get("bytes"), "stock_err": (stock or {}).get("delta"),
+                     "note": note}
+    return out
 
 
 def publish(repo, files, readme, private=False, log=print):
@@ -389,6 +374,10 @@ def main(argv=None):
     u.add_argument("--task", choices=("asr", "tts"), default="tts")
     u.add_argument("--texts", type=int, help="how many held-out sentences the scores used")
     u.add_argument("--judge", help="the ASR judge's name, for the card")
+    u.add_argument("--source", help="the source package (its size heads the card)")
+    u.add_argument("--note", help="one line for the card under the table (e.g. why the ladder starts where it does)")
+    u.add_argument("--params", help="param count for the card, e.g. 0.5B")
+    u.add_argument("--base-owner", help="the base model's owner, for the card's credit line")
     u.add_argument("--private", action="store_true")
     u.add_argument("--dry-run", action="store_true", help="write README.md next to the first rung, upload nothing")
     b = sub.add_parser("build")
@@ -471,17 +460,33 @@ def main(argv=None):
         return 0
 
     if a.cmd == "publish":
+        import subprocess as sp
+        import pollard_workspace as ws
         rungs, files = [], []
         for spec in a.rung:
             f, _, js = spec.partition("=")
             d = json.load(open(js))
+            label = re.sub(r"^.*-Pollard-|\.gguf$", "", os.path.basename(f))
+            ws.record_build(a.base_model, "audiocpp", f, tag=label, extra={"family": a.family})
             rungs.append(dict(d, file=os.path.basename(f), bytes=os.path.getsize(f)))
             files.append(f)
         stock = json.load(open(a.stock)) if a.stock else None
-        md = card_md(a.repo, a.family, a.base_model, rungs, stock, a.task, a.texts, a.judge)
-        readme = os.path.join(os.path.dirname(os.path.abspath(files[0])), "README.md")
-        open(readme, "w", encoding="utf-8").write(md)
-        print(f"card -> {readme}")
+        res = card_results(rungs, stock, os.path.getsize(a.source) if a.source else None, a.family, a.task,
+                           a.texts, a.judge, a.note)
+        here = os.path.dirname(os.path.abspath(files[0]))
+        rpath, readme = os.path.join(here, "results-audiocpp.json"), os.path.join(here, "README.md")
+        json.dump(res, open(rpath, "w"), indent=1)
+        card = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pollard_card.py"),
+                "--model", a.base_model, "--builds-from", a.base_model, "--lane", "audiocpp", "--results", rpath,
+                "--repo", a.repo, "--out", readme]
+        card += ["--pipeline-tag", "text-to-speech" if a.task == "tts" else "automatic-speech-recognition",
+                 "--input-support", "text" if a.task == "tts" else "audio"]
+        if a.params:
+            card += ["--params", a.params]
+        if a.base_owner:
+            card += ["--base-owner", a.base_owner]
+        sp.run(card, check=True)
+        print(f"card (pollard-card) -> {readme}")
         if not a.dry_run:
             print(publish(a.repo, files, readme, a.private))
         return 0

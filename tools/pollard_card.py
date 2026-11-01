@@ -37,11 +37,12 @@ LANE_TAGS = {"gguf": ["gguf", "llama.cpp", "ik_llama.cpp", "trellis", "imatrix"]
              # formats as Blackwell through vLLM. llama.cpp has no FP4 tensor-core path on sm_100/107, so
              # a GGUF card must never carry a Rubin tag that reads as an optimized build for it.
              "mx": ["nvfp4", "fp8", "mxfp6", "compressed-tensors", "vllm", "blackwell", "rubin", "vera-rubin"],
-             "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"], "exlr8": ["exlr8", "trellis"]}
+             "mlx": ["mlx", "apple-silicon"], "exl3": ["exl3", "exllamav3"], "exlr8": ["exlr8", "trellis"],
+             "audiocpp": ["audio.cpp", "gguf", "speech"]}
 # lane -> the hero's "Pollard shrank this model<...>" phrase
 LANE_WORD = {"gguf": "", "mlx": " for Apple Silicon", "gptq": " for vLLM/SGLang",
              "mx": " for Blackwell/Rubin (vLLM)", "exl3": " for exllamav3",
-             "exlr8": " in EXLR8 (one trellis encode, every rung a manifest)"}
+             "exlr8": " in EXLR8 (one trellis encode, every rung a manifest)", "audiocpp": " for audio.cpp"}
 RUBIN_VLLM_IMAGE = "vllm/vllm-openai:cu134-nightly"
 
 
@@ -435,7 +436,7 @@ def detect_card_facts(model_id, builds_dir, cfg, builds=()):
             tot = read_gguf_meta(g).get("_tensor_param_sum")
             if tot:
                 facts["params_b"] = float(tot) / 1e9
-    except Exception:
+    except (Exception, SystemExit):              # a best-effort count: an unreadable file must not end the card
         pass
     if builds_dir:
         home = os.environ.get("POLLARD_HOME") or os.path.expanduser("~/pollard")
@@ -648,7 +649,7 @@ def rung_subfolder(build, lane):
 
 def rungs_section(builds, lane, repo):
     """For a directory lane (MLX / GPTQ / MX / EXL3): which subfolder holds which rung, and how to load one."""
-    if lane == "gguf" or not builds:
+    if lane in ("gguf", "audiocpp") or not builds:          # single-file lanes: the files table already lists them
         return []
     run = {"mlx": "mlx_lm.generate --model ./{d} --prompt \"Hello\"", "gptq": "vllm serve ./{d}",
            "mx": "vllm serve ./{d}", "exl3": "# load ./{d} in exllamav3 / TabbyAPI",
@@ -1227,7 +1228,10 @@ def frontmatter(base_model, lic, lanes, model_type, quantized_by=None,
         tags.append(model_type)
     tags += ["quantized", "mixed-precision", "measured-allocation"]
     # A decision model answers typed questions with probabilities; it does not chat.
-    tags += ["decision-model", "systemone", "structured-output"] if decision else ["conversational"]
+    # a speech model speaks or listens; it does not hold a chat
+    speech = pipeline_tag in ("text-to-speech", "automatic-speech-recognition", "text-to-audio", "audio-to-audio")
+    tags += (["decision-model", "systemone", "structured-output"] if decision else
+             [pipeline_tag] if speech else ["conversational"])
     seen, uniq = set(), []
     for t in tags:
         if t not in seen:
@@ -1236,7 +1240,7 @@ def frontmatter(base_model, lic, lanes, model_type, quantized_by=None,
     # Say which library the files are for. Left unset, the Hub guesses from the tags: our "trellis" tag (the
     # ik_llama quant family) made it file every ik repo under Microsoft's TRELLIS 3D library, and a repo
     # without that tag (clef-flash-Pollard) showed "Downloads are not tracked for this model".
-    library = "gguf" if "gguf" in lanes else "mlx" if "mlx" in lanes else None
+    library = "gguf" if ("gguf" in lanes or "audiocpp" in lanes) else "mlx" if "mlx" in lanes else None
     if library:
         lines.append(f"library_name: {library}")
     # Better to say nothing than to credit the wrong account: an unattributed card is incomplete,
@@ -1411,6 +1415,14 @@ def main():
 
     primary = a.lane or (lanes[0] if lanes else "gguf")
     lane_word = LANE_WORD.get(primary, "")
+    # audio.cpp ladders (pollard-audiocpp) carry their own reference sizes and their measured round-trip error: the
+    # source package's real bytes beat a params estimate (it holds a VAE, a speaker encoder and a codec too)
+    aud = results.get("_audio") if isinstance(results.get("_audio"), dict) else {}
+    src_word = "f16"
+    if primary == "audiocpp" and aud.get("src_bytes"):
+        f16_gb, src_word = aud["src_bytes"] / 1e9, aud.get("src_label", "bf16")
+        pct = (1 - small_gb / f16_gb) * 100 if f16_gb else 0
+        x = f16_gb / small_gb if small_gb else 0
     # ---- frontmatter + hero
     # Both of these name a file that sits at the ROOT of the published repo, so only the basename
     # can ever be correct on the card. Accepting a path and printing it verbatim put
@@ -1427,9 +1439,14 @@ def main():
                        decision, uses_ik), "",
            f"# {name} -- Pollard", ""]
     if f16_gb and small_gb:
-        out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB (f16) -> {small_gb:.2f} GB** -- "
+        out += [f"> ### Pollard shrank this model{lane_word}: **{f16_gb:.2f} GB ({src_word}) -> {small_gb:.2f} GB** -- "
                 f"**{pct:.0f}% smaller, {x:.1f}x down**.",
                 "> The smallest rung here; larger, higher-fidelity rungs are listed below."]
+        if primary == "audiocpp":      # the audio.cpp references it was measured against
+            out += [">", "> | format | this model's size |", "> |---|---:|", f"> | {src_word} (source) | {f16_gb:.2f} GB |"]
+            if aud.get("stock_bytes"):
+                out.append(f"> | audio.cpp q8_0 | {aud['stock_bytes'] / 1e9:.2f} GB |")
+            out.append(f"> | **PollardMix (this repo's smallest)** | **{small_gb:.2f} GB** |")
         if primary == "gguf":          # the format size table is GGUF-specific
             out += [">", "> | format | this model's size |", "> |---|---:|", f"> | f16 | {f16_gb:.2f} GB |"]
             # If the repo SHIPS this format, quote the real file. An estimated "~22.40 GB" three
@@ -1526,7 +1543,10 @@ def main():
                    + "[table below](#decision-fidelity) (perplexity does not apply: a decision model "
                    "answers with probabilities, not text)" if dec_rows else "decision fidelity -- pending") + " |")
     else:
-        out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
+        if primary == "audiocpp":
+            out.append(f"| Output error measured | {'**yes** -- table below' if results else 'pending'} |")
+        else:
+            out.append(f"| Perplexity measured | {'**yes** -- table below' if f16_ppl or results else 'pending'} |")
     out.append("")
 
     # ---- Which file should I choose? -- the rung guide, sized off the real bytes
@@ -1594,7 +1614,10 @@ def main():
     has_v = any(gate_verdict(b, results) is not None for b in builds)
     v_h = " verified |" if has_v else ""
     v_s = "---|" if has_v else ""
-    if decision:
+    if primary == "audiocpp":
+        out += [f"| file | size | error vs source | vs audio.cpp q8_0 |{v_h} notes |",
+                f"|---|---:|---:|---:|{v_s}---|"]
+    elif decision:
         out += [f"| file | size | agrees with {decision_ref(results)} | option KL |{rt_h}{v_h} notes |",
                 f"|---|---:|---:|---:|{rt_s}{v_s}---|"]
     else:
@@ -1624,10 +1647,28 @@ def main():
             out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | {ag} | "
                        f"{_fmt_kl(d.get('option_kl'))} |{rt_c}{verified_cell(b, results) if has_v else ''} {note} |")
             continue
+        if primary == "audiocpp":
+            rel = (f"{100 * ((b.get('bytes') or 0) / aud['stock_bytes'] - 1):+.0f}%" if aud.get("stock_bytes")
+                   else "--")
+            err = r.get("audio_err")
+            note = r.get("note") or ("smallest" if _i == 0 else "largest" if _i == len(_ordered) - 1 else "")
+            out.append(f"| `{b.get('name','-')}` | {human_gb(b.get('bytes'))} | "
+                       f"{'--' if err is None else f'{float(err):+.4f}'} | {rel} |"
+                       f"{verified_cell(b, results) if has_v else ''} {note} |")
+            continue
         tc_c = f" {tool_ready_cell(r.get('toolcall'))} |" if has_tc else ""
         v_c = verified_cell(b, results) if has_v else ""
         out.append(f"| `{b.get('name','-')}` | {_fmt_num(_ppl)} | {human_gb(b.get('bytes'))} |{tps_c} "
                    f"{_fmt_num(_kld)} |{t1_c}{rt_c}{tc_c}{v_c} {note} |")
+    if primary == "audiocpp":
+        ref = (f" audio.cpp's own q8_0 ({aud['stock_bytes'] / 1e9:.2f} GB) measures {float(aud['stock_err']):+.4f} "
+               "on the same test." if aud.get("stock_bytes") and aud.get("stock_err") is not None else "")
+        out += ["", "_Error vs source: " + (aud.get("metric") or "the rung's output scored against the source model's")
+                + (f", on {aud['texts']} held-out sentences the allocation never saw" if aud.get("texts") else "")
+                + (f"; judge: {aud['judge']}" if aud.get("judge") else "")
+                + ". Lower is better; 0 = the source model's own output." + ref + "_"]
+        if aud.get("note"):
+            out += ["", f"_{aud['note']}_"]
     if has_top1:
         out += ["", "_Top-1 agree = share of tokens where the rung's most-likely token is the same "
                 "one the f16 would have picked (llama-perplexity's `Same top p` for GGUF, the same logit "
@@ -1653,7 +1694,7 @@ def main():
         out.append("")
         out.append(f"_tok/s measured on {hw}._" if hw else
                    "_tok/s is hardware-specific; the machine it was measured on is stated in the errata._")
-    if not results:
+    if not results and primary != "audiocpp":
         out.append("")
         out.append("_Decision-fidelity measurement pending -- sizes and allocation are final._" if decision else
                    "_PPL / Mean-KLD benchmarking pending -- sizes and allocation are final._")
@@ -1717,14 +1758,25 @@ def main():
                 "```", "<|fim_prefix|>{before}<|fim_suffix|>{after}<|fim_middle|>", "```", ""]
 
     # ---- Download a specific file (a directory lane's rungs are folders: its rungs section says how)
-    if primary == "gguf" or not builds:
+    if primary in ("gguf", "audiocpp") or not builds:
         out += ["## Download a specific file", "", "```bash",
                 'pip install -U "huggingface_hub[cli]"',
                 f"hf download {repo} \\", f'  --include "{exn}" --local-dir ./', "```", ""]
 
     # ---- How to run
     out += ["## How to run", ""]
-    if decision and (facts.get("decision_format") == D3_FORMAT or d3_boards(results)):
+    if primary == "audiocpp":
+        fam = aud.get("family") or "<family>"
+        task = aud.get("task") or "tts"
+        req = ('{"requests":[{"id":"s0","text":"Good evening. The harbor is quiet tonight."}]}' if task == "tts"
+               else '{"requests":[{"id":"a","audio":"speech.wav"}]}')
+        out += [f"These run with **[audio.cpp](https://github.com/0xShug0/audio.cpp)** (family `{fam}`) -- on Metal, "
+                "CUDA, Vulkan or CPU:", "", "```bash", f"echo '{req}' > requests.json",
+                f"audiocpp_cli --task {task} --family {fam} --model {exn} --backend metal \\",
+                "  --request-sequence requests.json --out-dir out/", "```", "",
+                "or as an OpenAI-style server (`/v1/audio/speech`, `/v1/audio/transcriptions`) with `audiocpp_server` "
+                "and a model config naming this file and the family.", ""]
+    elif decision and (facts.get("decision_format") == D3_FORMAT or d3_boards(results)):
         import pollard_d3 as D3
         out += D3.serve_lines(D3.info(a.model) if os.path.isdir(str(a.model)) else {"repo_id": base_model},
                               repo, lanes)
@@ -1901,7 +1953,8 @@ def main():
     owner = f" ({a.base_owner})" if a.base_owner else ""
     out += ["", "## Credits & license", "",
             f"- Base model: [`{base_model}`](https://huggingface.co/{base_model}){owner}",
-            "- Quantization tooling: [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org)",
+            ("- Runtime and quantization tooling: [audio.cpp](https://github.com/0xShug0/audio.cpp)" if primary == "audiocpp"
+             else "- Quantization tooling: [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org)"),
             "- Method + tooling: [Pollard Weights](https://github.com/WestWaters/pollard-weights) -- "
             "*measure first, no claim before a number.*"]
     out += [f"- License: `{lic}`, inherited from the base model."]
