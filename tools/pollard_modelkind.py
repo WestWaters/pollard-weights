@@ -1863,10 +1863,12 @@ def calib_profile(kind: dict, name: str = "") -> tuple:
     if _CODER_NAME.search(base):
         return "code", f"name '{base}' reads as a code model"
     mods = kind.get("modalities") or []
-    if "audio" in mods or "speech_out" in mods:
+    if "speech_out" in mods or ("audio" in mods and "image" in mods):
         # a speech model listens and speaks in many languages: an English agent mix left LFM3-Audio's 4-bit rung
-        # slurring Japanese and Korean TTS; the speech mix (multilingual-weighted, tool calls kept) fixed it
-        return "speech", "listens / speaks (" + "/".join(m for m in mods if m in ("audio", "speech_out")) + ")"
+        # slurring Japanese and Korean TTS; the speech mix (multilingual-weighted, tool calls kept) fixed it.
+        # A speech-to-text-only model (audio in, text out: Qwen3-ASR, granite-speech) is NOT one: the speech mix took
+        # Qwen3-ASR's IQ3_S from 1.6% to 49.6% WER on LibriSpeech clean, the general mix keeps it at 1.6%
+        return "speech", "listens / speaks (" + "/".join(m for m in mods if m in ("audio", "image", "speech_out")) + ")"
     if kind.get("agentic"):
         return "agent", "chat template drives tool calls"
     return "general", "no stronger signal than a general chat/base model"

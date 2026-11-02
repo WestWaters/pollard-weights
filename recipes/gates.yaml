@@ -22,6 +22,10 @@
 #                    Pollard's own runtime patch implements (`pollard`, e.g. clef-omni) passes when this release
 #                    built/verified it with Pollard's runtime; the card says "Needs llama.cpp with Pollard's patch"
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
+#   asr_wer_max      audio-in GGUF rungs (pollard-verify --asr): WER % on a fixed LibriSpeech test-clean subset,
+#                    transcribed through the rung + its mmproj (pollard-audiobench). BLOCKING: a rung that cannot
+#                    transcribe never publishes (Qwen3-ASR's IQ2_XXS passed KLD + coherence-off at 100% WER). Not an
+#                    audio model -> no row. An audio model with no number (no mmproj, set not fetchable) -> fails
 #   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
 #   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
 #   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
@@ -36,6 +40,7 @@ lanes:
   gguf:
     runtime: stock
     coherence: true
+    asr_wer_max: 10
   # exl3: KLD / top-1 through exllamav3's own kernels on --eval (the shared protocol), plus the assembled forward
   exl3:
     e2e_acc_min: 0.3

@@ -116,6 +116,9 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
+  asr: auto                    # speech-to-text WER gate (BLOCKING) on a LibriSpeech subset through rung + mmproj;
+                               # auto = on when pollard-modelkind finds an audio input. A dict sets the transcription:
+                               # {prompt: "...", jinja: true, system: "...", clips: 50} (granite-speech: jinja + prompt)
 card_args: []                  # extra pollard-card flags for this model (e.g. [--params, 7.996B, --mmproj, mmproj-X.gguf])
 lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
                                # the whole release stops before calibration (default: only that lane is held)
@@ -651,6 +654,51 @@ def toolcall_wanted(cfg, c):
     return False
 
 
+def takes_audio(c):
+    """True when the model listens: an audio input in the HF checkout or the f16 (pollard-modelkind), or an audio
+    encoder in the mmproj beside the f16. Every source is asked -- the f16 GGUF of Qwen3-ASR carries only the text
+    decoder (its audio tower is in the mmproj), so it alone reads as a text model."""
+    for src in (c.get("hf_dir"), c.get("f16")):
+        if src and os.path.exists(src):
+            try:
+                from pollard_modelkind import classify
+                if "audio" in (classify(src).get("modalities") or []):
+                    return True
+            except (Exception, SystemExit):                      # noqa: BLE001 -- unreadable: ask the next one
+                pass
+    try:
+        from pollard_preflight import find_mmproj
+        mm = find_mmproj(c.get("f16")) if c.get("f16") else None
+        if mm:
+            import gguf
+            f = gguf.GGUFReader(mm).fields.get("clip.has_audio_encoder")
+            return bool(f is not None and f.parts[f.data[0]][0])
+    except Exception:                                             # noqa: BLE001 -- no gguf lib / unreadable
+        pass
+    return False
+
+
+def asr_args(cfg, c):
+    """pollard-verify flags for the transcription gate: [] when measure.asr is off, or `auto` and the model takes
+    no audio input (pollard-modelkind, from the f16 or the HF checkout)."""
+    v = (cfg.get("measure") or {}).get("asr", "auto")
+    opts = v if isinstance(v, dict) else {}
+    if v is None or v is False or str(v).lower() in ("false", "off", "no"):
+        return []
+    if not opts and str(v).lower() == "auto" and not takes_audio(c):
+        return []
+    out = ["--asr"]
+    if opts.get("prompt"):
+        out += ["--asr-prompt", str(opts["prompt"])]
+    if opts.get("system"):
+        out += ["--asr-system", str(opts["system"])]
+    if opts.get("jinja"):
+        out += ["--asr-jinja"]
+    if opts.get("clips"):
+        out += ["--asr-clips", str(opts["clips"])]
+    return out
+
+
 #: lane -> pollard-toolcall's backend for its rungs (the server its users run it with)
 TOOLCALL_BACKEND = {"gguf": "gguf", "mlx": "mlx", "gptq": "vllm", "mx": "vllm", "exl3": "exl3", "exlr8": "hf"}
 
@@ -678,6 +726,7 @@ def gguf_rung_steps(cfg, c, builds):
     """Measure + verify for every rung the GGUF ladder produced (read back from the MANIFEST)."""
     m, res, steps = dict(cfg.get("measure") or {}), results_path(c, "gguf"), []
     m["toolcall"] = toolcall_wanted(cfg, c)
+    asr = asr_args(cfg, c)
     ref = c.get("measure_ref") or c["f16"]                        # served measurements; verify stays on the f16
     for b in builds:
         tag, path = b.get("tag") or b.get("name"), b.get("path")
@@ -710,7 +759,8 @@ def gguf_rung_steps(cfg, c, builds):
                               ok_codes=(0, 1)))
         steps.append(Step(id=f"{rid}/verify", lane="gguf", rung=tag, kind="verify", requires="any", out=path,
                           cmd=["pollard-verify", "--lane", "gguf", "--model", path, "--ref", c["f16"],
-                               "--eval", c["heldout"], "--ngl", c["ngl"], "--coherence"] + _verify_gate(c) + common))
+                               "--eval", c["heldout"], "--ngl", c["ngl"], "--coherence"] + asr + _verify_gate(c)
+                          + common))
         steps += _after_gate(c, "gguf", tag, path)
     return steps
 

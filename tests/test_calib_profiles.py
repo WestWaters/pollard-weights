@@ -123,6 +123,12 @@ def test_auto_profile_follows_modelkind(tmp_path):
     assert MK.calib_profile({}, "Hy-MT1.5-1.8B")[0] == "translation"
     assert MK.calib_profile({}, "tencent/HY-MT1.5-7B")[0] == "translation"
     assert MK.calib_profile({}, "Qwen3-8B")[0] == "general"
+    # listens AND speaks (LFM3-Audio) or listens and sees (an omni model): the multilingual speech mix
+    assert MK.calib_profile({"modalities": ["audio", "speech_out"]}, "LFM3-Audio")[0] == "speech"
+    assert MK.calib_profile({"modalities": ["image", "audio"]}, "LFM3-Omni")[0] == "speech"
+    # speech-to-text only (Qwen3-ASR, granite-speech): the speech mix broke Qwen3-ASR's IQ3_S -> not speech
+    assert MK.calib_profile({"modalities": ["audio"]}, "Qwen3-ASR-1.7B")[0] == "general"
+    assert MK.calib_profile({"modalities": ["audio"], "agentic": True}, "granite-speech")[0] == "agent"
     assert C.resolve_profile("auto", None)[0] == "general"
     assert C.resolve_profile("code", None) == ("code", "requested")
 
