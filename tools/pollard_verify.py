@@ -776,6 +776,10 @@ DEFAULT_GATES = """\
 #                    Pollard's own runtime patch implements (`pollard`, e.g. clef-omni) passes when this release
 #                    built/verified it with Pollard's runtime; the card says "Needs llama.cpp with Pollard's patch"
 #   coherence        true = passes the coherence gate (GGUF: pollard-bench's)
+#   asr_wer_max      audio-in GGUF rungs (pollard-verify --asr): WER % on a fixed LibriSpeech test-clean subset,
+#                    transcribed through the rung + its mmproj (pollard-audiobench). BLOCKING: a rung that cannot
+#                    transcribe never publishes (Qwen3-ASR's IQ2_XXS passed KLD + coherence-off at 100% WER). Not an
+#                    audio model -> no row. An audio model with no number (no mmproj, set not fetchable) -> fails
 #   draft_tau_min    drafter: tokens per target pass vs the quantized target rung(s), worst pairing  pollard-draft measure
 #   draft_accept_rate_min   drafter: accepted / drafted, 0-1                                    pollard-draft measure
 #   draft_redistributable   true = the drafter's licence lets us republish it                 pollard-draft convert
@@ -790,6 +794,7 @@ lanes:
   gguf:
     runtime: stock
     coherence: true
+    asr_wer_max: 10
   # exl3: KLD / top-1 through exllamav3's own kernels on --eval (the shared protocol), plus the assembled forward
   exl3:
     e2e_acc_min: 0.3
@@ -1021,6 +1026,13 @@ def evaluate_gate(metrics, th, missing="fail", report_only=(), strict=False):
             v = metrics.get("draft_redistributable")
             row("drafter licence allows republishing", v, "true", v is True if v is not None else missing == "skip",
                 "" if v is not None else "licence unknown")
+        elif key == "asr_wer_max":
+            v = metrics.get("asr_wer")
+            if v is None and not metrics.get("asr_expected"):
+                continue                       # not an audio-in model: there is nothing to transcribe
+            row("speech-to-text WER % (LibriSpeech clean)", v, f"<= {want}",
+                v is not None and float(v) <= float(want),
+                "" if v is not None else f"not measured: {metrics.get('asr_reason') or 'no transcription ran'}")
         elif key == "coherence" and want:
             v = metrics.get("coherence")
             row("coherence", v, "PASS", v == "PASS" if v is not None else missing == "skip",
@@ -1052,6 +1064,55 @@ def evaluate_gate(metrics, th, missing="fail", report_only=(), strict=False):
     below = [c["check"] for c in checks if not c["ok"] and not c["blocking"]]
     return {"pass": all(c["ok"] for c in checks if c["blocking"]), "checks": checks, "strict": bool(strict),
             "report_only_failed": below}
+
+
+#: the transcription check's set: a fixed, speaker-spread LibriSpeech test-clean subset (CC-BY), cached once
+ASR_SET, ASR_CLIPS = "librispeech-clean", 50
+#: the WER ceiling when a gates file names none for an audio model: a rung that can transcribe at all is far below it
+#: (Qwen3-ASR f16 1.35, IQ2_S 1.72), a broken one far above (the speech-calibrated IQ3_S 49.6, IQ2_XXS 100)
+ASR_WER_MAX = 10
+
+
+def asr_mmproj(model, ref=None):
+    """The audio projector a GGUF rung runs with: the one pollard wrote beside the f16 (--ref), else the only
+    mmproj in the rung's own folder."""
+    from pollard_preflight import find_mmproj
+    for g in (ref, model):
+        mm = find_mmproj(g) if g else None
+        if mm:
+            return mm
+    cands = sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(model)), "mmproj*.gguf")))
+    return cands[0] if len(cands) == 1 else None
+
+
+def measure_asr(model, ref=None, mmproj=None, prompt=None, system=None, jinja=False, ngl="99", clips=ASR_CLIPS,
+                set_dir=None, bin_dir=None):
+    """{asr_expected, asr_wer | asr_reason, asr}: transcribe the fixed LibriSpeech subset with the rung + its
+    mmproj (pollard-audiobench: leaderboard normalizer, corpus WER, speaker-block bootstrap CI)."""
+    import pollard_audiobench as AB
+    import pollard_workspace as ws
+    out = {"asr_expected": True}
+    mm = mmproj or asr_mmproj(model, ref)
+    if not mm:
+        out["asr_reason"] = "no mmproj beside the rung or its f16"
+        return out
+    set_dir = set_dir or os.path.join(ws.pollard_home(), "cache", "asr-gate", f"{ASR_SET}-{clips}")
+    man = os.path.join(set_dir, "manifest.jsonl")
+    if not os.path.isfile(man):
+        try:
+            AB.fetch(ASR_SET, clips, set_dir)
+        except (Exception, SystemExit) as e:                      # noqa: BLE001 -- offline / no datasets lib
+            out["asr_reason"] = f"could not fetch {ASR_SET}: {str(e).strip()[:200]}"
+            return out
+    manifest = [json.loads(l) for l in open(man, encoding="utf-8") if l.strip()][:clips]
+    hyps = [AB.transcribe_llama(model, mm, os.path.join(set_dir, m["audio"]), system,
+                                prompt=prompt or "Transcribe the audio.", ngl=ngl, bin_dir=bin_dir, jinja=jinja)
+            for m in manifest]
+    rep = AB.report(AB.score_rows(manifest, hyps, "en"), "en")
+    out["asr_wer"] = rep["value"]
+    out["asr"] = {"set": f"{ASR_SET}-{clips}", "wer": rep["value"], "ci95": rep["ci95"], "clips": rep["clips"],
+                  "empty": sum(1 for h in hyps if not h.strip()), "mmproj": os.path.basename(mm)}
+    return out
 
 
 def metrics_from_results(results, rung):
@@ -1091,6 +1152,8 @@ def metrics_from_results(results, rung):
         m["decision_option_kl"] = float(d["option_kl"])
     if r.get("coherence"):
         m["coherence"] = r["coherence"]
+    if (r.get("asr") or {}).get("wer") is not None:
+        m["asr_wer"], m["asr_expected"] = float(r["asr"]["wer"]), True
     if r.get("runtime_engine"):                # a `pollard`-architecture rung built / verified with Pollard's runtime
         m["runtime_engine"] = r["runtime_engine"]
     dr = r.get("draft") or {}
@@ -1183,6 +1246,14 @@ def main():
     ap.add_argument("--rung", help="the rung's tag for the gate patterns and --results (default: the file name)")
     ap.add_argument("--results", help="results.json: read what other tools measured, write what this run measured")
     ap.add_argument("--coherence", action="store_true", help="gguf: also run pollard-bench's coherence gate")
+    ap.add_argument("--asr", action="store_true",
+                    help="gguf, audio-in models: transcribe a fixed LibriSpeech test-clean subset through the rung + "
+                         "its mmproj and gate on WER (asr_wer_max, blocking)")
+    ap.add_argument("--mmproj", help="--asr: the audio projector (default: the one beside --ref / the rung)")
+    ap.add_argument("--asr-prompt", help="--asr: the transcription prompt (default 'Transcribe the audio.')")
+    ap.add_argument("--asr-system", help="--asr: a system prompt")
+    ap.add_argument("--asr-jinja", action="store_true", help="--asr: render the model's own chat template")
+    ap.add_argument("--asr-clips", type=int, default=ASR_CLIPS, help="--asr: clips from the set (default %(default)s)")
     ap.add_argument("--print-gates", action="store_true", help="print the default gates.yaml and exit")
     ap.add_argument("--threshold", type=float, default=0.9, help="exl3: min per-tensor decode cos vs source")
     ap.add_argument("--limit", type=int, default=0, help="exl3: cap tensors checked (0 = all)")
@@ -1340,10 +1411,20 @@ def main():
                              LS.resolve_ngl(a.model, a.ngl),
                              quick=True)
         measured["coherence"] = res.get("verdict")
+    if a.asr and lane == "gguf":
+        import pollard_llamaserve as LS
+        mtmd = LS.bin_for(a.model, "llama-mtmd-cli")
+        measured.update(measure_asr(a.model, a.source, a.mmproj, a.asr_prompt, a.asr_system, a.asr_jinja,
+                                    LS.resolve_ngl(a.model, a.ngl), a.asr_clips,
+                                    bin_dir=os.path.dirname(mtmd) if mtmd and os.path.isabs(mtmd) else None))
+        a_ = measured.get("asr") or {}
+        print(f"   speech-to-text: WER {measured['asr_wer']}% (95% CI {a_['ci95'][0]}-{a_['ci95'][1]}, "
+              f"{a_['clips']} clips, {a_['empty']} empty)" if measured.get("asr_wer") is not None
+              else f"   speech-to-text: NOT MEASURED ({measured.get('asr_reason')})")
 
     if a.results and measured:
         import pollard_workspace as ws
-        keep = {k: measured[k] for k in ("kld", "top1", "ppl", "coherence") if measured.get(k) is not None}
+        keep = {k: measured[k] for k in ("kld", "top1", "ppl", "coherence", "asr") if measured.get(k) is not None}
         if measured.get("runtime") == "pollard":       # the card reads this: "Needs llama.cpp with Pollard's patch"
             keep.update({k: measured[k] for k in ("runtime", "runtime_engine") if measured.get(k)})
         if keep:
@@ -1365,6 +1446,8 @@ def main():
         if dec_only and "decision_only" not in kinds:
             kinds.append("decision_only")
         th = thresholds_for(gates, rung, lane, kinds)
+        if metrics.get("asr_expected") and "asr_wer_max" not in th:
+            th["asr_wer_max"] = ASR_WER_MAX            # an audio model is held to transcribing, whatever the file says
         if dec_only:
             th = decision_only_thresholds(th, gates, rung)
         report_only, strict = gate_policy(gates, a.strict)

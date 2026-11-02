@@ -30,6 +30,9 @@ measure:                       # extra numbers for the card + gate (GGUF rungs; 
   mt: null                     # {limit: 100} -> chrF++ per language (translation models)
   toolcall: auto               # tool-call retention vs f16 (auto = on when pollard-modelkind finds a tool-call syntax)
   decision: false              # decision board vs f16 (decision models)
+  asr: auto                    # speech-to-text WER gate (BLOCKING) on a LibriSpeech subset through rung + mmproj;
+                               # auto = on when pollard-modelkind finds an audio input. A dict sets the transcription:
+                               # {prompt: "...", jinja: true, system: "...", clips: 50} (granite-speech: jinja + prompt)
 card_args: []                  # extra pollard-card flags for this model (e.g. [--params, 7.996B, --mmproj, mmproj-X.gguf])
 lanes:                         # any lane may add `critical: true`: if the engine preflight finds it cannot run here,
                                # the whole release stops before calibration (default: only that lane is held)
