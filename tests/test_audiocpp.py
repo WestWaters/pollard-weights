@@ -166,3 +166,41 @@ def test_publish_goes_through_safeapi(tmp_path, monkeypatch):
     assert url.endswith("/PollardWeights/M-Pollard")
     assert calls == [("create", "PollardWeights/M-Pollard", False), ("upload", "README.md"),
                      ("upload", "M-Pollard-8.0.gguf")]
+
+
+def test_rung_names_carry_a_quant_type_the_hub_reads(tmp_path):
+    """Ming went up as -6.4bpw.gguf and the Hub's GGUF widget could not read a type: names carry the main type."""
+    p = tmp_path / "rung.gguf"
+    # mostly q8_0 bytes, a q2_k slice, a big bf16 tensor that stays at source precision
+    write_gguf(p, [("a", 8, [896, 4096]), ("b", 10, [256, 1024]), ("spk", 30, [896, 2048])])
+    assert A.main_type(str(p)) == "Q8_0"
+    assert A.rung_name("Ming-3.0-tts-0.5B", str(p), 6.4) == "Ming-3.0-tts-0.5B-Pollard-Q8_0-6.4bpw.gguf"
+    for ok in ("M-Pollard-Q8_0-6.4bpw.gguf", "M-Pollard-IQ3_S.gguf", "M-Pollard-Q4_K_M.gguf", "M-bf16.gguf"):
+        assert A.HUB_TYPE.search(ok), ok
+    for bad in ("M-Pollard-6.4bpw.gguf", "M-Pollard-8.0.gguf", "M-Pollard-MIX-5bpw.gguf"):
+        assert not A.HUB_TYPE.search(bad), bad
+
+
+def test_publish_refuses_a_rung_name_without_a_type(tmp_path):
+    f = tmp_path / "M-Pollard-6.4bpw.gguf"
+    write_gguf(f, [("a", 8, [256, 4])])
+    s = tmp_path / "s.json"
+    s.write_text("{}")
+    with pytest.raises(SystemExit, match="M-Pollard-6.4bpw.gguf -> M-Pollard-Q8_0-6.4bpw.gguf"):
+        A.main(["publish", "--repo", "PollardWeights/M-Pollard", "--family", "x", "--base-model", "o/M",
+                "--rung", f"{f}={s}", "--dry-run"])
+
+
+def test_build_into_a_folder_names_the_rung(tmp_path, monkeypatch):
+    def fake_convert(source, family, out, base, rules=(), extra=()):
+        write_gguf(out, [("a", 8, [256, 1024]), ("b", 12, [256, 64])])
+        return out
+    monkeypatch.setattr(A, "convert", fake_convert)
+    r = tmp_path / "rules.json"
+    r.write_text(json.dumps({"bpw": 7.0, "rules": [["b", "q4_k"]]}))
+    src = tmp_path / "ming-3.0-tts-0.5b-bf16.gguf"
+    src.write_bytes(b"")
+    out = tmp_path / "rungs"
+    A.main(["build", "--source", str(src), "--family", "x", "--rules", str(r), "--out", str(out) + "/",
+            "--name", "Ming-3.0-tts-0.5B"])
+    assert os.listdir(out) == ["Ming-3.0-tts-0.5B-Pollard-Q8_0-7.0bpw.gguf"]

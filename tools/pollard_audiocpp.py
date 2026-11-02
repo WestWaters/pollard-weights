@@ -111,6 +111,29 @@ def tensor_types(path):
     return out
 
 
+#: a quant-type token the Hugging Face Hub reads from a GGUF file name (its GGUF widget, hardware estimate and variant
+#: list key off it); a name without one shows "not able to determine the quantization variants"
+HUB_TYPE = re.compile(r"(?<![A-Za-z0-9])(BF16|F16|F32|Q[2-8]_K(?:_[SML])?|Q[4-8]_[01]|IQ[1-4]_(?:XXS|XS|NL|S|M))"
+                      r"(?![A-Za-z0-9])", re.I)
+
+
+def main_type(path):
+    """The quant type holding most of a package's quantized bytes (upper case, e.g. Q8_0); the float types count only
+    when nothing is quantized."""
+    by = {}
+    for typ, n, _row in tensor_types(path).values():
+        t = str(typ).lower()
+        by[t] = by.get(t, 0) + n * BPW.get(t, 16.0) / 8
+    quant = {t: b for t, b in by.items() if t not in ("orig", "bf16", "f16", "f32")}
+    pool = quant or by
+    return max(pool, key=pool.get).upper() if pool else "F16"
+
+
+def rung_name(stem, path, bpw):
+    """<stem>-Pollard-<main type>-<bpw>bpw.gguf: the Hub reads the type, the bpw keeps rungs of one type apart."""
+    return f"{stem}-Pollard-{main_type(path)}-{float(bpw):.1f}bpw.gguf"
+
+
 def convert(source, family, out, base, rules=(), extra=()):
     """audiocpp_gguf: `source` (a GGUF or the family's weights) -> `out` at `base`, `rules` = [(name, type)] exact."""
     cmd = [find_bin("audiocpp_gguf"), "--input", source, "--output", out, "--type", base, "--overwrite"]
@@ -384,7 +407,9 @@ def main(argv=None):
     b.add_argument("--source", required=True)
     b.add_argument("--family", required=True)
     b.add_argument("--rules", required=True)
-    b.add_argument("--out", required=True)
+    b.add_argument("--out", required=True,
+                   help="the rung's path, or a folder: then it is named <name>-Pollard-<main type>-<bpw>bpw.gguf")
+    b.add_argument("--name", help="with a folder --out: the model's name (default: the source file's stem)")
     a = ap.parse_args(argv)
 
     if a.cmd == "eligible":
@@ -463,6 +488,12 @@ def main(argv=None):
         import subprocess as sp
         import pollard_workspace as ws
         rungs, files = [], []
+        unnamed = [spec.partition("=")[0] for spec in a.rung if not HUB_TYPE.search(os.path.basename(spec.partition("=")[0]))]
+        if unnamed:
+            raise SystemExit("these rung names carry no quant type the Hub reads (its GGUF widget would show \"not able "
+                             "to determine the quantization variants\"); rename them, e.g. "
+                             + ", ".join(f"{os.path.basename(f)} -> {re.sub(r'-Pollard-', '-Pollard-' + main_type(f) + '-', os.path.basename(f))}"
+                                         for f in unnamed))
         for spec in a.rung:
             f, _, js = spec.partition("=")
             d = json.load(open(js))
@@ -495,8 +526,20 @@ def main(argv=None):
         r = json.load(open(a.rules))
         # base orig: protected tensors stay exactly as the source has them (a q8_0 base narrows f32 norms to f16,
         # which audio.cpp's Metal ops assert against); only the plan's exact rules change anything
-        convert(a.source, a.family, a.out, "orig", [tuple(x) for x in r["rules"]])
-        print(f"built {a.out} ({os.path.getsize(a.out) / 1e6:.1f} MB)")
+        out = a.out
+        if os.path.isdir(out) or out.endswith(("/", os.sep)):
+            os.makedirs(out, exist_ok=True)
+            out = os.path.join(out, ".building.gguf")
+        convert(a.source, a.family, out, "orig", [tuple(x) for x in r["rules"]])
+        if os.path.basename(out) == ".building.gguf":
+            stem = a.name or re.sub(r"(?i)[-.](orig|bf16|f16|f32)$", "", os.path.splitext(os.path.basename(a.source))[0])
+            final = os.path.join(os.path.dirname(out), rung_name(stem, out, r["bpw"]))
+            os.replace(out, final)
+            out = final
+        elif not HUB_TYPE.search(os.path.basename(out)):
+            print(f"note: {os.path.basename(out)} names no quant type the Hub reads; publish will refuse it "
+                  f"(a folder --out names it {os.path.basename(rung_name('<name>', out, r['bpw']))})")
+        print(f"built {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
         return 0
 
 
