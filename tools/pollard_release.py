@@ -678,6 +678,20 @@ def takes_audio(c):
     return False
 
 
+def mlx_speech_model(c, domain=None):
+    """True when the MLX lane builds this checkpoint through mlx-audio (Qwen3-ASR, granite-speech, LFM3-Audio: speech
+    models mlx-vlm does not carry); with `domain` (stt / tts / sts) only a model of that kind. Only a speech-to-text
+    model gets the transcription gate here: mlx-audio's stt loader does not run a speech-to-speech one."""
+    if not (c.get("hf_dir") and os.path.isdir(str(c["hf_dir"]))):
+        return False
+    try:
+        import pollard_mlx as M
+        eng, kind = M.mlx_engine(c["hf_dir"])
+        return eng == "mlx_audio" and (domain is None or str(kind).split(":")[0] == domain)
+    except (Exception, SystemExit):                              # noqa: BLE001 -- no mlx on this machine
+        return False
+
+
 def asr_args(cfg, c):
     """pollard-verify flags for the transcription gate: [] when measure.asr is off, or `auto` and the model takes
     no audio input (pollard-modelkind, from the f16 or the HF checkout)."""
@@ -1149,6 +1163,8 @@ def lane_steps(cfg, c, lane):
             if c.get("max_ram_gb"):                      # the streamed verify plans both passes under the plan's cap
                 ver += ["--max-ram-gb", str(c["max_ram_gb"])]
         ver += (["--end-to-end"] if lane == "exl3" else []) + ["--eval", c["heldout"]]
+        if lane == "mlx" and mlx_speech_model(c, "stt"):  # speech-to-text through mlx-audio: transcription gates it
+            ver += asr_args(cfg, c)
         steps.append(Step(id=f"{rid}/verify", lane=lane, rung=tag, kind="verify", requires=REQUIRES[lane],
                           cmd=ver, out=out, mem="mlx-verify" if lane == "mlx" else None,
                           # disk / RAM short (MLX; the HF lanes' reference logits): held, rung kept

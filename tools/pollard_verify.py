@@ -1085,15 +1085,25 @@ def asr_mmproj(model, ref=None):
     return cands[0] if len(cands) == 1 else None
 
 
+def mlx_speech(source):
+    """True when pollard-mlx builds this checkpoint through mlx-audio (a speech model mlx-vlm does not carry)."""
+    try:
+        import pollard_mlx as M
+        return M.mlx_engine(source)[0] == "mlx_audio"
+    except (Exception, SystemExit):                               # noqa: BLE001 -- no mlx here: not that path
+        return False
+
+
 def measure_asr(model, ref=None, mmproj=None, prompt=None, system=None, jinja=False, ngl="99", clips=ASR_CLIPS,
-                set_dir=None, bin_dir=None):
-    """{asr_expected, asr_wer | asr_reason, asr}: transcribe the fixed LibriSpeech subset with the rung + its
-    mmproj (pollard-audiobench: leaderboard normalizer, corpus WER, speaker-block bootstrap CI)."""
+                set_dir=None, bin_dir=None, mlx=False):
+    """{asr_expected, asr_wer | asr_reason, asr}: transcribe the fixed LibriSpeech subset with the rung (a GGUF + its
+    mmproj through llama.cpp, or with `mlx` an MLX folder through mlx-audio) -- pollard-audiobench: leaderboard
+    normalizer, corpus WER, speaker-block bootstrap CI."""
     import pollard_audiobench as AB
     import pollard_workspace as ws
     out = {"asr_expected": True}
-    mm = mmproj or asr_mmproj(model, ref)
-    if not mm:
+    mm = None if mlx else (mmproj or asr_mmproj(model, ref))
+    if not mlx and not mm:
         out["asr_reason"] = "no mmproj beside the rung or its f16"
         return out
     set_dir = set_dir or os.path.join(ws.pollard_home(), "cache", "asr-gate", f"{ASR_SET}-{clips}")
@@ -1105,13 +1115,20 @@ def measure_asr(model, ref=None, mmproj=None, prompt=None, system=None, jinja=Fa
             out["asr_reason"] = f"could not fetch {ASR_SET}: {str(e).strip()[:200]}"
             return out
     manifest = [json.loads(l) for l in open(man, encoding="utf-8") if l.strip()][:clips]
-    hyps = [AB.transcribe_llama(model, mm, os.path.join(set_dir, m["audio"]), system,
-                                prompt=prompt or "Transcribe the audio.", ngl=ngl, bin_dir=bin_dir, jinja=jinja)
-            for m in manifest]
+    try:
+        hyps = [AB.transcribe_mlx(model, os.path.join(set_dir, m["audio"]), system) if mlx else
+                AB.transcribe_llama(model, mm, os.path.join(set_dir, m["audio"]), system,
+                                    prompt=prompt or "Transcribe the audio.", ngl=ngl, bin_dir=bin_dir, jinja=jinja)
+                for m in manifest]
+    except ImportError as e:                                      # mlx-audio missing: no number, the gate fails
+        out["asr_reason"] = f"cannot run the rung here: {e}"
+        return out
     rep = AB.report(AB.score_rows(manifest, hyps, "en"), "en")
     out["asr_wer"] = rep["value"]
     out["asr"] = {"set": f"{ASR_SET}-{clips}", "wer": rep["value"], "ci95": rep["ci95"], "clips": rep["clips"],
-                  "empty": sum(1 for h in hyps if not h.strip()), "mmproj": os.path.basename(mm)}
+                  "empty": sum(1 for h in hyps if not h.strip())}
+    if mm:
+        out["asr"]["mmproj"] = os.path.basename(mm)
     return out
 
 
@@ -1355,6 +1372,11 @@ def main():
                 fails += 1
                 print("   !! assembled forward is broken even if per-tensor checks passed "
                       "(per-tensor correct is necessary, not sufficient).")
+    elif a.measure and lane == "mlx" and a.source and mlx_speech(a.source):
+        # a speech model built through mlx-audio: no text-LM path to score next-token KLD through (report-only
+        # anyway); its fidelity check is the transcription gate (--asr)
+        print("-- fidelity: a speech model built through mlx-audio -- KLD not measured; the transcription check "
+              "(--asr) is its gate --")
     elif a.measure:
         if not a.source:
             ap.error(f"--lane {lane} measures against the source: pass --source (--ref for a GGUF)")
@@ -1417,6 +1439,10 @@ def main():
         measured.update(measure_asr(a.model, a.source, a.mmproj, a.asr_prompt, a.asr_system, a.asr_jinja,
                                     LS.resolve_ngl(a.model, a.ngl), a.asr_clips,
                                     bin_dir=os.path.dirname(mtmd) if mtmd and os.path.isabs(mtmd) else None))
+    if a.asr and lane == "mlx":
+        measured.update(measure_asr(a.model, a.source, prompt=a.asr_prompt, system=a.asr_system, clips=a.asr_clips,
+                                    mlx=True))
+    if a.asr and lane in ("gguf", "mlx"):
         a_ = measured.get("asr") or {}
         print(f"   speech-to-text: WER {measured['asr_wer']}% (95% CI {a_['ci95'][0]}-{a_['ci95'][1]}, "
               f"{a_['clips']} clips, {a_['empty']} empty)" if measured.get("asr_wer") is not None
