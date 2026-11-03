@@ -310,6 +310,27 @@ def transcribe_llama(gguf, mmproj, audio, system=None, prompt="Transcribe the au
     return clean_transcript(r.stdout, prompt) if r.returncode == 0 else ""
 
 
+_MLX_MODELS = {}
+
+
+def transcribe_mlx(model_dir, audio, system=None, language=None):
+    """An MLX rung built through mlx-audio (pollard-mlx's speech-model path): mlx_audio.stt, greedy, loaded once per
+    folder."""
+    if model_dir not in _MLX_MODELS:
+        from mlx_audio.stt.utils import load_model
+        _MLX_MODELS[model_dir] = load_model(model_dir)
+    kw = {"temperature": 0.0}
+    if system:
+        kw["system_prompt"] = system
+    if language:
+        kw["language"] = language
+    try:
+        out = _MLX_MODELS[model_dir].generate(audio, **kw)
+    except Exception:                                             # noqa: BLE001 -- a clip that fails scores as empty
+        return ""
+    return str(getattr(out, "text", out) or "").strip()
+
+
 def transcribe_audiocpp(family, model, audio, backend=None):
     exe = shutil.which("audiocpp_cli") or os.path.join(os.environ.get("POLLARD_AUDIOCPP_BIN", ""), "audiocpp_cli")
     with tempfile.TemporaryDirectory() as td:
@@ -419,6 +440,8 @@ def run_asr(a):
         wav = os.path.join(a.set, m["audio"])
         if a.audiocpp_family:
             hyps.append(transcribe_audiocpp(a.audiocpp_family, a.model, wav, a.backend))
+        elif getattr(a, "mlx", None):
+            hyps.append(transcribe_mlx(a.mlx, wav, a.system))
         else:
             hyps.append(transcribe_llama(a.gguf, a.mmproj, wav, a.system, prompt=a.prompt or "Transcribe the audio.",
                                          ngl=a.ngl, bin_dir=a.bin, jinja=a.jinja))
@@ -426,7 +449,7 @@ def run_asr(a):
             print(f"   {i + 1}/{len(manifest)}", flush=True)
     rows = score_rows(manifest, hyps, lang)
     res = dict(report(rows, lang), set=os.path.basename(os.path.normpath(a.set)), lang=lang,
-               model=os.path.basename(a.gguf or a.model or ""))
+               model=os.path.basename(os.path.normpath(a.gguf or getattr(a, "mlx", None) or a.model or "")))
     print(f"{res['set']}: {res['metric'].upper()} {res['value']}%  (95% CI {res['ci95'][0]}-{res['ci95'][1]}, "
           f"{res['clips']} clips, {res['speakers']} speakers)")
     if a.out:
@@ -468,6 +491,7 @@ def main(argv=None):
                                     "speech into a written format?'); default 'Transcribe the audio.'")
     s.add_argument("--jinja", action="store_true", help="render the model's own chat template (needed for custom ones)")
     s.add_argument("--audiocpp-family", help="an audio.cpp ASR family instead (with --model)")
+    s.add_argument("--mlx", help="an MLX rung folder built through mlx-audio instead")
     s.add_argument("--model")
     s.add_argument("--backend")
     s.add_argument("--lang", help="override the set's language (scoring)")
@@ -485,8 +509,8 @@ def main(argv=None):
             os.makedirs(a.keep, exist_ok=True)
         run_tts(a)
     else:
-        if not (a.gguf and a.mmproj) and not (a.audiocpp_family and a.model):
-            raise SystemExit("asr: --gguf + --mmproj, or --audiocpp-family + --model")
+        if not (a.gguf and a.mmproj) and not (a.audiocpp_family and a.model) and not a.mlx:
+            raise SystemExit("asr: --gguf + --mmproj, --mlx <folder>, or --audiocpp-family + --model")
         run_asr(a)
     return 0
 

@@ -182,6 +182,9 @@ def mlx_engine(model_dir):
     try:
         mod = importlib.import_module(f"mlx_vlm.models.{mt}")
     except Exception as e:                                  # noqa: BLE001
+        aud = mlx_audio_type(model_dir)                    # a speech model: mlx-audio carries it whole
+        if aud:
+            return "mlx_audio", aud
         hint = f" -- {MLX_VLM_NEWER}" if cfg.get("model_type") == "nemotron_h_omni" else ""
         return "hold", f"this model has {parts}; mlx-vlm has no {mt!r} model ({type(e).__name__}){hint}"
     import pollard_workspace as _ws
@@ -192,6 +195,46 @@ def mlx_engine(model_dir):
                             f"width per layer) and this mlx-vlm's {mt!r} builds every layer from one -- "
                             f"{MLX_VLM_NEWER}")
     return "mlx_vlm", mt
+
+
+def mlx_audio_type(model_dir):
+    """"<domain>:<model_type>" when mlx-audio builds this checkpoint (speech-to-text, text-to-speech, ...), else None.
+    Qwen3-ASR, granite-speech and Ming are mlx-audio models, not mlx-vlm ones (2026-11-01)."""
+    try:
+        from pathlib import Path
+        import json as _j
+        from mlx_audio.convert import detect_model_domain, get_model_class, get_model_type
+        p = Path(model_dir)
+        cfg = _j.load(open(p / "config.json", encoding="utf-8"))
+        dom = detect_model_domain(cfg, p)
+        mt = get_model_type(cfg, p, dom)
+        # mlx-audio guesses a family when it has none of its own (LFM3-Omni -> qwen2_audio, LFM3-Audio -> lfm_audio,
+        # which is LFM2-Audio): only an exact match of the checkpoint's own model_type is a model it really carries
+        if str(mt).replace("-", "_").lower() != str(cfg.get("model_type", "")).replace("-", "_").lower():
+            return None
+        get_model_class(mt, dom)
+        return f"{getattr(dom, 'value', dom)}:{mt}"
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def mlx_audio_convert(hf_path, mlx_path, quantize=True, q_bits=None, q_group_size=64, quant_predicate=None, **_):
+    """mlx-audio's converter with Pollard's per-module allocation in place of its preset recipes: its own
+    requirements (the model's model_quant_predicate, divisible rows) still apply, then Pollard's bits per module."""
+    import mlx_audio.convert as MAC
+    own = MAC.build_quant_predicate
+
+    def build(model, name=None):
+        base = own(model, None)
+        if quant_predicate is None:
+            return base
+        return lambda p, m: (quant_predicate(p, m) if base(p, m) else False)
+    MAC.build_quant_predicate = build
+    try:
+        return MAC.convert(hf_path=str(hf_path), mlx_path=str(mlx_path), quantize=quantize, q_bits=q_bits,
+                           q_group_size=q_group_size)
+    finally:
+        MAC.build_quant_predicate = own
 
 
 def d3_names(model_dir):
@@ -1946,6 +1989,11 @@ def main():
             from mlx_vlm import convert
             print(f"   mlx-vlm ({why}): the whole model -- towers and projector at {a.vision_bits or HIGH}-bit, "
                   "speech output at the checkpoint's precision")
+        elif engine == "mlx_audio":                         # a speech model: mlx-audio builds it whole
+            import mlx_audio  # noqa: F401
+            convert = mlx_audio_convert
+            print(f"   mlx-audio ({why}): the whole model -- the audio tower and what else the model's own recipe keeps "
+                  "at source precision stays there, the language layers at Pollard's measured allocation")
         else:
             from mlx_lm import convert
     except Exception:
@@ -1972,7 +2020,7 @@ def main():
     src_dir, staging = a.model, None
     # mlx-vlm reads float weights, and so does mlx-lm for most encodings: an already-quantized source is decoded to a
     # BF16 copy first, itself streamed tensor by tensor (pollard_stream's readers)
-    if (engine == "mlx_vlm" or stream) and encoded_source(a.model):
+    if (engine in ("mlx_vlm", "mlx_audio") or stream) and encoded_source(a.model):
         if mirror is not None:
             sys.exit("ERROR: an already-quantized source cannot be read through a remote mirror -- fetch it")
         staging = a.out.rstrip("/\\") + ".float-src"
@@ -1990,7 +2038,7 @@ def main():
             print(f"HELD: {e}")
             sys.exit(EXIT_HELD)
     # mlx-vlm builds the model from its own code: the checkpoint's modelling files are never needed there
-    trc = False if engine == "mlx_vlm" else ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
+    trc = False if engine in ("mlx_vlm", "mlx_audio") else ws.resolve_trust_remote_code(a.model, a.trust_remote_code)
     ckw = dict(mlx_path=a.out, quantize=True, q_bits=low, q_group_size=a.group_size, quant_predicate=predicate)
     existed = os.path.exists(a.out)
     try:
@@ -2000,7 +2048,10 @@ def main():
                 (StreamWriter(rs, guard, mirror=mirror, out_bytes=(bplan or {}).get("out_bytes", 0))
                  if stream else contextlib.nullcontext()):
             try:
-                convert(src_dir, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
+                if engine == "mlx_audio":
+                    convert(src_dir, **ckw)
+                else:
+                    convert(src_dir, trust_remote_code=trc, **ckw)     # newer mlx_lm accepts it
             except TypeError:
                 if trc:
                     print("   (this mlx_lm lacks trust_remote_code; a truly custom arch may not convert)")
@@ -2045,8 +2096,11 @@ def main():
     except Exception as e:
         print(f"   (warning: could not record build to the workspace manifest: {e})")
     print(f"wrote MLX model -> {a.out}\n"
-          f"  run:  mlx_lm.generate --model {a.out} --prompt \"hello\"\n"
-          f"  (mixed {low}/{high}-bit, Pollard-allocated; runs on Apple Silicon via MLX/Metal.)")
+          + (f"  run:  python -m mlx_audio.stt.generate --model {a.out} --audio <clip.wav>\n"
+             if engine == "mlx_audio" and str(why).startswith("stt") else
+             f"  run:  python -m mlx_audio.tts.generate --model {a.out} --text \"hello\"\n" if engine == "mlx_audio"
+             else f"  run:  mlx_lm.generate --model {a.out} --prompt \"hello\"\n")
+          + f"  (mixed {low}/{high}-bit, Pollard-allocated; runs on Apple Silicon via MLX/Metal.)")
 
 
 if __name__ == "__main__":
