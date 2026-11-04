@@ -19,6 +19,13 @@ refuse clearly when none does.
     pollard-convert --model <hf-dir> --outfile model-f16.gguf
     pollard-convert --model <hf-dir> --check          # can this machine do it? (exit 1 = no)
     pollard-convert --list                            # every converter found, and what it knows
+    pollard-convert --model <hf-dir> --outtype q8_0 --consume-source   # source + GGUF never both whole on disk
+
+--consume-source is for a source that does not fit on disk beside its GGUF (GLM-5.3: 756 GB of FP8 shards, a
+790 GB Q8_0 host, 949 GB free). The converter reads each source tensor's bytes exactly once, when it writes the
+tensor; here that read is a plain copy (no file mapping left open) and a shard is DELETED as soon as every tensor in
+it has been read, so its space comes back while the conversion runs. The GGUF is byte-identical to a normal run. The
+source is gone afterwards: re-download it to convert again (a download resumes from what is left).
 """
 from __future__ import annotations
 
@@ -145,7 +152,57 @@ def find_converter(model_dir=None):
                   "  convert_hf_to_gguf.py + conversion/ + gguf-py/ beside it is ~3MB.")
 
 
+class ShardConsumer:
+    """Counts the reads of every tensor of each safetensors shard under `model_dir`; once all of a shard's tensors
+    have been read, deletes the shard. Reads are copies (np.fromfile), so nothing keeps the deleted file's pages."""
+
+    def __init__(self, model_dir, log=print, remove=os.remove):
+        self.dir = os.path.realpath(str(model_dir))
+        self.log, self.remove = log, remove
+        self.left = {}                       # shard path -> offsets of tensors not read yet
+        self.freed = 0
+
+    def _pending(self, path):
+        if path not in self.left:
+            with open(path, "rb") as f:
+                n = int.from_bytes(f.read(8), "little")
+                meta = json.loads(f.read(n).decode("utf-8"))
+            start = 8 + n
+            self.left[path] = {start + m["data_offsets"][0] for k, m in meta.items() if k != "__metadata__"}
+        return self.left[path]
+
+    def read(self, filename, offset, size):
+        import numpy as np
+        path = os.path.realpath(str(filename))
+        data = np.fromfile(path, dtype=np.uint8, count=size, offset=offset)
+        if len(data) != size:
+            raise OSError(f"{path}: short read at {offset} ({len(data)} of {size} bytes)")
+        if os.path.dirname(path) == self.dir and path.endswith(".safetensors"):
+            left = self._pending(path)
+            left.discard(offset)
+            if not left:
+                sz = os.path.getsize(path)
+                self.remove(path)
+                self.freed += sz
+                self.log(f"   consumed {os.path.basename(path)} ({sz / 1e9:.1f} GB back, {self.freed / 1e9:.1f} GB so far)")
+        return data
+
+
+def _consume_run(model_dir, conv, argv):
+    """Run the converter in this process with every local tensor read going through a ShardConsumer."""
+    import runpy
+    sys.path[:0] = [str(Path(conv).parent / "gguf-py"), str(Path(conv).parent)]
+    import gguf.utility as U
+    sc = ShardConsumer(model_dir, log=lambda m: print(m, flush=True))
+    U.LocalTensor.mmap_bytes = lambda self: sc.read(self.data_range.filename, self.data_range.offset,
+                                                    self.data_range.size)
+    sys.argv = [str(conv)] + list(argv)
+    runpy.run_path(str(conv), run_name="__main__")
+
+
 def main():
+    if len(sys.argv) > 3 and sys.argv[1] == "--_consume-run":      # the child: model dir, converter, its args
+        return _consume_run(sys.argv[2], sys.argv[3], sys.argv[4:])
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", help="HF checkout to convert")
@@ -154,6 +211,9 @@ def main():
     ap.add_argument("--check", action="store_true", help="report capability only; exit 1 if it cannot")
     ap.add_argument("--list", action="store_true", help="every converter found on this machine")
     ap.add_argument("--python", default=sys.executable, help="interpreter to run the converter with")
+    ap.add_argument("--consume-source", action="store_true",
+                    help="DELETE each source shard once all its tensors are read (a source that does not fit beside "
+                         "its GGUF); the GGUF is the same, the source is gone afterwards")
     a = ap.parse_args()
 
     if a.list:
@@ -180,6 +240,9 @@ def main():
 
     out = a.outfile or str(Path(a.model).with_name(Path(a.model).name + f"-{a.outtype}.gguf"))
     cmd = [a.python, str(conv), str(a.model), "--outtype", a.outtype, "--outfile", out]
+    if a.consume_source:
+        print("   --consume-source: each source shard is deleted once every tensor in it is read", flush=True)
+        cmd = [a.python, os.path.abspath(__file__), "--_consume-run", str(a.model), str(conv)] + cmd[2:]
     print("   " + " ".join(cmd), flush=True)
     r = subprocess.run(cmd)
     if r.returncode != 0 or not os.path.exists(out):
