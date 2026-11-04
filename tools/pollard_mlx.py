@@ -314,7 +314,26 @@ PLE_SIDE_RE = re.compile(r"(^|\.)per_layer_(input_gate|projection|model_projecti
 TABLE_RE = re.compile(r"(^|\.)embed_tokens_per_layer$")
 
 
-def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None, table_bits=None, attn_min=None):
+#: --floor roles: the projection names each role covers (mlx-lm / mlx-vlm / mlx-audio module names)
+FLOOR_ROLES = {"q": ("q_proj",), "k": ("k_proj",), "v": ("v_proj",), "o": ("o_proj",),
+               "gate": ("gate_proj",), "up": ("up_proj",), "down": ("down_proj",)}
+
+
+def parse_floors(specs):
+    """['q=3', 'down=3'] -> {'q_proj': 3, 'down_proj': 3}."""
+    out = {}
+    for spec in specs or []:
+        role, _, b = str(spec).partition("=")
+        if role not in FLOOR_ROLES or not b.isdigit() or int(b) not in MLX_BITS:
+            raise SystemExit(f"--floor {spec}: ROLE=BITS, ROLE one of {', '.join(FLOOR_ROLES)}, BITS one of "
+                             f"{sorted(MLX_BITS)}")
+        for name in FLOOR_ROLES[role]:
+            out[name] = int(b)
+    return out
+
+
+def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None, table_bits=None, attn_min=None,
+             floors=None):
     """Per-module bit-width for MLX (returns a {'bits','group_size'} dict, or False to skip).
     Mirrors the Pollard policy: attn follows the attn profile; the FFN/expert body follows ffn;
     MoE router (`.gate`, not `gate_proj`) and shared experts are pinned HIGH; embeddings kept HIGH.
@@ -346,11 +365,21 @@ def bits_for(path, alloc, is_moe, gsize, vision_bits=None, low=None, high=None, 
         b = alloc[li]["attn"]                                      # NemotronH Mamba2 / LFM2 short-conv token mixers
         if attn_min and re.search(r"\.(v_proj|o_proj)$", path):  # attention v / o never under the rung's floor
             b = max(b, attn_min)
-        return {"bits": b, "group_size": gsize}
+        return {"bits": _floored(b, path, floors), "group_size": gsize}
     if ("mlp" in path or "block_sparse_moe" in path or "experts" in path or "latent_proj" in path
             or "feed_forward" in path):
-        return {"bits": alloc[li]["ffn"], "group_size": gsize}
+        return {"bits": _floored(alloc[li]["ffn"], path, floors), "group_size": gsize}
     return {"bits": LOW, "group_size": gsize}
+
+
+def _floored(b, path, floors):
+    """--floor: a role's projections never under the rung's floor for them (Qwen3-ASR's 2-bit rung stops after its
+    language tag unless attention q / k and down_proj stay at 3 bits, as its GGUF IQ2_S does)."""
+    if floors:
+        name = path.rsplit(".", 1)[-1]
+        if name in floors:
+            b = max(b, floors[name])
+    return b
 
 
 # ----------------------------------------------------------------- range search (imatrix-weighted)
@@ -1886,6 +1915,9 @@ def main():
     ap.add_argument("--attn-min-bits", type=int, choices=sorted(MLX_BITS), default=None,
                     help="floor for attention v_proj / o_proj in every layer (a low rung's 2-bit body otherwise "
                          "takes them down in its cold layers)")
+    ap.add_argument("--floor", action="append", metavar="ROLE=BITS",
+                    help="never put a role's projections under BITS in any layer (repeat; ROLE: q k v o gate up "
+                         "down), e.g. a low rung's --floor q=3 --floor k=3 --floor down=3")
     ap.add_argument("--vision-bits", type=int, default=None,
                     help="bits for a vision/audio tower inside the checkpoint (default: 8, same as "
                          "embeddings). The modality PROJECTOR is always held high regardless. "
@@ -1915,6 +1947,7 @@ def main():
     ap.add_argument("--mirror-only", action="store_true", help="with --remote-source: create the mirror and stop")
     ap.add_argument("--plan-only", action="store_true", help="print the per-module bit plan, build nothing")
     a = ap.parse_args()
+    floors = parse_floors(a.floor)
 
     if a.remote_source and not os.path.isfile(os.path.join(a.model, MIRROR_MARK)):
         if os.path.isdir(a.model) and os.listdir(a.model):
@@ -2012,7 +2045,8 @@ def main():
     def predicate(path, module, config=None):              # mlx_lm calls with (path, module)
         if rs is not None:
             rs.note(path, module)                          # the next mx.quantize is this module's weight
-        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high, a.table_bits, a.attn_min_bits)
+        return bits_for(path, alloc, is_moe, a.group_size, a.vision_bits, low, high, a.table_bits, a.attn_min_bits,
+                        floors)
 
     import contextlib, shutil
     import pollard_workspace as ws

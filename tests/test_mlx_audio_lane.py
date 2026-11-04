@@ -95,3 +95,18 @@ def test_mlx_audio_routes_only_a_model_it_really_carries(tmp_path, monkeypatch):
         d.mkdir()
         (d / "config.json").write_text(json.dumps({"model_type": mt}))
         assert M.mlx_audio_type(str(d)) == want, mt
+
+
+def test_floor_holds_named_roles_up_and_leaves_the_rest():
+    import pytest
+    floors = M.parse_floors(["q=3", "k=3", "down=3"])
+    alloc = {5: {"attn": 2, "ffn": 2}}
+    b = lambda p: M.bits_for(p, alloc, False, 64, low=2, high=4, floors=floors)["bits"]
+    assert b("model.layers.5.self_attn.q_proj") == 3 and b("model.layers.5.self_attn.k_proj") == 3
+    assert b("model.layers.5.mlp.down_proj") == 3
+    assert b("model.layers.5.mlp.gate_proj") == 2 and b("model.layers.5.self_attn.v_proj") == 2
+    alloc[5] = {"attn": 4, "ffn": 4}                                  # a floor never lowers a module
+    assert b("model.layers.5.self_attn.q_proj") == 4
+    assert M.bits_for("model.layers.5.mlp.down_proj", {5: {"attn": 2, "ffn": 2}}, False, 64, low=2, high=4)["bits"] == 2
+    with pytest.raises(SystemExit):
+        M.parse_floors(["ffn=3"])
